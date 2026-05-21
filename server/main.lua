@@ -7,19 +7,35 @@
 --
 -- Chat commands handled (exact match only):
 --   /race      race-start stub -- acknowledges in chat + log; no race yet.
---   /beamcomp  diagnostic ping -- replies with plugin version + player count.
+--   /beamcomp  diagnostic ping -- replies in chat AND sends a server->client
+--              "ping" event (channel "beamcompEvent") that the client mod surfaces.
 -- Both suppress their own chat echo. Anything else relays as normal chat.
--- Server -> client messaging (Sprint-1 item 5) and the actual race logic
--- (Phase 2+) are not here yet.
+-- The actual race logic (Phase 2+) is not here yet.
 
 local M = {}
 
 local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
 local CHAT_COMMAND_PING = "/beamcomp"
+-- Server -> client event channel. Must be colon-free: the BeamMP client parser
+-- splits incoming events on ':' (see ADR-0004).
+local EVENT_CHANNEL = "beamcompEvent"
 
 local function log_info(subsystem, msg)
     print("[" .. subsystem .. "] " .. msg)
+end
+
+-- Send a typed event to one client as a { type, payload } envelope. BeamMP
+-- JSON-encodes the table; the client decodes it with the shared envelope module.
+local function send_event(player_id, message_type, payload)
+    local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, {
+        type = message_type,
+        payload = payload,
+    })
+    if not ok then
+        log_info("beamcomp.net", "client event '" .. message_type .. "' to id "
+            .. player_id .. " failed: " .. tostring(err))
+    end
 end
 
 local function handle_race_command(player_id, player_name)
@@ -31,6 +47,11 @@ local function handle_ping_command(player_id, player_name)
     local player_count = MP.GetPlayerCount()
     log_info("beamcomp", CHAT_COMMAND_PING .. " from " .. player_name .. " (id " .. player_id .. ")")
     MP.SendChatMessage(player_id, "BeamComp v" .. PLUGIN_VERSION .. " -- alive (" .. player_count .. " players online)")
+    send_event(player_id, "ping", {
+        v = PLUGIN_VERSION,
+        players = player_count,
+        ts = os.time(),
+    })
 end
 
 local function on_chat_message(player_id, player_name, message)
