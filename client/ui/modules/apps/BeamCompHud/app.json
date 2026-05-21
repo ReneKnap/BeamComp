@@ -1,0 +1,20 @@
+{
+  "domElement": "<beam-comp-hud></beam-comp-hud>",
+  "directive": "beamCompHud",
+  "name": "BeamComp HUD",
+  "description": "BeamComp race HUD -- next checkpoint, position, and live time. Placeholder; populated in Phase 4.",
+  "author": "BeamComp",
+  "version": "0.0.1",
+  "category": "Gameplay",
+  "types": [
+    "ui.apps.categories.racing"
+  ],
+  "css": {
+    "top": "30px",
+    "left": "50px",
+    "width": "350px",
+    "height": "200px",
+    "min-width": "320px",
+    "min-height": "120px"
+  }
+}
