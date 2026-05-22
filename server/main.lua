@@ -5,12 +5,15 @@
 -- API reference: the BeamMP server-plugin recon note (kept in the project's
 -- local docs).
 --
--- Chat commands handled (exact match only):
---   /race      race-start stub -- acknowledges in chat + log; no race yet.
---   /beamcomp  diagnostic ping -- replies in chat AND sends a server->client
---              "ping" event (channel "beamcompEvent") that the client mod surfaces.
+-- Chat commands handled (leading token; trailing text is the argument):
+--   /race <name>  assign every present player a slot and send each one a server->client
+--                 "raceStart" event (channel "beamcompEvent") carrying its slot + the
+--                 grid roster; the client resolves and parses <name> locally (ADR-0005).
+--                 Bare /race replies with usage. The server never validates <name>.
+--   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
+--                 mod surfaces.
 -- Both suppress their own chat echo. Anything else relays as normal chat.
--- The actual race logic (Phase 2+) is not here yet.
+-- Spawning/movement (Phase 2 items 3-5, Phase 3+) is not here yet.
 
 local M = {}
 
@@ -38,9 +41,55 @@ local function send_event(player_id, message_type, payload)
     end
 end
 
-local function handle_race_command(player_id, player_name)
-    log_info("beamcomp.chat", CHAT_COMMAND_RACE .. " from " .. player_name .. " (id " .. player_id .. ")")
-    MP.SendChatMessage(player_id, "BeamComp: /race empfangen (skeleton)")
+-- Assign every connected player a 0-based slot, ordered by player id ascending. The
+-- order is deterministic so every client computes the same grid from the same roster.
+local function build_slots(players)
+    local ids = {}
+    for id in pairs(players) do
+        ids[#ids + 1] = id
+    end
+    table.sort(ids)
+
+    local slots = {}
+    for index, id in ipairs(ids) do
+        slots[#slots + 1] = {id = id, slot = index - 1, name = players[id]}
+    end
+    return slots
+end
+
+-- The roster shipped to every client: each player's slot + name, in slot order. Used
+-- client-side for the full grid layout and marker labels.
+local function build_roster(slots)
+    local roster = {}
+    for _, entry in ipairs(slots) do
+        roster[#roster + 1] = {slot = entry.slot, name = entry.name}
+    end
+    return roster
+end
+
+local function handle_race_command(player_id, player_name, race_name)
+    if race_name == "" then
+        MP.SendChatMessage(player_id, "BeamComp: usage -- /race <name>")
+        return
+    end
+
+    local slots = build_slots(MP.GetPlayers())
+    local roster = build_roster(slots)
+
+    log_info("beamcomp.race", "race '" .. race_name .. "' requested by " .. player_name
+        .. " (id " .. player_id .. ") for " .. #slots .. " player(s)")
+
+    for _, entry in ipairs(slots) do
+        send_event(entry.id, "raceStart", {
+            race = race_name,
+            slot = entry.slot,
+            grid = roster,
+            variant = "default",
+        })
+    end
+
+    MP.SendChatMessage(player_id, "BeamComp: starting race '" .. race_name .. "' with "
+        .. #slots .. " player(s)")
 end
 
 local function handle_ping_command(player_id, player_name)
@@ -54,13 +103,24 @@ local function handle_ping_command(player_id, player_name)
     })
 end
 
+-- Split a chat message into its leading command token and the trimmed remainder.
+local function parse_command(message)
+    return message:match("^(%S+)%s*(.-)%s*$")
+end
+
 local function on_chat_message(player_id, player_name, message)
-    if message == CHAT_COMMAND_RACE then
-        handle_race_command(player_id, player_name)
+    if type(message) ~= "string" then
+        return
+    end
+
+    local command, argument = parse_command(message)
+
+    if command == CHAT_COMMAND_RACE then
+        handle_race_command(player_id, player_name, argument)
         return 1  -- suppress the command's own chat echo
     end
 
-    if message == CHAT_COMMAND_PING then
+    if command == CHAT_COMMAND_PING then
         handle_ping_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
