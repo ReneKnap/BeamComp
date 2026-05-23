@@ -11,8 +11,8 @@
 -- `type` (ADR-0004). Handled types:
 --   ping       -- diagnostic; surfaces a toast.
 --   raceStart  -- resolve + parse the race locally, compute this client's grid start pose
---                 (race/start + race/grid), and draw throwaway grid markers (onPreRender).
--- No vehicle spawn yet (Phase-2 item 4); markers are the visible result for now.
+--                 (race/start + race/grid), draw the grid markers (onPreRender), and respawn
+--                 this client's own car fresh at its assigned grid pose (race/vehicles).
 
 local M = {}
 
@@ -60,14 +60,14 @@ local function handle_race_start(payload)
     M.state.race = race
     M.state.marker_warned = false
 
-    -- Clear what this client is currently driving so item 4 can spawn a fresh car at the
-    -- grid pose. Owned-only + BeamMP-propagated (see race/vehicles.lua); the grid markers
-    -- keep rendering from M.state.race regardless.
-    local removed, despawn_err = vehicles.despawn_own()
-    if removed then
-        log("I", RACE_LOG_TAG, string.format("despawned %d own vehicle(s) for race start", removed))
+    -- Clear this client's vehicles and spawn a fresh copy of its own car at the assigned grid
+    -- pose. Owned-only + BeamMP-propagated (see race/vehicles.lua); the grid markers keep
+    -- rendering from M.state.race regardless.
+    local spawned, respawn_err = vehicles.respawn_own_at(race.myPose)
+    if spawned then
+        log("I", RACE_LOG_TAG, string.format("respawned at grid slot %d", race.mySlot))
     else
-        log("W", RACE_LOG_TAG, "despawn skipped: " .. tostring(despawn_err))
+        log("W", RACE_LOG_TAG, "respawn skipped: " .. tostring(respawn_err))
     end
 
     log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d", race.name, race.mySlot))
