@@ -18,6 +18,7 @@ local M = {}
 
 local envelope = require("beamcomp/envelope")
 local race_start = require("beamcomp/race/start")
+local vehicles = require("beamcomp/race/vehicles")
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -58,6 +59,17 @@ local function handle_race_start(payload)
 
     M.state.race = race
     M.state.marker_warned = false
+
+    -- Clear what this client is currently driving so item 4 can spawn a fresh car at the
+    -- grid pose. Owned-only + BeamMP-propagated (see race/vehicles.lua); the grid markers
+    -- keep rendering from M.state.race regardless.
+    local removed, despawn_err = vehicles.despawn_own()
+    if removed then
+        log("I", RACE_LOG_TAG, string.format("despawned %d own vehicle(s) for race start", removed))
+    else
+        log("W", RACE_LOG_TAG, "despawn skipped: " .. tostring(despawn_err))
+    end
+
     log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d", race.name, race.mySlot))
     guihooks.trigger("toastrMsg", {
         type = "success",
