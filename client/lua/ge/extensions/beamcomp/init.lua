@@ -11,14 +11,16 @@
 -- `type` (ADR-0004). Handled types:
 --   ping       -- diagnostic; surfaces a toast.
 --   raceStart  -- resolve + parse the race locally, compute this client's grid start pose
---                 (race/start + race/grid), draw the grid markers (onPreRender), and respawn
---                 this client's own car fresh at its assigned grid pose (race/vehicles).
+--                 (race/start + race/grid), draw the grid markers (onPreRender), respawn this
+--                 client's own car fresh at its assigned grid pose (race/vehicles), and load the
+--                 race's static-scenery prop prefab(s) into the scene (race/props).
 
 local M = {}
 
 local envelope = require("beamcomp/envelope")
 local race_start = require("beamcomp/race/start")
 local vehicles = require("beamcomp/race/vehicles")
+local props = require("beamcomp/race/props")
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -33,6 +35,7 @@ M.state = {
     registered = false,
     race = nil,          -- current race-start state (slot, poses, roster) or nil
     marker_warned = false,
+    prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
 }
 
 local function handle_ping(_payload)
@@ -60,11 +63,25 @@ local function handle_race_start(payload)
     M.state.race = race
     M.state.marker_warned = false
 
+    -- Load the race's static-scenery prefab(s) BEFORE the vehicle respawn, so the fresh car's
+    -- spawn + auto-enter stays the LAST scene action and the player lands seated in it. Loading
+    -- props after the respawn left the player's camera latched onto a prop (a pylon) instead of
+    -- the car. Clear first so re-issuing /race never stacks duplicates; placement is client-local
+    -- + deterministic (see race/props.lua).
+    props.clear(M.state.prop_names or {})
+    M.state.prop_names = props.load(race.prefabFiles or {})
+
     -- Clear this client's vehicles and spawn a fresh copy of its own car at the assigned grid
-    -- pose. Owned-only + BeamMP-propagated (see race/vehicles.lua); the grid markers keep
-    -- rendering from M.state.race regardless.
+    -- pose. Owned-only + BeamMP-propagated (see race/vehicles.lua); kept last so auto-enter seats
+    -- the player. The grid markers keep rendering from M.state.race regardless.
     local spawned, respawn_err = vehicles.respawn_own_at(race.myPose)
     if spawned then
+        -- Re-assert the player into the fresh car. props.load above removes the prefab's
+        -- prop-vehicles (cones) first, but this guarantees seating even if one slipped past the
+        -- auto-enter race rather than leaving the player on a prop.
+        if be then
+            pcall(function() be:enterVehicle(0, spawned) end)
+        end
         log("I", RACE_LOG_TAG, string.format("respawned at grid slot %d", race.mySlot))
     else
         log("W", RACE_LOG_TAG, "respawn skipped: " .. tostring(respawn_err))
@@ -186,6 +203,8 @@ function M.onExtensionUnloaded()
         RemoveEventHandler(EVENT_CHANNEL, "beamcomp")
     end
     M.state.registered = false
+    props.clear(M.state.prop_names or {})
+    M.state.prop_names = nil
     M.state.race = nil
     log("I", LOG_TAG, "unloaded")
 end
