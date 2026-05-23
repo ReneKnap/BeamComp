@@ -3,29 +3,92 @@
 -- Deployed to Resources/Server/BeamComp/. BeamMP loads every .lua file in the
 -- plugin folder alphabetically at server start.
 -- API reference: the BeamMP server-plugin recon note (kept in the project's
--- local docs).
+-- local docs). Design: ADR-0006 (server-side race state machine).
+--
+-- Owns a server-authoritative race state machine (ADR-0006):
+--   lobby -> spawning -> countdown -> racing -> finished -> lobby
+-- An always-on 250 ms tick (MP.CreateEventTimer) drives the timed transitions; a
+-- monotonic MP.CreateTimer() stopwatch measures elapsed time per phase. Every
+-- transition is broadcast to all clients as a "racePhase" envelope on the
+-- "beamcompEvent" channel; the later Phase-3 items (movement lock, countdown UI,
+-- release) act on those phases. The finish-grace hook and the racing -> finished
+-- trigger are built but dormant -- finish detection lands in Phase 4.
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race <name>  assign every present player a slot and send each one a server->client
---                 "raceStart" event (channel "beamcompEvent") carrying its slot + the
---                 grid roster; the client resolves and parses <name> locally (ADR-0005).
---                 Bare /race replies with usage. The server never validates <name>.
+--   /race <name>  from lobby/finished: assign every present player a slot, send each a
+--                 "raceStart" event (slot + grid roster), and enter the spawning phase. The
+--                 client resolves and parses <name> locally (ADR-0005). While a race is
+--                 already running, /race queues the new race and runs a short abort window
+--                 before restarting. Bare /race replies with usage.
+--   /raceend      force the state machine back to lobby (safety hatch).
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
--- Both suppress their own chat echo. Anything else relays as normal chat.
--- Spawning/movement (Phase 2 items 3-5, Phase 3+) is not here yet.
+-- All three suppress their own chat echo. Anything else relays as normal chat.
+-- The server never validates <name> (ADR-0005).
 
 local M = {}
 
 local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
+local CHAT_COMMAND_RACEEND = "/raceend"
 local CHAT_COMMAND_PING = "/beamcomp"
+
 -- Server -> client event channel. Must be colon-free: the BeamMP client parser
 -- splits incoming events on ':' (see ADR-0004).
 local EVENT_CHANNEL = "beamcompEvent"
+local MSG_RACE_START = "raceStart"
+local MSG_RACE_PHASE = "racePhase"
+
+-- State-machine tick. ~4x/second: fine enough for a 3-2-1-GO, idle cost is a nil-check.
+local TICK_EVENT = "beamcompTick"
+local TICK_INTERVAL_MS = 250
+
+-- The five canonical race phases (the racePhase contract, ADR-0006). Referenced by name so a
+-- typo is a load error, not a silent mis-compare.
+local PHASE = {
+    lobby = "lobby",
+    spawning = "spawning",
+    countdown = "countdown",
+    racing = "racing",
+    finished = "finished",
+}
+
+-- Phase durations in seconds. Editable server config (ADR-0006); not a runtime/in-game UI.
+local PHASE_DURATIONS = {
+    spawning = 3.0,       -- fixed wait for clients to resolve/parse/spawn (acks deferred: backlog)
+    countdown = 3.0,      -- pre-race 3-2-1-GO
+    finish_grace = 30.0,  -- after the first finisher (Phase-4 hook; dormant here)
+    abort_window = 1.5,   -- short finished window when /race restarts a running race
+    finished_hold = 8.0,  -- results/cleanup window before returning to lobby
+}
+
+-- Monotonic stopwatch for phase timing; only elapsed differences are used, so its origin
+-- (creation moment) does not matter.
+local clock = MP.CreateTimer()
+
+-- In-memory session state. Resets on a Lua-state reload (a race spanning a code reload is a
+-- dev-only scenario), so nothing unrecoverable lives here.
+local session = {
+    phase = PHASE.lobby,
+    race = nil,             -- active race name, or nil
+    roster = nil,           -- grid roster shipped in raceStart, or nil
+    phase_started_at = 0,   -- clock seconds at the current phase's entry
+    phase_duration = nil,   -- configured length of the current timed phase, or nil if open-ended
+    grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
+    pending_race = nil,     -- race name queued by a /race re-issued while one is active
+}
+
 
 local function log_info(subsystem, msg)
     print("[" .. subsystem .. "] " .. msg)
+end
+
+local function now()
+    return clock:GetCurrent()
+end
+
+local function phase_elapsed()
+    return now() - session.phase_started_at
 end
 
 -- Send a typed event to one client as a { type, payload } envelope. BeamMP
@@ -39,6 +102,25 @@ local function send_event(player_id, message_type, payload)
         log_info("beamcomp.net", "client event '" .. message_type .. "' to id "
             .. player_id .. " failed: " .. tostring(err))
     end
+end
+
+-- Send a typed event to every connected player. BeamMP has no broadcast for
+-- TriggerClientEvent*, so loop over the player table (server API note, section 7).
+local function broadcast_event(message_type, payload)
+    for player_id in pairs(MP.GetPlayers()) do
+        send_event(player_id, message_type, payload)
+    end
+end
+
+-- Move the session into `phase`, stamp the entry time, and announce it to all clients as a
+-- racePhase envelope. `duration` (seconds) is carried for timed phases so a client can render a
+-- synced countdown; pass nil for open-ended phases (lobby, racing).
+local function enter_phase(phase, duration)
+    session.phase = phase
+    session.phase_duration = duration
+    session.phase_started_at = now()
+    log_info("beamcomp.race", "phase -> " .. phase)
+    broadcast_event(MSG_RACE_PHASE, {phase = phase, duration = duration})
 end
 
 -- Assign every connected player a 0-based slot, ordered by player id ascending. The
@@ -67,20 +149,30 @@ local function build_roster(slots)
     return roster
 end
 
-local function handle_race_command(player_id, player_name, race_name)
-    if race_name == "" then
-        MP.SendChatMessage(player_id, "BeamComp: usage -- /race <name>")
-        return
-    end
+-- Clear the session and announce the lobby phase.
+local function reset_to_lobby()
+    session.race = nil
+    session.roster = nil
+    session.grace_deadline = nil
+    session.pending_race = nil
+    enter_phase(PHASE.lobby, nil)
+end
 
+-- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster), and
+-- enter the spawning phase. The client resolves and parses the race name locally (ADR-0005).
+local function start_race(race_name)
     local slots = build_slots(MP.GetPlayers())
     local roster = build_roster(slots)
 
-    log_info("beamcomp.race", "race '" .. race_name .. "' requested by " .. player_name
-        .. " (id " .. player_id .. ") for " .. #slots .. " player(s)")
+    session.race = race_name
+    session.roster = roster
+    session.grace_deadline = nil
+    session.pending_race = nil
+
+    log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
     for _, entry in ipairs(slots) do
-        send_event(entry.id, "raceStart", {
+        send_event(entry.id, MSG_RACE_START, {
             race = race_name,
             slot = entry.slot,
             grid = roster,
@@ -88,8 +180,93 @@ local function handle_race_command(player_id, player_name, race_name)
         })
     end
 
-    MP.SendChatMessage(player_id, "BeamComp: starting race '" .. race_name .. "' with "
-        .. #slots .. " player(s)")
+    enter_phase(PHASE.spawning, PHASE_DURATIONS.spawning)
+end
+
+-- Arm the finish-grace countdown: once the first player crosses the line the race runs for
+-- finish_grace more seconds, then ends. Finish detection is Phase 4 (client-side checkpoint
+-- tracking -> a client->server event), which will call this -- it is the documented racing ->
+-- finished seam and is dormant today (ADR-0006).
+local function start_finish_grace()
+    if session.phase ~= PHASE.racing or session.grace_deadline then
+        return
+    end
+    session.grace_deadline = now() + PHASE_DURATIONS.finish_grace
+    log_info("beamcomp.race", "finish grace armed")
+end
+
+-- A finished phase either restarts into a queued race (a re-issued /race) or settles to lobby.
+local function advance_from_finished()
+    local pending = session.pending_race
+    if pending then
+        session.pending_race = nil
+        start_race(pending)
+        return
+    end
+    reset_to_lobby()
+end
+
+-- Advance the state machine one step. Runs on every tick; a no-op while idle in lobby.
+local function tick()
+    local phase = session.phase
+    if phase == PHASE.lobby then
+        return
+    end
+
+    -- racing is open-ended: it ends only when the (Phase-3-dormant) finish grace elapses.
+    if phase == PHASE.racing then
+        if session.grace_deadline and now() >= session.grace_deadline then
+            enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
+        end
+        return
+    end
+
+    -- Every other active phase is timed: advance once its configured duration elapses.
+    if not session.phase_duration or phase_elapsed() < session.phase_duration then
+        return
+    end
+
+    if phase == PHASE.spawning then
+        enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+    elseif phase == PHASE.countdown then
+        -- The release signal itself is a later Phase-3 item; here we only enter racing.
+        enter_phase(PHASE.racing, nil)
+    elseif phase == PHASE.finished then
+        advance_from_finished()
+    end
+end
+
+-- /race <name>: from an idle/finished session start the race; from an active one queue the new
+-- race and cut the current one short with a brief abort window before it restarts (ADR-0006).
+local function handle_race_command(player_id, player_name, race_name)
+    if race_name == "" then
+        MP.SendChatMessage(player_id, "BeamComp: usage -- /race <name>")
+        return
+    end
+
+    log_info("beamcomp.race", "/race '" .. race_name .. "' by " .. player_name
+        .. " (phase " .. session.phase .. ")")
+
+    if session.phase == PHASE.lobby or session.phase == PHASE.finished then
+        start_race(race_name)
+        MP.SendChatMessage(player_id, "BeamComp: starting race '" .. race_name .. "'")
+        return
+    end
+
+    session.pending_race = race_name
+    enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
+    MP.SendChatMessage(player_id, "BeamComp: restarting with race '" .. race_name .. "'")
+end
+
+-- /raceend: force the machine back to lobby from any active phase (safety hatch).
+local function handle_raceend_command(player_id, player_name)
+    if session.phase == PHASE.lobby then
+        MP.SendChatMessage(player_id, "BeamComp: no race in progress")
+        return
+    end
+    log_info("beamcomp.race", "/raceend by " .. player_name)
+    reset_to_lobby()
+    MP.SendChatMessage(player_id, "BeamComp: race ended")
 end
 
 local function handle_ping_command(player_id, player_name)
@@ -101,6 +278,28 @@ local function handle_ping_command(player_id, player_name)
         players = player_count,
         ts = os.time(),
     })
+end
+
+-- True if no connected player other than `leaving_id` remains. onPlayerDisconnect may or may
+-- not still list the leaving player, so exclude it explicitly.
+local function is_server_empty_without(leaving_id)
+    for id in pairs(MP.GetPlayers()) do
+        if id ~= leaving_id then
+            return false
+        end
+    end
+    return true
+end
+
+-- If the last player leaves mid-race there is no one to race -- fall back to lobby.
+local function on_player_disconnect(player_id)
+    if session.phase == PHASE.lobby then
+        return
+    end
+    if is_server_empty_without(player_id) then
+        log_info("beamcomp.race", "all players gone; returning to lobby")
+        reset_to_lobby()
+    end
 end
 
 -- Split a chat message into its leading command token and the trimmed remainder.
@@ -120,6 +319,11 @@ local function on_chat_message(player_id, player_name, message)
         return 1  -- suppress the command's own chat echo
     end
 
+    if command == CHAT_COMMAND_RACEEND then
+        handle_raceend_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
     if command == CHAT_COMMAND_PING then
         handle_ping_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
@@ -129,12 +333,15 @@ end
 
 local function on_init()
     log_info("beamcomp", "server plugin loaded v" .. PLUGIN_VERSION)
+    -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
+    -- fully up; the tick is a no-op while the session sits in lobby.
+    MP.CreateEventTimer(TICK_EVENT, TICK_INTERVAL_MS, MP.CallStrategy.BestEffort)
+    log_info("beamcomp.race", "state-machine tick started (" .. TICK_INTERVAL_MS .. "ms)")
 end
 
--- The two functions below are the only file-scope globals in this plugin.
--- BeamMP's MP.RegisterEvent binds a handler by its global function name, so the
--- registered entry points must be global. Each stays a thin wrapper that
--- delegates straight into a local function.
+-- The functions below are the only file-scope globals in this plugin. BeamMP's MP.RegisterEvent
+-- binds a handler by its global function name, so registered entry points must be global. Each
+-- stays a thin wrapper that delegates straight into a local function.
 
 -- BeamMP event handler (must be global)
 function beamcomp_on_chat(player_id, player_name, message)
@@ -146,7 +353,19 @@ function beamcomp_on_init()
     return on_init()
 end
 
+-- BeamMP event handler (must be global)
+function beamcomp_on_tick()
+    return tick()
+end
+
+-- BeamMP event handler (must be global)
+function beamcomp_on_disconnect(player_id)
+    return on_player_disconnect(player_id)
+end
+
 MP.RegisterEvent("onChatMessage", "beamcomp_on_chat")
 MP.RegisterEvent("onInit", "beamcomp_on_init")
+MP.RegisterEvent("onPlayerDisconnect", "beamcomp_on_disconnect")
+MP.RegisterEvent(TICK_EVENT, "beamcomp_on_tick")
 
 return M
