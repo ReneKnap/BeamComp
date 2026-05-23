@@ -56,6 +56,21 @@ local function maps_match(loaded, race_map)
     return a == b or a:find(b, 1, true) ~= nil or b:find(a, 1, true) ~= nil
 end
 
+local REVERSE_PREFAB = "reversePrefab.prefab.json"
+
+-- The prefab files to load for a forward race: every shipped prefab except the reverse one
+-- (i.e. main + forward, given the parser's fixed {main, forward, reverse} set). Reverse-
+-- direction support is a deferred feature, so its prefab is excluded here.
+local function forward_prefabs(prefab_files)
+    local forward = {}
+    for _, file in ipairs(prefab_files or {}) do
+        if file:sub(-#REVERSE_PREFAB) ~= REVERSE_PREFAB then
+            forward[#forward + 1] = file
+        end
+    end
+    return forward
+end
+
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
 function M.prepare(payload)
     if type(payload) ~= "table" or type(payload.race) ~= "string" then
@@ -113,6 +128,7 @@ function M.prepare(payload)
         myPose = my_pose,
         gridPoses = poses,
         roster = roster,
+        prefabFiles = forward_prefabs(race.props.prefabFiles),
     }
 end
 
