@@ -14,6 +14,9 @@
 --                 (race/start + race/grid), draw the grid markers (onPreRender), respawn this
 --                 client's own car fresh at its assigned grid pose (race/vehicles), and load the
 --                 race's static-scenery prop prefab(s) into the scene (race/props).
+--   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
+--                 ADR-0006). For now we just record + surface it; movement lock, countdown UI,
+--                 and release (later Phase-3 items) will act on these phases.
 
 local M = {}
 
@@ -34,6 +37,7 @@ M.state = {
     last_event_at = 0,
     registered = false,
     race = nil,          -- current race-start state (slot, poses, roster) or nil
+    phase = nil,         -- current server-authoritative race phase (ADR-0006) or nil
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
 }
@@ -96,9 +100,39 @@ local function handle_race_start(payload)
     })
 end
 
+-- Record the server-authoritative race phase and surface it. The server broadcasts a racePhase
+-- on every transition (ADR-0006); later Phase-3 items hang movement lock, countdown UI, and
+-- release off M.state.phase. Here we only store + toast it.
+local function handle_race_phase(payload)
+    local phase = type(payload) == "table" and payload.phase or nil
+    if type(phase) ~= "string" then
+        log("W", RACE_LOG_TAG, "racePhase ignored: missing phase")
+        return
+    end
+
+    M.state.phase = phase
+    log("I", RACE_LOG_TAG, "race phase -> " .. phase)
+
+    -- Race over (back to lobby): despawn the track props and stop drawing the grid markers, but
+    -- leave the player's vehicle exactly where it is -- never despawn or move it. The abort-restart
+    -- path skips lobby (finished -> spawning), and handle_race_start reloads props there instead.
+    if phase == "lobby" then
+        props.clear(M.state.prop_names or {})
+        M.state.prop_names = nil
+        M.state.race = nil
+    end
+
+    guihooks.trigger("toastrMsg", {
+        type = "info",
+        title = "BeamComp",
+        msg = "Race phase: " .. phase,
+    })
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
+    racePhase = handle_race_phase,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -206,6 +240,7 @@ function M.onExtensionUnloaded()
     props.clear(M.state.prop_names or {})
     M.state.prop_names = nil
     M.state.race = nil
+    M.state.phase = nil
     log("I", LOG_TAG, "unloaded")
 end
 
