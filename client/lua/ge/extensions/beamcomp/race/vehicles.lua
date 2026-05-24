@@ -3,22 +3,25 @@
 -- Lives at lua/ge/extensions/beamcomp/race/vehicles.lua inside the client mod zip. Stateless
 -- and reload-safe (no M.state, no file-scope mutable state). Target: client GE (LuaJIT 5.1).
 --
--- On a race start each client clears the vehicles it owns and spawns one fresh copy of its own
--- car at the grid pose the server assigned it (M.respawn_own_at). Owned-only is deliberate:
--- getOwnMap() (BeamMP's MPVehicleGE) lists vehicles whose isLocal == true, and both deleting
--- and spawning an owned vehicle are propagated to every client by BeamMP -- a delete fires
--- BeamNG's onVehicleDestroyed -> 'Od:', a spawn fires onVehicleSpawned -> 'Os:'. Touching a
--- non-owned (synced) vehicle would desync, so we never do (hence no core_vehicles.removeAll);
--- each client clears and spawns only its own car and the full grid fills in as all do the same.
+-- On a race start each client places its own car at the grid pose the server assigned it
+-- (M.respawn_own_at, ADR-0007). Primary path: if the player is already in a real owned car, keep
+-- it -- repair + teleport it in place and despawn only the OTHER owned cars -- so its runtime state
+-- (ESC / drive-mode, customization) survives. Fallback (no real own car): despawn all and spawn a
+-- fresh one. Owned-only is deliberate: getOwnMap() (BeamMP's MPVehicleGE) lists vehicles whose
+-- isLocal == true, and deleting / spawning / teleporting an owned vehicle is propagated to every
+-- client by BeamMP (delete -> 'Od:', spawn -> 'Os:', teleport via normal position sync). Touching a
+-- non-owned (synced) vehicle would desync, so we never do; each client handles only its own car and
+-- the full grid fills in as all do the same.
 
 local M = {}
 
 local LOG_TAG = "beamcomp.spawn"
 
--- Remove every vehicle this client owns in the current multiplayer session. Returns the
--- number deleted (0 is valid), or nil plus a reason when there is no MP session to act in.
-function M.despawn_own()
-    -- getOwnMap is a BeamMP GE global that exists only inside a multiplayer session.
+-- Delete every owned vehicle except `keep_id` (pass nil to delete all). Returns the count deleted
+-- (0 is valid), or nil plus a reason when there is no MP session to act in. Shared by despawn_own
+-- and despawn_owned_except. getOwnMap is a BeamMP GE global that exists only inside an MP session;
+-- the delete is propagated to all clients by BeamMP (onVehicleDestroyed -> 'Od:').
+local function delete_owned_except(keep_id)
     if type(getOwnMap) ~= "function" or not be then
         return nil, "not in a multiplayer session"
     end
@@ -30,26 +33,53 @@ function M.despawn_own()
 
     local removed = 0
     for game_vehicle_id in pairs(own) do
-        local veh = be:getObjectByID(game_vehicle_id)
-        if veh then
-            local ok, err = pcall(function() veh:delete() end)
-            if ok then
-                removed = removed + 1
-            else
-                log("W", LOG_TAG, "failed to delete vehicle " .. tostring(game_vehicle_id)
-                    .. ": " .. tostring(err))
+        -- Compare as strings: own-map keys and getId() may differ in number/string type.
+        if tostring(game_vehicle_id) ~= tostring(keep_id) then
+            local veh = be:getObjectByID(game_vehicle_id)
+            if veh then
+                local ok, err = pcall(function() veh:delete() end)
+                if ok then
+                    removed = removed + 1
+                else
+                    log("W", LOG_TAG, "failed to delete vehicle " .. tostring(game_vehicle_id)
+                        .. ": " .. tostring(err))
+                end
             end
         end
     end
 
+    return removed
+end
+
+-- Remove every vehicle this client owns in the current multiplayer session. Returns the
+-- number deleted (0 is valid), or nil plus a reason when there is no MP session to act in.
+function M.despawn_own()
+    local removed, reason = delete_owned_except(nil)
+    if not removed then
+        return nil, reason
+    end
+
     -- Our camera may be left on a now-deleted vehicle; drop to free-cam when we removed our
-    -- car and none of ours remains (item 4 will spawn a fresh one to enter).
+    -- car and none of ours remains (the fresh-spawn fallback will spawn one to enter).
     if removed > 0 and type(getPlayerVehicle) == "function" and not getPlayerVehicle(0)
             and commands and commands.setFreeCamera then
         pcall(commands.setFreeCamera)
     end
 
     log("I", LOG_TAG, string.format("despawned %d own vehicle(s)", removed))
+    return removed
+end
+
+-- Remove every owned vehicle EXCEPT `keep_id` -- used by the keep+repair+teleport path to clear the
+-- player's other cars while leaving the one they sit in untouched (no free-cam drop: the seated car
+-- stays). Returns the count deleted, or nil plus a reason.
+function M.despawn_owned_except(keep_id)
+    local removed, reason = delete_owned_except(keep_id)
+    if not removed then
+        return nil, reason
+    end
+
+    log("I", LOG_TAG, string.format("despawned %d other own vehicle(s)", removed))
     return removed
 end
 
@@ -123,12 +153,68 @@ local function spawn_vehicle_at(pose, spec)
     return veh
 end
 
--- Clear this client's owned vehicles and spawn a fresh copy of its own car at `pose` (the grid
--- start the server assigned). Capturing before the despawn is required, since the despawn
--- deletes the car we copy. Returns the spawned vehicle, or nil plus a reason. BeamMP propagates
--- both the despawn ('Od:') and the spawn ('Os:') to every client. _spawnNewVehicle auto-enters
--- the player, so the despawn's free-cam is superseded.
-function M.respawn_own_at(pose)
+-- Return the car the player is currently in, iff it is a real owned car worth keeping for the race
+-- (in the owned-vehicle map and not the walking unicycle); else nil (which selects the fresh-spawn
+-- fallback). Owned membership is what makes it BeamMP-safe to touch.
+--
+-- `preferred_id` is the vehicle the player last switched into, tracked GE-side via onVehicleSwitched
+-- (see init.lua). This is REQUIRED in BeamMP: the polling APIs (getPlayerVehicle(0) /
+-- be:getPlayerVehicle(0)) stick to the FIRST owned car and do not follow later spawns/switches, so
+-- without the tracked id the race start keeps the wrong car when several are spawned (confirmed
+-- in-game: only the tracked-id version works). Falls back to be:getPlayerVehicle(0) when no tracked
+-- id is owned/valid (single car, or right after load).
+function M.resolve_own_car(preferred_id)
+    if not be or type(getOwnMap) ~= "function" then
+        return nil
+    end
+    local own = getOwnMap()
+    if type(own) ~= "table" then
+        return nil
+    end
+
+    -- The owned, non-unicycle vehicle object for `id`, or nil.
+    local function owned_car(id)
+        if id == nil then
+            return nil
+        end
+        for game_vehicle_id in pairs(own) do
+            if tostring(game_vehicle_id) == tostring(id) then
+                local veh = be:getObjectByID(game_vehicle_id)
+                if veh and veh.JBeam ~= "unicycle" then
+                    return veh
+                end
+                return nil
+            end
+        end
+        return nil
+    end
+
+    local seated = owned_car(preferred_id)
+    if seated then
+        return seated
+    end
+    local pv = be:getPlayerVehicle(0)
+    return owned_car(pv and pv:getId())
+end
+
+-- Repair + teleport a vehicle to a grid pose. veh:setPositionRotation resets the vehicle to its
+-- undamaged rest state at the new pose -- BeamNG's own race-start repair path
+-- (gameplay/race/startPosition.lua). The 180-degree Z flip (quat(0,0,1,0) * rot) matches the flip
+-- the spawn path applies internally and the engine's repair branch applies explicitly; verified
+-- in-game at handover.
+local function repair_and_place(veh, pose)
+    local rot = quat(0, 0, 1, 0) * quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
+    veh:setPositionRotation(pose.pos.x, pose.pos.y, pose.pos.z, rot.x, rot.y, rot.z, rot.w)
+end
+
+-- Place this client's own car at `pose` (the grid start the server assigned). Two paths (ADR-0007):
+-- if `own_car` is the player's seated owned car (resolved by the caller via M.resolve_own_car with
+-- the onVehicleSwitched-tracked id), keep it -- despawn only the OTHER owned cars, then repair +
+-- teleport the kept car in place (preserving ESC/drive-mode and customization); otherwise fall back
+-- to a fresh spawn (despawn all, spawn a new car). Returns the resolved race car (the caller enters
+-- + freezes it), or nil plus a reason. BeamMP propagates the despawn ('Od:'), spawn ('Os:'), and the
+-- kept car's teleport (via normal owned-vehicle position sync).
+function M.respawn_own_at(pose, own_car)
     if type(getOwnMap) ~= "function" or not be then
         return nil, "not in a multiplayer session"
     end
@@ -136,6 +222,20 @@ function M.respawn_own_at(pose)
         return nil, "invalid grid pose"
     end
 
+    if own_car then
+        M.despawn_owned_except(own_car:getId())
+        local ok, err = pcall(repair_and_place, own_car, pose)
+        if not ok then
+            log("W", LOG_TAG, "repair+teleport failed: " .. tostring(err))
+            return nil, "repair+teleport failed: " .. tostring(err)
+        end
+        log("I", LOG_TAG, string.format("kept + placed own car id=%s at grid (%.1f, %.1f, %.1f)",
+            tostring(own_car:getId()), pose.pos.x, pose.pos.y, pose.pos.z))
+        return own_car
+    end
+
+    -- Fallback: no real own car (free-cam / walking / none) -- spawn a fresh one. Capturing before
+    -- the despawn is required, since the despawn deletes the car we copy.
     local spec = capture_own_spec()
     M.despawn_own()
 
@@ -146,7 +246,7 @@ function M.respawn_own_at(pose)
     end
 
     local model_name = (spec and spec.model) or "default"
-    log("I", LOG_TAG, string.format("respawned own '%s' at grid (%.1f, %.1f, %.1f)",
+    log("I", LOG_TAG, string.format("spawned fresh own '%s' at grid (%.1f, %.1f, %.1f)",
         tostring(model_name), pose.pos.x, pose.pos.y, pose.pos.z))
     return veh
 end

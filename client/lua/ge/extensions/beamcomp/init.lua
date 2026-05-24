@@ -41,6 +41,7 @@ M.state = {
     phase = nil,         -- current server-authoritative race phase (ADR-0006) or nil
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
+    current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
 }
 
 local function handle_ping(_payload)
@@ -68,6 +69,11 @@ local function handle_race_start(payload)
     M.state.race = race
     M.state.marker_warned = false
 
+    -- Resolve the car the player is in, preferring the onVehicleSwitched-tracked id (the polling API
+    -- be:getPlayerVehicle(0) sticks to the first owned car in BeamMP). Resolve BEFORE loading props
+    -- so the choice is taken before any prop-vehicle churn.
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+
     -- Load the race's static-scenery prefab(s) BEFORE the vehicle respawn, so the fresh car's
     -- spawn + auto-enter stays the LAST scene action and the player lands seated in it. Loading
     -- props after the respawn left the player's camera latched onto a prop (a pylon) instead of
@@ -76,28 +82,29 @@ local function handle_race_start(payload)
     props.clear(M.state.prop_names or {})
     M.state.prop_names = props.load(race.prefabFiles or {})
 
-    -- Clear this client's vehicles and spawn a fresh copy of its own car at the assigned grid
-    -- pose. Owned-only + BeamMP-propagated (see race/vehicles.lua); kept last so auto-enter seats
-    -- the player. The grid markers keep rendering from M.state.race regardless.
-    local spawned, respawn_err = vehicles.respawn_own_at(race.myPose)
-    if spawned then
-        -- Re-assert the player into the fresh car. props.load above removes the prefab's
-        -- prop-vehicles (cones) first, but this guarantees seating even if one slipped past the
-        -- auto-enter race rather than leaving the player on a prop.
+    -- Place this client's own car at the assigned grid pose: the car the player is in is repaired +
+    -- teleported in place (preserving its settings), or a fresh one is spawned as a fallback
+    -- (ADR-0007). Owned-only + BeamMP-propagated (see race/vehicles.lua). The grid markers keep
+    -- rendering from M.state.race regardless.
+    local race_car, respawn_err = vehicles.respawn_own_at(race.myPose, own_car)
+    if race_car then
+        -- Re-assert the player into the race car. Harmless when they are already seated (kept-car
+        -- path); on the fresh-spawn fallback this guarantees seating even if a prop-vehicle slipped
+        -- past the auto-enter race rather than leaving the player on a prop.
         if be then
-            pcall(function() be:enterVehicle(0, spawned) end)
+            pcall(function() be:enterVehicle(0, race_car) end)
         end
-        -- Spawn the car frozen: hold it in place from spawn through the countdown so nobody can
-        -- jump the start (released on the racing phase, see handle_race_phase). Freeze the spawned
-        -- handle rather than getPlayerVehicle(0): the spawn/enter settle over later frames, so the
-        -- command must be queued to this exact vehicle's VE.
-        local frozen, freeze_err = vehicles.set_vehicle_frozen(spawned, true)
+        -- Spawn/place the car frozen: hold it from race start through the countdown so nobody can
+        -- jump the start (released on the racing phase, see handle_race_phase). Freeze the resolved
+        -- handle directly: on the fallback the spawn settles over later frames, so the command must
+        -- be queued to this exact vehicle's VE.
+        local frozen, freeze_err = vehicles.set_vehicle_frozen(race_car, true)
         if not frozen then
-            log("W", RACE_LOG_TAG, "could not freeze spawned car: " .. tostring(freeze_err))
+            log("W", RACE_LOG_TAG, "could not freeze race car: " .. tostring(freeze_err))
         end
-        log("I", RACE_LOG_TAG, string.format("respawned at grid slot %d", race.mySlot))
+        log("I", RACE_LOG_TAG, string.format("placed at grid slot %d", race.mySlot))
     else
-        log("W", RACE_LOG_TAG, "respawn skipped: " .. tostring(respawn_err))
+        log("W", RACE_LOG_TAG, "race-car placement skipped: " .. tostring(respawn_err))
     end
 
     log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d", race.name, race.mySlot))
@@ -228,7 +235,20 @@ function M.onExtensionLoaded()
     -- rather than trusting the serialized flag.
     M.state.registered = false
     ensure_registered()
+    -- Seed the current-vehicle tracker; onVehicleSwitched keeps it current from here on.
+    if be and be:getPlayerVehicle(0) then
+        M.state.current_vehicle_id = be:getPlayerVehicle(0):getId()
+    end
     log("I", LOG_TAG, "loaded")
+end
+
+-- Track the vehicle the player is currently in. BeamNG fires onVehicleSwitched(old, new) on every
+-- switch; we keep the latest `new` as the authoritative seated car, because in BeamMP the polling
+-- API be:getPlayerVehicle(0) sticks to the first owned car -- so race/vehicles.lua resolve_own_car
+-- prefers this tracked id (confirmed in-game: the tracked-id version keeps the right car, the
+-- polling-only version does not).
+function M.onVehicleSwitched(_oldId, newId)
+    M.state.current_vehicle_id = newId
 end
 
 function M.onUpdate(dtReal, dtSim, dtRaw)
