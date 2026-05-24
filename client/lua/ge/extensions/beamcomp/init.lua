@@ -17,7 +17,9 @@
 --   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
 --                 ADR-0006). We record + surface it, and drive the start lock off it: the car is
 --                 spawned frozen (handle_race_start) and held through the countdown, released on
---                 racing, with a defensive release on lobby. Countdown UI is a later Phase-3 item.
+--                 racing, with a defensive release on lobby. The synced 3-2-1-GO! countdown UI
+--                 runs off the same phases (race/countdown + ADR-0008): countdown starts the
+--                 count, racing shows GO! on the release, lobby/reload clears it.
 
 local M = {}
 
@@ -25,6 +27,7 @@ local envelope = require("beamcomp/envelope")
 local race_start = require("beamcomp/race/start")
 local vehicles = require("beamcomp/race/vehicles")
 local props = require("beamcomp/race/props")
+local countdown = require("beamcomp/race/countdown")
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -119,7 +122,8 @@ end
 -- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
 -- server broadcasts a racePhase on every transition (ADR-0006). The car is spawned frozen in
 -- handle_race_start and held through the countdown; here we release it on racing, and release
--- defensively on lobby (the car is preserved in place, only unlocked). Countdown UI is a later item.
+-- defensively on lobby (the car is preserved in place, only unlocked). The countdown UI is driven
+-- off the same phases via race/countdown (ADR-0008): countdown starts the count, racing shows GO!.
 local function handle_race_phase(payload)
     local phase = type(payload) == "table" and payload.phase or nil
     if type(phase) ~= "string" then
@@ -130,29 +134,38 @@ local function handle_race_phase(payload)
     M.state.phase = phase
     log("I", RACE_LOG_TAG, "race phase -> " .. phase)
 
-    if phase == "racing" then
-        -- Countdown over: release the start lock so the car can drive.
+    if phase == "countdown" then
+        -- Start the synced 3-2-1 count off the server-issued duration (built-in flash surface).
+        countdown.show_countdown(payload.duration)
+    elseif phase == "racing" then
+        -- Countdown over: show GO! (server-authoritative, so it lands exactly on the release)
+        -- and release the start lock so the car can drive.
+        countdown.show_go()
         local released, release_err = vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
         if not released then
             log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
         end
     elseif phase == "lobby" then
-        -- Race over (back to lobby): despawn the track props and stop drawing the grid markers,
-        -- but leave the player's vehicle exactly where it is -- never despawn or move it. Release
-        -- the start lock too, so a /raceend mid-countdown leaves the preserved car drivable. The
-        -- abort-restart path skips lobby (finished -> spawning), where handle_race_start reloads
-        -- props and re-freezes instead.
+        -- Race over (back to lobby): clear any countdown overlay, despawn the track props and stop
+        -- drawing the grid markers, but leave the player's vehicle exactly where it is -- never
+        -- despawn or move it. Release the start lock too, so a /raceend mid-countdown leaves the
+        -- preserved car drivable. The abort-restart path skips lobby (finished -> spawning), where
+        -- handle_race_start reloads props and re-freezes instead.
+        countdown.clear()
         props.clear(M.state.prop_names or {})
         M.state.prop_names = nil
         M.state.race = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = "Race phase: " .. phase,
-    })
+    -- Surface the phase as a toast, except countdown/racing -- the countdown UI covers those.
+    if phase ~= "countdown" and phase ~= "racing" then
+        guihooks.trigger("toastrMsg", {
+            type = "info",
+            title = "BeamComp",
+            msg = "Race phase: " .. phase,
+        })
+    end
 end
 
 local HANDLERS = {
@@ -276,6 +289,7 @@ function M.onExtensionUnloaded()
         RemoveEventHandler(EVENT_CHANNEL, "beamcomp")
     end
     M.state.registered = false
+    countdown.clear()
     props.clear(M.state.prop_names or {})
     M.state.prop_names = nil
     M.state.race = nil
