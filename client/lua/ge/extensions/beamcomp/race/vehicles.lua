@@ -151,4 +151,25 @@ function M.respawn_own_at(pose)
     return veh
 end
 
+-- Freeze or release a vehicle in place using BeamNG's built-in controller.setFreeze -- the same
+-- lock the base game's quickrace / scenario countdowns use (e.g. scenario/quickRace.lua,
+-- gameplay/race/race.lua). It holds the car put while still letting the player rev and steer. The
+-- command is queued to the vehicle's VE VM, so it applies even when the car was just spawned and
+-- its VE is still coming up. Owned-only by construction: the caller passes its own vehicle (the
+-- freshly spawned handle, or getPlayerVehicle(0)), so no remote car is ever touched. Returns true,
+-- or nil plus a reason.
+function M.set_vehicle_frozen(veh, frozen)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    local mode = frozen and 1 or 0
+    local ok, err = pcall(function()
+        veh:queueLuaCommand("controller.setFreeze(" .. mode .. ")")
+    end)
+    if not ok then
+        return nil, "setFreeze failed: " .. tostring(err)
+    end
+    return true
+end
+
 return M

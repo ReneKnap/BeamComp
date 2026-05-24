@@ -15,8 +15,9 @@
 --                 client's own car fresh at its assigned grid pose (race/vehicles), and load the
 --                 race's static-scenery prop prefab(s) into the scene (race/props).
 --   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
---                 ADR-0006). For now we just record + surface it; movement lock, countdown UI,
---                 and release (later Phase-3 items) will act on these phases.
+--                 ADR-0006). We record + surface it, and drive the start lock off it: the car is
+--                 spawned frozen (handle_race_start) and held through the countdown, released on
+--                 racing, with a defensive release on lobby. Countdown UI is a later Phase-3 item.
 
 local M = {}
 
@@ -86,6 +87,14 @@ local function handle_race_start(payload)
         if be then
             pcall(function() be:enterVehicle(0, spawned) end)
         end
+        -- Spawn the car frozen: hold it in place from spawn through the countdown so nobody can
+        -- jump the start (released on the racing phase, see handle_race_phase). Freeze the spawned
+        -- handle rather than getPlayerVehicle(0): the spawn/enter settle over later frames, so the
+        -- command must be queued to this exact vehicle's VE.
+        local frozen, freeze_err = vehicles.set_vehicle_frozen(spawned, true)
+        if not frozen then
+            log("W", RACE_LOG_TAG, "could not freeze spawned car: " .. tostring(freeze_err))
+        end
         log("I", RACE_LOG_TAG, string.format("respawned at grid slot %d", race.mySlot))
     else
         log("W", RACE_LOG_TAG, "respawn skipped: " .. tostring(respawn_err))
@@ -100,9 +109,10 @@ local function handle_race_start(payload)
     })
 end
 
--- Record the server-authoritative race phase and surface it. The server broadcasts a racePhase
--- on every transition (ADR-0006); later Phase-3 items hang movement lock, countdown UI, and
--- release off M.state.phase. Here we only store + toast it.
+-- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
+-- server broadcasts a racePhase on every transition (ADR-0006). The car is spawned frozen in
+-- handle_race_start and held through the countdown; here we release it on racing, and release
+-- defensively on lobby (the car is preserved in place, only unlocked). Countdown UI is a later item.
 local function handle_race_phase(payload)
     local phase = type(payload) == "table" and payload.phase or nil
     if type(phase) ~= "string" then
@@ -113,13 +123,22 @@ local function handle_race_phase(payload)
     M.state.phase = phase
     log("I", RACE_LOG_TAG, "race phase -> " .. phase)
 
-    -- Race over (back to lobby): despawn the track props and stop drawing the grid markers, but
-    -- leave the player's vehicle exactly where it is -- never despawn or move it. The abort-restart
-    -- path skips lobby (finished -> spawning), and handle_race_start reloads props there instead.
-    if phase == "lobby" then
+    if phase == "racing" then
+        -- Countdown over: release the start lock so the car can drive.
+        local released, release_err = vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
+        if not released then
+            log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
+        end
+    elseif phase == "lobby" then
+        -- Race over (back to lobby): despawn the track props and stop drawing the grid markers,
+        -- but leave the player's vehicle exactly where it is -- never despawn or move it. Release
+        -- the start lock too, so a /raceend mid-countdown leaves the preserved car drivable. The
+        -- abort-restart path skips lobby (finished -> spawning), where handle_race_start reloads
+        -- props and re-freezes instead.
         props.clear(M.state.prop_names or {})
         M.state.prop_names = nil
         M.state.race = nil
+        vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
     guihooks.trigger("toastrMsg", {
@@ -240,6 +259,8 @@ function M.onExtensionUnloaded()
     props.clear(M.state.prop_names or {})
     M.state.prop_names = nil
     M.state.race = nil
+    -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
+    vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     M.state.phase = nil
     log("I", LOG_TAG, "unloaded")
 end
