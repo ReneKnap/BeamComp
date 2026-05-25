@@ -76,6 +76,7 @@ local session = {
     phase = PHASE.lobby,
     race = nil,             -- active race name, or nil
     roster = nil,           -- grid roster shipped in raceStart, or nil
+    progress = nil,         -- per-player checkpoint tracking keyed by player id, or nil
     phase_started_at = 0,   -- clock seconds at the current phase's entry
     phase_duration = nil,   -- configured length of the current timed phase, or nil if open-ended
     grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
@@ -154,10 +155,30 @@ local function build_roster(slots)
     return roster
 end
 
+-- Seed a per-player progress record for every slot, keyed by player id. Each record tracks the
+-- player's checkpoint progress, cumulative split times, and total time; `finished` flips on the
+-- final crossing and leaves room for a future DNF state (Phase 5). Splits are 1-based: splits[k] is
+-- the cumulative race-relative time at the k-th checkpoint; segment deltas are derived, not stored.
+local function build_progress(slots)
+    local progress = {}
+    for _, entry in ipairs(slots) do
+        progress[entry.id] = {
+            name = entry.name,
+            slot = entry.slot,
+            completed = 0,
+            splits = {},
+            total_time = 0,
+            finished = false,
+        }
+    end
+    return progress
+end
+
 -- Clear the session and announce the lobby phase.
 local function reset_to_lobby()
     session.race = nil
     session.roster = nil
+    session.progress = nil
     session.grace_deadline = nil
     session.pending_race = nil
     session.pending_owner = nil
@@ -175,6 +196,7 @@ local function start_race(race_name, owner_id)
 
     session.race = race_name
     session.roster = roster
+    session.progress = build_progress(slots)
     session.grace_deadline = nil
     session.pending_race = nil
     session.pending_owner = nil
@@ -195,9 +217,9 @@ local function start_race(race_name, owner_id)
 end
 
 -- Arm the finish-grace countdown: once the first player crosses the line the race runs for
--- finish_grace more seconds, then ends. Finish detection is Phase 4 (client-side checkpoint
--- tracking -> a client->server event), which will call this -- it is the documented racing ->
--- finished seam and is dormant today (ADR-0006).
+-- finish_grace more seconds, then ends. Armed by handle_checkpoint_report when a player crosses
+-- the final checkpoint (the documented racing -> finished seam, ADR-0006). Idempotent: later
+-- finishers re-call it harmlessly once grace_deadline is set.
 local function start_finish_grace()
     if session.phase ~= PHASE.racing or session.grace_deadline then
         return
@@ -345,9 +367,12 @@ local function on_chat_message(player_id, player_name, message)
     -- not a BeamComp command: return nothing so the message relays normally
 end
 
--- Log one client checkpoint report. Scope-limited to Phase-4 item 2: prove the client->server path
--- and surface progress. Per-player tracking, standings, and arming the finish grace are later items;
--- the race-blind server (ADR-0005) reads progress straight from the payload's index/count.
+-- Record one client checkpoint report into the reporting player's progress (ADR-0011 path).
+-- Advances the completed count, appends the cumulative split time, updates the running total, and
+-- arms the finish grace (the ADR-0006 racing -> finished seam) on the final crossing. Stays
+-- race-blind (ADR-0005): progress and the finish threshold come from the payload index/count, not
+-- race geometry. Strict-sequential: only the next expected index is accepted; duplicates, gaps,
+-- out-of-order, a report outside racing, or one from an unseeded player are logged and dropped.
 local function handle_checkpoint_report(player_id, payload)
     if type(payload) ~= "table" or type(payload.index) ~= "number" then
         log_info("beamcomp.net", "checkpoint report from id " .. tostring(player_id)
@@ -355,16 +380,51 @@ local function handle_checkpoint_report(player_id, payload)
         return
     end
 
-    -- Coerce to integers for %d (a fractional index/count from a malformed client would otherwise
-    -- raise "number has no integer representation" in Lua 5.3); index is already a number per the
-    -- guard above, count may be absent.
-    local position = math.floor(payload.index) + 1
+    if session.phase ~= PHASE.racing then
+        log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
+            .. " ignored: not racing (phase " .. session.phase .. ")")
+        return
+    end
+
+    local record = session.progress and session.progress[player_id]
+    if not record then
+        log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
+            .. " ignored: no race record")
+        return
+    end
+
+    -- Coerce to integers: a fractional index/count from a bad client would break the %d formatting
+    -- (Lua 5.3 rejects non-integer floats) and the ordering compare. count may be absent, in which
+    -- case finish cannot be detected and only progress is tracked.
+    local index = math.floor(payload.index)
     local count = (type(payload.count) == "number") and math.floor(payload.count) or nil
     local time = tonumber(payload.time) or 0
-    local progress = count and string.format("%d/%d", position, count) or tostring(position)
-    local final = count and (position >= count)
+
+    if index ~= record.completed then
+        log_info("beamcomp.race", string.format(
+            "player %d out-of-order checkpoint: got %d, expected %d",
+            player_id, index, record.completed))
+        return
+    end
+
+    record.completed = record.completed + 1
+    if count then
+        record.count = count
+    end
+    record.splits[record.completed] = time
+    record.total_time = time
+
+    local final = record.count and (record.completed >= record.count)
+    if final then
+        record.finished = true
+        start_finish_grace()
+    end
+
+    local progress_label = record.count
+        and string.format("%d/%d", record.completed, record.count)
+        or tostring(record.completed)
     log_info("beamcomp.race", string.format("player %d checkpoint %s @ %.2fs%s",
-        player_id, progress, time, final and " (final)" or ""))
+        player_id, progress_label, time, final and " (final)" or ""))
 end
 
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
