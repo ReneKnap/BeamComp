@@ -118,6 +118,12 @@ function M.clear(names)
         cleared = cleared + 1
     end
 
+    -- Rebuild the static collision mesh: removePrefab drops the visual meshes but leaves stale
+    -- collision behind, so despawned barriers stay solid otherwise (mirror of the load path).
+    if cleared > 0 and be then
+        pcall(function() be:reloadCollision(false, true) end)
+    end
+
     log("I", LOG_TAG, string.format("cleared %d prop prefab(s)", cleared))
     return cleared
 end
