@@ -42,6 +42,8 @@ local MSG_RACE_START = "raceStart"
 local MSG_RACE_PHASE = "racePhase"
 -- Client -> server message type (received on EVENT_CHANNEL; ADR-0011).
 local MSG_CHECKPOINT = "checkpoint"
+-- Server -> client broadcast type: the live ranked standings table.
+local MSG_STANDINGS = "standings"
 
 -- State-machine tick. ~4x/second: fine enough for a 3-2-1-GO, idle cost is a nil-check.
 local TICK_EVENT = "beamcompTick"
@@ -174,6 +176,55 @@ local function build_progress(slots)
     return progress
 end
 
+-- Build the live ranked standings from session.progress: a pure function over the per-player
+-- records (race-blind, ADR-0005). Sort key: most checkpoints completed, then earliest time at that
+-- checkpoint, then slot as a stable tiebreak -- finished players lead by finish time, the rest
+-- follow by how far and how fast. Each entry carries a 1-based position; `count` falls back to a
+-- shared known_count so entries agree once any report has set it (nil at race-start baseline).
+local function build_standings()
+    if not session.progress then
+        return {}
+    end
+
+    local ranked = {}
+    local known_count
+    for _, record in pairs(session.progress) do
+        ranked[#ranked + 1] = record
+        if not known_count and record.count then
+            known_count = record.count
+        end
+    end
+    table.sort(ranked, function(a, b)
+        if a.completed ~= b.completed then
+            return a.completed > b.completed
+        end
+        if a.total_time ~= b.total_time then
+            return a.total_time < b.total_time
+        end
+        return a.slot < b.slot
+    end)
+
+    local entries = {}
+    for i, record in ipairs(ranked) do
+        entries[i] = {
+            position = i,
+            slot = record.slot,
+            name = record.name,
+            completed = record.completed,
+            count = record.count or known_count,
+            total_time = record.total_time,
+            finished = record.finished,
+        }
+    end
+    return entries
+end
+
+-- Broadcast the standings to every client as a `standings` envelope (ADR-0004). Fired at the
+-- racing-phase baseline and after every accepted checkpoint report.
+local function broadcast_standings()
+    broadcast_event(MSG_STANDINGS, {entries = build_standings()})
+end
+
 -- Clear the session and announce the lobby phase.
 local function reset_to_lobby()
     session.race = nil
@@ -264,8 +315,10 @@ local function tick()
     if phase == PHASE.spawning then
         enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
     elseif phase == PHASE.countdown then
-        -- The release signal itself is a later Phase-3 item; here we only enter racing.
+        -- The release signal itself is a later Phase-3 item; here we enter racing and send the
+        -- baseline standings (every player at zero) so clients have a table to show from the start.
         enter_phase(PHASE.racing, nil)
+        broadcast_standings()
     elseif phase == PHASE.finished then
         advance_from_finished()
     end
@@ -425,6 +478,8 @@ local function handle_checkpoint_report(player_id, payload)
         or tostring(record.completed)
     log_info("beamcomp.race", string.format("player %d checkpoint %s @ %.2fs%s",
         player_id, progress_label, time, final and " (final)" or ""))
+
+    broadcast_standings()
 end
 
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
