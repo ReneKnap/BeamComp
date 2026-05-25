@@ -54,6 +54,7 @@ M.state = {
     cone_ids = nil,      -- ids of the shared cone vehicles we own + must clear (owner only, ADR-0009)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
+    standings = nil,     -- latest server-broadcast ranked standings entries, or nil
 }
 
 local function handle_ping(_payload)
@@ -80,9 +81,10 @@ local function handle_race_start(payload)
 
     M.state.race = race
     M.state.marker_warned = false
-    -- Reset checkpoint detection; it is armed fresh on the racing phase. The abort-restart path is
-    -- finished -> spawning (here), skipping the lobby reset, so clear it here too.
+    -- Reset checkpoint detection and any stale standings; both are refreshed during the race (the
+    -- abort-restart path is finished -> spawning, skipping the lobby reset, so clear them too).
     M.state.detection = nil
+    M.state.standings = nil
 
     -- Resolve the car the player is in, preferring the onVehicleSwitched-tracked id (the polling API
     -- be:getPlayerVehicle(0) sticks to the first owned car in BeamMP). Resolve BEFORE loading props
@@ -176,6 +178,7 @@ local function handle_race_phase(payload)
         M.state.cone_ids = nil
         M.state.race = nil
         M.state.detection = nil
+        M.state.standings = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
@@ -189,10 +192,37 @@ local function handle_race_phase(payload)
     end
 end
 
+-- Store the latest server-broadcast standings for the HUD to render (item 5). Receive and store
+-- only -- no rendering here. The summary log lets a single client confirm the path and the payload.
+local function handle_standings(payload)
+    local entries = type(payload) == "table" and payload.entries or nil
+    if type(entries) ~= "table" then
+        log("W", LOG_TAG, "standings ignored: missing entries")
+        return
+    end
+
+    M.state.standings = entries
+
+    local leader = entries[1]
+    if not leader then
+        log("I", RACE_LOG_TAG, "standings: 0 entries")
+        return
+    end
+
+    local progress = tostring(leader.completed)
+    if leader.count then
+        progress = progress .. "/" .. tostring(leader.count)
+    end
+    log("I", RACE_LOG_TAG, string.format("standings: %d entr%s -- leader %s %s @ %.2fs",
+        #entries, #entries == 1 and "y" or "ies", tostring(leader.name), progress,
+        tonumber(leader.total_time) or 0))
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
     racePhase = handle_race_phase,
+    standings = handle_standings,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
