@@ -22,7 +22,9 @@
 --                 spawned frozen (handle_race_start) and held through the countdown, released on
 --                 racing, with a defensive release on lobby. The synced 3-2-1-GO! countdown UI
 --                 runs off the same phases (race/countdown + ADR-0008): countdown starts the
---                 count, racing shows GO! on the release, lobby/reload clears it.
+--                 count, racing shows GO! on the release, lobby/reload clears it. The racing phase
+--                 also arms the local checkpoint detector (race/checkpoints, ADR-0010), stepped each
+--                 frame in onUpdate, which surfaces each passed checkpoint as a toast + log line.
 
 local M = {}
 
@@ -32,6 +34,7 @@ local vehicles = require("beamcomp/race/vehicles")
 local props = require("beamcomp/race/props")
 local cones = require("beamcomp/race/cones")
 local countdown = require("beamcomp/race/countdown")
+local checkpoints = require("beamcomp/race/checkpoints")
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -50,6 +53,7 @@ M.state = {
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
     cone_ids = nil,      -- ids of the shared cone vehicles we own + must clear (owner only, ADR-0009)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
+    detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
 }
 
 local function handle_ping(_payload)
@@ -76,6 +80,9 @@ local function handle_race_start(payload)
 
     M.state.race = race
     M.state.marker_warned = false
+    -- Reset checkpoint detection; it is armed fresh on the racing phase. The abort-restart path is
+    -- finished -> spawning (here), skipping the lobby reset, so clear it here too.
+    M.state.detection = nil
 
     -- Resolve the car the player is in, preferring the onVehicleSwitched-tracked id (the polling API
     -- be:getPlayerVehicle(0) sticks to the first owned car in BeamMP). Resolve BEFORE loading props
@@ -153,6 +160,9 @@ local function handle_race_phase(payload)
         if not released then
             log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
         end
+        -- Arm checkpoint detection now the lock is released: it tests the local car against the
+        -- next expected checkpoint each frame (onUpdate) while racing (ADR-0010).
+        M.state.detection = checkpoints.new()
     elseif phase == "lobby" then
         -- Race over (back to lobby): clear any countdown overlay, despawn the track props and stop
         -- drawing the grid markers, but leave the player's vehicle exactly where it is -- never
@@ -165,6 +175,7 @@ local function handle_race_phase(payload)
         M.state.prop_names = nil
         M.state.cone_ids = nil
         M.state.race = nil
+        M.state.detection = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
@@ -290,9 +301,50 @@ function M.onVehicleSpawned(vehicleId)
     cones.exclude_from_cycle(be:getObjectByID(vehicleId))
 end
 
+-- Surface one detected checkpoint passage: log + toast. This is the single emission seam the
+-- client->server send (next sprint item) hooks into -- keep it the one place a passage is reported.
+local function on_checkpoint_reached(event)
+    log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) reached @ %.2fs",
+        event.index, tostring(event.name), event.time))
+    guihooks.trigger("toastrMsg", {
+        type = "success",
+        title = "BeamComp",
+        msg = string.format("Checkpoint %d reached @ %.1fs", event.index, event.time),
+    })
+end
+
+-- Step the checkpoint detector for one racing frame: resolve this client's own car (the tracked
+-- seated id, BeamMP-correct -- see race/vehicles.lua), read its world position, and advance the
+-- detector. Emits each crossed checkpoint through on_checkpoint_reached. No-op until armed
+-- (M.state.detection set on the racing phase) and once the sequence is done.
+local function step_detection(dt_sim)
+    local detection = M.state.detection
+    local race = M.state.race
+    if not detection or detection.done or not race or not race.checkpoints then
+        return
+    end
+
+    local veh_pos = nil
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if own_car then
+        local ok, pos = pcall(function() return own_car:getPosition() end)
+        if ok then
+            veh_pos = pos
+        end
+    end
+
+    local event = checkpoints.step(detection, race.checkpoints, veh_pos, dt_sim)
+    if event then
+        on_checkpoint_reached(event)
+    end
+end
+
 function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
+    end
+    if M.state.phase == "racing" then
+        step_detection(dtSim)
     end
 end
 
@@ -321,6 +373,7 @@ function M.onExtensionUnloaded()
     M.state.prop_names = nil
     M.state.cone_ids = nil
     M.state.race = nil
+    M.state.detection = nil
     -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     M.state.phase = nil
