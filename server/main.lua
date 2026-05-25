@@ -33,11 +33,15 @@ local CHAT_COMMAND_RACE = "/race"
 local CHAT_COMMAND_RACEEND = "/raceend"
 local CHAT_COMMAND_PING = "/beamcomp"
 
--- Server -> client event channel. Must be colon-free: the BeamMP client parser
--- splits incoming events on ':' (see ADR-0004).
+-- Server <-> client event channel. Must be colon-free: the BeamMP client parser
+-- splits incoming events on ':' (see ADR-0004). Bidirectional (ADR-0011): the server
+-- sends raceStart/racePhase/ping on it via TriggerClientEventJson, and receives client
+-- reports on it via MP.RegisterEvent (the client fires TriggerServerEvent on the same name).
 local EVENT_CHANNEL = "beamcompEvent"
 local MSG_RACE_START = "raceStart"
 local MSG_RACE_PHASE = "racePhase"
+-- Client -> server message type (received on EVENT_CHANNEL; ADR-0011).
+local MSG_CHECKPOINT = "checkpoint"
 
 -- State-machine tick. ~4x/second: fine enough for a 3-2-1-GO, idle cost is a nil-check.
 local TICK_EVENT = "beamcompTick"
@@ -341,6 +345,52 @@ local function on_chat_message(player_id, player_name, message)
     -- not a BeamComp command: return nothing so the message relays normally
 end
 
+-- Log one client checkpoint report. Scope-limited to Phase-4 item 2: prove the client->server path
+-- and surface progress. Per-player tracking, standings, and arming the finish grace are later items;
+-- the race-blind server (ADR-0005) reads progress straight from the payload's index/count.
+local function handle_checkpoint_report(player_id, payload)
+    if type(payload) ~= "table" or type(payload.index) ~= "number" then
+        log_info("beamcomp.net", "checkpoint report from id " .. tostring(player_id)
+            .. " ignored: bad payload")
+        return
+    end
+
+    -- Coerce to integers for %d (a fractional index/count from a malformed client would otherwise
+    -- raise "number has no integer representation" in Lua 5.3); index is already a number per the
+    -- guard above, count may be absent.
+    local position = math.floor(payload.index) + 1
+    local count = (type(payload.count) == "number") and math.floor(payload.count) or nil
+    local time = tonumber(payload.time) or 0
+    local progress = count and string.format("%d/%d", position, count) or tostring(position)
+    local final = count and (position >= count)
+    log_info("beamcomp.race", string.format("player %d checkpoint %s @ %.2fs%s",
+        player_id, progress, time, final and " (final)" or ""))
+end
+
+-- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
+-- hand-decodes (it does not load the shared envelope module, ADR-0004); `data` arrives as a JSON
+-- string. A non-string `data` means the handler arg order differs from the assumed (player_id, data)
+-- -- log both arg types so the real signature is visible in-game (the one runtime-verification point).
+local function handle_client_event(player_id, data)
+    if type(data) ~= "string" then
+        log_info("beamcomp.net", "client event: unexpected arg types (arg1=" .. type(player_id)
+            .. ", arg2=" .. type(data) .. ")")
+        return
+    end
+
+    local ok, decoded = pcall(Util.JsonDecode, data)
+    if not ok or type(decoded) ~= "table" or type(decoded.type) ~= "string" then
+        log_info("beamcomp.net", "dropped malformed client event from id " .. tostring(player_id))
+        return
+    end
+
+    if decoded.type == MSG_CHECKPOINT then
+        handle_checkpoint_report(player_id, decoded.payload)
+    else
+        log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
+    end
+end
+
 local function on_init()
     log_info("beamcomp", "server plugin loaded v" .. PLUGIN_VERSION)
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
@@ -373,9 +423,15 @@ function beamcomp_on_disconnect(player_id)
     return on_player_disconnect(player_id)
 end
 
+-- BeamMP event handler (must be global)
+function beamcomp_on_client_event(player_id, data)
+    return handle_client_event(player_id, data)
+end
+
 MP.RegisterEvent("onChatMessage", "beamcomp_on_chat")
 MP.RegisterEvent("onInit", "beamcomp_on_init")
 MP.RegisterEvent("onPlayerDisconnect", "beamcomp_on_disconnect")
 MP.RegisterEvent(TICK_EVENT, "beamcomp_on_tick")
+MP.RegisterEvent(EVENT_CHANNEL, "beamcomp_on_client_event")
 
 return M
