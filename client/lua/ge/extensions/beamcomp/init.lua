@@ -301,15 +301,45 @@ function M.onVehicleSpawned(vehicleId)
     cones.exclude_from_cycle(be:getObjectByID(vehicleId))
 end
 
--- Surface one detected checkpoint passage: log + toast. This is the single emission seam the
--- client->server send (next sprint item) hooks into -- keep it the one place a passage is reported.
-local function on_checkpoint_reached(event)
+-- Send a typed { type, payload } envelope to the server -- the client->server mirror of the server's
+-- send_event (ADR-0004, ADR-0011). Encode via the shared module (the client already loads it for
+-- decode), then ship the string with TriggerServerEvent, a GE global present only inside an MP
+-- session. Reliable + ordered TCP, so fire-and-forget. Generic so later client->server messages (e.g.
+-- spawn-ready acks) reuse it.
+local function send_to_server(message_type, payload)
+    if not TriggerServerEvent then
+        return
+    end
+    local ok, encoded = pcall(envelope.encode, message_type, payload)
+    if not ok then
+        log("W", LOG_TAG, "could not encode '" .. message_type .. "' for server: "
+            .. tostring(encoded))
+        return
+    end
+    local sent, err = pcall(TriggerServerEvent, EVENT_CHANNEL, encoded)
+    if not sent then
+        log("W", LOG_TAG, "TriggerServerEvent failed for '" .. message_type .. "': "
+            .. tostring(err))
+    end
+end
+
+-- Surface one detected checkpoint passage: log + toast + report to the server. This is the single
+-- emission seam for a passage -- keep it the one place a passage is reported. `count` is the race's
+-- total checkpoint count, sent so the race-blind server (ADR-0005) can derive progress (index+1 of
+-- count) and recognize the final crossing without parsing the race (ADR-0011).
+local function on_checkpoint_reached(event, count)
     log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) reached @ %.2fs",
         event.index, tostring(event.name), event.time))
     guihooks.trigger("toastrMsg", {
         type = "success",
         title = "BeamComp",
         msg = string.format("Checkpoint %d reached @ %.1fs", event.index, event.time),
+    })
+    send_to_server("checkpoint", {
+        index = event.index,
+        name = event.name,
+        time = event.time,
+        count = count,
     })
 end
 
@@ -335,7 +365,7 @@ local function step_detection(dt_sim)
 
     local event = checkpoints.step(detection, race.checkpoints, veh_pos, dt_sim)
     if event then
-        on_checkpoint_reached(event)
+        on_checkpoint_reached(event, #race.checkpoints)
     end
 end
 
