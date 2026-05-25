@@ -129,6 +129,9 @@ function M.prepare(payload)
         gridPoses = poses,
         roster = roster,
         prefabFiles = forward_prefabs(race.props.prefabFiles),
+        -- Ordered, visible-only checkpoints with a stable 0-based index (ADR-0005); consumed by
+        -- the racing-phase checkpoint detector (race/checkpoints.lua).
+        checkpoints = race.checkpoints,
     }
 end
 
