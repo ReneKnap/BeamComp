@@ -76,6 +76,7 @@ local session = {
     phase_duration = nil,   -- configured length of the current timed phase, or nil if open-ended
     grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
     pending_race = nil,     -- race name queued by a /race re-issued while one is active
+    pending_owner = nil,    -- player id of the queued race's issuer (owns its shared props), or nil
 }
 
 
@@ -155,12 +156,16 @@ local function reset_to_lobby()
     session.roster = nil
     session.grace_deadline = nil
     session.pending_race = nil
+    session.pending_owner = nil
     enter_phase(PHASE.lobby, nil)
 end
 
 -- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster), and
 -- enter the spawning phase. The client resolves and parses the race name locally (ADR-0005).
-local function start_race(race_name)
+-- `owner_id` is the player that issued /race; exactly that player's raceStart carries
+-- propOwner = true, designating it as the one client that spawns the shared race props -- the
+-- knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
+local function start_race(race_name, owner_id)
     local slots = build_slots(MP.GetPlayers())
     local roster = build_roster(slots)
 
@@ -168,6 +173,7 @@ local function start_race(race_name)
     session.roster = roster
     session.grace_deadline = nil
     session.pending_race = nil
+    session.pending_owner = nil
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
@@ -177,6 +183,7 @@ local function start_race(race_name)
             slot = entry.slot,
             grid = roster,
             variant = "default",
+            propOwner = entry.id == owner_id,
         })
     end
 
@@ -199,8 +206,10 @@ end
 local function advance_from_finished()
     local pending = session.pending_race
     if pending then
+        local owner = session.pending_owner
         session.pending_race = nil
-        start_race(pending)
+        session.pending_owner = nil
+        start_race(pending, owner)
         return
     end
     reset_to_lobby()
@@ -248,12 +257,13 @@ local function handle_race_command(player_id, player_name, race_name)
         .. " (phase " .. session.phase .. ")")
 
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name)
+        start_race(race_name, player_id)
         MP.SendChatMessage(player_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
 
     session.pending_race = race_name
+    session.pending_owner = player_id
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
     MP.SendChatMessage(player_id, "BeamComp: restarting with race '" .. race_name .. "'")
 end
