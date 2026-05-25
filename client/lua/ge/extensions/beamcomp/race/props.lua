@@ -12,11 +12,12 @@
 -- client with no message exchanged (ADR-0005: the client owns its geometry).
 --
 -- Two runtime quirks of these mission prefabs, discovered in-game, are handled here:
---   1. They bundle physics "prop vehicles" (jbeam objects like cones, each with
---      autoEnterVehicle) alongside the static meshes. spawnPrefab loads the whole file, so those
---      spawn as real vehicles that hijack the player and clutter the vehicle list -- we delete
---      the ones each load creates (matched by jbeam, snapshot-diffed so pre-existing vehicles are
---      untouched), keeping only the static scenery.
+--   1. They bundle physics "prop vehicles" (jbeam "cones", each with autoEnterVehicle) alongside
+--      the static meshes. spawnPrefab loads the whole file, so those spawn as real vehicles. Their
+--      shared lifecycle is owned by race/cones.lua (ADR-0009): the designated `keep_cones` owner
+--      keeps the ones this load creates (BeamMP syncs them to everyone), while every other client
+--      deletes only its own. We snapshot vehicle ids before the load and hand the snapshot to
+--      cones.lua to diff against, then return the kept cone ids for the caller to track.
 --   2. Statics spawned at runtime have no collision until the static collision mesh is rebuilt
 --      (spawnPrefab only rebuilds it when the world editor is open), so we call be:reloadCollision
 --      once after loading -- mirroring core/dynamicProps.
@@ -30,18 +31,13 @@
 
 local M = {}
 
+local cones = require("beamcomp/race/cones")
+
 local LOG_TAG = "beamcomp.props"
 local PROP_NAME_PREFIX = "beamcomp_prop_"
 
--- Jbeam objects that race prefabs ship as physics "prop vehicles". They carry autoEnterVehicle
--- and would otherwise seat the player and show up in the Tab vehicle cycle, so they are removed
--- right after the prefab loads, leaving only the static scenery.
-local PROP_VEHICLE_JBEAMS = {
-    cones = true,
-}
-
--- The set of vehicle object IDs currently in the scene, so prop vehicles a subsequent prefab
--- load creates can be told apart from pre-existing (player/synced) vehicles.
+-- The set of vehicle object IDs currently in the scene, so the cone prop-vehicles a subsequent
+-- prefab load creates can be told apart from pre-existing (player/synced) vehicles.
 local function current_vehicle_ids()
     local ids = {}
     if not be then
@@ -56,38 +52,19 @@ local function current_vehicle_ids()
     return ids
 end
 
--- Delete vehicles that did not exist before the load and are a known prop jbeam. Iterates in
--- reverse because deleting shifts the object list. Returns the count removed.
-local function remove_new_prop_vehicles(existing_before)
-    if not be then
-        return 0
-    end
-    local removed = 0
-    for i = be:getObjectCount() - 1, 0, -1 do
-        local veh = be:getObject(i)
-        if veh and not existing_before[veh:getID()] and PROP_VEHICLE_JBEAMS[veh.JBeam] then
-            local ok, err = pcall(function() veh:delete() end)
-            if ok then
-                removed = removed + 1
-            else
-                log("W", LOG_TAG, "failed to delete prop vehicle: " .. tostring(err))
-            end
-        end
-    end
-    return removed
-end
-
--- Load each prefab file as a scene object under a deterministic name, drop the prop vehicles the
--- load created, and rebuild static collision. Returns the list of prefab names actually spawned
--- (possibly empty) so the caller can track them for cleanup. One bad prefab warns and is skipped
--- rather than aborting the rest.
-function M.load(prefab_files)
+-- Load each prefab file as a scene object under a deterministic name, settle the cone prop-vehicles
+-- the load created, and rebuild static collision. `keep_cones` is true on the single designated
+-- owner (ADR-0009): it keeps the new cones for BeamMP to sync; every other client deletes only its
+-- own. Returns the list of prefab names spawned (for prefab cleanup) and the list of kept cone
+-- vehicle ids (empty unless owner; for cone cleanup). One bad prefab warns and is skipped rather
+-- than aborting the rest.
+function M.load(prefab_files, keep_cones)
     if type(spawnPrefab) ~= "function" or type(removePrefab) ~= "function" then
         log("W", LOG_TAG, "spawnPrefab/removePrefab unavailable -- cannot load props")
-        return {}
+        return {}, {}
     end
     if type(prefab_files) ~= "table" then
-        return {}
+        return {}, {}
     end
 
     local vehicles_before = current_vehicle_ids()
@@ -109,7 +86,13 @@ function M.load(prefab_files)
         end
     end
 
-    local removed = remove_new_prop_vehicles(vehicles_before)
+    -- Settle the cone prop-vehicles this load created (ADR-0009, owned by race/cones.lua).
+    local cone_ids = {}
+    if keep_cones then
+        cone_ids = cones.keep_new(vehicles_before)
+    else
+        cones.delete_owned_new(vehicles_before)
+    end
 
     -- Rebuild the static collision mesh so the freshly spawned barriers are solid (spawnPrefab
     -- only does this when the world editor is open). Same call core/dynamicProps uses.
@@ -117,9 +100,9 @@ function M.load(prefab_files)
         pcall(function() be:reloadCollision(false, true) end)
     end
 
-    log("I", LOG_TAG, string.format("loaded %d prop prefab(s), removed %d prop vehicle(s)",
-        #spawned, removed))
-    return spawned
+    log("I", LOG_TAG, string.format("loaded %d prop prefab(s), %d shared cone(s)",
+        #spawned, #cone_ids))
+    return spawned, cone_ids
 end
 
 -- Remove every prop prefab previously spawned, by name. Tolerant of names whose object is

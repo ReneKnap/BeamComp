@@ -13,7 +13,10 @@
 --   raceStart  -- resolve + parse the race locally, compute this client's grid start pose
 --                 (race/start + race/grid), draw the grid markers (onPreRender), respawn this
 --                 client's own car fresh at its assigned grid pose (race/vehicles), and load the
---                 race's static-scenery prop prefab(s) into the scene (race/props).
+--                 race's static-scenery prop prefab(s) into the scene (race/props). The knockable
+--                 cones are shared: the payload's propOwner client keeps the set its load spawns
+--                 (BeamMP syncs it to everyone), and the cones are kept non-enterable / out of the
+--                 Tab cycle on every client via race/cones (ADR-0009).
 --   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
 --                 ADR-0006). We record + surface it, and drive the start lock off it: the car is
 --                 spawned frozen (handle_race_start) and held through the countdown, released on
@@ -27,6 +30,7 @@ local envelope = require("beamcomp/envelope")
 local race_start = require("beamcomp/race/start")
 local vehicles = require("beamcomp/race/vehicles")
 local props = require("beamcomp/race/props")
+local cones = require("beamcomp/race/cones")
 local countdown = require("beamcomp/race/countdown")
 
 local EVENT_CHANNEL = "beamcompEvent"
@@ -44,6 +48,7 @@ M.state = {
     phase = nil,         -- current server-authoritative race phase (ADR-0006) or nil
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
+    cone_ids = nil,      -- ids of the shared cone vehicles we own + must clear (owner only, ADR-0009)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
 }
 
@@ -81,9 +86,12 @@ local function handle_race_start(payload)
     -- spawn + auto-enter stays the LAST scene action and the player lands seated in it. Loading
     -- props after the respawn left the player's camera latched onto a prop (a pylon) instead of
     -- the car. Clear first so re-issuing /race never stacks duplicates; placement is client-local
-    -- + deterministic (see race/props.lua).
+    -- + deterministic (see race/props.lua). The knockable cones are shared (ADR-0009): only the
+    -- propOwner keeps the set its load creates (cone_ids, cleared here on re-issue too); the
+    -- abort/restart path skips the lobby branch, so clearing here is what prevents owner stacking.
     props.clear(M.state.prop_names or {})
-    M.state.prop_names = props.load(race.prefabFiles or {})
+    cones.clear(M.state.cone_ids or {})
+    M.state.prop_names, M.state.cone_ids = props.load(race.prefabFiles or {}, payload.propOwner)
 
     -- Place this client's own car at the assigned grid pose: the car the player is in is repaired +
     -- teleported in place (preserving its settings), or a fresh one is spawned as a fallback
@@ -153,7 +161,9 @@ local function handle_race_phase(payload)
         -- handle_race_start reloads props and re-freezes instead.
         countdown.clear()
         props.clear(M.state.prop_names or {})
+        cones.clear(M.state.cone_ids or {})
         M.state.prop_names = nil
+        M.state.cone_ids = nil
         M.state.race = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
@@ -255,13 +265,29 @@ function M.onExtensionLoaded()
     log("I", LOG_TAG, "loaded")
 end
 
--- Track the vehicle the player is currently in. BeamNG fires onVehicleSwitched(old, new) on every
--- switch; we keep the latest `new` as the authoritative seated car, because in BeamMP the polling
--- API be:getPlayerVehicle(0) sticks to the first owned car -- so race/vehicles.lua resolve_own_car
--- prefers this tracked id (confirmed in-game: the tracked-id version keeps the right car, the
--- polling-only version does not).
+-- Track the vehicle the player is currently in, and keep them out of the shared cones. BeamNG fires
+-- onVehicleSwitched(old, new) on every switch; we keep the latest non-cone `new` as the
+-- authoritative seated car, because in BeamMP the polling API be:getPlayerVehicle(0) sticks to the
+-- first owned car -- so race/vehicles.lua resolve_own_car prefers this tracked id (confirmed
+-- in-game). If the player switches into a cone (Tab cycle or auto-enter), bounce them straight back
+-- to the last real car and do NOT record the cone -- the guaranteed non-enterable layer (ADR-0009).
 function M.onVehicleSwitched(_oldId, newId)
+    if cones.is_cone(be and be:getObjectByID(newId)) then
+        cones.enforce_non_enterable(newId, M.state.current_vehicle_id)
+        return
+    end
     M.state.current_vehicle_id = newId
+end
+
+-- Keep the shared cones out of the Tab vehicle cycle as they appear: the owner's local set when its
+-- prefab load spawns them, and the remote synced set on every other client (BeamMP vehicle spawns
+-- fire this hook too). Best-effort exclusion layer; the onVehicleSwitched bounce is the guarantee
+-- (ADR-0009).
+function M.onVehicleSpawned(vehicleId)
+    if not be then
+        return
+    end
+    cones.exclude_from_cycle(be:getObjectByID(vehicleId))
 end
 
 function M.onUpdate(dtReal, dtSim, dtRaw)
@@ -291,7 +317,9 @@ function M.onExtensionUnloaded()
     M.state.registered = false
     countdown.clear()
     props.clear(M.state.prop_names or {})
+    cones.clear(M.state.cone_ids or {})
     M.state.prop_names = nil
+    M.state.cone_ids = nil
     M.state.race = nil
     -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
