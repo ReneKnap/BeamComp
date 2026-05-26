@@ -168,6 +168,9 @@ local function handle_race_phase(payload)
         -- Arm checkpoint detection now the lock is released: it tests the local car against the
         -- next expected checkpoint each frame (onUpdate) while racing (ADR-0010).
         M.state.detection = checkpoints.new()
+        -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
+        -- dedups, so a manually-added copy is not duplicated.
+        hud.show()
     elseif phase == "lobby" then
         -- Race over (back to lobby): clear any countdown overlay, despawn the track props and stop
         -- drawing the grid markers, but leave the player's vehicle exactly where it is -- never
@@ -176,6 +179,7 @@ local function handle_race_phase(payload)
         -- handle_race_start reloads props and re-freezes instead.
         countdown.clear()
         hud.clear()
+        hud.hide()
         props.clear(M.state.prop_names or {})
         cones.clear(M.state.cone_ids or {})
         M.state.prop_names = nil
@@ -492,6 +496,7 @@ function M.onExtensionUnloaded()
     M.state.registered = false
     countdown.clear()
     hud.clear()
+    hud.hide()
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     M.state.prop_names = nil

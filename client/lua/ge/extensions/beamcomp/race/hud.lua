@@ -16,6 +16,10 @@ local LOG_TAG = "beamcomp.race"
 -- The GE->UI contract: the AngularJS app subscribes with scope.$on(HOOK, ...) (ADR-0012).
 local HOOK = "BeamCompHudUpdate"
 
+-- The app's key in BeamNG's apps registry: ui_apps uses app.json's "directive" as appName when no
+-- "appName" field is given, and the registry is keyed by appName (ui/modules/apps/app-service.js).
+local APP_NAME = "beamCompHud"
+
 -- Fire the UI hook defensively: a bad payload or missing surface must never break the caller
 -- (the per-frame onUpdate push). Mirrors race/countdown.lua's trigger_ui.
 local function trigger_ui(name, payload)
@@ -37,6 +41,19 @@ end
 -- Blank the HUD (between races / reload): an inactive snapshot the app hides on. Idempotent.
 function M.clear()
     M.push({active = false})
+end
+
+-- Show the HUD app for the race: ask the apps container to add it if it isn't already on the layout
+-- (ensureAppVisible dedups by appName, so a manual copy isn't duplicated). Transient: spawns into
+-- the live container; the saved layout is untouched (app-container.js / app-service.js, ADR-0012).
+function M.show()
+    trigger_ui("appContainer:ensureAppVisible", jsonEncode({appName = APP_NAME}))
+end
+
+-- Hide the HUD app after the race: remove it from the live container by appName, reverting to the
+-- player's normal (multiplayer) HUD. Transient like show() -- the saved layout is untouched.
+function M.hide()
+    trigger_ui("appContainer:removeApp", APP_NAME)
 end
 
 return M
