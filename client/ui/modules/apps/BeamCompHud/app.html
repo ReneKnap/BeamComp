@@ -32,6 +32,10 @@
       opacity: 0.85;
       text-align: right;
     }
+    .beamcomp-hud .bc-lap {
+      opacity: 0.85;
+      text-align: right;
+    }
     .beamcomp-hud .bc-time {
       font-variant-numeric: tabular-nums;
       text-align: right;
@@ -50,6 +54,7 @@
       <td class="bc-pos">P{{e.position}}</td>
       <td class="bc-name">{{e.name}}</td>
       <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
+      <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
       <td class="bc-time">{{formatTime(e.time)}}</td>
     </tr>
   </table>
