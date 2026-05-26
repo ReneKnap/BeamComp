@@ -25,9 +25,13 @@
 --                 new race and runs a short abort window before restarting. Bare /race replies
 --                 with usage.
 --   /raceend      force the state machine back to lobby (safety hatch).
+--   /races        list the time-trial races on the asking player's current map. The server is
+--                 race-blind (ADR-0005), so it asks that client (a "listRaces" event); the client
+--                 builds the list and sends it back ("raceList"), and the server posts it to the
+--                 player. Reply is to the asker only.
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
--- All three suppress their own chat echo. Anything else relays as normal chat.
+-- All four suppress their own chat echo. Anything else relays as normal chat.
 -- The server never validates <name> (ADR-0005).
 
 local M = {}
@@ -35,6 +39,7 @@ local M = {}
 local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
 local CHAT_COMMAND_RACEEND = "/raceend"
+local CHAT_COMMAND_RACES = "/races"
 local CHAT_COMMAND_PING = "/beamcomp"
 
 -- Server <-> client event channel. Must be colon-free: the BeamMP client parser
@@ -44,10 +49,15 @@ local CHAT_COMMAND_PING = "/beamcomp"
 local EVENT_CHANNEL = "beamcompEvent"
 local MSG_RACE_START = "raceStart"
 local MSG_RACE_PHASE = "racePhase"
--- Client -> server message type (received on EVENT_CHANNEL; ADR-0011).
+-- Client -> server message types (received on EVENT_CHANNEL; ADR-0011).
 local MSG_CHECKPOINT = "checkpoint"
--- Server -> client broadcast type: the live ranked standings table.
-local MSG_STANDINGS = "standings"
+local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
+-- Server -> client broadcast/request types.
+local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadcast)
+local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
+
+-- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
+local RACE_LIST_MAX_LINES = 60
 
 -- State-machine tick. ~4x/second: fine enough for a 3-2-1-GO, idle cost is a nil-check.
 local TICK_EVENT = "beamcompTick"
@@ -475,6 +485,13 @@ local function on_chat_message(player_id, player_name, message)
         return 1  -- suppress the command's own chat echo
     end
 
+    if command == CHAT_COMMAND_RACES then
+        -- Race-blind (ADR-0005): ask the asking client to report its race list; it replies with a
+        -- raceList event we post back (handle_race_list).
+        send_event(player_id, MSG_LIST_RACES, {})
+        return 1  -- suppress the command's own chat echo
+    end
+
     if command == CHAT_COMMAND_PING then
         handle_ping_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
@@ -555,6 +572,26 @@ local function handle_checkpoint_report(player_id, payload)
     broadcast_standings()
 end
 
+-- Post a client's /races reply to that player. The client (which owns race knowledge, ADR-0005) built
+-- the chat lines and sent them back (ADR-0011); the server only relays them. `player_id` is the
+-- responder -- i.e. the player who ran /races -- so no request tracking is needed. Capped to
+-- RACE_LIST_MAX_LINES so a misbehaving client cannot flood chat.
+local function handle_race_list(player_id, payload)
+    local lines = type(payload) == "table" and payload.lines or nil
+    if type(lines) ~= "table" then
+        log_info("beamcomp.net", "raceList from id " .. tostring(player_id) .. " ignored: no lines")
+        return
+    end
+    for i, line in ipairs(lines) do
+        if i > RACE_LIST_MAX_LINES then
+            break
+        end
+        if type(line) == "string" then
+            MP.SendChatMessage(player_id, line)
+        end
+    end
+end
+
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
 -- hand-decodes (it does not load the shared envelope module, ADR-0004); `data` arrives as a JSON
 -- string. A non-string `data` means the handler arg order differs from the assumed (player_id, data)
@@ -574,6 +611,8 @@ local function handle_client_event(player_id, data)
 
     if decoded.type == MSG_CHECKPOINT then
         handle_checkpoint_report(player_id, decoded.payload)
+    elseif decoded.type == MSG_RACE_LIST then
+        handle_race_list(player_id, decoded.payload)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
