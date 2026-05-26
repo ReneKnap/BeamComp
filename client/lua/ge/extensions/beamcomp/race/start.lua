@@ -13,8 +13,12 @@ local M = {}
 local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local grid = require("beamcomp/race/grid")
+local checkpoints = require("beamcomp/race/checkpoints")
 
 local LOG_TAG = "beamcomp.race"
+
+-- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
+local MAX_LAPS = 50
 
 -- The pose the grid anchors on: the race's `default` start selector, else the first listed
 -- start position. Returns {pos, rot} (plain tables) or nil plus a reason.
@@ -71,6 +75,40 @@ local function forward_prefabs(prefab_files)
     return forward
 end
 
+-- Resolve the effective race mode + lap count for this start (ADR-0013). The server relays the
+-- admin's /race tokens but cannot validate them against geometry (race-blind, ADR-0005), so the
+-- check lands here:
+--   mode -- the payload override ("sprint"/"circuit") if given, else auto from meta.closed.
+--   laps -- circuit only: the payload override else meta.defaultLaps, clamped >= 1; sprint is always
+--           a single pass (laps = 1).
+-- A circuit forced on a non-closed race cannot run as a loop, so it falls back to sprint and returns
+-- a warning the caller surfaces (the client cannot reply in chat). Returns mode, laps, warning (nil).
+local function resolve_mode(race, payload)
+    local closed = race.meta and race.meta.closed
+    local requested = payload.mode
+
+    local mode
+    if requested == "sprint" or requested == "circuit" then
+        mode = requested
+    else
+        mode = closed and "circuit" or "sprint"
+    end
+
+    local warning
+    if mode == "circuit" and not closed then
+        warning = "circuit requested on a non-loop race -- running as sprint"
+        mode = "sprint"
+    end
+
+    local laps = 1
+    if mode == "circuit" then
+        local requested_laps = tonumber(payload.laps) or (race.meta and race.meta.defaultLaps) or 1
+        laps = math.max(1, math.min(MAX_LAPS, math.floor(requested_laps)))
+    end
+
+    return mode, laps, warning
+end
+
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
 function M.prepare(payload)
     if type(payload) ~= "table" or type(payload.race) ~= "string" then
@@ -118,8 +156,16 @@ function M.prepare(payload)
         return nil, "invalid slot " .. tostring(my_slot)
     end
 
-    log("I", LOG_TAG, string.format("race '%s' ready: slot %d of %d at (%.1f, %.1f, %.1f)",
-        race.meta.name, my_slot, count, my_pose.pos.x, my_pose.pos.y, my_pose.pos.z))
+    local mode, laps, mode_warning = resolve_mode(race, payload)
+    local plan = checkpoints.plan(race.checkpoints, mode, laps)
+    if mode_warning then
+        log("W", LOG_TAG, "raceStart: " .. mode_warning)
+    end
+
+    log("I", LOG_TAG, string.format(
+        "race '%s' ready: slot %d of %d, mode=%s laps=%d (%d crossings) at (%.1f, %.1f, %.1f)",
+        race.meta.name, my_slot, count, mode, laps, plan.count,
+        my_pose.pos.x, my_pose.pos.y, my_pose.pos.z))
 
     return {
         name = race.meta.name,
@@ -132,6 +178,11 @@ function M.prepare(payload)
         -- Ordered, visible-only checkpoints with a stable 0-based index (ADR-0005); consumed by
         -- the racing-phase checkpoint detector (race/checkpoints.lua).
         checkpoints = race.checkpoints,
+        -- Resolved race mode + lap count and the detector's traversal plan (ADR-0013).
+        mode = mode,
+        laps = laps,
+        plan = plan,
+        modeWarning = mode_warning,
     }
 end
 

@@ -6,9 +6,13 @@
 --
 -- Detects when the local player's car passes the next expected checkpoint, using an own lightweight
 -- swept test against the parser's normalized checkpoints (stable 0-based index, ADR-0005) rather than
--- driving BeamNG's gameplay/race/race.lua (ADR-0010). Single linear pass: only the next expected
--- checkpoint is tested, so out-of-order / skipped checkpoints never advance; the sequence ends once
--- the last checkpoint is passed. Multi-lap, finish, and the client->server send are deferred.
+-- driving BeamNG's gameplay/race/race.lua (ADR-0010). The detector walks a per-race traversal plan
+-- (M.plan): an ordered list of {cursor, lap} entries built from the race mode + lap count (ADR-0013).
+-- Only the planned-next checkpoint is tested, so out-of-order / skipped checkpoints never advance;
+-- the sequence ends once the final plan entry is passed (the finish). Two modes:
+--   sprint  -- every checkpoint once; finish at the last.
+--   circuit -- CP1..CP(N-1) then CP0 (the start/finish line) per lap, repeated for L laps; the
+--              start-line CP0 crossing at the gun is never scored, so there is no spurious t=0 hit.
 
 local M = {}
 
@@ -54,21 +58,52 @@ local function segment_hits_checkpoint(prev_pos, cur_pos, checkpoint)
     return true
 end
 
--- A fresh detection-state table, armed at index 0 with no elapsed time. Held in the caller's
--- reload-surviving M.state; all fields are plain serializable values.
-function M.new()
+-- Build the traversal plan for a race (ADR-0013): the ordered checkpoints to score, each a
+-- {cursor, lap} entry (cursor is 1-based into `checkpoints`, lap is 1-based). Sprint scores every
+-- checkpoint once. Circuit scores CP1..CP(N-1) then CP0 per lap, repeated `laps` times -- the
+-- start-line CP0 (cursor 1) is omitted from the lap's front, so it is only scored as the lap/finish
+-- crossing, never at the gun. A circuit needs >= 2 checkpoints for a distinct line + body; anything
+-- smaller (or any non-circuit mode) falls back to the sprint plan. `count` equals the number of
+-- scored crossings: N for sprint, laps * N for circuit.
+function M.plan(checkpoints, mode, laps)
+    local n = #checkpoints
+    local entries = {}
+
+    if mode == "circuit" and n >= 2 then
+        local lap_count = math.max(1, laps or 1)
+        for lap = 1, lap_count do
+            for cursor = 2, n do
+                entries[#entries + 1] = {cursor = cursor, lap = lap}
+            end
+            entries[#entries + 1] = {cursor = 1, lap = lap}
+        end
+    else
+        for cursor = 1, n do
+            entries[#entries + 1] = {cursor = cursor, lap = 1}
+        end
+    end
+
+    return {entries = entries, count = #entries}
+end
+
+-- A fresh detection-state table for a traversal plan, armed before the first plan entry with no
+-- elapsed time. Held in the caller's reload-surviving M.state; all fields are plain serializable
+-- values.
+function M.new(plan)
     return {
-        cursor = 1,      -- 1-based index into the checkpoints array; the next expected checkpoint
+        plan = plan,     -- the traversal plan from M.plan ({entries, count}; ADR-0013)
+        seq = 0,         -- count of scored crossings so far; also the index of the next plan entry
         elapsed = 0,     -- sim-seconds since arming; the provisional passage time (ADR-0010)
         prev_pos = nil,  -- {x, y, z} previous-frame car position, or nil to (re)seed without testing
-        done = false,    -- true once the last checkpoint has been passed
+        done = false,    -- true once the final plan entry has been passed
     }
 end
 
 -- Advance the detector by one frame. Accumulates `dt` into elapsed, then -- given the local car's
--- world position `veh_pos` ({x,y,z} or a vec3) -- runs the swept test against the next expected
--- checkpoint. Returns a passage event {index, name, time} on a crossing (reporting the checkpoint's
--- stable 0-based index, ADR-0005), or nil. At most one passage per frame.
+-- world position `veh_pos` ({x,y,z} or a vec3) -- runs the swept test against the checkpoint named
+-- by the next plan entry. Returns a passage event {seq, index, name, lap, time} on a crossing (seq
+-- is the 0-based plan ordinal, the server's ordering key; index is the checkpoint's stable 0-based
+-- index, ADR-0005), or nil. At most one passage per frame.
 --
 -- A nil `veh_pos` (car momentarily unresolved) drops prev_pos so re-acquisition reseeds rather than
 -- spanning the gap with a spurious segment; the first armed frame likewise only seeds.
@@ -89,15 +124,18 @@ function M.step(state, checkpoints, veh_pos, dt)
 
     local event = nil
     if not state.done then
-        local checkpoint = checkpoints[state.cursor]
+        local entry = state.plan.entries[state.seq + 1]
+        local checkpoint = entry and checkpoints[entry.cursor]
         if checkpoint and segment_hits_checkpoint(state.prev_pos, cur, checkpoint) then
             event = {
+                seq = state.seq,
                 index = checkpoint.index,
                 name = checkpoint.name,
+                lap = entry.lap,
                 time = state.elapsed,
             }
-            state.cursor = state.cursor + 1
-            if state.cursor > #checkpoints then
+            state.seq = state.seq + 1
+            if state.seq >= #state.plan.entries then
                 state.done = true
             end
         end

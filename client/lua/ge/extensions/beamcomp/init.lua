@@ -23,8 +23,9 @@
 --                 racing, with a defensive release on lobby. The synced 3-2-1-GO! countdown UI
 --                 runs off the same phases (race/countdown + ADR-0008): countdown starts the
 --                 count, racing shows GO! on the release, lobby/reload clears it. The racing phase
---                 also arms the local checkpoint detector (race/checkpoints, ADR-0010), stepped each
---                 frame in onUpdate, which surfaces each passed checkpoint as a toast + log line.
+--                 also arms the local checkpoint detector (race/checkpoints, ADR-0010), which walks
+--                 the race's sprint/circuit traversal plan (ADR-0013), stepped each frame in onUpdate
+--                 and surfacing each passed checkpoint as a toast + log line + server report.
 
 local M = {}
 
@@ -130,13 +131,23 @@ local function handle_race_start(payload)
         log("W", RACE_LOG_TAG, "race-car placement skipped: " .. tostring(respawn_err))
     end
 
-    log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d", race.name, race.mySlot))
+    log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d, mode=%s laps=%d",
+        race.name, race.mySlot, tostring(race.mode), race.laps or 1))
     guihooks.trigger("toastrMsg", {
         type = "success",
         title = "BeamComp -- " .. race.name,
         msg = string.format("Slot %d -- start (%.0f, %.0f, %.0f)",
             race.mySlot, race.myPose.pos.x, race.myPose.pos.y, race.myPose.pos.z),
     })
+    -- The server can't validate the requested mode against geometry (race-blind); a fallback was
+    -- decided client-side in race/start (ADR-0013), so surface it here.
+    if race.modeWarning then
+        guihooks.trigger("toastrMsg", {
+            type = "warning",
+            title = "BeamComp",
+            msg = race.modeWarning,
+        })
+    end
 end
 
 -- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
@@ -165,9 +176,15 @@ local function handle_race_phase(payload)
         if not released then
             log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
         end
-        -- Arm checkpoint detection now the lock is released: it tests the local car against the
-        -- next expected checkpoint each frame (onUpdate) while racing (ADR-0010).
-        M.state.detection = checkpoints.new()
+        -- Arm checkpoint detection now the lock is released: it walks the race's traversal plan
+        -- (sprint/circuit, ADR-0013), testing the local car against the planned-next checkpoint each
+        -- frame (onUpdate) while racing (ADR-0010).
+        local plan = M.state.race and M.state.race.plan
+        if plan then
+            M.state.detection = checkpoints.new(plan)
+        else
+            log("W", RACE_LOG_TAG, "racing: no traversal plan; checkpoint detection disabled")
+        end
         -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
         -- dedups, so a manually-added copy is not duplicated.
         hud.show()
@@ -284,9 +301,12 @@ end
 
 -- Draw the next expected checkpoint as an in-world sphere so the player sees where to head next.
 -- Distinct blue vs the grid markers' green/amber; immediate-mode like draw_grid_markers (redrawn
--- each frame, nothing to clean up). detection.cursor is the 1-based index of the next checkpoint.
+-- each frame, nothing to clean up). The next checkpoint is the plan entry at detection.seq + 1, whose
+-- cursor indexes the checkpoints array (ADR-0013) -- so on a circuit it points at CP1 first and back
+-- at the start/finish line (CP0) for the final crossing.
 local function draw_next_checkpoint(race, detection)
-    local checkpoint = race.checkpoints[detection.cursor]
+    local entry = detection.plan and detection.plan.entries[detection.seq + 1]
+    local checkpoint = entry and race.checkpoints[entry.cursor]
     if not checkpoint then
         return
     end
@@ -376,20 +396,23 @@ local function send_to_server(message_type, payload)
 end
 
 -- Surface one detected checkpoint passage: log + toast + report to the server. This is the single
--- emission seam for a passage -- keep it the one place a passage is reported. `count` is the race's
--- total checkpoint count, sent so the race-blind server (ADR-0005) can derive progress (index+1 of
--- count) and recognize the final crossing without parsing the race (ADR-0011).
+-- emission seam for a passage -- keep it the one place a passage is reported. The report carries
+-- `seq` (the plan ordinal, the server's ordering key), `lap`, the display `index`/`name`, the time,
+-- and `count` (total scored crossings) so the race-blind server (ADR-0005) tracks progress and the
+-- final crossing without parsing the race (ADR-0011, ADR-0013).
 local function on_checkpoint_reached(event, count)
-    log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) reached @ %.2fs",
-        event.index, tostring(event.name), event.time))
+    log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) lap %d reached @ %.2fs (seq %d)",
+        event.index, tostring(event.name), event.lap, event.time, event.seq))
     guihooks.trigger("toastrMsg", {
         type = "success",
         title = "BeamComp",
         msg = string.format("Checkpoint %d reached @ %.1fs", event.index, event.time),
     })
     send_to_server("checkpoint", {
+        seq = event.seq,
         index = event.index,
         name = event.name,
+        lap = event.lap,
         time = event.time,
         count = count,
     })
@@ -417,19 +440,38 @@ local function step_detection(dt_sim)
 
     local event = checkpoints.step(detection, race.checkpoints, veh_pos, dt_sim)
     if event then
-        on_checkpoint_reached(event, #race.checkpoints)
+        on_checkpoint_reached(event, detection.plan.count)
     end
 end
 
+-- The lap the local player is currently on, read from the detector's plan: the lap of the next plan
+-- entry, or the final entry's lap once done (ADR-0013). Defaults to 1 when there is no plan.
+local function detection_lap(detection)
+    local entries = detection.plan and detection.plan.entries
+    if not entries then
+        return 1
+    end
+    local next_entry = entries[detection.seq + 1]
+    if next_entry then
+        return next_entry.lap
+    end
+    local last_entry = entries[#entries]
+    return last_entry and last_entry.lap or 1
+end
+
 -- Build the HUD snapshot for the render app (ADR-0012): the full ranked standings list. The local
--- player's row gets the live ticking time + checkpoint from the local detector (freezes on finish),
--- not the last server total. Pure read of M.state; the race-blind server is unaffected.
+-- player's row gets the live ticking time, crossing count, and lap from the local detector (freezes
+-- on finish), not the last server total. `lapCount` is the resolved race lap count (1 for sprint;
+-- the HUD shows a lap indicator only when > 1, ADR-0013). Pure read of M.state; the server is
+-- unaffected (race-blind).
 local function build_hud_snapshot()
     local race = M.state.race
     local detection = M.state.detection
     local standings = M.state.standings
     local my_slot = race and race.mySlot
-    local checkpoint_count = (race and race.checkpoints) and #race.checkpoints or 0
+    local checkpoint_count = (race and race.plan and race.plan.count)
+        or ((race and race.checkpoints) and #race.checkpoints) or 0
+    local lap_count = (race and race.laps) or 1
 
     local entries = {}
     if standings then
@@ -437,9 +479,11 @@ local function build_hud_snapshot()
             local is_local = my_slot ~= nil and e.slot == my_slot
             local checkpoint = e.completed
             local time = e.total_time
+            local lap = e.lap or 1
             if is_local and detection then
-                checkpoint = detection.cursor - 1
+                checkpoint = detection.seq
                 time = detection.elapsed
+                lap = detection_lap(detection)
             end
             entries[i] = {
                 position = e.position,
@@ -449,6 +493,8 @@ local function build_hud_snapshot()
                 time = time,
                 finished = e.finished,
                 isLocal = is_local,
+                lap = lap,
+                lapCount = lap_count,
             }
         end
     end
