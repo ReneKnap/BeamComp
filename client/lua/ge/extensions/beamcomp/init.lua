@@ -78,6 +78,13 @@ local function handle_race_start(payload)
             title = "BeamComp",
             msg = "Race not started: " .. tostring(reason),
         })
+        -- A raceStart we can't resolve still means the server has begun a new race, so any prior race
+        -- on this client is over. Drop its state (and blank the HUD) so the phase guard below skips the
+        -- countdown/racing for a race we are not in, and nothing stale lingers.
+        M.state.race = nil
+        M.state.detection = nil
+        M.state.standings = nil
+        hud.clear()
         return
     end
 
@@ -164,6 +171,14 @@ local function handle_race_phase(payload)
 
     M.state.phase = phase
     log("I", RACE_LOG_TAG, "race phase -> " .. phase)
+
+    -- Ignore phases for a race this client is not in: with no resolved race (unknown name, wrong map)
+    -- there is no car, plan, or checkpoints, so the server-driven countdown/racing must not render or
+    -- arm detection. Lobby still runs so any prior race tears down normally.
+    if not M.state.race and phase ~= "lobby" then
+        log("I", RACE_LOG_TAG, "racePhase '" .. phase .. "' ignored: no active race on this client")
+        return
+    end
 
     if phase == "countdown" then
         -- Start the synced 3-2-1 count off the server-issued duration (built-in flash surface).
@@ -509,7 +524,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
     end
-    if M.state.phase == "racing" then
+    if M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
         hud.push(build_hud_snapshot())
     end
