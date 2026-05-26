@@ -37,6 +37,8 @@ local cones = require("beamcomp/race/cones")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
 local hud = require("beamcomp/race/hud")
+local racelist = require("beamcomp/race/racelist")
+local maps = require("beamcomp/race/maps")
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -58,6 +60,10 @@ M.state = {
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
 }
+
+-- Client->server send primitive; defined below but forward-declared so the event handlers (and the
+-- HANDLERS table) above its definition can reference it.
+local send_to_server
 
 local function handle_ping(_payload)
     guihooks.trigger("toastrMsg", {
@@ -258,11 +264,20 @@ local function handle_standings(payload)
         tonumber(leader.total_time) or 0))
 end
 
+-- Answer the server's listRaces request: build this client's installed-race list for the loaded map
+-- and ship it back for the server to post to the asking player (ADR-0005: the server is race-blind,
+-- so the client owns the list; ADR-0011: client->server reply). The request payload is empty -- it is
+-- just the server asking us to report.
+local function handle_list_races(_payload)
+    send_to_server("raceList", {lines = racelist.build(maps.current())})
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
     racePhase = handle_race_phase,
     standings = handle_standings,
+    listRaces = handle_list_races,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -392,8 +407,8 @@ end
 -- send_event (ADR-0004, ADR-0011). Encode via the shared module (the client already loads it for
 -- decode), then ship the string with TriggerServerEvent, a GE global present only inside an MP
 -- session. Reliable + ordered TCP, so fire-and-forget. Generic so later client->server messages (e.g.
--- spawn-ready acks) reuse it.
-local function send_to_server(message_type, payload)
+-- spawn-ready acks) reuse it. Forward-declared above (local) so handlers defined earlier can call it.
+function send_to_server(message_type, payload)
     if not TriggerServerEvent then
         return
     end
