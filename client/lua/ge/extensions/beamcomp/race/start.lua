@@ -14,6 +14,7 @@ local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local grid = require("beamcomp/race/grid")
 local checkpoints = require("beamcomp/race/checkpoints")
+local maps = require("beamcomp/race/maps")
 
 local LOG_TAG = "beamcomp.race"
 
@@ -38,26 +39,6 @@ local function default_start_pose(race)
         return {pos = first.pos, rot = first.rot}
     end
     return nil, "race has no start position"
-end
-
--- The loaded level's identifier (e.g. "hirochi_raceway"), or nil if it can't be read.
--- getCurrentLevelIdentifier is a GE global; guarded so a missing API degrades to "unknown".
-local function current_map()
-    if type(getCurrentLevelIdentifier) ~= "function" then
-        return nil
-    end
-    local ok, level = pcall(getCurrentLevelIdentifier)
-    if ok and type(level) == "string" and level ~= "" then
-        return level
-    end
-    return nil
-end
-
--- Whether the loaded level matches the race's map. Substring-tolerant so a path-form
--- identifier ("/levels/<map>/info.json") still matches a bare map name.
-local function maps_match(loaded, race_map)
-    local a, b = loaded:lower(), race_map:lower()
-    return a == b or a:find(b, 1, true) ~= nil or b:find(a, 1, true) ~= nil
 end
 
 local REVERSE_PREFAB = "reversePrefab.prefab.json"
@@ -125,10 +106,10 @@ function M.prepare(payload)
 
     -- Markers/poses are in the race's own world coordinates, so refuse a race that isn't on
     -- the loaded map (ADR-0005: only the client knows the race's map). Skip if undetectable.
-    local loaded = current_map()
+    local loaded = maps.current()
     log("I", LOG_TAG, "race map '" .. tostring(locator.map) .. "', loaded map '"
         .. tostring(loaded) .. "'")
-    if loaded and locator.map and not maps_match(loaded, locator.map) then
+    if loaded and locator.map and not maps.matches(loaded, locator.map) then
         return nil, "race is on map '" .. locator.map .. "' -- you are on '" .. loaded .. "'"
     end
 
