@@ -11,15 +11,19 @@
 -- monotonic MP.CreateTimer() stopwatch measures elapsed time per phase. Every
 -- transition is broadcast to all clients as a "racePhase" envelope on the
 -- "beamcompEvent" channel; the later Phase-3 items (movement lock, countdown UI,
--- release) act on those phases. The finish-grace hook and the racing -> finished
--- trigger are built but dormant -- finish detection lands in Phase 4.
+-- release) act on those phases. Finish detection is active (ADR-0013): a player's final
+-- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race <name>  from lobby/finished: assign every present player a slot, send each a
---                 "raceStart" event (slot + grid roster), and enter the spawning phase. The
---                 client resolves and parses <name> locally (ADR-0005). While a race is
---                 already running, /race queues the new race and runs a short abort window
---                 before restarting. Bare /race replies with usage.
+--   /race <name> [sprint|circuit] [laps]
+--                 from lobby/finished: assign every present player a slot, send each a
+--                 "raceStart" event (slot + grid roster + relayed mode/laps), and enter the
+--                 spawning phase. The client resolves and parses <name> locally (ADR-0005) and
+--                 decides the actual mode/laps; the optional sprint|circuit and lap-count tokens
+--                 are relayed verbatim as overrides (ADR-0013) -- the server never validates them
+--                 against geometry (race-blind). While a race is already running, /race queues the
+--                 new race and runs a short abort window before restarting. Bare /race replies
+--                 with usage.
 --   /raceend      force the state machine back to lobby (safety hatch).
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
@@ -84,6 +88,8 @@ local session = {
     grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
     pending_race = nil,     -- race name queued by a /race re-issued while one is active
     pending_owner = nil,    -- player id of the queued race's issuer (owns its shared props), or nil
+    pending_mode = nil,     -- queued race's relayed mode override ("sprint"/"circuit"), or nil
+    pending_laps = nil,     -- queued race's relayed lap-count override, or nil
 }
 
 
@@ -158,9 +164,10 @@ local function build_roster(slots)
 end
 
 -- Seed a per-player progress record for every slot, keyed by player id. Each record tracks the
--- player's checkpoint progress, cumulative split times, and total time; `finished` flips on the
--- final crossing and leaves room for a future DNF state (Phase 5). Splits are 1-based: splits[k] is
--- the cumulative race-relative time at the k-th checkpoint; segment deltas are derived, not stored.
+-- player's checkpoint progress, cumulative split times, total time, and current lap (1-based, set
+-- from each report -- ADR-0013); `finished` flips on the final crossing and leaves room for a future
+-- DNF state (Phase 5). Splits are 1-based: splits[k] is the cumulative race-relative time at the
+-- k-th scored crossing; segment deltas are derived, not stored.
 local function build_progress(slots)
     local progress = {}
     for _, entry in ipairs(slots) do
@@ -171,6 +178,7 @@ local function build_progress(slots)
             splits = {},
             total_time = 0,
             finished = false,
+            lap = 1,
         }
     end
     return progress
@@ -214,6 +222,7 @@ local function build_standings()
             count = record.count or known_count,
             total_time = record.total_time,
             finished = record.finished,
+            lap = record.lap,
         }
     end
     return entries
@@ -233,15 +242,19 @@ local function reset_to_lobby()
     session.grace_deadline = nil
     session.pending_race = nil
     session.pending_owner = nil
+    session.pending_mode = nil
+    session.pending_laps = nil
     enter_phase(PHASE.lobby, nil)
 end
 
--- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster), and
--- enter the spawning phase. The client resolves and parses the race name locally (ADR-0005).
--- `owner_id` is the player that issued /race; exactly that player's raceStart carries
--- propOwner = true, designating it as the one client that spawns the shared race props -- the
--- knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
-local function start_race(race_name, owner_id)
+-- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster + relayed
+-- mode/laps), and enter the spawning phase. The client resolves and parses the race name locally
+-- (ADR-0005) and decides the actual mode/laps; `mode` ("sprint"/"circuit") and `laps` are the
+-- admin's overrides relayed verbatim, or nil for "auto" (the client derives them from the race
+-- file -- ADR-0013). `owner_id` is the player that issued /race; exactly that player's raceStart
+-- carries propOwner = true, designating it as the one client that spawns the shared race props --
+-- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
+local function start_race(race_name, owner_id, mode, laps)
     local slots = build_slots(MP.GetPlayers())
     local roster = build_roster(slots)
 
@@ -251,6 +264,8 @@ local function start_race(race_name, owner_id)
     session.grace_deadline = nil
     session.pending_race = nil
     session.pending_owner = nil
+    session.pending_mode = nil
+    session.pending_laps = nil
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
@@ -261,6 +276,8 @@ local function start_race(race_name, owner_id)
             grid = roster,
             variant = "default",
             propOwner = entry.id == owner_id,
+            mode = mode,  -- nil = auto (client derives from meta.closed); ADR-0013
+            laps = laps,  -- nil = auto (client uses meta.defaultLaps); ADR-0013
         })
     end
 
@@ -284,9 +301,13 @@ local function advance_from_finished()
     local pending = session.pending_race
     if pending then
         local owner = session.pending_owner
+        local mode = session.pending_mode
+        local laps = session.pending_laps
         session.pending_race = nil
         session.pending_owner = nil
-        start_race(pending, owner)
+        session.pending_mode = nil
+        session.pending_laps = nil
+        start_race(pending, owner, mode, laps)
         return
     end
     reset_to_lobby()
@@ -324,25 +345,66 @@ local function tick()
     end
 end
 
--- /race <name>: from an idle/finished session start the race; from an active one queue the new
--- race and cut the current one short with a brief abort window before it restarts (ADR-0006).
-local function handle_race_command(player_id, player_name, race_name)
-    if race_name == "" then
-        MP.SendChatMessage(player_id, "BeamComp: usage -- /race <name>")
+local RACE_USAGE = "BeamComp: usage -- /race <name> [sprint|circuit] [laps]"
+
+-- Valid /race mode-override tokens; anything else (besides a bare integer lap count) is rejected.
+local RACE_MODES = {sprint = true, circuit = true}
+
+-- Parse a /race argument into the race name plus optional mode/laps overrides (ADR-0013). The first
+-- whitespace token is the race name (race ids are slug-based, no spaces -- ADR-0005); of the rest,
+-- a "sprint"/"circuit" token sets the mode and a bare integer sets the lap count, order-independent.
+-- Returns name (nil if the argument is empty), mode (or nil = auto), laps (or nil = auto), and the
+-- first unrecognized token (or nil) so the caller can reply with usage.
+local function parse_race_args(argument)
+    local tokens = {}
+    for token in argument:gmatch("%S+") do
+        tokens[#tokens + 1] = token
+    end
+
+    local name = tokens[1]
+    local mode, laps, bad_token
+    for i = 2, #tokens do
+        local token = tokens[i]
+        if RACE_MODES[token:lower()] then
+            mode = token:lower()
+        elseif token:match("^%d+$") then
+            laps = math.floor(tonumber(token))
+        elseif not bad_token then
+            bad_token = token
+        end
+    end
+    return name, mode, laps, bad_token
+end
+
+-- /race <name> [mode] [laps]: from an idle/finished session start the race; from an active one queue
+-- the new race and cut the current one short with a brief abort window before it restarts (ADR-0006).
+-- mode/laps are relayed verbatim to clients (race-blind, ADR-0013).
+local function handle_race_command(player_id, player_name, argument)
+    local race_name, mode, laps, bad_token = parse_race_args(argument)
+
+    if not race_name then
+        MP.SendChatMessage(player_id, RACE_USAGE)
+        return
+    end
+    if bad_token then
+        MP.SendChatMessage(player_id, "BeamComp: unknown option '" .. bad_token .. "' -- " .. RACE_USAGE)
         return
     end
 
-    log_info("beamcomp.race", "/race '" .. race_name .. "' by " .. player_name
-        .. " (phase " .. session.phase .. ")")
+    log_info("beamcomp.race", string.format("/race '%s' by %s (phase %s)%s%s",
+        race_name, player_name, session.phase,
+        mode and (" mode=" .. mode) or "", laps and (" laps=" .. laps) or ""))
 
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name, player_id)
+        start_race(race_name, player_id, mode, laps)
         MP.SendChatMessage(player_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
 
     session.pending_race = race_name
     session.pending_owner = player_id
+    session.pending_mode = mode
+    session.pending_laps = laps
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
     MP.SendChatMessage(player_id, "BeamComp: restarting with race '" .. race_name .. "'")
 end
@@ -421,13 +483,15 @@ local function on_chat_message(player_id, player_name, message)
 end
 
 -- Record one client checkpoint report into the reporting player's progress (ADR-0011 path).
--- Advances the completed count, appends the cumulative split time, updates the running total, and
--- arms the finish grace (the ADR-0006 racing -> finished seam) on the final crossing. Stays
--- race-blind (ADR-0005): progress and the finish threshold come from the payload index/count, not
--- race geometry. Strict-sequential: only the next expected index is accepted; duplicates, gaps,
--- out-of-order, a report outside racing, or one from an unseeded player are logged and dropped.
+-- Advances the completed count, appends the cumulative split time, updates the running total, tracks
+-- the current lap, and arms the finish grace (the ADR-0006 racing -> finished seam) on the final
+-- crossing. Stays race-blind (ADR-0005): progress and the finish threshold come from the payload
+-- seq/count, not race geometry. Ordered by `seq` (the 0-based ordinal in the client's traversal
+-- plan -- ADR-0013), not the stable checkpoint index, so a circuit's reordered/repeated indices are
+-- accepted; only the next expected seq advances -- duplicates, gaps, out-of-order, a report outside
+-- racing, or one from an unseeded player are logged and dropped.
 local function handle_checkpoint_report(player_id, payload)
-    if type(payload) ~= "table" or type(payload.index) ~= "number" then
+    if type(payload) ~= "table" or type(payload.seq) ~= "number" then
         log_info("beamcomp.net", "checkpoint report from id " .. tostring(player_id)
             .. " ignored: bad payload")
         return
@@ -446,23 +510,29 @@ local function handle_checkpoint_report(player_id, payload)
         return
     end
 
-    -- Coerce to integers: a fractional index/count from a bad client would break the %d formatting
+    -- Coerce to integers: a fractional seq/count from a bad client would break the %d formatting
     -- (Lua 5.3 rejects non-integer floats) and the ordering compare. count may be absent, in which
-    -- case finish cannot be detected and only progress is tracked.
-    local index = math.floor(payload.index)
+    -- case finish cannot be detected and only progress is tracked. index/lap are optional metadata
+    -- (display + logging); seq is the ordering key (ADR-0013).
+    local seq = math.floor(payload.seq)
     local count = (type(payload.count) == "number") and math.floor(payload.count) or nil
     local time = tonumber(payload.time) or 0
+    local lap = (type(payload.lap) == "number") and math.floor(payload.lap) or nil
+    local index = (type(payload.index) == "number") and math.floor(payload.index) or nil
 
-    if index ~= record.completed then
+    if seq ~= record.completed then
         log_info("beamcomp.race", string.format(
-            "player %d out-of-order checkpoint: got %d, expected %d",
-            player_id, index, record.completed))
+            "player %d out-of-order checkpoint: got seq %d, expected %d",
+            player_id, seq, record.completed))
         return
     end
 
     record.completed = record.completed + 1
     if count then
         record.count = count
+    end
+    if lap then
+        record.lap = lap
     end
     record.splits[record.completed] = time
     record.total_time = time
@@ -476,8 +546,11 @@ local function handle_checkpoint_report(player_id, payload)
     local progress_label = record.count
         and string.format("%d/%d", record.completed, record.count)
         or tostring(record.completed)
-    log_info("beamcomp.race", string.format("player %d checkpoint %s @ %.2fs%s",
-        player_id, progress_label, time, final and " (final)" or ""))
+    log_info("beamcomp.race", string.format("player %d checkpoint %s%s%s @ %.2fs%s",
+        player_id, progress_label,
+        lap and string.format(" lap %d", lap) or "",
+        index and string.format(" (cp %d)", index) or "",
+        time, final and " (final)" or ""))
 
     broadcast_standings()
 end
