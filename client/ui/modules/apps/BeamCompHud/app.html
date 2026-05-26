@@ -1,6 +1,56 @@
-<!-- BeamComp HUD -- AngularJS app template (placeholder).
-     Populated in Phase 4: next-checkpoint marker, current position, live time.
-     Receives data from the GE extension via scope.$on(...) wired in app.js. -->
-<div class="beamcomp-hud">
-  <!-- HUD content goes here -->
+<div class="beamcomp-hud" ng-show="hud.active">
+  <!-- Ranked standings pushed by the GE extension (race/hud.lua) via scope.$on; wired in app.js.
+       This root <div> must be the template's first node: replace:true forbids a leading comment. -->
+  <style>
+    .beamcomp-hud {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.55);
+      border-radius: 6px;
+      padding: 6px 10px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    }
+    .beamcomp-hud table.bc-standings {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 16px;
+    }
+    .beamcomp-hud table.bc-standings td {
+      padding: 2px 6px;
+      white-space: nowrap;
+    }
+    .beamcomp-hud .bc-pos {
+      font-weight: bold;
+      text-align: right;
+    }
+    .beamcomp-hud .bc-name {
+      width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .beamcomp-hud .bc-cp {
+      opacity: 0.85;
+      text-align: right;
+    }
+    .beamcomp-hud .bc-time {
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    .beamcomp-hud tr.bc-local {
+      background: rgba(63, 217, 107, 0.18);
+      font-weight: bold;
+    }
+    .beamcomp-hud tr.bc-finished .bc-time {
+      color: #3fd96b;
+    }
+  </style>
+  <table class="bc-standings">
+    <tr ng-repeat="e in hud.entries"
+        ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished}">
+      <td class="bc-pos">P{{e.position}}</td>
+      <td class="bc-name">{{e.name}}</td>
+      <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
+      <td class="bc-time">{{formatTime(e.time)}}</td>
+    </tr>
+  </table>
 </div>

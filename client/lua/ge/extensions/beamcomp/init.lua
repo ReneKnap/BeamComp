@@ -35,6 +35,7 @@ local props = require("beamcomp/race/props")
 local cones = require("beamcomp/race/cones")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
+local hud = require("beamcomp/race/hud")
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -85,6 +86,8 @@ local function handle_race_start(payload)
     -- abort-restart path is finished -> spawning, skipping the lobby reset, so clear them too).
     M.state.detection = nil
     M.state.standings = nil
+    -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
+    hud.clear()
 
     -- Resolve the car the player is in, preferring the onVehicleSwitched-tracked id (the polling API
     -- be:getPlayerVehicle(0) sticks to the first owned car in BeamMP). Resolve BEFORE loading props
@@ -172,6 +175,7 @@ local function handle_race_phase(payload)
         -- preserved car drivable. The abort-restart path skips lobby (finished -> spawning), where
         -- handle_race_start reloads props and re-freezes instead.
         countdown.clear()
+        hud.clear()
         props.clear(M.state.prop_names or {})
         cones.clear(M.state.cone_ids or {})
         M.state.prop_names = nil
@@ -272,6 +276,20 @@ local function draw_grid_markers(race)
         local label = name and ("P" .. slot .. " " .. name) or ("P" .. slot)
         debugDrawer:drawTextAdvanced(center, label, label_fg, true, false, label_bg)
     end
+end
+
+-- Draw the next expected checkpoint as an in-world sphere so the player sees where to head next.
+-- Distinct blue vs the grid markers' green/amber; immediate-mode like draw_grid_markers (redrawn
+-- each frame, nothing to clean up). detection.cursor is the 1-based index of the next checkpoint.
+local function draw_next_checkpoint(race, detection)
+    local checkpoint = race.checkpoints[detection.cursor]
+    if not checkpoint then
+        return
+    end
+    local c = checkpoint.pos
+    local center = vec3(c.x, c.y, c.z + MARKER_LIFT)
+    local radius = checkpoint.radius or MARKER_RADIUS
+    debugDrawer:drawSphere(center, radius, ColorF(0.2, 0.6, 1.0, 0.5))
 end
 
 -- Register the server->client handler. AddEventHandler is a GE global provided by BeamMP's
@@ -399,12 +417,51 @@ local function step_detection(dt_sim)
     end
 end
 
+-- Build the HUD snapshot for the render app (ADR-0012): the full ranked standings list. The local
+-- player's row gets the live ticking time + checkpoint from the local detector (freezes on finish),
+-- not the last server total. Pure read of M.state; the race-blind server is unaffected.
+local function build_hud_snapshot()
+    local race = M.state.race
+    local detection = M.state.detection
+    local standings = M.state.standings
+    local my_slot = race and race.mySlot
+    local checkpoint_count = (race and race.checkpoints) and #race.checkpoints or 0
+
+    local entries = {}
+    if standings then
+        for i, e in ipairs(standings) do
+            local is_local = my_slot ~= nil and e.slot == my_slot
+            local checkpoint = e.completed
+            local time = e.total_time
+            if is_local and detection then
+                checkpoint = detection.cursor - 1
+                time = detection.elapsed
+            end
+            entries[i] = {
+                position = e.position,
+                name = e.name,
+                checkpoint = checkpoint,
+                count = e.count or checkpoint_count,
+                time = time,
+                finished = e.finished,
+                isLocal = is_local,
+            }
+        end
+    end
+
+    return {
+        active = true,
+        entries = entries,
+    }
+end
+
 function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
     end
     if M.state.phase == "racing" then
         step_detection(dtSim)
+        hud.push(build_hud_snapshot())
     end
 end
 
@@ -413,12 +470,18 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
     if not race or not debugDrawer then
         return
     end
-    -- Guard the draw: debugDrawer's exact API is runtime-confirmed here, so a mismatch
-    -- warns once rather than spamming every frame.
-    local ok, err = pcall(draw_grid_markers, race)
+    -- Guard the draws: debugDrawer's exact API is runtime-confirmed here, so a mismatch warns once
+    -- rather than spamming every frame. The next-checkpoint marker only shows while racing.
+    local ok, err = pcall(function()
+        draw_grid_markers(race)
+        local detection = M.state.detection
+        if M.state.phase == "racing" and detection and not detection.done then
+            draw_next_checkpoint(race, detection)
+        end
+    end)
     if not ok and not M.state.marker_warned then
         M.state.marker_warned = true
-        log("W", RACE_LOG_TAG, "grid marker draw failed (debugDrawer API?): " .. tostring(err))
+        log("W", RACE_LOG_TAG, "marker draw failed (debugDrawer API?): " .. tostring(err))
     end
 end
 
@@ -428,6 +491,7 @@ function M.onExtensionUnloaded()
     end
     M.state.registered = false
     countdown.clear()
+    hud.clear()
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     M.state.prop_names = nil
