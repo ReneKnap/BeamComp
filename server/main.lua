@@ -29,9 +29,11 @@
 --                 race-blind (ADR-0005), so it asks that client (a "listRaces" event); the client
 --                 builds the list and sends it back ("raceList"), and the server posts it to the
 --                 player. Reply is to the asker only.
+--   /dnf          give up the current race: marks the issuing player DNF (did not finish). Racing
+--                 only (ADR-0014).
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
--- All four suppress their own chat echo. Anything else relays as normal chat.
+-- All five suppress their own chat echo. Anything else relays as normal chat.
 -- The server never validates <name> (ADR-0005).
 
 local M = {}
@@ -40,6 +42,7 @@ local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
 local CHAT_COMMAND_RACEEND = "/raceend"
 local CHAT_COMMAND_RACES = "/races"
+local CHAT_COMMAND_DNF = "/dnf"
 local CHAT_COMMAND_PING = "/beamcomp"
 
 -- Server <-> client event channel. Must be colon-free: the BeamMP client parser
@@ -55,6 +58,7 @@ local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat
 -- Server -> client broadcast/request types.
 local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadcast)
 local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
+local MSG_FINISH_GRACE = "finishGrace"  -- the DNF-cutoff countdown duration, broadcast when armed (ADR-0014)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -77,7 +81,8 @@ local PHASE = {
 local PHASE_DURATIONS = {
     spawning = 3.0,       -- fixed wait for clients to resolve/parse/spawn (acks deferred: backlog)
     countdown = 3.0,      -- pre-race 3-2-1-GO
-    finish_grace = 30.0,  -- after the first finisher (Phase-4 hook; dormant here)
+    finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
+    all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
     finished_hold = 8.0,  -- results/cleanup window before returning to lobby
 }
@@ -175,9 +180,9 @@ end
 
 -- Seed a per-player progress record for every slot, keyed by player id. Each record tracks the
 -- player's checkpoint progress, cumulative split times, total time, and current lap (1-based, set
--- from each report -- ADR-0013); `finished` flips on the final crossing and leaves room for a future
--- DNF state (Phase 5). Splits are 1-based: splits[k] is the cumulative race-relative time at the
--- k-th scored crossing; segment deltas are derived, not stored.
+-- from each report -- ADR-0013); `finished` flips on the final crossing, and `dnf` flips (terminally)
+-- on disconnect, /dnf, or finish-grace expiry (ADR-0014). Splits are 1-based: splits[k] is the
+-- cumulative race-relative time at the k-th scored crossing; segment deltas are derived, not stored.
 local function build_progress(slots)
     local progress = {}
     for _, entry in ipairs(slots) do
@@ -188,6 +193,7 @@ local function build_progress(slots)
             splits = {},
             total_time = 0,
             finished = false,
+            dnf = false,
             lap = 1,
         }
     end
@@ -195,10 +201,11 @@ local function build_progress(slots)
 end
 
 -- Build the live ranked standings from session.progress: a pure function over the per-player
--- records (race-blind, ADR-0005). Sort key: most checkpoints completed, then earliest time at that
--- checkpoint, then slot as a stable tiebreak -- finished players lead by finish time, the rest
--- follow by how far and how fast. Each entry carries a 1-based position; `count` falls back to a
--- shared known_count so entries agree once any report has set it (nil at race-start baseline).
+-- records (race-blind, ADR-0005). Sort key: non-DNF before DNF (ADR-0014), then most checkpoints
+-- completed, then earliest time at that checkpoint, then slot as a stable tiebreak -- so finishers and
+-- active racers rank above DNFs, finished players lead by finish time, and DNFs rank by how far they
+-- got. Each entry carries a 1-based position; `count` falls back to a shared known_count so entries
+-- agree once any report has set it (nil at race-start baseline).
 local function build_standings()
     if not session.progress then
         return {}
@@ -213,6 +220,9 @@ local function build_standings()
         end
     end
     table.sort(ranked, function(a, b)
+        if a.dnf ~= b.dnf then
+            return not a.dnf  -- non-DNF ranks ahead of DNF (ADR-0014)
+        end
         if a.completed ~= b.completed then
             return a.completed > b.completed
         end
@@ -232,6 +242,7 @@ local function build_standings()
             count = record.count or known_count,
             total_time = record.total_time,
             finished = record.finished,
+            dnf = record.dnf,
             lap = record.lap,
         }
     end
@@ -255,6 +266,35 @@ local function reset_to_lobby()
     session.pending_mode = nil
     session.pending_laps = nil
     enter_phase(PHASE.lobby, nil)
+end
+
+-- Early-end check (ADR-0014): once no player can still finish, don't wait out the full grace. With at
+-- least one finisher, cut the grace to a short results window (never extend, and re-broadcast so the
+-- client countdown resyncs); with everyone DNF and no finisher there is nothing to show, so return to
+-- lobby. Called after any finish/DNF while racing.
+local function maybe_end_race()
+    if session.phase ~= PHASE.racing or not session.progress then
+        return
+    end
+    local active = 0
+    for _, record in pairs(session.progress) do
+        if not record.finished and not record.dnf then
+            active = active + 1
+        end
+    end
+    if active > 0 then
+        return
+    end
+    -- No one can still finish (everyone finished and/or DNF): run the short results/countdown window,
+    -- then the race settles via the normal tick (racing -> finished -> lobby) -- the same 5 s end for an
+    -- all-DNF race as for a completed one (ADR-0014). The window is armed even with no finisher, so an
+    -- all-DNF race no longer hangs.
+    local short_deadline = now() + PHASE_DURATIONS.all_done_grace
+    if not session.grace_deadline or short_deadline < session.grace_deadline then
+        session.grace_deadline = short_deadline
+        broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.all_done_grace})
+        log_info("beamcomp.race", "all players accounted for; grace shortened to results window")
+    end
 end
 
 -- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster + relayed
@@ -304,6 +344,8 @@ local function start_finish_grace()
     end
     session.grace_deadline = now() + PHASE_DURATIONS.finish_grace
     log_info("beamcomp.race", "finish grace armed")
+    -- Tell every client the cutoff length so still-racing players can show a live countdown (ADR-0014).
+    broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.finish_grace})
 end
 
 -- A finished phase either restarts into a queued race (a re-issued /race) or settles to lobby.
@@ -323,6 +365,21 @@ local function advance_from_finished()
     reset_to_lobby()
 end
 
+-- Mark every still-active player (not finished, not already DNF) as DNF, then broadcast the standings.
+-- Called when the finish grace expires so the race settles with everyone classified (ADR-0014).
+local function dnf_active_players(reason)
+    if not session.progress then
+        return
+    end
+    for id, record in pairs(session.progress) do
+        if not record.finished and not record.dnf then
+            record.dnf = true
+            log_info("beamcomp.race", string.format("player %s DNF (%s)", tostring(id), reason))
+        end
+    end
+    broadcast_standings()
+end
+
 -- Advance the state machine one step. Runs on every tick; a no-op while idle in lobby.
 local function tick()
     local phase = session.phase
@@ -330,9 +387,11 @@ local function tick()
         return
     end
 
-    -- racing is open-ended: it ends only when the (Phase-3-dormant) finish grace elapses.
+    -- racing ends when the finish grace (armed by the first finisher) elapses; any player still out
+    -- on track at that point is marked DNF before the race settles (ADR-0014).
     if phase == PHASE.racing then
         if session.grace_deadline and now() >= session.grace_deadline then
+            dnf_active_players("grace expired")
             enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
         end
         return
@@ -430,6 +489,33 @@ local function handle_raceend_command(player_id, player_name)
     MP.SendChatMessage(player_id, "BeamComp: race ended")
 end
 
+-- /dnf: the issuing player gives up the current race -- mark them DNF (terminal, ADR-0014). Racing
+-- only; a finished or already-DNF player is told so. Broadcasts standings so all clients reflect it.
+local function handle_dnf_command(player_id, player_name)
+    if session.phase ~= PHASE.racing then
+        MP.SendChatMessage(player_id, "BeamComp: no race in progress")
+        return
+    end
+    local record = session.progress and session.progress[player_id]
+    if not record then
+        MP.SendChatMessage(player_id, "BeamComp: you are not in this race")
+        return
+    end
+    if record.finished then
+        MP.SendChatMessage(player_id, "BeamComp: you already finished")
+        return
+    end
+    if record.dnf then
+        MP.SendChatMessage(player_id, "BeamComp: you are already out (DNF)")
+        return
+    end
+    record.dnf = true
+    log_info("beamcomp.race", "/dnf by " .. player_name .. " (id " .. tostring(player_id) .. ")")
+    broadcast_standings()
+    MP.SendChatMessage(player_id, "BeamComp: you are out (DNF)")
+    maybe_end_race()
+end
+
 local function handle_ping_command(player_id, player_name)
     local player_count = MP.GetPlayerCount()
     log_info("beamcomp", CHAT_COMMAND_PING .. " from " .. player_name .. " (id " .. player_id .. ")")
@@ -452,7 +538,8 @@ local function is_server_empty_without(leaving_id)
     return true
 end
 
--- If the last player leaves mid-race there is no one to race -- fall back to lobby.
+-- A player leaving mid-race is marked DNF so the race can still settle; if they were the last one
+-- there is no one to race, so fall back to lobby instead (ADR-0014).
 local function on_player_disconnect(player_id)
     if session.phase == PHASE.lobby then
         return
@@ -460,6 +547,14 @@ local function on_player_disconnect(player_id)
     if is_server_empty_without(player_id) then
         log_info("beamcomp.race", "all players gone; returning to lobby")
         reset_to_lobby()
+        return
+    end
+    local record = session.progress and session.progress[player_id]
+    if record and not record.finished and not record.dnf then
+        record.dnf = true
+        log_info("beamcomp.race", "player " .. tostring(player_id) .. " disconnected; DNF")
+        broadcast_standings()
+        maybe_end_race()
     end
 end
 
@@ -489,6 +584,11 @@ local function on_chat_message(player_id, player_name, message)
         -- Race-blind (ADR-0005): ask the asking client to report its race list; it replies with a
         -- raceList event we post back (handle_race_list).
         send_event(player_id, MSG_LIST_RACES, {})
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == CHAT_COMMAND_DNF then
+        handle_dnf_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
 
@@ -524,6 +624,15 @@ local function handle_checkpoint_report(player_id, payload)
     if not record then
         log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
             .. " ignored: no race record")
+        return
+    end
+
+    -- A finished or DNF player is terminal (ADR-0014): drop further reports so a DNF'd player who keeps
+    -- driving can never progress or set finished. (Finished players' clients stop sending; this also
+    -- guards a DNF'd player whose detector is still armed.)
+    if record.finished or record.dnf then
+        log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
+            .. " ignored: already " .. (record.finished and "finished" or "DNF"))
         return
     end
 
@@ -570,6 +679,9 @@ local function handle_checkpoint_report(player_id, payload)
         time, final and " (final)" or ""))
 
     broadcast_standings()
+    if final then
+        maybe_end_race()
+    end
 end
 
 -- Post a client's /races reply to that player. The client (which owns race knowledge, ADR-0005) built
