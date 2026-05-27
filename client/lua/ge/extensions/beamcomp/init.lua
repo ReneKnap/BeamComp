@@ -59,6 +59,7 @@ M.state = {
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
+    grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -90,16 +91,18 @@ local function handle_race_start(payload)
         M.state.race = nil
         M.state.detection = nil
         M.state.standings = nil
+        M.state.grace = nil
         hud.clear()
         return
     end
 
     M.state.race = race
     M.state.marker_warned = false
-    -- Reset checkpoint detection and any stale standings; both are refreshed during the race (the
+    -- Reset checkpoint detection and any stale standings/grace; all are refreshed during the race (the
     -- abort-restart path is finished -> spawning, skipping the lobby reset, so clear them too).
     M.state.detection = nil
     M.state.standings = nil
+    M.state.grace = nil
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
 
@@ -225,6 +228,7 @@ local function handle_race_phase(payload)
         M.state.race = nil
         M.state.detection = nil
         M.state.standings = nil
+        M.state.grace = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
@@ -272,12 +276,26 @@ local function handle_list_races(_payload)
     send_to_server("raceList", {lines = racelist.build(maps.current())})
 end
 
+-- Store the server-issued finish-grace countdown (ADR-0014): once the first player finishes, every
+-- still-racing player has this many seconds to finish or be marked DNF. Ticked down locally in
+-- onUpdate; shown on the HUD only while the local player has not finished.
+local function handle_finish_grace(payload)
+    local duration = type(payload) == "table" and tonumber(payload.duration) or nil
+    if not duration or duration <= 0 then
+        log("W", RACE_LOG_TAG, "finishGrace ignored: bad duration")
+        return
+    end
+    M.state.grace = {remaining = duration}
+    log("I", RACE_LOG_TAG, string.format("finish grace: %.0fs to finish or DNF", duration))
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
     racePhase = handle_race_phase,
     standings = handle_standings,
     listRaces = handle_list_races,
+    finishGrace = handle_finish_grace,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -502,6 +520,8 @@ local function build_hud_snapshot()
     local checkpoint_count = (race and race.plan and race.plan.count)
         or ((race and race.checkpoints) and #race.checkpoints) or 0
     local lap_count = (race and race.laps) or 1
+    local local_finished = detection and detection.done
+    local local_dnf = false
 
     local entries = {}
     if standings then
@@ -515,6 +535,9 @@ local function build_hud_snapshot()
                 time = detection.elapsed
                 lap = detection_lap(detection)
             end
+            if is_local then
+                local_dnf = e.dnf and true or false
+            end
             entries[i] = {
                 position = e.position,
                 name = e.name,
@@ -522,6 +545,7 @@ local function build_hud_snapshot()
                 count = e.count or checkpoint_count,
                 time = time,
                 finished = e.finished,
+                dnf = e.dnf,
                 isLocal = is_local,
                 lap = lap,
                 lapCount = lap_count,
@@ -529,9 +553,16 @@ local function build_hud_snapshot()
         end
     end
 
+    -- Show the finish-grace countdown to everyone during the grace; the label adapts to whether the
+    -- local player can still finish (ADR-0014) -- finished/DNF players see how long until the race ends.
+    local grace = M.state.grace and M.state.grace.remaining or nil
+    local grace_can_finish = not local_finished and not local_dnf
+
     return {
         active = true,
         entries = entries,
+        grace = grace,
+        graceCanFinish = grace_can_finish,
     }
 end
 
@@ -541,6 +572,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     end
     if M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
+        -- Tick the finish-grace countdown in wall time (the server's cutoff is wall-time; ADR-0014).
+        -- Visual only -- the server stays authoritative on the actual DNF cutoff.
+        if M.state.grace then
+            M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
+        end
         hud.push(build_hud_snapshot())
     end
 end
@@ -579,6 +615,7 @@ function M.onExtensionUnloaded()
     M.state.cone_ids = nil
     M.state.race = nil
     M.state.detection = nil
+    M.state.grace = nil
     -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     M.state.phase = nil
