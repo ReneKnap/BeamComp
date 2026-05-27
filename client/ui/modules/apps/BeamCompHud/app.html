@@ -47,15 +47,29 @@
     .beamcomp-hud tr.bc-finished .bc-time {
       color: #3fd96b;
     }
+    .beamcomp-hud tr.bc-dnf {
+      opacity: 0.5;
+    }
+    .beamcomp-hud tr.bc-dnf .bc-time {
+      color: #d9534f;
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-grace {
+      text-align: center;
+      font-weight: bold;
+      color: #ffcc33;
+      padding-bottom: 4px;
+    }
   </style>
+  <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
   <table class="bc-standings">
     <tr ng-repeat="e in hud.entries"
-        ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished}">
+        ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
       <td class="bc-pos">P{{e.position}}</td>
       <td class="bc-name">{{e.name}}</td>
       <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
       <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
-      <td class="bc-time">{{formatTime(e.time)}}</td>
+      <td class="bc-time">{{e.dnf ? 'DNF' : formatTime(e.time)}}</td>
     </tr>
   </table>
 </div>
