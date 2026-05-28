@@ -84,7 +84,7 @@ local PHASE_DURATIONS = {
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
     all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
-    finished_hold = 8.0,  -- results/cleanup window before returning to lobby
+    finished_hold = 15.0, -- results-display window before returning to lobby (ADR-0006)
 }
 
 -- Monotonic stopwatch for phase timing; only elapsed differences are used, so its origin
@@ -244,6 +244,10 @@ local function build_standings()
             finished = record.finished,
             dnf = record.dnf,
             lap = record.lap,
+            -- Cumulative race-relative time at each scored crossing (ADR-0015). Shallow reference --
+            -- downstream readers must not mutate. DNF entries carry only the splits completed before
+            -- DNF; the results UI derives segment deltas from this.
+            splits = record.splits,
         }
     end
     return entries
