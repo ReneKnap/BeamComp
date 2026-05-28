@@ -1,6 +1,7 @@
 <div class="beamcomp-hud" ng-show="hud.active">
-  <!-- Ranked standings pushed by the GE extension (race/hud.lua) via scope.$on; wired in app.js.
-       This root <div> must be the template's first node: replace:true forbids a leading comment. -->
+  <!-- Pushed by the GE extension (race/hud.lua) via scope.$on; wired in app.js. Branches on
+       hud.phase: the live HUD during racing, a results card during finished (ADR-0012). This root
+       <div> must be the template's first node: replace:true forbids a leading comment. -->
   <style>
     .beamcomp-hud {
       font-family: 'Segoe UI', Arial, sans-serif;
@@ -40,12 +41,29 @@
       font-variant-numeric: tabular-nums;
       text-align: right;
     }
+    .beamcomp-hud .bc-gap,
+    .beamcomp-hud .bc-int {
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+      opacity: 0.85;
+    }
     .beamcomp-hud tr.bc-local {
       background: rgba(63, 217, 107, 0.18);
       font-weight: bold;
     }
     .beamcomp-hud tr.bc-finished .bc-time {
       color: #3fd96b;
+    }
+    /* Podium tints apply to non-DNF rows only -- :not(.bc-dnf) keeps DNF styling winning even when
+       an all-DNF race puts DNFs at P1/P2/P3. Source order also places these before bc-dnf below. */
+    .beamcomp-hud tr.bc-p1:not(.bc-dnf) {
+      background: rgba(212, 175, 55, 0.30);
+    }
+    .beamcomp-hud tr.bc-p2:not(.bc-dnf) {
+      background: rgba(192, 192, 192, 0.25);
+    }
+    .beamcomp-hud tr.bc-p3:not(.bc-dnf) {
+      background: rgba(176, 116, 60, 0.30);
     }
     .beamcomp-hud tr.bc-dnf {
       opacity: 0.5;
@@ -60,16 +78,43 @@
       color: #ffcc33;
       padding-bottom: 4px;
     }
+    .beamcomp-hud .bc-results-title {
+      text-align: center;
+      font-weight: bold;
+      font-size: 18px;
+      letter-spacing: 0.04em;
+      padding: 2px 0 6px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+      margin-bottom: 4px;
+    }
   </style>
-  <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
-  <table class="bc-standings">
-    <tr ng-repeat="e in hud.entries"
-        ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
-      <td class="bc-pos">P{{e.position}}</td>
-      <td class="bc-name">{{e.name}}</td>
-      <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
-      <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
-      <td class="bc-time">{{e.dnf ? 'DNF' : formatTime(e.time)}}</td>
-    </tr>
-  </table>
+  <div ng-if="hud.phase !== 'finished'">
+    <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
+    <table class="bc-standings">
+      <tr ng-repeat="e in hud.entries"
+          ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
+        <td class="bc-pos">P{{e.position}}</td>
+        <td class="bc-name">{{e.name}}</td>
+        <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
+        <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
+        <td class="bc-time">{{e.dnf ? 'DNF' : formatTime(e.time)}}</td>
+        <td class="bc-gap">{{formatDelta(e.gap)}}</td>
+        <td class="bc-int">{{formatDelta(e.interval)}}</td>
+      </tr>
+    </table>
+  </div>
+  <div ng-if="hud.phase === 'finished'">
+    <div class="bc-results-title">Final Standings</div>
+    <table class="bc-standings bc-results">
+      <tr ng-repeat="e in hud.entries"
+          ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf,
+                     'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
+        <td class="bc-pos">P{{e.position}}</td>
+        <td class="bc-name">{{e.name}}</td>
+        <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
+        <td class="bc-gap">{{formatDelta(e.gap)}}</td>
+        <td class="bc-int">{{formatDelta(e.interval)}}</td>
+      </tr>
+    </table>
+  </div>
 </div>
