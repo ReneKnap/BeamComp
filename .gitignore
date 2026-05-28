@@ -4,3 +4,6 @@ CLAUDE.md
 
 # Per-project PowerShell background color (personal terminal tint)
 .pscolor
+
+# Local release snapshots (deploy.ps1 outputs)
+releases/
