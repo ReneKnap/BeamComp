@@ -507,15 +507,18 @@ local function detection_lap(detection)
     return last_entry and last_entry.lap or 1
 end
 
--- Build the HUD snapshot for the render app (ADR-0012): the full ranked standings list. The local
--- player's row gets the live ticking time, crossing count, and lap from the local detector (freezes
--- on finish), not the last server total. `lapCount` is the resolved race lap count (1 for sprint;
--- the HUD shows a lap indicator only when > 1, ADR-0013). Pure read of M.state; the server is
--- unaffected (race-blind).
+-- Build the HUD snapshot for the render app (ADR-0012): the full ranked standings list, tagged
+-- with the current phase so the app can branch live-HUD vs results template. During racing the
+-- local player's row uses the live detector (ticking time, crossing count, lap); during finished
+-- it falls back to the server-broadcast values so the frozen final readout matches every other
+-- client. `lapCount` is the resolved race lap count (1 for sprint; the HUD shows a lap indicator
+-- only when > 1, ADR-0013). Per-entry `splits` (cumulative race-time at each crossing, ADR-0015)
+-- rides through opaquely for the results template. Pure read of M.state; the server is unaffected.
 local function build_hud_snapshot()
     local race = M.state.race
     local detection = M.state.detection
     local standings = M.state.standings
+    local phase = M.state.phase
     local my_slot = race and race.mySlot
     local checkpoint_count = (race and race.plan and race.plan.count)
         or ((race and race.checkpoints) and #race.checkpoints) or 0
@@ -530,7 +533,9 @@ local function build_hud_snapshot()
             local checkpoint = e.completed
             local time = e.total_time
             local lap = e.lap or 1
-            if is_local and detection then
+            -- Only substitute live detector values for the local row during racing -- once the race
+            -- is finished, every client must show the same server-authoritative totals.
+            if is_local and detection and phase == "racing" then
                 checkpoint = detection.seq
                 time = detection.elapsed
                 lap = detection_lap(detection)
@@ -549,7 +554,39 @@ local function build_hud_snapshot()
                 isLocal = is_local,
                 lap = lap,
                 lapCount = lap_count,
+                splits = e.splits,
             }
+        end
+    end
+
+    -- Gap (vs leader) and interval (vs entry ahead), computed at the highest checkpoint both have
+    -- crossed (their splits arrays, ADR-0015). At the same shared crossing the comparison is fair
+    -- regardless of who has since progressed further: positive = entry is behind. For two finishers
+    -- the shared crossing is the final one, so the value equals the total-time delta. DNF rows and
+    -- pairs without a shared crossing leave the fields nil; the template renders a placeholder.
+    local function shared_split_gap(entry, reference)
+        local a, b = entry.splits, reference.splits
+        if not a or not b then
+            return nil
+        end
+        local shared = math.min(#a, #b)
+        if shared <= 0 then
+            return nil
+        end
+        return a[shared] - b[shared]
+    end
+
+    local leader = entries[1]
+    if leader and not leader.dnf then
+        for i = 2, #entries do
+            local entry = entries[i]
+            local ahead = entries[i - 1]
+            if not entry.dnf then
+                entry.gap = shared_split_gap(entry, leader)
+                if not ahead.dnf then
+                    entry.interval = shared_split_gap(entry, ahead)
+                end
+            end
         end
     end
 
@@ -560,6 +597,7 @@ local function build_hud_snapshot()
 
     return {
         active = true,
+        phase = phase,
         entries = entries,
         grace = grace,
         graceCanFinish = grace_can_finish,
@@ -577,6 +615,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         if M.state.grace then
             M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
         end
+    end
+    -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
+    -- frozen final standings, not the last frame caught mid-racing.
+    if (M.state.phase == "racing" or M.state.phase == "finished") and M.state.race then
         hud.push(build_hud_snapshot())
     end
 end
