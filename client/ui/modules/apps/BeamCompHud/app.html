@@ -1,7 +1,10 @@
-<div class="beamcomp-hud" ng-show="hud.active">
+<div class="beamcomp-hud" ng-show="hud.active"
+     ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
   <!-- Pushed by the GE extension (race/hud.lua) via scope.$on; wired in app.js. Branches on
        hud.phase: the live HUD during racing, a results card during finished (ADR-0012). This root
-       <div> must be the template's first node: replace:true forbids a leading comment. -->
+       <div> must be the template's first node: replace:true forbids a leading comment. The root
+       fills the app frame (height:100%) so the .bc-scroll body can bound its overflow to the frame
+       instead of spilling past it; the bc-size-* class shrinks content as the field grows. -->
   <style>
     .beamcomp-hud {
       font-family: 'Segoe UI', Arial, sans-serif;
@@ -10,15 +13,63 @@
       border-radius: 6px;
       padding: 6px 10px;
       text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+    }
+    /* Live: fill and stay bounded by the app frame so the row window scrolls within it. Finished:
+       let the results card grow past the frame (height:auto) up to a viewport cap, since covering
+       more screen for the final overview is acceptable. */
+    .beamcomp-hud.bc-phase-live {
+      height: 100%;
+    }
+    .beamcomp-hud.bc-phase-finished {
+      height: auto;
+      max-height: 90vh;
+    }
+    .beamcomp-hud .bc-body {
+      display: flex;
+      flex-direction: column;
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    /* min-height:0 lets the scroll child shrink below its content height inside the flex column;
+       without it the table would push the frame and overflow-y would never engage. */
+    .beamcomp-hud .bc-scroll {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+    }
+    .beamcomp-hud.bc-phase-live .bc-scroll {
+      max-height: 100%;
+    }
+    .beamcomp-hud.bc-phase-finished .bc-scroll {
+      max-height: 85vh;
     }
     .beamcomp-hud table.bc-standings {
       width: 100%;
       border-collapse: collapse;
-      font-size: 16px;
     }
     .beamcomp-hud table.bc-standings td {
-      padding: 2px 6px;
       white-space: nowrap;
+    }
+    .beamcomp-hud.bc-size-normal table.bc-standings {
+      font-size: 16px;
+    }
+    .beamcomp-hud.bc-size-normal table.bc-standings td {
+      padding: 2px 6px;
+    }
+    .beamcomp-hud.bc-size-compact table.bc-standings {
+      font-size: 14px;
+    }
+    .beamcomp-hud.bc-size-compact table.bc-standings td {
+      padding: 1px 5px;
+    }
+    .beamcomp-hud.bc-size-dense table.bc-standings {
+      font-size: 13px;
+    }
+    .beamcomp-hud.bc-size-dense table.bc-standings td {
+      padding: 1px 4px;
     }
     .beamcomp-hud .bc-pos {
       font-weight: bold;
@@ -88,33 +139,37 @@
       margin-bottom: 4px;
     }
   </style>
-  <div ng-if="hud.phase !== 'finished'">
+  <div class="bc-body" ng-if="hud.phase !== 'finished'">
     <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
-    <table class="bc-standings">
-      <tr ng-repeat="e in hud.entries"
-          ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
-        <td class="bc-pos">P{{e.position}}</td>
-        <td class="bc-name">{{e.name}}</td>
-        <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
-        <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
-        <td class="bc-time">{{e.dnf ? 'DNF' : formatTime(e.time)}}</td>
-        <td class="bc-gap">{{formatDelta(e.gap)}}</td>
-        <td class="bc-int">{{formatDelta(e.interval)}}</td>
-      </tr>
-    </table>
+    <div class="bc-scroll">
+      <table class="bc-standings">
+        <tr ng-repeat="e in hud.liveEntries"
+            ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
+          <td class="bc-pos">P{{e.position}}</td>
+          <td class="bc-name">{{e.name}}</td>
+          <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
+          <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
+          <td class="bc-time">{{e.dnf ? 'DNF' : formatTime(e.time)}}</td>
+          <td class="bc-gap">{{formatDelta(e.gap)}}</td>
+          <td class="bc-int">{{formatDelta(e.interval)}}</td>
+        </tr>
+      </table>
+    </div>
   </div>
-  <div ng-if="hud.phase === 'finished'">
+  <div class="bc-body" ng-if="hud.phase === 'finished'">
     <div class="bc-results-title">Final Standings</div>
-    <table class="bc-standings bc-results">
-      <tr ng-repeat="e in hud.entries"
-          ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf,
-                     'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
-        <td class="bc-pos">P{{e.position}}</td>
-        <td class="bc-name">{{e.name}}</td>
-        <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
-        <td class="bc-gap">{{formatDelta(e.gap)}}</td>
-        <td class="bc-int">{{formatDelta(e.interval)}}</td>
-      </tr>
-    </table>
+    <div class="bc-scroll">
+      <table class="bc-standings bc-results">
+        <tr ng-repeat="e in hud.entries"
+            ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf,
+                       'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
+          <td class="bc-pos">P{{e.position}}</td>
+          <td class="bc-name">{{e.name}}</td>
+          <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
+          <td class="bc-gap">{{formatDelta(e.gap)}}</td>
+          <td class="bc-int">{{formatDelta(e.interval)}}</td>
+        </tr>
+      </table>
+    </div>
   </div>
 </div>

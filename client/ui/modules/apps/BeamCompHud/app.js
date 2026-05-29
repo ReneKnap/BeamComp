@@ -6,6 +6,10 @@
 // No GE round-trip on load -- the per-frame push covers a mid-race add.
 angular.module('beamng.apps')
 .directive('beamCompHud', [function () {
+  // Live HUD row cap: the leader plus a slice around the local player (see windowLiveEntries). The
+  // finished results card is exempt -- it renders the whole field.
+  var MAX_LIVE_ROWS = 7;
+
   // Race time in seconds -> "m:ss.cs" (e.g. 83.4 -> "1:23.40"); placeholder when not a number.
   function formatTime(t) {
     if (typeof t !== 'number') {
@@ -33,6 +37,62 @@ angular.module('beamng.apps')
     return sign + m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
   }
 
+  // Content-density bucket for the rows actually on screen. The app frame is owned by the BeamNG
+  // layout system and does not grow with content, so the template shrinks font and padding as the
+  // shown field, lap count, or checkpoint count climbs. A tier is chosen only when every dimension
+  // fits its limits, otherwise we fall through to the denser tier.
+  function computeSizeBucket(entries) {
+    entries = entries || [];
+    var maxLap = 0;
+    var maxCount = 0;
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].lapCount > maxLap) {
+        maxLap = entries[i].lapCount;
+      }
+      if (entries[i].count > maxCount) {
+        maxCount = entries[i].count;
+      }
+    }
+    if (entries.length <= 4 && maxLap <= 3 && maxCount <= 10) {
+      return 'normal';
+    }
+    if (entries.length <= 8 && maxLap <= 10 && maxCount <= 20) {
+      return 'compact';
+    }
+    return 'dense';
+  }
+
+  // Window the live standings to a fixed height: the leader pinned on the top row plus a slice
+  // around the local player (2 ahead, self, 3 behind). Near an edge the slice slides to stay full,
+  // so a front-runner still sees a full board (P1..P7). Fields up to MAX_LIVE_ROWS are shown whole.
+  // The finished results card does not call this -- it renders the full field.
+  function windowLiveEntries(entries) {
+    if (!entries || entries.length <= MAX_LIVE_ROWS) {
+      return entries || [];
+    }
+    var localIndex = 0;
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].isLocal) {
+        localIndex = i;
+        break;
+      }
+    }
+    var rowsBehind = 3;
+    var start = localIndex - (MAX_LIVE_ROWS - 1 - rowsBehind);
+    var maxStart = entries.length - MAX_LIVE_ROWS;
+    if (start < 0) {
+      start = 0;
+    }
+    if (start > maxStart) {
+      start = maxStart;
+    }
+    var slice = entries.slice(start, start + MAX_LIVE_ROWS);
+    if (start > 0) {
+      slice[0] = entries[0];
+    }
+    return slice;
+  }
+
   return {
     templateUrl: '/ui/modules/apps/BeamCompHud/app.html',
     replace: true,
@@ -46,6 +106,9 @@ angular.module('beamng.apps')
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
           scope.hud = data || {active: false, entries: []};
+          scope.hud.liveEntries = windowLiveEntries(scope.hud.entries);
+          var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
+          scope.hud.sizeBucket = computeSizeBucket(shown);
         });
       });
     }
