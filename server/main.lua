@@ -107,9 +107,102 @@ local session = {
     pending_laps = nil,     -- queued race's relayed lap-count override, or nil
 }
 
+-- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
+-- /raceend; it is loaded on init from the plugin config file. Candidate paths tolerate the unverified
+-- runtime working directory (recon TODO #4) -- server root first, then the plugin folder. An empty,
+-- missing, or unparseable config leaves the gate inactive (opt-in: everyone may start/end races).
+local CONFIG_CANDIDATE_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.config.json",
+    "beamcomp.config.json",
+}
+
+-- Normalized (trimmed, lowercased) admin names -> true, and whether the gate is on.
+local race_admins = {}
+local race_admin_gate_active = false
+
 
 local function log_info(subsystem, msg)
     print("[" .. subsystem .. "] " .. msg)
+end
+
+-- Normalize a player name for allowlist comparison: trim surrounding whitespace, then lowercase.
+local function normalize_name(name)
+    return (name:gsub("^%s*(.-)%s*$", "%1")):lower()
+end
+
+-- Read and JSON-decode the plugin config from the first candidate path that opens. Returns the decoded
+-- table plus the resolved path, or nil plus the resolved path and an error label ("parse"/"missing").
+-- The decode is pcall-guarded so a malformed file can never crash the plugin load.
+local function read_config()
+    for _, path in ipairs(CONFIG_CANDIDATE_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            local contents = file:read("*a")
+            file:close()
+            local ok, decoded = pcall(Util.JsonDecode, contents)
+            if not ok or type(decoded) ~= "table" then
+                return nil, path, "parse"
+            end
+            return decoded, path, nil
+        end
+    end
+    return nil, nil, "missing"
+end
+
+-- Populate the race-admin allowlist from the plugin config (ADR-0016). An empty list, a missing file,
+-- or a parse error all leave the gate inactive so the existing open behaviour is preserved (opt-in);
+-- only a real parse error warns. The resolved path is logged so the runtime working directory is
+-- visible in the server console (recon TODO #4). Called from on_init.
+local function load_config()
+    race_admins = {}
+    race_admin_gate_active = false
+
+    local config, path, err = read_config()
+    if not config then
+        if err == "parse" then
+            log_info("beamcomp.cfg", "config at " .. tostring(path)
+                .. " is not valid JSON; race-admin gate inactive")
+        else
+            log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
+        end
+        return
+    end
+
+    if type(config.raceAdmins) ~= "table" then
+        log_info("beamcomp.cfg", "config at " .. path
+            .. " has no raceAdmins array; race-admin gate inactive")
+        return
+    end
+
+    local count = 0
+    for _, name in ipairs(config.raceAdmins) do
+        if type(name) == "string" then
+            local normalized = normalize_name(name)
+            if normalized ~= "" and not race_admins[normalized] then
+                race_admins[normalized] = true
+                count = count + 1
+            end
+        end
+    end
+
+    if count == 0 then
+        log_info("beamcomp.cfg", "loaded config from " .. path
+            .. "; no race admins listed, gate inactive")
+        return
+    end
+
+    race_admin_gate_active = true
+    log_info("beamcomp.cfg", "loaded config from " .. path .. "; "
+        .. count .. " race admin(s), gate active")
+end
+
+-- Whether `player_name` may issue the gated race commands. With the gate inactive (no admins
+-- configured) everyone is allowed -- the opt-in default (ADR-0016).
+local function is_race_admin(player_name)
+    if not race_admin_gate_active then
+        return true
+    end
+    return race_admins[normalize_name(player_name)] == true
 end
 
 local function now()
@@ -736,6 +829,7 @@ end
 
 local function on_init()
     log_info("beamcomp", "server plugin loaded v" .. PLUGIN_VERSION)
+    load_config()
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
     -- fully up; the tick is a no-op while the session sits in lobby.
     MP.CreateEventTimer(TICK_EVENT, TICK_INTERVAL_MS, MP.CallStrategy.BestEffort)
