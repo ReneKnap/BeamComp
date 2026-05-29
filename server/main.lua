@@ -546,6 +546,12 @@ end
 -- the new race and cut the current one short with a brief abort window before it restarts (ADR-0006).
 -- mode/laps are relayed verbatim to clients (race-blind, ADR-0013).
 local function handle_race_command(player_id, player_name, argument)
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
+        log_info("beamcomp.race", "denied /race from " .. player_name .. " (not a race admin)")
+        return
+    end
+
     local race_name, mode, laps, bad_token = parse_race_args(argument)
 
     if not race_name then
@@ -577,6 +583,12 @@ end
 
 -- /raceend: force the machine back to lobby from any active phase (safety hatch).
 local function handle_raceend_command(player_id, player_name)
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to end races")
+        log_info("beamcomp.race", "denied /raceend from " .. player_name .. " (not a race admin)")
+        return
+    end
+
     if session.phase == PHASE.lobby then
         MP.SendChatMessage(player_id, "BeamComp: no race in progress")
         return
