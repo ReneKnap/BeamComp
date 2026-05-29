@@ -19,7 +19,7 @@ local maps = require("beamcomp/race/maps")
 local LOG_TAG = "beamcomp.race"
 
 -- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
-local MAX_LAPS = 50
+local MAX_LAPS = 1000
 
 -- The pose the grid anchors on: the race's `default` start selector, else the first listed
 -- start position. Returns {pos, rot} (plain tables) or nil plus a reason.
