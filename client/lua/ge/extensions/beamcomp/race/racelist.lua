@@ -14,16 +14,23 @@ local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local maps = require("beamcomp/race/maps")
 
--- One chat line describing a race: "  <slug> - circuit, 6 cp, 2 laps" (laps only for a closed-loop
--- circuit), or "  <slug> - (unsupported)" when it can't be parsed (e.g. a branching race).
-local function describe(locator)
+-- One chat line describing a race: "  <slug> [<short>] - circuit, 6 cp, 2 laps" (laps only for a
+-- closed-loop circuit), or "  <slug> [<short>] - (unsupported)" when it can't be parsed (e.g. a
+-- branching race). <short> is the tippable shortname for /race; it equals the slug when no shorter
+-- unique form exists, in which case the bracket is dropped to avoid a redundant "[<slug>]".
+local function describe(locator, shortname)
+    local label = locator.displayName
+    if shortname and shortname ~= locator.displayName then
+        label = label .. " [" .. shortname .. "]"
+    end
+
     local race = parser.parse(locator.raceFile)
     if not race then
-        return "  " .. locator.displayName .. " - (unsupported)"
+        return "  " .. label .. " - (unsupported)"
     end
 
     local mode = (race.meta and race.meta.closed) and "circuit" or "sprint"
-    local line = string.format("  %s - %s, %d cp", locator.displayName, mode, #race.checkpoints)
+    local line = string.format("  %s - %s, %d cp", label, mode, #race.checkpoints)
     if mode == "circuit" then
         local laps = math.max(1, math.floor(tonumber(race.meta.defaultLaps) or 1))
         line = line .. string.format(", %d laps", laps)
@@ -56,13 +63,17 @@ function M.build(loaded_map)
         end
     end
 
+    -- Shortnames over this map's races only: that's the set /race resolves against here, so the
+    -- shown form is the shortest that stays unambiguous among the startable races.
+    local shortnames = discovery.shortnames(here)
+
     local lines = {}
     if #here == 0 then
         lines[#lines + 1] = "BeamComp: no races on this map (" .. loaded_map .. ")"
     else
         lines[#lines + 1] = string.format("BeamComp races on %s (%d):", loaded_map, #here)
         for _, locator in ipairs(here) do
-            lines[#lines + 1] = describe(locator)
+            lines[#lines + 1] = describe(locator, shortnames[locator.id])
         end
     end
 

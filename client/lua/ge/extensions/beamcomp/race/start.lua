@@ -96,22 +96,28 @@ function M.prepare(payload)
         return nil, "malformed raceStart payload"
     end
 
-    local locator, miss = discovery.resolve(payload.race)
+    -- Resolve against this map's races only (ADR-0005: only the client knows a race's map, and a
+    -- race only starts on its own map). Skip the map filter if the level is undetectable.
+    local loaded = maps.current()
+    local locator, miss = discovery.resolve(payload.race, loaded)
     if not locator then
         if miss and miss.code == "ambiguous" then
             return nil, "ambiguous race name '" .. payload.race .. "'"
         end
+        -- Not on this map: if the name does pick out a race elsewhere, say so -- more helpful
+        -- than a bare "not found" on a multi-map server.
+        if loaded then
+            local elsewhere = discovery.resolve(payload.race)
+            if elsewhere and elsewhere.map and not maps.matches(loaded, elsewhere.map) then
+                return nil, "race is on map '" .. elsewhere.map .. "' -- you are on '"
+                    .. loaded .. "'"
+            end
+        end
         return nil, "race not found: '" .. payload.race .. "'"
     end
 
-    -- Markers/poses are in the race's own world coordinates, so refuse a race that isn't on
-    -- the loaded map (ADR-0005: only the client knows the race's map). Skip if undetectable.
-    local loaded = maps.current()
     log("I", LOG_TAG, "race map '" .. tostring(locator.map) .. "', loaded map '"
         .. tostring(loaded) .. "'")
-    if loaded and locator.map and not maps.matches(loaded, locator.map) then
-        return nil, "race is on map '" .. locator.map .. "' -- you are on '" .. loaded .. "'"
-    end
 
     local race, parse_err = parser.parse(locator.raceFile)
     if not race then
