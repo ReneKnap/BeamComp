@@ -86,6 +86,18 @@ function M.show_go()
     flash({{GO_MESSAGE, 1, play_sound_cmd(GO_SOUND), true}})
 end
 
+-- Show the recover/repair assist countdown, e.g. "Recover 5 ... 1" (ADR-0017). Built as one beat
+-- sequence the UI auto-sequences (like the start countdown) so it animates smoothly instead of
+-- re-triggering every second; smaller than the start (big = false) so it fits the window. No beep --
+-- this is a player-held assist, not the synced start. Cleared via M.clear() on cancel/fire.
+function M.show_assist_countdown(label, seconds)
+    local beats = {}
+    for n = seconds, 1, -1 do
+        beats[#beats + 1] = {label .. " " .. n, 1, "", false}
+    end
+    flash(beats)
+end
+
 -- Clear any countdown message (race end / reload). Idempotent.
 function M.clear()
     trigger_ui(FLASH_RESET_HOOK)

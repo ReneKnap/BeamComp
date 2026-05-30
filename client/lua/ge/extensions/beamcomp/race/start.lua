@@ -21,6 +21,12 @@ local LOG_TAG = "beamcomp.race"
 -- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
 local MAX_LAPS = 1000
 
+-- Recover/repair assist hold-time bounds (ADR-0017). The server already clamps, but this is a trust
+-- boundary (ADR-0005), so the client re-clamps and defaults a missing/garbage value.
+local ASSIST_DEFAULT_HOLD_SECONDS = 5
+local ASSIST_MIN_HOLD_SECONDS = 1
+local ASSIST_MAX_HOLD_SECONDS = 30
+
 -- The pose the grid anchors on: the race's `default` start selector, else the first listed
 -- start position. Returns {pos, rot} (plain tables) or nil plus a reason.
 local function default_start_pose(race)
@@ -88,6 +94,24 @@ local function resolve_mode(race, payload)
     end
 
     return mode, laps, warning
+end
+
+-- A valid hold time from the payload, defaulted + clamped (ADR-0017).
+local function resolve_hold(seconds)
+    local value = tonumber(seconds) or ASSIST_DEFAULT_HOLD_SECONDS
+    return math.max(ASSIST_MIN_HOLD_SECONDS, math.min(ASSIST_MAX_HOLD_SECONDS, value))
+end
+
+-- The opt-in recover/repair assist config for this race, read from the relayed raceStart fields
+-- (ADR-0017). Both are off unless the payload explicitly enables them; the hold time only matters
+-- when enabled but is resolved either way so the VE never reads a nil.
+local function resolve_assists(payload)
+    return {
+        recoverEnabled = payload.recoverEnabled == true,
+        recoverHoldSeconds = resolve_hold(payload.recoverHoldSeconds),
+        repairEnabled = payload.repairEnabled == true,
+        repairHoldSeconds = resolve_hold(payload.repairHoldSeconds),
+    }
 end
 
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
@@ -170,6 +194,8 @@ function M.prepare(payload)
         laps = laps,
         plan = plan,
         modeWarning = mode_warning,
+        -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.
+        assists = resolve_assists(payload),
     }
 end
 

@@ -251,6 +251,34 @@ function M.respawn_own_at(pose, own_car)
     return veh
 end
 
+-- Teleport + repair a vehicle to a recover pose: `pos` ({x,y,z}) facing along `dir` ({x,y,z}, world
+-- up). Like repair_and_place, veh:setPositionRotation resets the car to its undamaged rest state at
+-- the pose, and the same 180-degree Z-flip (quat(0,0,1,0) * ...) matches the engine's repair branch
+-- (verified in-game for grid placement). A nil/degenerate dir keeps the car's current heading. Used
+-- by the recover-to-last-checkpoint assist (ADR-0017). Returns true, or nil plus a reason.
+function M.recover_to(veh, pos, dir)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pos) ~= "table" then
+        return nil, "invalid recover pose"
+    end
+    local ok, err = pcall(function()
+        if dir then
+            local base = quatFromDir(vec3(dir.x, dir.y, dir.z), vec3(0, 0, 1))
+            local rot = quat(0, 0, 1, 0) * base
+            veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+        else
+            local rot = quat(veh:getRotation())
+            veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+        end
+    end)
+    if not ok then
+        return nil, "recover_to failed: " .. tostring(err)
+    end
+    return true
+end
+
 -- Freeze or release a vehicle in place using BeamNG's built-in controller.setFreeze -- the same
 -- lock the base game's quickrace / scenario countdowns use (e.g. scenario/quickRace.lua,
 -- gameplay/race/race.lua). It holds the car put while still letting the player rev and steer. The

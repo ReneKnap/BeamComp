@@ -36,6 +36,7 @@ local props = require("beamcomp/race/props")
 local cones = require("beamcomp/race/cones")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
+local lock = require("beamcomp/race/lock")
 local hud = require("beamcomp/race/hud")
 local racelist = require("beamcomp/race/racelist")
 local maps = require("beamcomp/race/maps")
@@ -65,11 +66,18 @@ M.state = {
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
+    assist_armed = false,  -- whether the VE forwarders have been armed for this race (ADR-0017)
+    assist_held = nil,     -- kind ("recover"/"repair") of the assist key currently held, or nil (ADR-0017)
+    assist_arming = nil,   -- active recover/repair countdown {kind, remaining}, or nil (ADR-0017)
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
 -- HANDLERS table) above its definition can reference it.
 local send_to_server
+
+-- Disarms the seated car's VE recovery override; defined far below (next to the assist push) but used
+-- earlier in handle_race_phase's lobby teardown, so forward-declared here (ADR-0017).
+local disarm_assist_ve
 
 local function handle_ping(_payload)
     guihooks.trigger("toastrMsg", {
@@ -92,12 +100,20 @@ local function handle_race_start(payload)
         })
         -- A raceStart we can't resolve still means the server has begun a new race, so any prior race
         -- on this client is over. Drop its state (and blank the HUD) so the phase guard below skips the
-        -- countdown/racing for a race we are not in, and nothing stale lingers.
+        -- countdown/racing for a race we are not in, and nothing stale lingers. Lift the in-race lock
+        -- and restore the car's recovery too: on an abort-restart (finished -> spawning, no lobby) a
+        -- prior race we DID run could otherwise leave us locked through a race we are not in (ADR-0017).
         M.state.race = nil
         M.state.race_car_id = nil
         M.state.detection = nil
         M.state.standings = nil
         M.state.grace = nil
+        M.state.assist_armed = false
+        M.state.assist_held = nil
+        M.state.assist_arming = nil
+        lock.remove()
+        disarm_assist_ve()
+        countdown.clear()
         hud.clear()
         return
     end
@@ -112,8 +128,16 @@ local function handle_race_start(payload)
     M.state.detection = nil
     M.state.standings = nil
     M.state.grace = nil
+    M.state.assist_armed = false
+    M.state.assist_held = nil
+    M.state.assist_arming = nil
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
+
+    -- Lift any in-race lock before respawning (ADR-0017): the abort-restart path (finished -> spawning)
+    -- skips the lobby reset, so a prior race's lock could still be guarding core_vehicles.spawnNewVehicle
+    -- and refuse our own fresh-spawn fallback. The countdown phase re-arms it.
+    lock.remove()
 
     -- Resolve the car the player is in, preferring the onVehicleSwitched-tracked id (the polling API
     -- be:getPlayerVehicle(0) sticks to the first owned car in BeamMP). Resolve BEFORE loading props
@@ -202,6 +226,9 @@ local function handle_race_phase(payload)
     end
 
     if phase == "countdown" then
+        -- Arm the in-race vehicle-action lock for the whole countdown + racing span (ADR-0017): no
+        -- switching, spawning, replacing, or alternative recover/reset until the race returns to lobby.
+        lock.install()
         -- Start the synced 3-2-1 count off the server-issued duration (built-in flash surface).
         countdown.show_countdown(payload.duration)
     elseif phase == "racing" then
@@ -233,6 +260,10 @@ local function handle_race_phase(payload)
         countdown.clear()
         hud.clear()
         hud.hide()
+        -- Lift the in-race vehicle-action lock (ADR-0017): switching/spawning/recover are free again.
+        lock.remove()
+        -- Restore the seated car's vanilla recovery before the race state is cleared below.
+        disarm_assist_ve()
         props.clear(M.state.prop_names or {})
         cones.clear(M.state.cone_ids or {})
         M.state.prop_names = nil
@@ -242,6 +273,9 @@ local function handle_race_phase(payload)
         M.state.detection = nil
         M.state.standings = nil
         M.state.grace = nil
+        M.state.assist_armed = false
+        M.state.assist_held = nil
+        M.state.assist_arming = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
@@ -660,17 +694,227 @@ local function build_hud_snapshot()
     }
 end
 
+-- Normalize a plain {x, y, z} vector, or nil when it is degenerate (too short to give a direction).
+local function normalize_dir(v)
+    local length = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    if length < 1e-6 then
+        return nil
+    end
+    return {x = v.x / length, y = v.y / length, z = v.z / length}
+end
+
+-- The checkpoint at a 1-based plan ordinal (entries[ordinal].cursor -> checkpoints[cursor]), or nil.
+local function plan_checkpoint(race, ordinal)
+    local entries = race.plan and race.plan.entries
+    local entry = entries and entries[ordinal]
+    return entry and race.checkpoints[entry.cursor] or nil
+end
+
+-- The recover target for the local player: the last passed checkpoint (ADR-0010/0013) facing the
+-- next one, or -- before any checkpoint is passed -- the grid start pose facing the first checkpoint.
+-- Returns {pos = {x,y,z}, dir = {x,y,z} or nil}; the VE falls back to a default facing on a nil dir.
+local function recover_target(race, detection)
+    local seq = (detection and detection.seq) or 0
+    local target_pos, face_pos
+    if seq <= 0 then
+        target_pos = race.myPose.pos
+        local first = plan_checkpoint(race, 1)
+        face_pos = first and first.pos
+    else
+        local last = plan_checkpoint(race, seq)
+        target_pos = (last and last.pos) or race.myPose.pos
+        local next_cp = plan_checkpoint(race, seq + 1)
+        face_pos = next_cp and next_cp.pos
+    end
+
+    local dir
+    if face_pos and target_pos then
+        dir = normalize_dir({
+            x = face_pos.x - target_pos.x,
+            y = face_pos.y - target_pos.y,
+            z = face_pos.z - target_pos.z,
+        })
+    end
+    return {pos = target_pos, dir = dir}
+end
+
+-- Arm the seated car's VE key forwarders for the race (ADR-0017). GE owns the enable check, countdown,
+-- and action, so nothing but a bare "arm" is sent. Pushed once (tracked by assist_armed). Vehicle
+-- extensions under lua/vehicle/extensions/ are NOT auto-loaded (only the .../auto subdir is;
+-- vehicle/main.lua), so load ours into the car's VM first; extensions.load is synchronous, so
+-- beamcomp_init is available on the same command. No-op until the own car resolves; retried from onUpdate.
+local function push_assist_arm()
+    local race = M.state.race
+    if not race or not race.assists or M.state.assist_armed then
+        return
+    end
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        return
+    end
+
+    local command = "if not beamcomp_init then extensions.load('beamcomp_init') end "
+        .. "if beamcomp_init then beamcomp_init.on_assist_arm() end"
+    local ok, err = pcall(function() own_car:queueLuaCommand(command) end)
+    if not ok then
+        log("W", RACE_LOG_TAG, "could not arm assist forwarders on VE: " .. tostring(err))
+        return
+    end
+    M.state.assist_armed = true
+end
+
+-- Tell the seated car's VE to restore the vanilla recovery functions (ADR-0017): the race is over, so
+-- recover/repair behave normally again. Best-effort -- if the car is gone the override died with it.
+-- Assigns the forward-declared local so handle_race_phase (above) can call it.
+function disarm_assist_ve()
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        return
+    end
+    pcall(function()
+        own_car:queueLuaCommand("if beamcomp_init then beamcomp_init.on_assist_disarm() end")
+    end)
+end
+
+-- Perform a recover/repair once its countdown completes (ADR-0017). GE owns the action: "repair"
+-- fixes the car in place (queued recovery.recoverInPlace), "recover" teleports + repairs to the last
+-- passed checkpoint (grid pose before the first). Reseed the detector so the teleport jump is not
+-- swept as a spurious crossing next frame.
+local function perform_assist(kind)
+    local race = M.state.race
+    if not race then
+        return
+    end
+    if M.state.detection then
+        M.state.detection.prev_pos = nil
+    end
+
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        log("W", RACE_LOG_TAG, "assist '" .. tostring(kind) .. "' completed but no own car resolved")
+        return
+    end
+
+    if kind == "repair" then
+        pcall(function() own_car:queueLuaCommand("recovery.recoverInPlace()") end)
+    else
+        local target = recover_target(race, M.state.detection)
+        local placed, err = vehicles.recover_to(own_car, target.pos, target.dir)
+        if not placed then
+            log("W", RACE_LOG_TAG, "recover-to-checkpoint failed: " .. tostring(err))
+            return
+        end
+    end
+
+    log("I", RACE_LOG_TAG, "assist performed: " .. tostring(kind))
+    guihooks.trigger("toastrMsg", {
+        type = "info",
+        title = "BeamComp",
+        msg = (kind == "repair") and "Repaired in place" or "Recovered to last checkpoint",
+    })
+end
+
+-- Clear any in-progress assist countdown and its on-screen flash (ADR-0017). Idempotent.
+local function clear_assist_arming()
+    if M.state.assist_arming then
+        M.state.assist_arming = nil
+        countdown.clear()
+    end
+end
+
+-- Speed (m/s) at or below which the car counts as stopped for recover/repair: the countdown only
+-- runs while (near) stationary, so it cannot be triggered while driving (ADR-0017).
+local ASSIST_STATIONARY_SPEED = 2.0
+
+-- The (enabled, holdSeconds) setting for an assist kind, read with an explicit branch (the enabled
+-- flags are booleans, so `a and b or c` would wrongly fall through to the other assist).
+local function assist_setting(kind)
+    local assists = M.state.race and M.state.race.assists
+    if not assists then
+        return false, 0
+    end
+    if kind == "repair" then
+        return assists.repairEnabled, assists.repairHoldSeconds
+    end
+    return assists.recoverEnabled, assists.recoverHoldSeconds
+end
+
+-- Whether the local car is stopped enough to begin/continue a recover/repair hold.
+local function is_car_stationary()
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        return false
+    end
+    local ok, speed = pcall(function() return own_car:getVelocity():length() end)
+    return ok and speed <= ASSIST_STATIONARY_SPEED
+end
+
+-- A recover/repair key went down (forwarded from the VE, ADR-0017): record which assist is held so
+-- the per-frame stepper can run the hold. Racing only, enabled assists only -- a disabled assist's
+-- key is inert (blocked). The actual countdown starts in step_assist once the car is stationary.
+function M.on_assist_key_down(kind)
+    if not M.state.race or M.state.phase ~= "racing" then
+        return
+    end
+    local enabled = assist_setting(kind)
+    if not enabled then
+        return
+    end
+    M.state.assist_held = kind
+end
+
+-- The held recover/repair key was released: drop the hold and cancel any running countdown.
+function M.on_assist_key_up()
+    M.state.assist_held = nil
+    clear_assist_arming()
+end
+
+-- Drive the hold-to-activate recover/repair each frame (ADR-0017): the countdown runs only while the
+-- key is held AND the car is (near) stationary -- releasing or driving off cancels it. On completion
+-- the held kind is consumed (cleared) so it does not immediately re-fire while the key is still down.
+local function step_assist(dt_real)
+    local held = M.state.assist_held
+    if not held or not is_car_stationary() then
+        clear_assist_arming()
+        return
+    end
+
+    local arming = M.state.assist_arming
+    if not arming or arming.kind ~= held then
+        local _, seconds = assist_setting(held)
+        arming = {kind = held, remaining = seconds}
+        M.state.assist_arming = arming
+        countdown.show_assist_countdown(held == "repair" and "Repair" or "Recover", math.ceil(seconds))
+    end
+
+    arming.remaining = arming.remaining - (dt_real or 0)
+    if arming.remaining <= 0 then
+        local kind = arming.kind
+        clear_assist_arming()
+        M.state.assist_held = nil
+        perform_assist(kind)
+    end
+end
+
 function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
     end
     if M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
+        -- Drive the held recover/repair countdown (ADR-0017).
+        step_assist(dtReal)
         -- Tick the finish-grace countdown in wall time (the server's cutoff is wall-time; ADR-0014).
         -- Visual only -- the server stays authoritative on the actual DNF cutoff.
         if M.state.grace then
             M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
         end
+    end
+    -- Arm the seated car's VE key forwarders across the locked sequence (countdown + racing). The
+    -- first successful arm installs the override + reset guard, so vanilla recover/reset is never
+    -- available mid-race even with both assists off (ADR-0017).
+    if (M.state.phase == "countdown" or M.state.phase == "racing") and M.state.race then
+        push_assist_arm()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
     -- frozen final standings, not the last frame caught mid-racing.
@@ -707,6 +951,10 @@ function M.onExtensionUnloaded()
     countdown.clear()
     hud.clear()
     hud.hide()
+    -- Lift the in-race vehicle-action lock so a reload mid-race never leaves switching/spawning or the
+    -- guarded core_vehicles functions stuck blocked (ADR-0017), and restore the seated car's recovery.
+    lock.remove()
+    disarm_assist_ve()
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     M.state.prop_names = nil
@@ -715,6 +963,9 @@ function M.onExtensionUnloaded()
     M.state.race_car_id = nil
     M.state.detection = nil
     M.state.grace = nil
+    M.state.assist_armed = false
+    M.state.assist_held = nil
+    M.state.assist_arming = nil
     -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     M.state.phase = nil
