@@ -47,6 +47,10 @@ local RACE_LOG_TAG = "beamcomp.race"
 local MARKER_RADIUS = 0.6
 local MARKER_LIFT = 1.0  -- raise the sphere off the ground so it stays visible
 
+-- Min seconds between "switch locked" toasts, so spamming Tab during a race shows one toast, not a
+-- flood (the bounce itself still fires every time).
+local SWITCH_BLOCK_TOAST_THROTTLE = 2.0
+
 -- Reload-surviving state (BeamNG serializes M.state across a Lua reload).
 M.state = {
     last_event_at = 0,
@@ -57,6 +61,7 @@ M.state = {
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
     cone_ids = nil,      -- ids of the shared cone vehicles we own + must clear (owner only, ADR-0009)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
+    race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
@@ -89,6 +94,7 @@ local function handle_race_start(payload)
         -- on this client is over. Drop its state (and blank the HUD) so the phase guard below skips the
         -- countdown/racing for a race we are not in, and nothing stale lingers.
         M.state.race = nil
+        M.state.race_car_id = nil
         M.state.detection = nil
         M.state.standings = nil
         M.state.grace = nil
@@ -98,6 +104,9 @@ local function handle_race_start(payload)
 
     M.state.race = race
     M.state.marker_warned = false
+    -- Drop any stale race-car id up front; it is re-set below once the car is placed, and left nil if
+    -- the placement fails (so the switch lock has no bounce target and lets switches through).
+    M.state.race_car_id = nil
     -- Reset checkpoint detection and any stale standings/grace; all are refreshed during the race (the
     -- abort-restart path is finished -> spawning, skipping the lobby reset, so clear them too).
     M.state.detection = nil
@@ -128,6 +137,9 @@ local function handle_race_start(payload)
     -- rendering from M.state.race regardless.
     local race_car, respawn_err = vehicles.respawn_own_at(race.myPose, own_car)
     if race_car then
+        -- Remember the race car as the bounce target for the in-race switch lock (onVehicleSwitched):
+        -- during countdown/racing any switch to another vehicle is bounced back to this id.
+        M.state.race_car_id = race_car:getId()
         -- Re-assert the player into the race car. Harmless when they are already seated (kept-car
         -- path); on the fresh-spawn fallback this guarantees seating even if a prop-vehicle slipped
         -- past the auto-enter race rather than leaving the player on a prop.
@@ -226,6 +238,7 @@ local function handle_race_phase(payload)
         M.state.prop_names = nil
         M.state.cone_ids = nil
         M.state.race = nil
+        M.state.race_car_id = nil
         M.state.detection = nil
         M.state.standings = nil
         M.state.grace = nil
@@ -396,13 +409,56 @@ function M.onExtensionLoaded()
     log("I", LOG_TAG, "loaded")
 end
 
--- Track the vehicle the player is currently in, and keep them out of the shared cones. BeamNG fires
--- onVehicleSwitched(old, new) on every switch; we keep the latest non-cone `new` as the
--- authoritative seated car, because in BeamMP the polling API be:getPlayerVehicle(0) sticks to the
--- first owned car -- so race/vehicles.lua resolve_own_car prefers this tracked id (confirmed
--- in-game). If the player switches into a cone (Tab cycle or auto-enter), bounce them straight back
--- to the last real car and do NOT record the cone -- the guaranteed non-enterable layer (ADR-0009).
+-- os.clock() reading of the last switch-lock toast, for SWITCH_BLOCK_TOAST_THROTTLE (CPU seconds is
+-- monotonic and precise enough to gate a UI toast). A plain file-scope local: a Lua reload resets it,
+-- which at worst shows one extra toast -- not worth M.state.
+local last_block_toast_at = 0
+
+-- Put the player straight back into their race car after a blocked switch, and surface a throttled
+-- toast so a deliberate Tab press is not silently swallowed. Returns false when the race car is gone
+-- (so the caller lets the switch through rather than trapping the player). Mirrors the cone bounce
+-- (cones.enforce_non_enterable), but race-car-general and with the in-race feedback toast.
+local function bounce_to_race_car()
+    local race_car = be and be:getObjectByID(M.state.race_car_id)
+    if not race_car then
+        return false
+    end
+    local ok, err = pcall(function() be:enterVehicle(0, race_car) end)
+    if not ok then
+        log("W", RACE_LOG_TAG, "could not bounce player back to race car: " .. tostring(err))
+        return false
+    end
+    local now = os.clock()
+    if now - last_block_toast_at >= SWITCH_BLOCK_TOAST_THROTTLE then
+        last_block_toast_at = now
+        guihooks.trigger("toastrMsg", {
+            type = "warning",
+            title = "BeamComp",
+            msg = "Vehicle switching is locked during the race",
+        })
+    end
+    log("I", RACE_LOG_TAG, "blocked vehicle switch -- bounced player back to race car")
+    return true
+end
+
+-- Track the vehicle the player is currently in, keep them in their race car during the race, and keep
+-- them out of the shared cones otherwise. BeamNG fires onVehicleSwitched(old, new) on every switch.
+-- During the locked sequence (countdown + racing) any switch to a vehicle that is not the race car is
+-- bounced straight back to it (this also covers the cones while racing); when the race car is gone the
+-- bounce is skipped so the player is never trapped. Outside the race we keep the latest non-cone `new`
+-- as the authoritative seated car, because in BeamMP the polling API be:getPlayerVehicle(0) sticks to
+-- the first owned car -- so race/vehicles.lua resolve_own_car prefers this tracked id (confirmed
+-- in-game). A switch into a cone bounces back to the last real car and is NOT recorded -- the
+-- guaranteed non-enterable layer (ADR-0009). A blocked switch likewise never updates current_vehicle_id
+-- (the checkpoint detector must keep reading the race car).
 function M.onVehicleSwitched(_oldId, newId)
+    local phase = M.state.phase
+    if (phase == "countdown" or phase == "racing") and M.state.race_car_id ~= nil
+            and tostring(newId) ~= tostring(M.state.race_car_id) then
+        if bounce_to_race_car() then
+            return
+        end
+    end
     if cones.is_cone(be and be:getObjectByID(newId)) then
         cones.enforce_non_enterable(newId, M.state.current_vehicle_id)
         return
@@ -656,6 +712,7 @@ function M.onExtensionUnloaded()
     M.state.prop_names = nil
     M.state.cone_ids = nil
     M.state.race = nil
+    M.state.race_car_id = nil
     M.state.detection = nil
     M.state.grace = nil
     -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
