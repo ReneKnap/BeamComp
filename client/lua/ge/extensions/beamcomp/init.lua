@@ -303,6 +303,13 @@ local function handle_race_phase(payload)
         -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
         -- dedups, so a manually-added copy is not duplicated.
         hud.show()
+    elseif phase == "finished" then
+        -- Race over, but the results + props stay up for the long free-roam window (ADR-0006/0017
+        -- amendments, B3). Release the in-race lock and hand the recover/repair keys back to vanilla
+        -- now, so players can drive, switch vehicles, recover, and roam the track while results show.
+        -- Everything else (race state, props, standings, HUD) lives on until the lobby teardown.
+        lock.remove()
+        disarm_assist_ve()
     elseif phase == "lobby" then
         -- Race over (back to lobby): clear any countdown overlay, despawn the track props and stop
         -- drawing the grid markers, but leave the player's vehicle exactly where it is -- never
