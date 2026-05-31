@@ -5,8 +5,8 @@
 -- API reference: the BeamMP server-plugin recon note (kept in the project's
 -- local docs). Design: ADR-0006 (server-side race state machine).
 --
--- Owns a server-authoritative race state machine (ADR-0006):
---   lobby -> spawning -> countdown -> racing -> finished -> lobby
+-- Owns a server-authoritative race state machine (ADR-0006, staging phase ADR-0021):
+--   lobby -> spawning -> staging -> countdown -> racing -> finished -> lobby
 -- An always-on 250 ms tick (MP.CreateEventTimer) drives the timed transitions; a
 -- monotonic MP.CreateTimer() stopwatch measures elapsed time per phase. Every
 -- transition is broadcast to all clients as a "racePhase" envelope on the
@@ -29,6 +29,8 @@
 --                 reason is posted to the admin, who can re-issue with force. While a race is already
 --                 running, an ok'd /race queues the new race and runs a short abort window before
 --                 restarting. Bare /race replies with usage.
+--   /go /start /racestart  start the race now: end the staging wait early and begin the countdown
+--                 (ADR-0021). Admin-gated like /race; only acts while a race is staging.
 --   /raceend      force the state machine back to lobby (safety hatch).
 --   /races        list the time-trial races on the asking player's current map. The server is
 --                 race-blind (ADR-0005), so it asks that client (a "listRaces" event); the client
@@ -38,7 +40,7 @@
 --                 only (ADR-0014).
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
--- All five suppress their own chat echo. Anything else relays as normal chat.
+-- All commands suppress their own chat echo. Anything else relays as normal chat.
 -- The server never validates <name> (ADR-0005).
 
 local M = {}
@@ -49,6 +51,11 @@ local CHAT_COMMAND_RACEEND = "/raceend"
 local CHAT_COMMAND_RACES = "/races"
 local CHAT_COMMAND_DNF = "/dnf"
 local CHAT_COMMAND_PING = "/beamcomp"
+-- Manual race-start aliases (ADR-0021): any of these ends the staging wait early and starts the
+-- countdown. All three route to one handler.
+local CHAT_COMMAND_GO = "/go"
+local CHAT_COMMAND_START = "/start"
+local CHAT_COMMAND_RACESTART = "/racestart"
 
 -- Server <-> client event channel. Must be colon-free: the BeamMP client parser
 -- splits incoming events on ':' (see ADR-0004). Bidirectional (ADR-0011): the server
@@ -79,6 +86,7 @@ local TICK_INTERVAL_MS = 250
 local PHASE = {
     lobby = "lobby",
     spawning = "spawning",
+    staging = "staging",
     countdown = "countdown",
     racing = "racing",
     finished = "finished",
@@ -87,7 +95,8 @@ local PHASE = {
 -- Phase durations in seconds. Editable server config (ADR-0006); not a runtime/in-game UI.
 local PHASE_DURATIONS = {
     spawning = 3.0,       -- fixed wait for clients to resolve/parse/spawn (acks deferred: backlog)
-    countdown = 3.0,      -- pre-race 3-2-1-GO
+    staging = 120.0,      -- pre-countdown staging wait; ends early on /go|/start|/racestart (ADR-0021)
+    countdown = 8.0,      -- pre-race countdown (ADR-0021: was 3.0)
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
     all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
@@ -529,6 +538,10 @@ local function tick()
     end
 
     if phase == PHASE.spawning then
+        -- Spawned and placed: hold a staging wait so players can sort out, endable early by an admin
+        -- /go|/start|/racestart (ADR-0021).
+        enter_phase(PHASE.staging, PHASE_DURATIONS.staging)
+    elseif phase == PHASE.staging then
         enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
     elseif phase == PHASE.countdown then
         -- The release signal itself is a later Phase-3 item; here we enter racing and send the
@@ -806,6 +819,24 @@ local function handle_raceend_command(player_id, player_name)
     MP.SendChatMessage(player_id, "BeamComp: race ended")
 end
 
+-- /go, /start, /racestart: end the staging wait early and start the countdown (ADR-0021). Admin-gated
+-- like /race; a no-op (with a notice) from any phase other than staging.
+local function handle_start_command(player_id, player_name)
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
+        log_info("beamcomp.race", "denied /go from " .. player_name .. " (not a race admin)")
+        return
+    end
+
+    if session.phase ~= PHASE.staging then
+        MP.SendChatMessage(player_id, "BeamComp: nothing to start (no race staging)")
+        return
+    end
+    log_info("beamcomp.race", "manual start by " .. player_name)
+    enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+    MP.SendChatMessage(player_id, "BeamComp: countdown started")
+end
+
 -- /dnf: the issuing player gives up the current race -- mark them DNF (terminal, ADR-0014). Racing
 -- only; a finished or already-DNF player is told so. Broadcasts standings so all clients reflect it.
 local function handle_dnf_command(player_id, player_name)
@@ -894,6 +925,12 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_RACEEND then
         handle_raceend_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == CHAT_COMMAND_GO or command == CHAT_COMMAND_START
+        or command == CHAT_COMMAND_RACESTART then
+        handle_start_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
 
