@@ -1,29 +1,27 @@
--- BeamComp -- race start countdown (GE side).
+-- BeamComp -- race countdown surface (GE side).
 --
--- Renders the synchronized 3-2-1-GO! start countdown on BeamNG's built-in centered flash-message
--- surface (the same one the base game's race countdowns use; scenarios.lua:1584-1597). Driven from
--- the client GE handler (init.lua handle_race_phase) off the server-authoritative race phases
--- (ADR-0006): the `countdown` phase (carrying a `duration`) starts the count, the `racing` phase
--- shows GO! (coincident with the movement-lock release), and `lobby`/reload clears it.
+-- Renders the start countdown (8-2-1-GO!), the staging-wait indicator, and the recover/repair assist
+-- hold countdown on BeamComp's own centered HUD overlay (ADR-0021), pushed GE->UI via the
+-- BeamCompCountdown guihooks hook and drawn by the BeamCompHud app (ui/modules/apps/BeamCompHud,
+-- ADR-0012). This replaces the built-in ScenarioFlashMessage surface used before (ADR-0008): that
+-- surface depended on a base-game UI app a player might not have on their layout, so a player could see
+-- no countdown at all (live-test Finding #5). The overlay rides the same app BeamComp force-shows for
+-- the race HUD, so it needs no separate per-player setup beyond that one app.
 --
--- A custom, colorable BeamComp countdown overlay is deferred to the Phase-4 HUD (ADR-0008): a
--- server-delivered mod mounts after BeamNG's one-time UI-module bootstrap, so a custom UI module
--- never loads. The built-in flash surface is the reliable choice and needs no per-player setup.
+-- The counts are ticked GE-side in init.lua onUpdate (like the grace and assist countdowns already
+-- are) and pushed here a beat at a time; this module is a thin render + audio shim. guihooks is
+-- bootstrap-immune (ADR-0008 Finding 4), so the push works for a server-delivered mod.
 
 local M = {}
 
 local LOG_TAG = "beamcomp.race"
 
--- Built-in centered flash-message surface (base-game race countdown; scenarios.lua:1584-1597).
-local FLASH_HOOK = "ScenarioFlashMessage"
-local FLASH_RESET_HOOK = "ScenarioFlashMessageReset"
+-- The GE->UI contract: the BeamCompHud app subscribes with scope.$on(HOOK, ...) (ADR-0012/0021).
+local HOOK = "BeamCompCountdown"
 
-local DEFAULT_COUNTDOWN_SECONDS = 3
-local GO_MESSAGE = "GO!"
-
--- Per-number countdown beep events (base-game AudioGui). The sound index is intentionally
--- reversed from the number: "3" plays Countdown1, "2" Countdown2, "1" Countdown3. Numbers
--- above 3 (longer countdowns) get no beep -- only the final three and GO! do.
+-- Per-number countdown beep events (base-game AudioGui). The sound index is intentionally reversed
+-- from the number: "3" plays Countdown1, "2" Countdown2, "1" Countdown3. Numbers above 3 (the longer
+-- 8 s count) get no beep -- only the final three and GO! do.
 local BEAT_SOUNDS = {
     [3] = "event:UI_Countdown1",
     [2] = "event:UI_Countdown2",
@@ -32,75 +30,66 @@ local BEAT_SOUNDS = {
 local GO_SOUND = "event:UI_CountdownGo"
 
 
-local function play_sound_cmd(event)
-    if not event then
-        return ""
-    end
-    return "Engine.Audio.playOnce('AudioGui', '" .. event .. "')"
-end
-
--- Fire a UI hook defensively: a malformed payload or a missing surface must never break the
--- phase handler that calls us.
-local function trigger_ui(name, payload)
+-- Fire a UI hook defensively: a malformed payload or a missing surface must never break the phase
+-- handler / onUpdate tick that calls us. Mirrors race/hud.lua's trigger_ui.
+local function trigger_ui(payload)
     if not guihooks then
         return
     end
-    local ok, err = pcall(guihooks.trigger, name, payload)
+    local ok, err = pcall(guihooks.trigger, HOOK, payload)
     if not ok then
-        log("W", LOG_TAG, "countdown UI trigger '" .. name .. "' failed: " .. tostring(err))
+        log("W", LOG_TAG, "countdown UI trigger failed: " .. tostring(err))
     end
 end
 
--- Round the server-issued duration to whole seconds, clamped to at least one; fall back to the
--- default if the payload is missing or invalid.
-local function resolve_seconds(duration)
-    if type(duration) ~= "number" or duration <= 0 then
-        return DEFAULT_COUNTDOWN_SECONDS
+-- Play a UI sound defensively (the cue the flash surface used to run via its soundCmd). A missing
+-- audio API must never break the countdown.
+local function play_audio(event)
+    if not event or not Engine or not Engine.Audio then
+        return
     end
-    return math.max(1, math.floor(duration + 0.5))
-end
-
--- Build the flash-message beat list the UI auto-sequences: one {message, seconds, sound, big}
--- tuple per second, counting down from `seconds` to 1.
-local function build_beats(seconds)
-    local beats = {}
-    for n = seconds, 1, -1 do
-        beats[#beats + 1] = {n, 1, play_sound_cmd(BEAT_SOUNDS[n]), true}
+    local ok, err = pcall(Engine.Audio.playOnce, "AudioGui", event)
+    if not ok then
+        log("W", LOG_TAG, "countdown audio '" .. event .. "' failed: " .. tostring(err))
     end
-    return beats
-end
-
-local function flash(message_list)
-    trigger_ui(FLASH_RESET_HOOK)
-    trigger_ui(FLASH_HOOK, message_list)
 end
 
 
--- Start the synced 3-2-1 count off the server-issued duration.
-function M.show_countdown(duration)
-    flash(build_beats(resolve_seconds(duration)))
+-- Show one start-count beat (the whole-second number n). Ticked from init.lua onUpdate.
+function M.show_start(value)
+    trigger_ui({active = true, kind = "start", value = value})
 end
 
--- Show GO! -- driven by the server `racing` phase, so it lands on the movement-lock release.
+-- Show GO! -- driven by the server `racing` phase, so it lands on the movement-lock release. The app
+-- self-hides it after a beat (the racing phase sends no clear).
 function M.show_go()
-    flash({{GO_MESSAGE, 1, play_sound_cmd(GO_SOUND), true}})
+    trigger_ui({active = true, kind = "go"})
 end
 
--- Show the recover/repair assist countdown, e.g. "Recover 5 ... 1" (ADR-0017). Built as one beat
--- sequence the UI auto-sequences (like the start countdown) so it animates smoothly instead of
--- re-triggering every second; smaller than the start (big = false) so it fits the window. No beep --
--- this is a player-held assist, not the synced start. Cleared via M.clear() on cancel/fire.
-function M.show_assist_countdown(label, seconds)
-    local beats = {}
-    for n = seconds, 1, -1 do
-        beats[#beats + 1] = {label .. " " .. n, 1, "", false}
-    end
-    flash(beats)
+-- Show the recover/repair assist hold countdown, e.g. "Recover 5" (ADR-0017). Ticked from step_assist.
+function M.show_assist(label, value)
+    trigger_ui({active = true, kind = "assist", label = label, value = value})
 end
 
--- Clear any countdown message (race end / reload). Idempotent.
+-- Show the staging-wait indicator with the remaining auto-start seconds (ADR-0021). Ticked from
+-- init.lua onUpdate during the staging phase.
+function M.show_staging(remaining)
+    trigger_ui({active = true, kind = "staging", remaining = remaining})
+end
+
+-- Hide the overlay (race end / reload / count finished). Idempotent.
 function M.clear()
-    trigger_ui(FLASH_RESET_HOOK)
+    trigger_ui({active = false})
+end
+
+-- Play the per-number beep for the final 3-2-1 beats (no-op for the silent 8..4 beats).
+function M.play_beat(value)
+    play_audio(BEAT_SOUNDS[value])
+end
+
+-- Play the GO! cue, coincident with M.show_go on the racing transition.
+function M.play_go()
+    play_audio(GO_SOUND)
 end
 
 return M
