@@ -542,7 +542,7 @@ end
 
 local RACE_USAGE =
     "BeamComp: usage -- /race <name> [sprint|circuit] [laps] [reverse] [force] "
-    .. "[recover[:secs]] [repair[:secs]]"
+    .. "[recover[:secs|off]] [repair[:secs|off]]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -551,9 +551,29 @@ local ASSIST_DEFAULT_HOLD_SECONDS = 5
 local ASSIST_MIN_HOLD_SECONDS = 1
 local ASSIST_MAX_HOLD_SECONDS = 30
 
+-- Tokens that turn an assist OFF via its ":suffix" (recover:off / recover:-1 / recover:false). The
+-- delay value doubles as the on/off switch, so there is no separate enable flag (ADR-0017 amendment).
+local ASSIST_DISABLE_TOKENS = {off = true, ["false"] = true, ["-1"] = true}
+
 -- Clamp a requested assist hold time into the sane [min, max] range.
 local function clamp_assist_hold(seconds)
     return math.max(ASSIST_MIN_HOLD_SECONDS, math.min(ASSIST_MAX_HOLD_SECONDS, seconds))
+end
+
+-- Interpret the ":suffix" on a recover/repair token. No suffix (bare keyword) -> enabled at the
+-- default hold; a disable token -> disabled; a positive integer -> enabled at that clamped hold;
+-- anything else -> nil so the caller rejects the whole token and replies usage.
+local function parse_assist_suffix(suffix)
+    if not suffix then
+        return {enabled = true, hold = ASSIST_DEFAULT_HOLD_SECONDS}
+    end
+    if ASSIST_DISABLE_TOKENS[suffix] then
+        return {enabled = false}
+    end
+    if suffix:match("^%d+$") then
+        return {enabled = true, hold = clamp_assist_hold(math.floor(tonumber(suffix)))}
+    end
+    return nil
 end
 
 -- The /race keyword options. RACE_KEYWORDS is the full union matched by unambiguous prefix across ALL
@@ -588,15 +608,16 @@ end
 
 -- Classify one /race option token into the override it sets, by unambiguous prefix across the whole
 -- keyword union. Returns a (kind, value) pair: "mode"/<keyword>, "direction"/"reverse", "force"/true,
--- or "assist"/{keyword, hold}; or nil if the token is not a recognized option (ambiguous/unknown
--- prefix, not letters, or a ":secs" suffix on a non-assist keyword). A bare keyword uses the default
--- hold; "<prefix>:<secs>" is clamped. ":secs" is valid only on the assist keywords (ADR-0017/0018).
+-- or "assist"/{keyword, enabled, hold}; or nil if the token is not a recognized option (ambiguous/
+-- unknown prefix, not letters, or a ":" suffix on a non-assist keyword, or an unrecognized assist
+-- suffix). A ":" suffix is valid only on the assist keywords: ":<secs>" sets the clamped hold and
+-- ":off"/":-1"/":false" disables it; a bare keyword is enabled at the default hold (ADR-0017/0018).
 local function parse_option_token(token)
     local lowered = token:lower()
     local word = lowered:match("^(%a+)$")
-    local seconds
+    local suffix
     if not word then
-        word, seconds = lowered:match("^(%a+):(%d+)$")
+        word, suffix = lowered:match("^(%a+):(.+)$")
     end
     if not word then
         return nil
@@ -605,8 +626,8 @@ local function parse_option_token(token)
     if not keyword then
         return nil
     end
-    if seconds and not ASSIST_KEYWORDS[keyword] then
-        return nil  -- ":secs" only applies to recover/repair
+    if suffix and not ASSIST_KEYWORDS[keyword] then
+        return nil  -- a ":" suffix only applies to recover/repair
     end
     if RACE_MODES[keyword] then
         return "mode", keyword
@@ -615,18 +636,21 @@ local function parse_option_token(token)
     elseif keyword == "force" then
         return "force", true
     end
-    local hold = seconds and clamp_assist_hold(math.floor(tonumber(seconds)))
-        or ASSIST_DEFAULT_HOLD_SECONDS
-    return "assist", {keyword = keyword, hold = hold}
+    local assist = parse_assist_suffix(suffix)
+    if not assist then
+        return nil  -- recover/repair with an unrecognized suffix (not :secs, not a disable token)
+    end
+    return "assist", {keyword = keyword, enabled = assist.enabled, hold = assist.hold}
 end
 
 -- Parse a /race argument into the race name plus an overrides table (ADR-0013, ADR-0017, ADR-0018). The
 -- first whitespace token is the race name (slug-based, no spaces -- ADR-0005); each remaining token is
 -- an order-independent option, matched by unambiguous prefix across the whole keyword set:
--- sprint|circuit (mode), reverse (direction), force, recover|repair[:secs] (assists), or a bare integer
--- (lap count). Returns name (nil if the argument is empty), an overrides table (always present;
--- mode/laps/direction nil = auto, force false, both assists disabled by default), and the first
--- unrecognized token (or nil) so the caller can reply usage.
+-- sprint|circuit (mode), reverse (direction), force, recover|repair[:secs|off] (assists), or a bare
+-- integer (lap count). Returns name (nil if the argument is empty), an overrides table (always present;
+-- mode/laps/direction nil = auto, force false, both assists ON at the default hold), and the first
+-- unrecognized token (or nil) so the caller can reply usage. Both assists default ON at the default
+-- hold; a recover:off / repair:off (or :-1 / :false) token turns one back off (ADR-0017 amendment).
 local function parse_race_args(argument)
     local tokens = {}
     for token in argument:gmatch("%S+") do
@@ -637,7 +661,12 @@ local function parse_race_args(argument)
     local bad_token
     local overrides = {
         force = false,
-        assists = {recoverEnabled = false, repairEnabled = false},
+        assists = {
+            recoverEnabled = true,
+            recoverHoldSeconds = ASSIST_DEFAULT_HOLD_SECONDS,
+            repairEnabled = true,
+            repairHoldSeconds = ASSIST_DEFAULT_HOLD_SECONDS,
+        },
     }
     for i = 2, #tokens do
         local token = tokens[i]
@@ -649,12 +678,17 @@ local function parse_race_args(argument)
         elseif kind == "force" then
             overrides.force = true
         elseif kind == "assist" then
+            local assists = overrides.assists
             if value.keyword == "recover" then
-                overrides.assists.recoverEnabled = true
-                overrides.assists.recoverHoldSeconds = value.hold
+                assists.recoverEnabled = value.enabled
+                if value.enabled then
+                    assists.recoverHoldSeconds = value.hold
+                end
             else
-                overrides.assists.repairEnabled = true
-                overrides.assists.repairHoldSeconds = value.hold
+                assists.repairEnabled = value.enabled
+                if value.enabled then
+                    assists.repairHoldSeconds = value.hold
+                end
             end
         elseif token:match("^%d+$") then
             overrides.laps = math.floor(tonumber(token))
@@ -688,14 +722,14 @@ local function handle_race_command(player_id, player_name, argument)
     end
 
     local assists = overrides.assists
-    log_info("beamcomp.race", string.format("/race '%s' by %s (phase %s)%s%s%s%s%s%s",
+    log_info("beamcomp.race", string.format("/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
         overrides.direction and (" dir=" .. overrides.direction) or "",
         overrides.force and " force" or "",
-        assists.recoverEnabled and (" recover=" .. assists.recoverHoldSeconds .. "s") or "",
-        assists.repairEnabled and (" repair=" .. assists.repairHoldSeconds .. "s") or ""))
+        assists.recoverEnabled and (assists.recoverHoldSeconds .. "s") or "off",
+        assists.repairEnabled and (assists.repairHoldSeconds .. "s") or "off"))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
