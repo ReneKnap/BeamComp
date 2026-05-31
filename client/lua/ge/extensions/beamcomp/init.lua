@@ -104,6 +104,8 @@ M.state = {
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
+    staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
+    countdown = nil,     -- start-countdown {remaining = seconds}, ticked locally to drive the 8s count (ADR-0021), or nil
     assist_armed = false,  -- whether the VE forwarders have been armed for this race (ADR-0017)
     assist_held = nil,     -- kind ("recover"/"repair") of the assist key currently held, or nil (ADR-0017)
     assist_arming = nil,   -- active recover/repair countdown {kind, remaining}, or nil (ADR-0017)
@@ -173,6 +175,8 @@ local function handle_race_start(payload)
     M.state.detection = nil
     M.state.standings = nil
     M.state.grace = nil
+    M.state.staging = nil
+    M.state.countdown = nil
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
@@ -263,16 +267,26 @@ local function handle_race_phase(payload)
         return
     end
 
-    if phase == "countdown" then
-        -- Arm the in-race vehicle-action lock for the whole countdown + racing span (ADR-0017): no
-        -- switching, spawning, replacing, or alternative recover/reset until the race returns to lobby.
+    if phase == "staging" then
+        -- Arm the in-race vehicle-action lock for the whole staging + countdown + racing span
+        -- (ADR-0017/0021): no switching, spawning, replacing, or alternative recover/reset until the
+        -- race returns to lobby. The car is already frozen at its grid slot (handle_race_start) and
+        -- stays so until racing. Force the HUD app visible now so the countdown overlay it hosts is
+        -- present before the count starts (ADR-0021), and seed the staging indicator (ticked locally).
         lock.install()
-        -- Start the synced 3-2-1 count off the server-issued duration (built-in flash surface).
-        countdown.show_countdown(payload.duration)
+        hud.show()
+        M.state.staging = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
+    elseif phase == "countdown" then
+        -- Staging over: seed the start countdown; the local onUpdate tick renders each whole second
+        -- and plays the final beeps on the centered overlay (ADR-0021).
+        M.state.staging = nil
+        M.state.countdown = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
     elseif phase == "racing" then
-        -- Countdown over: show GO! (server-authoritative, so it lands exactly on the release)
-        -- and release the start lock so the car can drive.
+        -- Countdown over: show GO! (server-authoritative, so it lands exactly on the release), play
+        -- the GO cue, stop the local count, and release the start lock so the car can drive.
+        M.state.countdown = nil
         countdown.show_go()
+        countdown.play_go()
         local released, release_err = vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
         if not released then
             log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
@@ -311,6 +325,8 @@ local function handle_race_phase(payload)
         M.state.detection = nil
         M.state.standings = nil
         M.state.grace = nil
+        M.state.staging = nil
+        M.state.countdown = nil
         M.state.assist_armed = false
         M.state.assist_held = nil
         M.state.assist_arming = nil
@@ -318,8 +334,9 @@ local function handle_race_phase(payload)
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
-    -- Surface the phase as a toast, except countdown/racing -- the countdown UI covers those.
-    if phase ~= "countdown" and phase ~= "racing" then
+    -- Surface the phase as a toast, except staging/countdown/racing -- the centered overlay covers
+    -- those (the staging indicator, the count, and GO!).
+    if phase ~= "staging" and phase ~= "countdown" and phase ~= "racing" then
         guihooks.trigger("toastrMsg", {
             type = "info",
             title = "BeamComp",
@@ -942,7 +959,7 @@ local function perform_assist(kind)
     })
 end
 
--- Clear any in-progress assist countdown and its on-screen flash (ADR-0017). Idempotent.
+-- Clear any in-progress assist countdown and its centered overlay (ADR-0017). Idempotent.
 local function clear_assist_arming()
     if M.state.assist_arming then
         M.state.assist_arming = nil
@@ -1046,9 +1063,8 @@ local function step_assist(dt_real)
     local arming = M.state.assist_arming
     if not arming or arming.kind ~= held then
         local _, seconds = assist_setting(held)
-        arming = {kind = held, remaining = seconds}
+        arming = {kind = held, remaining = seconds, last_shown = nil}
         M.state.assist_arming = arming
-        countdown.show_assist_countdown(held == "repair" and "Repair" or "Recover", math.ceil(seconds))
     end
 
     arming.remaining = arming.remaining - (dt_real or 0)
@@ -1057,6 +1073,48 @@ local function step_assist(dt_real)
         clear_assist_arming()
         M.state.assist_held = nil
         perform_assist(kind)
+        return
+    end
+
+    -- Push the centered overlay each whole second so it counts down live (the GE side drives it a
+    -- beat at a time; ADR-0021).
+    local shown = math.max(1, math.ceil(arming.remaining))
+    if shown ~= arming.last_shown then
+        arming.last_shown = shown
+        countdown.show_assist(held == "repair" and "Repair" or "Recover", shown)
+    end
+end
+
+-- Tick the staging-wait indicator in wall time (ADR-0021): count the local copy of the server's
+-- auto-start window down and push the remaining whole seconds to the centered overlay only when the
+-- shown second changes. The server stays authoritative on the actual staging->countdown transition.
+local function step_staging(dt_real)
+    local staging = M.state.staging
+    if not staging then
+        return
+    end
+    staging.remaining = math.max(0, staging.remaining - (dt_real or 0))
+    local shown = math.ceil(staging.remaining)
+    if shown ~= staging.last_shown then
+        staging.last_shown = shown
+        countdown.show_staging(shown)
+    end
+end
+
+-- Tick the start countdown in wall time off the server-issued duration (ADR-0021): render each whole
+-- second on the centered overlay and play the final 3-2-1 beeps as the shown number changes. GO! and
+-- the actual release are driven by the server `racing` phase, not this tick.
+local function step_start_countdown(dt_real)
+    local count = M.state.countdown
+    if not count then
+        return
+    end
+    count.remaining = math.max(0, count.remaining - (dt_real or 0))
+    local shown = math.max(1, math.ceil(count.remaining))
+    if shown ~= count.last_shown then
+        count.last_shown = shown
+        countdown.show_start(shown)
+        countdown.play_beat(shown)
     end
 end
 
@@ -1064,7 +1122,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
     end
-    if M.state.phase == "racing" and M.state.race then
+    if M.state.phase == "staging" and M.state.race then
+        -- Tick the staging-wait indicator on the centered overlay (ADR-0021).
+        step_staging(dtReal)
+    elseif M.state.phase == "countdown" and M.state.race then
+        -- Tick the start countdown on the centered overlay (ADR-0021).
+        step_start_countdown(dtReal)
+    elseif M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
         -- Drive the held recover/repair countdown (ADR-0017).
         step_assist(dtReal)
@@ -1074,10 +1138,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
             M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
         end
     end
-    -- Arm the seated car's VE key forwarders across the locked sequence (countdown + racing). The
-    -- first successful arm installs the override + reset guard, so vanilla recover/reset is never
-    -- available mid-race even with both assists off (ADR-0017).
-    if (M.state.phase == "countdown" or M.state.phase == "racing") and M.state.race then
+    -- Arm the seated car's VE key forwarders across the locked sequence (staging + countdown + racing).
+    -- The first successful arm installs the override + reset guard, so vanilla recover/reset is never
+    -- available mid-race even with both assists off (ADR-0017). It must cover staging too: the lock
+    -- arms there (ADR-0021), but the recover keys are owned by this VE override (not action-filtered),
+    -- so without it Insert/Ctrl+Insert would still trigger vanilla recover and break the grid freeze.
+    if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing")
+        and M.state.race then
         push_assist_arm()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
@@ -1128,6 +1195,8 @@ function M.onExtensionUnloaded()
     M.state.race_car_id = nil
     M.state.detection = nil
     M.state.grace = nil
+    M.state.staging = nil
+    M.state.countdown = nil
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
