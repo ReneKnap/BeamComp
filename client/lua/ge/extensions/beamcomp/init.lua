@@ -14,9 +14,10 @@
 --                 (race/start + race/grid), draw the grid markers (onPreRender), respawn this
 --                 client's own car fresh at its assigned grid pose (race/vehicles), and load the
 --                 race's static-scenery prop prefab(s) into the scene (race/props). The knockable
---                 cones are shared: the payload's propOwner client keeps the set its load spawns
---                 (BeamMP syncs it to everyone), and the cones are kept non-enterable / out of the
---                 Tab cycle on every client via race/cones (ADR-0009).
+--                 cones are shared: only the payload's propOwner (host) spawns them and BeamMP syncs
+--                 them to everyone; non-hosts spawn a statics-only prefab and never instantiate a
+--                 cone. The cones are kept non-enterable / out of the Tab cycle on every client via
+--                 race/cones (ADR-0020, superseding ADR-0009).
 --   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
 --                 ADR-0006). We record + surface it, and drive the start lock off it: the car is
 --                 spawned frozen (handle_race_start) and held through the countdown, released on
@@ -34,12 +35,17 @@ local race_start = require("beamcomp/race/start")
 local vehicles = require("beamcomp/race/vehicles")
 local props = require("beamcomp/race/props")
 local cones = require("beamcomp/race/cones")
+local spawn_mute = require("beamcomp/race/spawn_mute")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
 local lock = require("beamcomp/race/lock")
 local hud = require("beamcomp/race/hud")
 local racelist = require("beamcomp/race/racelist")
 local maps = require("beamcomp/race/maps")
+
+-- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
+-- cone-spawn burst on every other client (race/spawn_mute, ADR-0020 finding #2b).
+local SPAWN_NOTIFICATION_MUTE_SECONDS = 5
 
 local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
@@ -92,7 +98,7 @@ M.state = {
     phase = nil,         -- current server-authoritative race phase (ADR-0006) or nil
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
-    cone_ids = nil,      -- ids of the shared cone vehicles we own + must clear (owner only, ADR-0009)
+    cone_ids = nil,      -- ids of the shared cone vehicles we spawned + must clear (host only, ADR-0020)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
@@ -152,6 +158,11 @@ local function handle_race_start(payload)
 
     M.state.race = race
     M.state.marker_warned = false
+    -- Mute BeamMP's spawn notifications for the spawn burst: the host's ~14 synced cones would
+    -- otherwise flood every other client's notification list (ADR-0020 finding #2b). Armed on every
+    -- client; the raceStart always arrives before the host's cone spawns can propagate, so the window
+    -- opens in time. A real player spawning inside the window is muted too -- accepted edge case.
+    spawn_mute.mute_for(SPAWN_NOTIFICATION_MUTE_SECONDS)
     -- Drop any stale race-car id up front; it is re-set below once the car is placed, and left nil if
     -- the placement fails (so the switch lock has no bounce target and lets switches through).
     M.state.race_car_id = nil
@@ -180,9 +191,10 @@ local function handle_race_start(payload)
     -- spawn + auto-enter stays the LAST scene action and the player lands seated in it. Loading
     -- props after the respawn left the player's camera latched onto a prop (a pylon) instead of
     -- the car. Clear first so re-issuing /race never stacks duplicates; placement is client-local
-    -- + deterministic (see race/props.lua). The knockable cones are shared (ADR-0009): only the
-    -- propOwner keeps the set its load creates (cone_ids, cleared here on re-issue too); the
-    -- abort/restart path skips the lobby branch, so clearing here is what prevents owner stacking.
+    -- + deterministic (see race/props.lua). The knockable cones are shared (ADR-0020): only the
+    -- propOwner (host) spawns + keeps them (cone_ids, cleared here on re-issue too); non-hosts spawn
+    -- a statics-only prefab and never instantiate a cone. The abort/restart path skips the lobby
+    -- branch, so clearing here is what prevents host cone-stacking on a re-issued /race.
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     M.state.prop_names, M.state.cone_ids = props.load(race.prefabFiles or {}, payload.propOwner)
@@ -609,15 +621,18 @@ function M.onVehicleSwitched(_oldId, newId)
     M.state.current_vehicle_id = newId
 end
 
--- Keep the shared cones out of the Tab vehicle cycle as they appear: the owner's local set when its
--- prefab load spawns them, and the remote synced set on every other client (BeamMP vehicle spawns
--- fire this hook too). Best-effort exclusion layer; the onVehicleSwitched bounce is the guarantee
--- (ADR-0009).
+-- As each shared cone appears -- the host's local set when its prefab load spawns them, and the
+-- remote synced set on every other client (BeamMP vehicle spawns fire this hook too) -- keep it out
+-- of the Tab vehicle cycle and suppress BeamMP's owner nametag on it. Both are best-effort layers
+-- (the onVehicleSwitched bounce is the non-enterable guarantee; the tag may stay if the cone is not
+-- yet registered in MPVehicleGE -- accepted, ADR-0020).
 function M.onVehicleSpawned(vehicleId)
     if not be then
         return
     end
-    cones.exclude_from_cycle(be:getObjectByID(vehicleId))
+    local veh = be:getObjectByID(vehicleId)
+    cones.exclude_from_cycle(veh)
+    cones.hide_nametag(veh)
 end
 
 -- Send a typed { type, payload } envelope to the server -- the client->server mirror of the server's
@@ -1064,6 +1079,7 @@ function M.onExtensionUnloaded()
     -- guarded core_vehicles functions stuck blocked (ADR-0017), and restore the seated car's recovery.
     lock.remove()
     disarm_assist_ve()
+    spawn_mute.restore()
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     M.state.prop_names = nil

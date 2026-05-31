@@ -13,11 +13,13 @@
 --
 -- Two runtime quirks of these mission prefabs, discovered in-game, are handled here:
 --   1. They bundle physics "prop vehicles" (jbeam "cones", each with autoEnterVehicle) alongside
---      the static meshes. spawnPrefab loads the whole file, so those spawn as real vehicles. Their
---      shared lifecycle is owned by race/cones.lua (ADR-0009): the designated `keep_cones` owner
---      keeps the ones this load creates (BeamMP syncs them to everyone), while every other client
---      deletes only its own. We snapshot vehicle ids before the load and hand the snapshot to
---      cones.lua to diff against, then return the kept cone ids for the caller to track.
+--      the static meshes. spawnPrefab loads the whole file, so those spawn as real vehicles -- and
+--      every vehicle a client spawns in a BeamMP session is owned and propagated. ADR-0020: only the
+--      host (`keep_cones`) spawns the full prefab, keeping the cones its load creates for BeamMP to
+--      sync to everyone; non-hosts spawn a STATICS-ONLY copy (race/prefab.lua) so they never
+--      instantiate a cone vehicle at all -- prevention, not spawn-then-delete. We snapshot vehicle
+--      ids before the host load and hand the snapshot to cones.lua to diff against, returning the
+--      kept cone ids for the caller to track (host only; non-hosts have none).
 --   2. Statics spawned at runtime have no collision until the static collision mesh is rebuilt
 --      (spawnPrefab only rebuilds it when the world editor is open), so we call be:reloadCollision
 --      once after loading -- mirroring core/dynamicProps.
@@ -32,9 +34,14 @@
 local M = {}
 
 local cones = require("beamcomp/race/cones")
+local prefab = require("beamcomp/race/prefab")
 
 local LOG_TAG = "beamcomp.props"
 local PROP_NAME_PREFIX = "beamcomp_prop_"
+
+-- Where the statics-only prefab copies non-hosts spawn are written (one per source prefab index).
+-- A BeamNG temp vpath, overwritten each load -- no cleanup needed.
+local STATICS_TMP_PREFIX = "/temp/beamcomp_statics_"
 
 -- The set of vehicle object IDs currently in the scene, so the cone prop-vehicles a subsequent
 -- prefab load creates can be told apart from pre-existing (player/synced) vehicles.
@@ -52,12 +59,12 @@ local function current_vehicle_ids()
     return ids
 end
 
--- Load each prefab file as a scene object under a deterministic name, settle the cone prop-vehicles
--- the load created, and rebuild static collision. `keep_cones` is true on the single designated
--- owner (ADR-0009): it keeps the new cones for BeamMP to sync; every other client deletes only its
--- own. Returns the list of prefab names spawned (for prefab cleanup) and the list of kept cone
--- vehicle ids (empty unless owner; for cone cleanup). One bad prefab warns and is skipped rather
--- than aborting the rest.
+-- Load each prefab file as a scene object under a deterministic name and rebuild static collision.
+-- `keep_cones` is true only on the host (ADR-0020): the host spawns the FULL prefab and keeps the
+-- knockable cones its load creates for BeamMP to sync; every other client spawns a STATICS-ONLY copy
+-- (race/prefab.lua) so it never instantiates a cone vehicle -- prevention, not spawn-then-delete.
+-- Returns the list of prefab names spawned (for prefab cleanup) and the list of kept cone vehicle ids
+-- (empty unless host; for cone cleanup). One bad prefab warns and is skipped rather than aborting.
 function M.load(prefab_files, keep_cones)
     if type(spawnPrefab) ~= "function" or type(removePrefab) ~= "function" then
         log("W", LOG_TAG, "spawnPrefab/removePrefab unavailable -- cannot load props")
@@ -75,23 +82,35 @@ function M.load(prefab_files, keep_cones)
         -- Clear the name first: addPrefab refuses an existing name, and this also reaps any
         -- orphan from a prior load whose tracked names were lost (e.g. a hard reload).
         pcall(removePrefab, name)
+        -- Non-hosts spawn a statics-only copy so the cone vehicles are never created (ADR-0020). The
+        -- host spawns the full file as-is. If the filter fails, degrade to the full prefab rather
+        -- than leave the client with no barriers (logged).
+        local source = file
+        if not keep_cones then
+            local statics_file = STATICS_TMP_PREFIX .. i .. ".prefab.json"
+            if prefab.write_statics_only(file, statics_file) then
+                source = statics_file
+            else
+                log("W", LOG_TAG, "statics-only filter failed; loading full prefab '"
+                    .. tostring(file) .. "'")
+            end
+        end
         -- Identity pos/rot/scale: prefab object coords are absolute world-space, so the
         -- container transform is identity (mirrors gameplay/race/path.lua's own spawnPrefab call).
-        local ok, obj = pcall(spawnPrefab, name, file, "0 0 0", "0 0 1", "1 1 1")
+        local ok, obj = pcall(spawnPrefab, name, source, "0 0 0", "0 0 1", "1 1 1")
         if ok and obj then
             spawned[#spawned + 1] = name
         else
-            log("W", LOG_TAG, "failed to load prop prefab '" .. tostring(file) .. "': "
+            log("W", LOG_TAG, "failed to load prop prefab '" .. tostring(source) .. "': "
                 .. tostring(obj))
         end
     end
 
-    -- Settle the cone prop-vehicles this load created (ADR-0009, owned by race/cones.lua).
+    -- Only the host instantiates cones, so only the host tracks their ids for cleanup; non-hosts
+    -- never spawned any and have nothing to track (ADR-0020).
     local cone_ids = {}
     if keep_cones then
         cone_ids = cones.keep_new(vehicles_before)
-    else
-        cones.delete_owned_new(vehicles_before)
     end
 
     -- Rebuild the static collision mesh so the freshly spawned barriers are solid (spawnPrefab

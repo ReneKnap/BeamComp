@@ -5,13 +5,14 @@
 -- owns the tracked cone ids and passes them back. Target: client GE (LuaJIT 5.1).
 --
 -- Race prefabs ship knockable physics prop-vehicles (jbeam "cones", each with autoEnterVehicle)
--- alongside the static scenery. They must be spawned ONCE for all players, not per-client: in a
--- BeamMP session every spawned vehicle is owned and propagated, so a per-client load made N x 14
--- duplicates. The fix (ADR-0009): exactly one client -- the /race issuer, flagged propOwner by the
--- server -- KEEPS the cones its prefab load creates (M.keep_new); BeamMP syncs them to everyone.
--- Every other client DELETES only its OWN newly-spawned cones (M.delete_owned_new), so the owner's
--- incoming synced cones (not owned locally) are left untouched. The owner clears its set on race
--- end (M.clear), and BeamMP removes them for all clients.
+-- alongside the static scenery. They must exist ONCE for all players, not per-client: in a BeamMP
+-- session every spawned vehicle is owned and propagated, so a per-client load made N x 14 duplicates.
+-- The fix (ADR-0020, superseding ADR-0009): non-hosts spawn a statics-only prefab (race/prefab.lua)
+-- and never instantiate a cone at all; only the host -- the /race issuer, flagged propOwner by the
+-- server -- spawns the full prefab and KEEPS the cones its load creates (M.keep_new), which BeamMP
+-- syncs to everyone. The host clears its set on race end (M.clear), and BeamMP removes them for all.
+-- (The earlier non-host "delete your own cones" path is gone: it relied on BeamMP's getOwnMap()
+-- ownership, which a freshly-spawned cone is not yet in synchronously, so it deleted nothing.)
 --
 -- The cones must never be enterable or clutter the Tab vehicle cycle, on every client. Two layers:
 --   * M.enforce_non_enterable -- GUARANTEED: bounce the player off a cone back to the race car.
@@ -32,39 +33,20 @@ function M.is_cone(veh)
     return veh ~= nil and veh.JBeam == CONE_JBEAM
 end
 
--- The owned-vehicle id set (as a string-keyed lookup) for the current BeamMP session, or nil
--- outside a session. getOwnMap is BeamMP's MPVehicleGE global listing vehicles whose isLocal is
--- true; its keys and getID() may differ in number/string type, so keys are normalised to strings.
-local function owned_id_set()
-    if type(getOwnMap) ~= "function" then
-        return nil
-    end
-    local own = getOwnMap()
-    if type(own) ~= "table" then
-        return nil
-    end
-    local ids = {}
-    for game_vehicle_id in pairs(own) do
-        ids[tostring(game_vehicle_id)] = true
-    end
-    return ids
-end
-
 -- The cone vehicles in the scene that did not exist before the load (diffed against
--- `existing_before`, a set of pre-load object ids). When `owned_only` is true the result is
--- restricted to vehicles this client owns. Returns a list of game vehicle ids.
-local function new_cone_ids(existing_before, owned_only)
+-- `existing_before`, a set of pre-load object ids). Returns a list of game vehicle ids. Scene
+-- presence is synchronous after spawnPrefab (unlike BeamMP ownership), so the host's diff is
+-- reliable here.
+local function new_cone_ids(existing_before)
     local ids = {}
     if not be then
         return ids
     end
-    local owned = owned_only and owned_id_set() or nil
     for i = 0, be:getObjectCount() - 1 do
         local veh = be:getObject(i)
         if veh and M.is_cone(veh) then
             local id = veh:getID()
-            local is_owned = (not owned_only) or (owned ~= nil and owned[tostring(id)])
-            if not existing_before[id] and is_owned then
+            if not existing_before[id] then
                 ids[#ids + 1] = id
             end
         end
@@ -72,37 +54,16 @@ local function new_cone_ids(existing_before, owned_only)
     return ids
 end
 
--- OWNER path: keep the cone vehicles this prefab load just created (do not delete them) and return
+-- HOST path: keep the cone vehicles this prefab load just created (do not delete them) and return
 -- their ids so the caller can track them for cleanup. BeamMP propagates the spawns ('Os:') to every
--- other client, so the owner is the single source of the shared cone set.
+-- other client, so the host is the single source of the shared cone set (ADR-0020).
 function M.keep_new(existing_before)
-    local ids = new_cone_ids(existing_before, false)
+    local ids = new_cone_ids(existing_before)
     log("I", LOG_TAG, string.format("kept %d shared cone(s)", #ids))
     return ids
 end
 
--- NON-OWNER path: delete only the OWNED cones this prefab load just created, leaving the owner's
--- incoming synced cones (not owned here) in place. Returns the count removed.
-function M.delete_owned_new(existing_before)
-    local ids = new_cone_ids(existing_before, true)
-    local removed = 0
-    for _, id in ipairs(ids) do
-        local veh = be:getObjectByID(id)
-        if veh then
-            local ok, err = pcall(function() veh:delete() end)
-            if ok then
-                removed = removed + 1
-            else
-                log("W", LOG_TAG, "failed to delete own cone " .. tostring(id) .. ": "
-                    .. tostring(err))
-            end
-        end
-    end
-    log("I", LOG_TAG, string.format("removed %d own cone(s)", removed))
-    return removed
-end
-
--- OWNER cleanup: delete the tracked cone vehicles by id. Tolerant of ids whose vehicle is already
+-- HOST cleanup: delete the tracked cone vehicles by id. Tolerant of ids whose vehicle is already
 -- gone. BeamMP propagates the owned delete ('Od:'), removing them for all clients. Returns the
 -- count processed.
 function M.clear(ids)
@@ -164,6 +125,34 @@ function M.exclude_from_cycle(veh)
         return false
     end
     return true
+end
+
+-- Suppress BeamMP's floating player-nametag + "spawned a vehicle" label on a synced cone (ADR-0020,
+-- finding #2). BeamMP's nametag draw loop skips a vehicle whose MPVehicleGE Vehicle entry has
+-- `hideNametag` set; BeamMP never sets the field itself, so it is the sanctioned per-vehicle opt-out.
+-- Best-effort, fully guarded: a freshly synced cone may not be registered in MPVehicleGE yet at spawn
+-- time, in which case this no-ops (the accepted fallback is that the tag stays). No-op for non-cones
+-- or outside a BeamMP session. Returns true if the tag was hidden.
+function M.hide_nametag(veh)
+    if not M.is_cone(veh) then
+        return false
+    end
+    if type(MPVehicleGE) ~= "table" or type(MPVehicleGE.getVehicleByGameID) ~= "function" then
+        return false
+    end
+    local ok, hidden = pcall(function()
+        local entry = MPVehicleGE.getVehicleByGameID(veh:getID())
+        if type(entry) == "table" then
+            entry.hideNametag = true
+            return true
+        end
+        return false
+    end)
+    if not ok then
+        log("W", LOG_TAG, "hide_nametag attempt failed: " .. tostring(hidden))
+        return false
+    end
+    return hidden
 end
 
 return M
