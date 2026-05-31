@@ -107,6 +107,7 @@ M.state = {
     assist_armed = false,  -- whether the VE forwarders have been armed for this race (ADR-0017)
     assist_held = nil,     -- kind ("recover"/"repair") of the assist key currently held, or nil (ADR-0017)
     assist_arming = nil,   -- active recover/repair countdown {kind, remaining}, or nil (ADR-0017)
+    assist_notice = nil,   -- which abort reason was last toasted this hold ("moving"), latches one-shot
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -149,6 +150,7 @@ local function handle_race_start(payload)
         M.state.assist_armed = false
         M.state.assist_held = nil
         M.state.assist_arming = nil
+        M.state.assist_notice = nil
         lock.remove()
         disarm_assist_ve()
         countdown.clear()
@@ -174,6 +176,7 @@ local function handle_race_start(payload)
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
+    M.state.assist_notice = nil
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
 
@@ -311,6 +314,7 @@ local function handle_race_phase(payload)
         M.state.assist_armed = false
         M.state.assist_held = nil
         M.state.assist_arming = nil
+        M.state.assist_notice = nil
         vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     end
 
@@ -973,6 +977,21 @@ local function is_car_stationary()
     return ok and speed <= ASSIST_STATIONARY_SPEED
 end
 
+-- Lowercase verb for an assist kind, for the failure-feedback toasts ("Hold to <verb>").
+local function assist_verb(kind)
+    return (kind == "repair") and "repair" or "recover"
+end
+
+-- Warning toast telling the player WHY a recover/repair did not fire (ADR-0017 amendment): disabled,
+-- not stationary, or released too early. Mirrors the lock's notify_spawn_blocked toast style.
+local function notify_assist_blocked(msg)
+    guihooks.trigger("toastrMsg", {
+        type = "warning",
+        title = "BeamComp",
+        msg = msg,
+    })
+end
+
 -- A recover/repair key went down (forwarded from the VE, ADR-0017): record which assist is held so
 -- the per-frame stepper can run the hold. Racing only, enabled assists only -- a disabled assist's
 -- key is inert (blocked). The actual countdown starts in step_assist once the car is stationary.
@@ -982,15 +1001,26 @@ function M.on_assist_key_down(kind)
     end
     local enabled = assist_setting(kind)
     if not enabled then
+        notify_assist_blocked(((kind == "repair") and "Repair" or "Recover")
+            .. " is disabled in this race")
         return
     end
     M.state.assist_held = kind
+    M.state.assist_notice = nil
 end
 
--- The held recover/repair key was released: drop the hold and cancel any running countdown.
+-- The held recover/repair key was released: drop the hold and cancel any running countdown. If a
+-- countdown was actually mid-flight (not completed, not never-started), tell the player they let go
+-- too early -- "released too early" is only a failure when the hold was genuinely running.
 function M.on_assist_key_up()
+    local was_arming = M.state.assist_arming ~= nil
+    local kind = M.state.assist_held
     M.state.assist_held = nil
     clear_assist_arming()
+    M.state.assist_notice = nil
+    if was_arming and kind then
+        notify_assist_blocked("Hold to " .. assist_verb(kind))
+    end
 end
 
 -- Drive the hold-to-activate recover/repair each frame (ADR-0017): the countdown runs only while the
@@ -998,7 +1028,17 @@ end
 -- the held kind is consumed (cleared) so it does not immediately re-fire while the key is still down.
 local function step_assist(dt_real)
     local held = M.state.assist_held
-    if not held or not is_car_stationary() then
+    if not held then
+        clear_assist_arming()
+        return
+    end
+    if not is_car_stationary() then
+        -- Held while moving: cancel the hold and tell the player once (latched so it does not flood
+        -- every frame the car keeps rolling).
+        if M.state.assist_notice ~= "moving" then
+            notify_assist_blocked("Stop the car to " .. assist_verb(held))
+            M.state.assist_notice = "moving"
+        end
         clear_assist_arming()
         return
     end
