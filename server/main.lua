@@ -7,6 +7,8 @@
 --
 -- Owns a server-authoritative race state machine (ADR-0006, staging phase ADR-0021):
 --   lobby -> spawning -> staging -> countdown -> racing -> finished -> lobby
+-- finished is a long results + free-roam window (ADR-0006 amendment, B3): results and props stay
+-- up for PHASE_DURATIONS.finished_hold (or until /raceend) with a heads-up before cleanup.
 -- An always-on 250 ms tick (MP.CreateEventTimer) drives the timed transitions; a
 -- monotonic MP.CreateTimer() stopwatch measures elapsed time per phase. Every
 -- transition is broadcast to all clients as a "racePhase" envelope on the
@@ -100,8 +102,13 @@ local PHASE_DURATIONS = {
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
     all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
-    finished_hold = 15.0, -- results-display window before returning to lobby (ADR-0006)
+    finished_hold = 900.0, -- long results + free-roam window before returning to lobby (ADR-0006 amendment)
 }
+
+-- Seconds before the finished results window expires to warn players that the props and results
+-- are about to be cleared (delayed-race-cleanup / B3). Not a phase duration: the finished phase
+-- still ends at PHASE_DURATIONS.finished_hold; this is just the one-shot heads-up offset.
+local FINISHED_CLEANUP_WARNING = 60.0
 
 -- How long the server waits for the issuer's client to answer a pre-flight validateRace before giving
 -- up and telling the admin (covers a client that disconnected mid-check; ADR-0019).
@@ -126,6 +133,7 @@ local session = {
     pending_overrides = nil, -- queued race's relayed {mode, laps, direction, force, assists} (ADR-0018)
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
+    cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -255,6 +263,14 @@ local function broadcast_event(message_type, payload)
     end
 end
 
+-- Send a chat line to every connected player. Like broadcast_event, BeamMP has no single broadcast,
+-- so loop the player table (server API note, section 7).
+local function broadcast_chat(message)
+    for player_id in pairs(MP.GetPlayers()) do
+        MP.SendChatMessage(player_id, message)
+    end
+end
+
 -- Move the session into `phase`, stamp the entry time, and announce it to all clients as a
 -- racePhase envelope. `duration` (seconds) is carried for timed phases so a client can render a
 -- synced countdown; pass nil for open-ended phases (lobby, racing).
@@ -373,8 +389,10 @@ local function broadcast_standings()
     broadcast_event(MSG_STANDINGS, {entries = build_standings()})
 end
 
--- Clear the session and announce the lobby phase.
+-- Clear the session and announce the lobby phase. If a race was active, tell players the world is
+-- back to free-roam (B3) -- so a /raceend or the finished-window expiry has a visible close-out.
 local function reset_to_lobby()
+    local had_race = session.race ~= nil
     session.race = nil
     session.roster = nil
     session.progress = nil
@@ -382,7 +400,11 @@ local function reset_to_lobby()
     session.pending_race = nil
     session.pending_owner = nil
     session.pending_overrides = nil
+    session.cleanup_warned = false
     enter_phase(PHASE.lobby, nil)
+    if had_race then
+        broadcast_chat("BeamComp: race cleared -- back in free roam")
+    end
 end
 
 -- Early-end check (ADR-0014): once no player can still finish, don't wait out the full grace. With at
@@ -433,6 +455,7 @@ local function start_race(race_name, owner_id, overrides)
     session.pending_race = nil
     session.pending_owner = nil
     session.pending_overrides = nil
+    session.cleanup_warned = false
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
@@ -514,8 +537,26 @@ local function expire_stale_validation()
     end
 end
 
+-- One-shot heads-up, ~FINISHED_CLEANUP_WARNING seconds before the finished results window expires,
+-- that the props and results are about to clear (B3). Only the long results window qualifies: the
+-- 1.5 s abort_window (a re-issued /race) sets session.pending_race, so it is excluded.
+local function maybe_warn_cleanup()
+    if session.phase ~= PHASE.finished or session.cleanup_warned or session.pending_race then
+        return
+    end
+    if not session.phase_duration then
+        return
+    end
+    if phase_elapsed() < session.phase_duration - FINISHED_CLEANUP_WARNING then
+        return
+    end
+    session.cleanup_warned = true
+    broadcast_chat("BeamComp: race props and results clear in 1 minute -- /raceend to clear now")
+end
+
 local function tick()
     expire_stale_validation()
+    maybe_warn_cleanup()
 
     local phase = session.phase
     if phase == PHASE.lobby then
