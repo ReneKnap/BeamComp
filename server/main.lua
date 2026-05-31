@@ -16,12 +16,14 @@
 --
 -- Chat commands handled (leading token; trailing text is the argument):
 --   /race <name> [sprint|circuit] [laps] [recover[:secs]] [repair[:secs]]
+--                 (each keyword token also accepts any unambiguous prefix: s/c, rec/rep)
 --                 from lobby/finished: assign every present player a slot, send each a
 --                 "raceStart" event (slot + grid roster + relayed mode/laps + recover/repair
 --                 assists), and enter the spawning phase. The client resolves and parses <name>
 --                 locally (ADR-0005) and decides the actual mode/laps; the optional sprint|circuit
 --                 and lap-count tokens are relayed verbatim as overrides (ADR-0013), and the
---                 optional recover/repair[:secs] tokens relay the opt-in in-race assists (ADR-0017,
+--                 optional recover/repair[:secs] tokens (or any unambiguous prefix, e.g. rec/rep)
+--                 relay the opt-in in-race assists (ADR-0017,
 --                 default off) -- the server never validates any of them against geometry
 --                 (race-blind). While a race is already running, /race queues the new race and runs
 --                 a short abort window before restarting. Bare /race replies with usage.
@@ -526,9 +528,9 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race <name> [sprint|circuit] [laps] [recover[:secs]] [repair[:secs]]"
 
--- Valid /race mode-override tokens; anything else (besides a bare integer lap count or a
--- recover/repair assist token) is rejected.
-local RACE_MODES = {sprint = true, circuit = true}
+-- Valid /race mode-override keywords, matched by unambiguous prefix (below); anything else (besides a
+-- bare integer lap count or a recover/repair assist token) is rejected.
+local RACE_MODES = {"sprint", "circuit"}
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -542,25 +544,69 @@ local function clamp_assist_hold(seconds)
     return math.max(ASSIST_MIN_HOLD_SECONDS, math.min(ASSIST_MAX_HOLD_SECONDS, seconds))
 end
 
--- Read a recover/repair assist token: returns the (clamped) hold seconds if `token` is `keyword` or
--- `keyword:<secs>`, else nil. A bare keyword uses the default hold; `keyword:<secs>` is clamped. A
--- malformed `keyword:<non-digits>` returns nil so the caller rejects it as an unknown token.
-local function parse_assist_token(token, keyword)
+-- The assist keywords a /race token can enable, matched by unambiguous prefix (below).
+local ASSIST_KEYWORDS = {"recover", "repair"}
+
+-- Resolve a keyword from a (lowercased) word by unambiguous prefix -- the same "shortest form that
+-- stays unambiguous" convenience the race shortnames use. `word` must be a non-empty prefix of
+-- exactly one entry in `keywords`; a word that prefixes none, or more than one, resolves to nil. So
+-- among modes "s" -> "sprint" and "c" -> "circuit"; among assists "rec" -> "recover" and "rep" ->
+-- "repair", while the shared "re"/"r" stay ambiguous. Returns the full keyword or nil.
+local function resolve_keyword(word, keywords)
+    if word == "" then
+        return nil
+    end
+    local matched
+    for _, keyword in ipairs(keywords) do
+        if keyword:sub(1, #word) == word then
+            if matched then
+                return nil  -- prefix of more than one keyword: ambiguous
+            end
+            matched = keyword
+        end
+    end
+    return matched
+end
+
+-- Resolve a /race mode-override token ("sprint"/"circuit") by unambiguous prefix, e.g. "s"/"c".
+-- Returns the full mode or nil if `token` is not letters or prefixes no/ambiguous mode.
+local function parse_mode_token(token)
+    local word = token:lower():match("^(%a+)$")
+    if not word then
+        return nil
+    end
+    return resolve_keyword(word, RACE_MODES)
+end
+
+-- Read a recover/repair assist token, accepting any unambiguous keyword prefix (e.g. "rec", "rep").
+-- Returns the resolved keyword ("recover"/"repair") plus the (clamped) hold seconds, or nil if `token`
+-- is not an assist token. A bare keyword/prefix uses the default hold; "<prefix>:<secs>" is clamped. A
+-- malformed token (not "<letters>" or "<letters>:<digits>") or an ambiguous/unknown prefix returns nil
+-- so the caller rejects it as an unknown option.
+local function parse_assist_token(token)
     local lowered = token:lower()
-    if lowered == keyword then
-        return ASSIST_DEFAULT_HOLD_SECONDS
+    local word = lowered:match("^(%a+)$")
+    local seconds
+    if not word then
+        word, seconds = lowered:match("^(%a+):(%d+)$")
     end
-    local seconds = lowered:match("^" .. keyword .. ":(%d+)$")
-    if seconds then
-        return clamp_assist_hold(math.floor(tonumber(seconds)))
+    if not word then
+        return nil
     end
-    return nil
+    local keyword = resolve_keyword(word, ASSIST_KEYWORDS)
+    if not keyword then
+        return nil
+    end
+    local hold = seconds and clamp_assist_hold(math.floor(tonumber(seconds)))
+        or ASSIST_DEFAULT_HOLD_SECONDS
+    return keyword, hold
 end
 
 -- Parse a /race argument into the race name plus optional overrides (ADR-0013, ADR-0017). The first
 -- whitespace token is the race name (race ids are slug-based, no spaces -- ADR-0005); of the rest, a
--- "sprint"/"circuit" token sets the mode, a bare integer sets the lap count, and "recover"/"repair"
--- (optionally ":secs") enable the matching assist -- all order-independent. Returns name (nil if the
+-- "sprint"/"circuit" token (or any unambiguous prefix, e.g. "s"/"c") sets the mode, a bare integer
+-- sets the lap count, and "recover"/"repair" (or any unambiguous prefix, e.g. "rec"/"rep"; optionally
+-- ":secs") enable the matching assist -- all order-independent. Returns name (nil if the
 -- argument is empty), mode (or nil = auto), laps (or nil = auto), an assists table (always present,
 -- both disabled by default), and the first unrecognized token (or nil) so the caller can reply usage.
 local function parse_race_args(argument)
@@ -574,16 +620,16 @@ local function parse_race_args(argument)
     local assists = {recoverEnabled = false, repairEnabled = false}
     for i = 2, #tokens do
         local token = tokens[i]
-        local recover_hold = parse_assist_token(token, "recover")
-        local repair_hold = parse_assist_token(token, "repair")
-        if RACE_MODES[token:lower()] then
-            mode = token:lower()
-        elseif recover_hold then
+        local mode_match = parse_mode_token(token)
+        local assist, hold = parse_assist_token(token)
+        if mode_match then
+            mode = mode_match
+        elseif assist == "recover" then
             assists.recoverEnabled = true
-            assists.recoverHoldSeconds = recover_hold
-        elseif repair_hold then
+            assists.recoverHoldSeconds = hold
+        elseif assist == "repair" then
             assists.repairEnabled = true
-            assists.repairHoldSeconds = repair_hold
+            assists.repairHoldSeconds = hold
         elseif token:match("^%d+$") then
             laps = math.floor(tonumber(token))
         elseif not bad_token then
