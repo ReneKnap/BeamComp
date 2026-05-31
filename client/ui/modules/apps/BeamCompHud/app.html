@@ -1,11 +1,49 @@
-<div class="beamcomp-hud" ng-show="hud.active"
-     ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
-  <!-- Pushed by the GE extension (race/hud.lua) via scope.$on; wired in app.js. Branches on
-       hud.phase: the live HUD during racing, a results card during finished (ADR-0012). This root
-       <div> must be the template's first node: replace:true forbids a leading comment. The root
-       fills the app frame (height:100%) so the .bc-scroll body can bound its overflow to the frame
-       instead of spilling past it; the bc-size-* class shrinks content as the field grows. -->
+<div class="beamcomp-root">
+  <!-- Single template root (replace:true forbids a leading comment/sibling). It hosts two regions:
+       the draggable race HUD (.beamcomp-hud, pushed by race/hud.lua via BeamCompHudUpdate) and a
+       screen-centered countdown overlay (.bc-countdown, pushed by race/countdown.lua via
+       BeamCompCountdown; ADR-0021). The root fills the app frame so the live HUD's bc-scroll body
+       can bound its overflow; the overlay is position:fixed, so it centers on the viewport
+       regardless of where the player dragged the app frame. -->
   <style>
+    .beamcomp-root {
+      height: 100%;
+    }
+    /* Screen-centered countdown overlay (ADR-0021): position:fixed centers it on the viewport
+       regardless of where the HUD frame was dragged; pointer-events:none so it never eats clicks. */
+    .beamcomp-root .bc-countdown {
+      position: fixed;
+      /* Upper quarter, not dead center, so the count does not sit on top of the car (translate keeps
+         the element's own center on this point). */
+      top: 25%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 1000;
+      color: #fff;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-weight: bold;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+      font-variant-numeric: tabular-nums;
+    }
+    .beamcomp-root .bc-cd-start,
+    .beamcomp-root .bc-cd-go {
+      font-size: 170px;
+      line-height: 1;
+    }
+    .beamcomp-root .bc-cd-go {
+      color: #3fd96b;
+    }
+    .beamcomp-root .bc-cd-assist {
+      font-size: 105px;
+    }
+    .beamcomp-root .bc-cd-staging .bc-cd-staging-title {
+      font-size: 64px;
+    }
+    .beamcomp-root .bc-cd-staging .bc-cd-staging-time {
+      font-size: 105px;
+    }
     .beamcomp-hud {
       font-family: 'Segoe UI', Arial, sans-serif;
       color: #fff;
@@ -139,6 +177,8 @@
       margin-bottom: 4px;
     }
   </style>
+  <div class="beamcomp-hud" ng-show="hud.active"
+       ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
   <div class="bc-body" ng-if="hud.phase !== 'finished'">
     <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
     <div class="bc-scroll">
@@ -170,6 +210,17 @@
           <td class="bc-int">{{formatDelta(e.interval)}}</td>
         </tr>
       </table>
+    </div>
+  </div>
+  </div><!-- .beamcomp-hud -->
+  <div class="bc-countdown" ng-show="countdown.active" ng-class="'bc-cd-' + countdown.kind"
+       ng-switch="countdown.kind">
+    <div ng-switch-when="start">{{countdown.value}}</div>
+    <div ng-switch-when="go">GO!</div>
+    <div ng-switch-when="assist">{{countdown.label}} {{countdown.value}}</div>
+    <div ng-switch-when="staging">
+      <div class="bc-cd-staging-title">Race starting…</div>
+      <div class="bc-cd-staging-time">{{formatStaging(countdown.remaining)}}</div>
     </div>
   </div>
 </div>

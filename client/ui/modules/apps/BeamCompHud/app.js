@@ -5,7 +5,7 @@
 // every racing and finished frame; we receive it with scope.$on and format it for the template.
 // No GE round-trip on load -- the per-frame push covers a mid-race add.
 angular.module('beamng.apps')
-.directive('beamCompHud', [function () {
+.directive('beamCompHud', ['$timeout', function ($timeout) {
   // Live HUD row cap: the leader plus a slice around the local player (see windowLiveEntries). The
   // finished results card is exempt -- it renders the whole field.
   var MAX_LIVE_ROWS = 7;
@@ -35,6 +35,18 @@ angular.module('beamng.apps')
     var m = Math.floor(abs / 60);
     var rest = abs - m * 60;
     return sign + m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
+  }
+
+  // Staging-countdown remaining (seconds) -> "M:SS" in whole seconds (the GE side pushes ceil'd
+  // seconds, so centiseconds would only ever read .00). Placeholder when not a number.
+  function formatStaging(t) {
+    if (typeof t !== 'number') {
+      return '';
+    }
+    var total = Math.max(0, Math.ceil(t));
+    var m = Math.floor(total / 60);
+    var s = total - m * 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
   }
 
   // Content-density bucket for the rows actually on screen. The app frame is owned by the BeamNG
@@ -100,8 +112,10 @@ angular.module('beamng.apps')
     scope: true,
     link: function (scope, element, attrs) {
       scope.hud = {active: false, entries: []};
+      scope.countdown = {active: false};
       scope.formatTime = formatTime;
       scope.formatDelta = formatDelta;
+      scope.formatStaging = formatStaging;
 
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
@@ -109,6 +123,27 @@ angular.module('beamng.apps')
           scope.hud.liveEntries = windowLiveEntries(scope.hud.entries);
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
+        });
+      });
+
+      // Centered countdown overlay (ADR-0021): the GE side (race/countdown.lua) pushes the staging
+      // indicator, the start count, the GO!, and the recover/repair assist count through this hook.
+      var goHideTimer = null;
+      scope.$on('BeamCompCountdown', function (event, data) {
+        scope.$evalAsync(function () {
+          scope.countdown = data || {active: false};
+          if (goHideTimer) {
+            $timeout.cancel(goHideTimer);
+            goHideTimer = null;
+          }
+          // GO! self-hides: the racing phase sends no clear, so fade it after a short beat.
+          if (scope.countdown.active && scope.countdown.kind === 'go') {
+            goHideTimer = $timeout(function () {
+              if (scope.countdown && scope.countdown.kind === 'go') {
+                scope.countdown.active = false;
+              }
+            }, 1200);
+          }
         });
       });
     }
