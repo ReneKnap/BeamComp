@@ -46,7 +46,39 @@ local LOG_TAG = "beamcomp.net"
 local RACE_LOG_TAG = "beamcomp.race"
 
 local MARKER_RADIUS = 0.6
-local MARKER_LIFT = 1.0  -- raise the sphere off the ground so it stays visible
+
+-- In-world marker styling. Checkpoints render singleplayer-style: a pale translucent column
+-- spanning the whole checkpoint radius, with thin posts marking the gate sides. Grid poses render
+-- as slot-colored pillars. All immediate-mode debugDrawer, redrawn each frame (nothing to clean up).
+-- Checkpoint columns extend far up (seen over buildings / at distance) and well below ground
+-- (no visible bottom end on a slope). The pale fill is a cylinder shell, so the extra length does
+-- not accumulate opacity.
+local CHECKPOINT_COLUMN_UP = 300.0      -- column reach above the checkpoint center
+local CHECKPOINT_COLUMN_DOWN = 100.0    -- column reach below the checkpoint center
+local GATE_POST_RADIUS = 0.15           -- radius of the thin left/right gate-side posts
+local GRID_COLUMN_HEIGHT = 2.5          -- height of a start-grid pillar (label sits on top)
+local GRID_COLUMN_RADIUS = 0.25         -- radius of a start-grid pillar
+
+-- Per-target marker colors ({r, g, b, a}). The next checkpoint is colored by role: regular
+-- (pale fill + red posts), the lap line (CP0 crossed at the end of a non-final lap, blue), or the
+-- race finish (green). The look-ahead -- the checkpoint after next -- always uses yellow posts, so
+-- it reads as "the one after" by color rather than by fading.
+local CHECKPOINT_STYLE = {
+    area = {r = 0.85, g = 0.88, b = 0.95, a = 0.12},
+    post = {r = 1.0, g = 0.15, b = 0.15, a = 0.85},
+}
+local LAP_STYLE = {
+    area = {r = 0.45, g = 0.65, b = 1.0, a = 0.16},
+    post = {r = 0.2, g = 0.5, b = 1.0, a = 0.9},
+}
+local FINISH_STYLE = {
+    area = {r = 0.55, g = 1.0, b = 0.6, a = 0.16},
+    post = {r = 0.3, g = 1.0, b = 0.4, a = 0.9},
+}
+local LOOKAHEAD_STYLE = {
+    area = {r = 0.85, g = 0.88, b = 0.95, a = 0.1},
+    post = {r = 1.0, g = 0.85, b = 0.1, a = 0.85},
+}
 
 -- Min seconds between "switch locked" toasts, so spamming Tab during a race shows one toast, not a
 -- flood (the bounce itself still fires every time).
@@ -367,22 +399,24 @@ local function on_server_event(data)
     handler(payload)
 end
 
--- Draw a debug sphere + label at every grid pose (own slot highlighted). Immediate-mode:
--- redrawn each frame from M.state, so there are no scene objects to clean up -- clearing
--- M.state.race removes the markers.
+-- Draw a slot-colored pillar + label at every grid pose (own slot highlighted), harmonized with
+-- the checkpoint columns. Immediate-mode: redrawn each frame from M.state, so there are no scene
+-- objects to clean up -- clearing M.state.race removes the markers.
 local function draw_grid_markers(race)
-    local mine = ColorF(0.2, 1.0, 0.3, 1.0)
+    local mine = ColorF(0.2, 1.0, 0.3, 0.9)
     local other = ColorF(1.0, 0.8, 0.1, 0.7)
     local centers = {}
     for index, pose in ipairs(race.gridPoses) do
-        local center = vec3(pose.pos.x, pose.pos.y, pose.pos.z + MARKER_LIFT)
-        centers[index] = center
+        local p = pose.pos
+        local base = vec3(p.x, p.y, p.z)
+        local top = vec3(p.x, p.y, p.z + GRID_COLUMN_HEIGHT)
+        centers[index] = top
         local slot = index - 1
-        debugDrawer:drawSphere(center, MARKER_RADIUS, (slot == race.mySlot) and mine or other)
+        debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, (slot == race.mySlot) and mine or other)
     end
 
     -- Labels last + lower-confidence API: if drawTextAdvanced/ColorI mismatch here, the
-    -- spheres above have already drawn this frame (the onPreRender pcall warns once).
+    -- pillars above have already drawn this frame (the onPreRender pcall warns once).
     local label_fg = ColorF(1, 1, 1, 1)
     local label_bg = ColorI(0, 0, 0, 255)
     for index, center in ipairs(centers) do
@@ -394,21 +428,91 @@ local function draw_grid_markers(race)
     end
 end
 
--- Draw the next expected checkpoint as an in-world sphere so the player sees where to head next.
--- Distinct blue vs the grid markers' green/amber; immediate-mode like draw_grid_markers (redrawn
--- each frame, nothing to clean up). The next checkpoint is the plan entry at detection.seq + 1, whose
--- cursor indexes the checkpoints array (ADR-0013) -- so on a circuit it points at CP1 first and back
--- at the start/finish line (CP0) for the final crossing.
-local function draw_next_checkpoint(race, detection)
-    local entry = detection.plan and detection.plan.entries[detection.seq + 1]
-    local checkpoint = entry and race.checkpoints[entry.cursor]
-    if not checkpoint then
+-- The two horizontal gate-edge points (left, right) of an oriented checkpoint, derived from its
+-- gate normal the way BeamNG's own pathnode renderer does -- the perpendicular to the normal in the
+-- ground plane (cross(normal, up)). Returns nil for a checkpoint with no normal: a pure-radius
+-- checkpoint has no meaningful left/right side, so only its area column is drawn.
+local function gate_edges(checkpoint)
+    local normal = checkpoint.normal
+    if not normal then
+        return nil
+    end
+    local len = math.sqrt(normal.x * normal.x + normal.y * normal.y)
+    if len < 1e-6 then
+        return nil
+    end
+    local perp_x = normal.y / len
+    local perp_y = -normal.x / len
+    local radius = checkpoint.radius or MARKER_RADIUS
+    local p = checkpoint.pos
+    local left = vec3(p.x - perp_x * radius, p.y - perp_y * radius, p.z)
+    local right = vec3(p.x + perp_x * radius, p.y + perp_y * radius, p.z)
+    return left, right
+end
+
+-- The style for the next checkpoint, by role: the race's final scored crossing is the finish
+-- (green); a non-final start/finish line (CP0, stable index 0) is a lap line (blue); every other
+-- checkpoint uses the regular pale-fill + red-post style.
+local function marker_style(checkpoint, is_finish)
+    if is_finish then
+        return FINISH_STYLE
+    end
+    if checkpoint.index == 0 then
+        return LAP_STYLE
+    end
+    return CHECKPOINT_STYLE
+end
+
+-- Draw one checkpoint as a singleplayer-style gate: a pale translucent column spanning the whole
+-- checkpoint radius, plus -- for an oriented gate -- two thin posts marking the left/right sides.
+local function draw_checkpoint_marker(checkpoint, style)
+    local p = checkpoint.pos
+    local radius = checkpoint.radius or MARKER_RADIUS
+    local base = vec3(p.x, p.y, p.z - CHECKPOINT_COLUMN_DOWN)
+    local top = vec3(p.x, p.y, p.z + CHECKPOINT_COLUMN_UP)
+    local area = style.area
+    debugDrawer:drawCylinder(base, top, radius, ColorF(area.r, area.g, area.b, area.a))
+
+    local left, right = gate_edges(checkpoint)
+    if not left then
         return
     end
-    local c = checkpoint.pos
-    local center = vec3(c.x, c.y, c.z + MARKER_LIFT)
-    local radius = checkpoint.radius or MARKER_RADIUS
-    debugDrawer:drawSphere(center, radius, ColorF(0.2, 0.6, 1.0, 0.5))
+    local post = style.post
+    local post_color = ColorF(post.r, post.g, post.b, post.a)
+    local left_base = vec3(left.x, left.y, left.z - CHECKPOINT_COLUMN_DOWN)
+    local right_base = vec3(right.x, right.y, right.z - CHECKPOINT_COLUMN_DOWN)
+    local left_top = vec3(left.x, left.y, left.z + CHECKPOINT_COLUMN_UP)
+    local right_top = vec3(right.x, right.y, right.z + CHECKPOINT_COLUMN_UP)
+    debugDrawer:drawCylinder(left_base, left_top, GATE_POST_RADIUS, post_color)
+    debugDrawer:drawCylinder(right_base, right_top, GATE_POST_RADIUS, post_color)
+end
+
+-- Draw the next expected checkpoint -- and the one after it as a yellow-posted look-ahead -- as
+-- singleplayer-style gates, so the player sees where to head next and can plan the line. Immediate-
+-- mode like draw_grid_markers (redrawn each frame, nothing to clean up). The next checkpoint is the
+-- plan entry at detection.seq + 1, the look-ahead the entry after it; each cursor indexes the
+-- checkpoints array (ADR-0013) -- so on a circuit they point at CP1 first and back at the start/
+-- finish line (CP0) for the final crossing.
+local function draw_next_checkpoint(race, detection)
+    local entries = detection.plan and detection.plan.entries
+    if not entries then
+        return
+    end
+    local final_seq = #entries
+
+    local next_entry = entries[detection.seq + 1]
+    local next_checkpoint = next_entry and race.checkpoints[next_entry.cursor]
+    if not next_checkpoint then
+        return
+    end
+    local next_style = marker_style(next_checkpoint, detection.seq + 1 == final_seq)
+    draw_checkpoint_marker(next_checkpoint, next_style)
+
+    local ahead_entry = entries[detection.seq + 2]
+    local ahead_checkpoint = ahead_entry and race.checkpoints[ahead_entry.cursor]
+    if ahead_checkpoint then
+        draw_checkpoint_marker(ahead_checkpoint, LOOKAHEAD_STYLE)
+    end
 end
 
 -- Register the server->client handler. AddEventHandler is a GE global provided by BeamMP's
