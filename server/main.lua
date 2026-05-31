@@ -15,18 +15,20 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race <name> [sprint|circuit] [laps] [recover[:secs]] [repair[:secs]]
---                 (each keyword token also accepts any unambiguous prefix: s/c, rec/rep)
+--   /race <name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]]
+--                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 from lobby/finished: assign every present player a slot, send each a
---                 "raceStart" event (slot + grid roster + relayed mode/laps + recover/repair
---                 assists), and enter the spawning phase. The client resolves and parses <name>
---                 locally (ADR-0005) and decides the actual mode/laps; the optional sprint|circuit
---                 and lap-count tokens are relayed verbatim as overrides (ADR-0013), and the
---                 optional recover/repair[:secs] tokens (or any unambiguous prefix, e.g. rec/rep)
---                 relay the opt-in in-race assists (ADR-0017,
---                 default off) -- the server never validates any of them against geometry
---                 (race-blind). While a race is already running, /race queues the new race and runs
---                 a short abort window before restarting. Bare /race replies with usage.
+--                 "raceStart" event (slot + grid roster + relayed overrides), and enter the spawning
+--                 phase. The client resolves and parses <name> locally (ADR-0005) and decides the
+--                 actual mode/laps/direction; the sprint|circuit, lap-count, reverse, and force tokens
+--                 are relayed verbatim as overrides (ADR-0013/0018), and recover/repair[:secs] relay
+--                 the opt-in in-race assists (ADR-0017, default off) -- the server never validates any
+--                 of them against geometry (race-blind). Instead it runs a pre-flight check (ADR-0019):
+--                 it asks the issuer's client (validateRace) to vet the options, and only on an "ok"
+--                 reply (raceValidation) does it start; on a mismatch or bad name nothing starts and the
+--                 reason is posted to the admin, who can re-issue with force. While a race is already
+--                 running, an ok'd /race queues the new race and runs a short abort window before
+--                 restarting. Bare /race replies with usage.
 --   /raceend      force the state machine back to lobby (safety hatch).
 --   /races        list the time-trial races on the asking player's current map. The server is
 --                 race-blind (ADR-0005), so it asks that client (a "listRaces" event); the client
@@ -58,10 +60,12 @@ local MSG_RACE_PHASE = "racePhase"
 -- Client -> server message types (received on EVENT_CHANNEL; ADR-0011).
 local MSG_CHECKPOINT = "checkpoint"
 local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
+local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
 -- Server -> client broadcast/request types.
 local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadcast)
 local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
 local MSG_FINISH_GRACE = "finishGrace"  -- the DNF-cutoff countdown duration, broadcast when armed (ADR-0014)
+local MSG_VALIDATE_RACE = "validateRace"  -- ask the issuer's client to vet /race options pre-start (ADR-0019)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -90,6 +94,10 @@ local PHASE_DURATIONS = {
     finished_hold = 15.0, -- results-display window before returning to lobby (ADR-0006)
 }
 
+-- How long the server waits for the issuer's client to answer a pre-flight validateRace before giving
+-- up and telling the admin (covers a client that disconnected mid-check; ADR-0019).
+local VALIDATION_TIMEOUT = 5.0
+
 -- Monotonic stopwatch for phase timing; only elapsed differences are used, so its origin
 -- (creation moment) does not matter.
 local clock = MP.CreateTimer()
@@ -104,11 +112,11 @@ local session = {
     phase_started_at = 0,   -- clock seconds at the current phase's entry
     phase_duration = nil,   -- configured length of the current timed phase, or nil if open-ended
     grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
-    pending_race = nil,     -- race name queued by a /race re-issued while one is active
-    pending_owner = nil,    -- player id of the queued race's issuer (owns its shared props), or nil
-    pending_mode = nil,     -- queued race's relayed mode override ("sprint"/"circuit"), or nil
-    pending_laps = nil,     -- queued race's relayed lap-count override, or nil
-    pending_assists = nil,  -- queued race's relayed recover/repair assist options (ADR-0017), or nil
+    pending_race = nil,      -- race name queued by a /race re-issued while one is active
+    pending_owner = nil,     -- player id of the queued race's issuer (owns its shared props), or nil
+    pending_overrides = nil, -- queued race's relayed {mode, laps, direction, force, assists} (ADR-0018)
+    pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
+    validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -364,9 +372,7 @@ local function reset_to_lobby()
     session.grace_deadline = nil
     session.pending_race = nil
     session.pending_owner = nil
-    session.pending_mode = nil
-    session.pending_laps = nil
-    session.pending_assists = nil
+    session.pending_overrides = nil
     enter_phase(PHASE.lobby, nil)
 end
 
@@ -400,16 +406,16 @@ local function maybe_end_race()
 end
 
 -- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster + relayed
--- mode/laps), and enter the spawning phase. The client resolves and parses the race name locally
--- (ADR-0005) and decides the actual mode/laps; `mode` ("sprint"/"circuit") and `laps` are the
--- admin's overrides relayed verbatim, or nil for "auto" (the client derives them from the race
--- file -- ADR-0013). `owner_id` is the player that issued /race; exactly that player's raceStart
--- carries propOwner = true, designating it as the one client that spawns the shared race props --
--- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009). `assists` carries
--- the per-race recover/repair options (ADR-0017), relayed verbatim like mode/laps (race-blind).
-local function start_race(race_name, owner_id, mode, laps, assists)
+-- overrides), and enter the spawning phase. The client resolves and parses the race name locally
+-- (ADR-0005) and decides the actual mode/laps/direction; `overrides` carries the admin's verbatim
+-- {mode, laps, direction, force, assists} (each nil/false = auto/off -- the client derives from the
+-- race file, ADR-0013/0018). `owner_id` is the player that issued /race; exactly that player's
+-- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
+-- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
+local function start_race(race_name, owner_id, overrides)
     local slots = build_slots(MP.GetPlayers())
     local roster = build_roster(slots)
+    local assists = overrides.assists
 
     session.race = race_name
     session.roster = roster
@@ -417,9 +423,7 @@ local function start_race(race_name, owner_id, mode, laps, assists)
     session.grace_deadline = nil
     session.pending_race = nil
     session.pending_owner = nil
-    session.pending_mode = nil
-    session.pending_laps = nil
-    session.pending_assists = nil
+    session.pending_overrides = nil
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
@@ -428,10 +432,11 @@ local function start_race(race_name, owner_id, mode, laps, assists)
             race = race_name,
             slot = entry.slot,
             grid = roster,
-            variant = "default",
             propOwner = entry.id == owner_id,
-            mode = mode,  -- nil = auto (client derives from meta.closed); ADR-0013
-            laps = laps,  -- nil = auto (client uses meta.defaultLaps); ADR-0013
+            mode = overrides.mode,            -- nil = auto (client derives from meta.closed); ADR-0013
+            laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
+            direction = overrides.direction,  -- nil = forward; "reverse" if reversible (ADR-0018)
+            force = overrides.force,          -- override a geometry mismatch where possible (ADR-0018)
             -- Opt-in recover/repair assists (ADR-0017); clients enforce. Disabled by default.
             recoverEnabled = assists.recoverEnabled,
             recoverHoldSeconds = assists.recoverHoldSeconds,
@@ -462,15 +467,11 @@ local function advance_from_finished()
     local pending = session.pending_race
     if pending then
         local owner = session.pending_owner
-        local mode = session.pending_mode
-        local laps = session.pending_laps
-        local assists = session.pending_assists
+        local overrides = session.pending_overrides
         session.pending_race = nil
         session.pending_owner = nil
-        session.pending_mode = nil
-        session.pending_laps = nil
-        session.pending_assists = nil
-        start_race(pending, owner, mode, laps, assists)
+        session.pending_overrides = nil
+        start_race(pending, owner, overrides)
         return
     end
     reset_to_lobby()
@@ -492,7 +493,21 @@ local function dnf_active_players(reason)
 end
 
 -- Advance the state machine one step. Runs on every tick; a no-op while idle in lobby.
+-- Drop a pre-flight validation whose issuer never answered (e.g. disconnected mid-check) and tell the
+-- admin, so a dead check never lingers (ADR-0019). Runs every tick, including while idle in lobby.
+local function expire_stale_validation()
+    local pending = session.pending_validation
+    if pending and now() >= pending.deadline then
+        session.pending_validation = nil
+        MP.SendChatMessage(pending.owner_id,
+            "BeamComp: race validation timed out -- no response from your client")
+        log_info("beamcomp.race", "/race '" .. pending.race .. "' validation timed out")
+    end
+end
+
 local function tick()
+    expire_stale_validation()
+
     local phase = session.phase
     if phase == PHASE.lobby then
         return
@@ -526,11 +541,8 @@ local function tick()
 end
 
 local RACE_USAGE =
-    "BeamComp: usage -- /race <name> [sprint|circuit] [laps] [recover[:secs]] [repair[:secs]]"
-
--- Valid /race mode-override keywords, matched by unambiguous prefix (below); anything else (besides a
--- bare integer lap count or a recover/repair assist token) is rejected.
-local RACE_MODES = {"sprint", "circuit"}
+    "BeamComp: usage -- /race <name> [sprint|circuit] [laps] [reverse] [force] "
+    .. "[recover[:secs]] [repair[:secs]]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -544,14 +556,20 @@ local function clamp_assist_hold(seconds)
     return math.max(ASSIST_MIN_HOLD_SECONDS, math.min(ASSIST_MAX_HOLD_SECONDS, seconds))
 end
 
--- The assist keywords a /race token can enable, matched by unambiguous prefix (below).
-local ASSIST_KEYWORDS = {"recover", "repair"}
+-- The /race keyword options. RACE_KEYWORDS is the full union matched by unambiguous prefix across ALL
+-- of them at once (resolve below), so the shortest typeable form of one option never silently shadows
+-- another: "s"/"c" -> sprint/circuit, "rev" -> reverse, "f" -> force, while the shared "re"/"r" stay
+-- three-way ambiguous (rec/rep/rev). There is deliberately no "forward" keyword -- forward is the
+-- default direction and is never typed, which keeps "f" unambiguously force. RACE_MODES and
+-- ASSIST_KEYWORDS classify a resolved keyword; only assist keywords accept a ":secs" suffix (ADR-0018).
+local RACE_KEYWORDS = {"sprint", "circuit", "reverse", "recover", "repair", "force"}
+local RACE_MODES = {sprint = true, circuit = true}
+local ASSIST_KEYWORDS = {recover = true, repair = true}
 
 -- Resolve a keyword from a (lowercased) word by unambiguous prefix -- the same "shortest form that
 -- stays unambiguous" convenience the race shortnames use. `word` must be a non-empty prefix of
--- exactly one entry in `keywords`; a word that prefixes none, or more than one, resolves to nil. So
--- among modes "s" -> "sprint" and "c" -> "circuit"; among assists "rec" -> "recover" and "rep" ->
--- "repair", while the shared "re"/"r" stay ambiguous. Returns the full keyword or nil.
+-- exactly one entry in `keywords`; a word that prefixes none, or more than one, resolves to nil.
+-- Returns the full keyword or nil.
 local function resolve_keyword(word, keywords)
     if word == "" then
         return nil
@@ -568,22 +586,12 @@ local function resolve_keyword(word, keywords)
     return matched
 end
 
--- Resolve a /race mode-override token ("sprint"/"circuit") by unambiguous prefix, e.g. "s"/"c".
--- Returns the full mode or nil if `token` is not letters or prefixes no/ambiguous mode.
-local function parse_mode_token(token)
-    local word = token:lower():match("^(%a+)$")
-    if not word then
-        return nil
-    end
-    return resolve_keyword(word, RACE_MODES)
-end
-
--- Read a recover/repair assist token, accepting any unambiguous keyword prefix (e.g. "rec", "rep").
--- Returns the resolved keyword ("recover"/"repair") plus the (clamped) hold seconds, or nil if `token`
--- is not an assist token. A bare keyword/prefix uses the default hold; "<prefix>:<secs>" is clamped. A
--- malformed token (not "<letters>" or "<letters>:<digits>") or an ambiguous/unknown prefix returns nil
--- so the caller rejects it as an unknown option.
-local function parse_assist_token(token)
+-- Classify one /race option token into the override it sets, by unambiguous prefix across the whole
+-- keyword union. Returns a (kind, value) pair: "mode"/<keyword>, "direction"/"reverse", "force"/true,
+-- or "assist"/{keyword, hold}; or nil if the token is not a recognized option (ambiguous/unknown
+-- prefix, not letters, or a ":secs" suffix on a non-assist keyword). A bare keyword uses the default
+-- hold; "<prefix>:<secs>" is clamped. ":secs" is valid only on the assist keywords (ADR-0017/0018).
+local function parse_option_token(token)
     local lowered = token:lower()
     local word = lowered:match("^(%a+)$")
     local seconds
@@ -593,22 +601,32 @@ local function parse_assist_token(token)
     if not word then
         return nil
     end
-    local keyword = resolve_keyword(word, ASSIST_KEYWORDS)
+    local keyword = resolve_keyword(word, RACE_KEYWORDS)
     if not keyword then
         return nil
     end
+    if seconds and not ASSIST_KEYWORDS[keyword] then
+        return nil  -- ":secs" only applies to recover/repair
+    end
+    if RACE_MODES[keyword] then
+        return "mode", keyword
+    elseif keyword == "reverse" then
+        return "direction", "reverse"
+    elseif keyword == "force" then
+        return "force", true
+    end
     local hold = seconds and clamp_assist_hold(math.floor(tonumber(seconds)))
         or ASSIST_DEFAULT_HOLD_SECONDS
-    return keyword, hold
+    return "assist", {keyword = keyword, hold = hold}
 end
 
--- Parse a /race argument into the race name plus optional overrides (ADR-0013, ADR-0017). The first
--- whitespace token is the race name (race ids are slug-based, no spaces -- ADR-0005); of the rest, a
--- "sprint"/"circuit" token (or any unambiguous prefix, e.g. "s"/"c") sets the mode, a bare integer
--- sets the lap count, and "recover"/"repair" (or any unambiguous prefix, e.g. "rec"/"rep"; optionally
--- ":secs") enable the matching assist -- all order-independent. Returns name (nil if the
--- argument is empty), mode (or nil = auto), laps (or nil = auto), an assists table (always present,
--- both disabled by default), and the first unrecognized token (or nil) so the caller can reply usage.
+-- Parse a /race argument into the race name plus an overrides table (ADR-0013, ADR-0017, ADR-0018). The
+-- first whitespace token is the race name (slug-based, no spaces -- ADR-0005); each remaining token is
+-- an order-independent option, matched by unambiguous prefix across the whole keyword set:
+-- sprint|circuit (mode), reverse (direction), force, recover|repair[:secs] (assists), or a bare integer
+-- (lap count). Returns name (nil if the argument is empty), an overrides table (always present;
+-- mode/laps/direction nil = auto, force false, both assists disabled by default), and the first
+-- unrecognized token (or nil) so the caller can reply usage.
 local function parse_race_args(argument)
     local tokens = {}
     for token in argument:gmatch("%S+") do
@@ -616,32 +634,41 @@ local function parse_race_args(argument)
     end
 
     local name = tokens[1]
-    local mode, laps, bad_token
-    local assists = {recoverEnabled = false, repairEnabled = false}
+    local bad_token
+    local overrides = {
+        force = false,
+        assists = {recoverEnabled = false, repairEnabled = false},
+    }
     for i = 2, #tokens do
         local token = tokens[i]
-        local mode_match = parse_mode_token(token)
-        local assist, hold = parse_assist_token(token)
-        if mode_match then
-            mode = mode_match
-        elseif assist == "recover" then
-            assists.recoverEnabled = true
-            assists.recoverHoldSeconds = hold
-        elseif assist == "repair" then
-            assists.repairEnabled = true
-            assists.repairHoldSeconds = hold
+        local kind, value = parse_option_token(token)
+        if kind == "mode" then
+            overrides.mode = value
+        elseif kind == "direction" then
+            overrides.direction = value
+        elseif kind == "force" then
+            overrides.force = true
+        elseif kind == "assist" then
+            if value.keyword == "recover" then
+                overrides.assists.recoverEnabled = true
+                overrides.assists.recoverHoldSeconds = value.hold
+            else
+                overrides.assists.repairEnabled = true
+                overrides.assists.repairHoldSeconds = value.hold
+            end
         elseif token:match("^%d+$") then
-            laps = math.floor(tonumber(token))
+            overrides.laps = math.floor(tonumber(token))
         elseif not bad_token then
             bad_token = token
         end
     end
-    return name, mode, laps, assists, bad_token
+    return name, overrides, bad_token
 end
 
--- /race <name> [mode] [laps]: from an idle/finished session start the race; from an active one queue
--- the new race and cut the current one short with a brief abort window before it restarts (ADR-0006).
--- mode/laps are relayed verbatim to clients (race-blind, ADR-0013).
+-- /race <name> [options]: from an idle/finished session start the race; from an active one queue the
+-- new race and cut the current one short with a brief abort window before it restarts (ADR-0006). The
+-- overrides (mode/laps/direction/force/assists) are relayed verbatim to clients (race-blind, ADR-0013/
+-- 0018); the client validates them against the parsed race geometry.
 local function handle_race_command(player_id, player_name, argument)
     if not is_race_admin(player_name) then
         MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
@@ -649,7 +676,7 @@ local function handle_race_command(player_id, player_name, argument)
         return
     end
 
-    local race_name, mode, laps, assists, bad_token = parse_race_args(argument)
+    local race_name, overrides, bad_token = parse_race_args(argument)
 
     if not race_name then
         MP.SendChatMessage(player_id, RACE_USAGE)
@@ -660,25 +687,72 @@ local function handle_race_command(player_id, player_name, argument)
         return
     end
 
-    log_info("beamcomp.race", string.format("/race '%s' by %s (phase %s)%s%s%s%s",
+    local assists = overrides.assists
+    log_info("beamcomp.race", string.format("/race '%s' by %s (phase %s)%s%s%s%s%s%s",
         race_name, player_name, session.phase,
-        mode and (" mode=" .. mode) or "", laps and (" laps=" .. laps) or "",
+        overrides.mode and (" mode=" .. overrides.mode) or "",
+        overrides.laps and (" laps=" .. overrides.laps) or "",
+        overrides.direction and (" dir=" .. overrides.direction) or "",
+        overrides.force and " force" or "",
         assists.recoverEnabled and (" recover=" .. assists.recoverHoldSeconds .. "s") or "",
         assists.repairEnabled and (" repair=" .. assists.repairHoldSeconds .. "s") or ""))
 
+    -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
+    -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
+    -- lets a stale/duplicate reply (e.g. a re-issued /race) be ignored.
+    session.validation_seq = session.validation_seq + 1
+    local nonce = session.validation_seq
+    session.pending_validation = {
+        race = race_name,
+        overrides = overrides,
+        owner_id = player_id,
+        nonce = nonce,
+        deadline = now() + VALIDATION_TIMEOUT,
+    }
+    send_event(player_id, MSG_VALIDATE_RACE, {
+        race = race_name,
+        mode = overrides.mode,
+        laps = overrides.laps,
+        direction = overrides.direction,
+        force = overrides.force,
+        nonce = nonce,
+    })
+end
+
+-- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
+-- phase is re-checked here, not at request time, since the race may have ended while the check was in
+-- flight: from lobby/finished start now; from an active phase queue + run the brief abort window.
+local function commit_validated_race(race_name, owner_id, overrides)
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name, player_id, mode, laps, assists)
-        MP.SendChatMessage(player_id, "BeamComp: starting race '" .. race_name .. "'")
+        start_race(race_name, owner_id, overrides)
+        MP.SendChatMessage(owner_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
 
     session.pending_race = race_name
-    session.pending_owner = player_id
-    session.pending_mode = mode
-    session.pending_laps = laps
-    session.pending_assists = assists
+    session.pending_owner = owner_id
+    session.pending_overrides = overrides
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
-    MP.SendChatMessage(player_id, "BeamComp: restarting with race '" .. race_name .. "'")
+    MP.SendChatMessage(owner_id, "BeamComp: restarting with race '" .. race_name .. "'")
+end
+
+-- The issuer's client's pre-flight verdict (ADR-0019). Match it to the in-flight check by nonce + owner
+-- so a stale or spoofed reply is dropped, then either commit the race (ok) or relay why it was refused.
+local function handle_race_validation(player_id, payload)
+    local pending = session.pending_validation
+    if not pending or type(payload) ~= "table" or payload.nonce ~= pending.nonce
+        or player_id ~= pending.owner_id then
+        return
+    end
+    session.pending_validation = nil
+
+    if payload.ok then
+        commit_validated_race(pending.race, pending.owner_id, pending.overrides)
+    else
+        local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
+        MP.SendChatMessage(pending.owner_id, "BeamComp: " .. reason)
+        log_info("beamcomp.race", string.format("/race '%s' refused: %s", pending.race, reason))
+    end
 end
 
 -- /raceend: force the machine back to lobby from any active phase (safety hatch).
@@ -934,6 +1008,8 @@ local function handle_client_event(player_id, data)
         handle_checkpoint_report(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_LIST then
         handle_race_list(player_id, decoded.payload)
+    elseif decoded.type == MSG_RACE_VALIDATION then
+        handle_race_validation(player_id, decoded.payload)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
