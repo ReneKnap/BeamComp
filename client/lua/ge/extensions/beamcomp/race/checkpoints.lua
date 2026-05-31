@@ -86,6 +86,44 @@ function M.plan(checkpoints, mode, laps)
     return {entries = entries, count = #entries}
 end
 
+-- The checkpoints for a reverse-direction race (ADR-0018): the forward list driven backward. Pure --
+-- no engine calls -- so it matches what BeamNG's own path:reverse() + autoConfig() would emit for the
+-- linear/closed shapes we support: a closed loop keeps CP0 (the start/finish line at array index 1)
+-- in front and reverses the body, an open path reverses wholesale. Each gate normal is negated so the
+-- detector's half-space test (segment_hits_checkpoint) fires when the car crosses from the reverse
+-- side. The stable `index` stays each checkpoint's id (display metadata); only the order changes.
+function M.reverse(checkpoints, closed)
+    local n = #checkpoints
+    local reversed = {}
+
+    -- Closed: CP0 stays the scored lap/finish line, so keep it first and reverse CP1..CP(N-1). Open:
+    -- reverse the whole array. A degenerate (<2) list reverses wholesale either way.
+    local head = (closed and n >= 2) and 1 or 0
+    for i = 1, head do
+        reversed[#reversed + 1] = checkpoints[i]
+    end
+    for i = n, head + 1, -1 do
+        reversed[#reversed + 1] = checkpoints[i]
+    end
+
+    local out = {}
+    for i, checkpoint in ipairs(reversed) do
+        local copy = {
+            index = checkpoint.index,
+            name = checkpoint.name,
+            pos = checkpoint.pos,
+            radius = checkpoint.radius,
+            useAsSplit = checkpoint.useAsSplit,
+        }
+        local normal = checkpoint.normal
+        if normal then
+            copy.normal = {x = -normal.x, y = -normal.y, z = -normal.z}
+        end
+        out[i] = copy
+    end
+    return out
+end
+
 -- A fresh detection-state table for a traversal plan, armed before the first plan entry with no
 -- elapsed time. Held in the caller's reload-surviving M.state; all fields are plain serializable
 -- values.

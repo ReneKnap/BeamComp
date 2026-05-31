@@ -27,14 +27,18 @@ local ASSIST_DEFAULT_HOLD_SECONDS = 5
 local ASSIST_MIN_HOLD_SECONDS = 1
 local ASSIST_MAX_HOLD_SECONDS = 30
 
--- The pose the grid anchors on: the race's `default` start selector, else the first listed
--- start position. Returns {pos, rot} (plain tables) or nil plus a reason.
-local function default_start_pose(race)
+-- The pose the grid anchors on for `direction`: the race's matching start selector (reverse ->
+-- selectors.reverse, forward -> selectors.default), else the first listed start position. A reversible
+-- race resolves selectors.reverse; a *forced* reverse on a track without one (ADR-0019) falls back to
+-- the default start here -- the checkpoint transform is purely computed, so reverse still works.
+-- Returns {pos, rot} (plain tables) or nil plus a reason.
+local function start_pose(race, direction)
     local start_positions = race.startPositions
-    local default_id = start_positions.selectors.default
-    if default_id then
+    local selector = (direction == "reverse") and start_positions.selectors.reverse
+        or start_positions.selectors.default
+    if selector then
         for _, sp in ipairs(start_positions.list) do
-            if sp.id == default_id then
+            if sp.id == selector then
                 return {pos = sp.pos, rot = sp.rot}
             end
         end
@@ -47,29 +51,39 @@ local function default_start_pose(race)
     return nil, "race has no start position"
 end
 
+local FORWARD_PREFAB = "forwardPrefab.prefab.json"
 local REVERSE_PREFAB = "reversePrefab.prefab.json"
 
--- The prefab files to load for a forward race: every shipped prefab except the reverse one
--- (i.e. main + forward, given the parser's fixed {main, forward, reverse} set). Reverse-
--- direction support is a deferred feature, so its prefab is excluded here.
-local function forward_prefabs(prefab_files)
-    local forward = {}
+-- The prefab files to load for `direction`: every shipped prefab except the opposite direction's one
+-- (the parser's fixed set is {main, forward, reverse}). Forward keeps main + forward and skips
+-- reverse; reverse keeps main + reverse and skips forward (ADR-0018).
+local function direction_prefabs(prefab_files, direction)
+    local skip = (direction == "reverse") and FORWARD_PREFAB or REVERSE_PREFAB
+    local kept = {}
     for _, file in ipairs(prefab_files or {}) do
-        if file:sub(-#REVERSE_PREFAB) ~= REVERSE_PREFAB then
-            forward[#forward + 1] = file
+        if file:sub(-#skip) ~= skip then
+            kept[#kept + 1] = file
         end
     end
-    return forward
+    return kept
 end
 
--- Resolve the effective race mode + lap count for this start (ADR-0013). The server relays the
--- admin's /race tokens but cannot validate them against geometry (race-blind, ADR-0005), so the
--- check lands here:
+-- Resolve the effective travel direction for this start (ADR-0018/0019). The pre-flight check already
+-- gated a reverse request against meta.reversible (and `force` overrides it), so a raceStart that
+-- reaches here is committed: reverse when asked, forward otherwise. A forced reverse on a non-reversible
+-- track still works -- start_pose falls back to the default selector when reverse is absent, and the
+-- checkpoint transform is purely computed.
+local function resolve_direction(payload)
+    return payload.direction == "reverse" and "reverse" or "forward"
+end
+
+-- Resolve the effective race mode + lap count for this start (ADR-0013/0018/0019):
 --   mode -- the payload override ("sprint"/"circuit") if given, else auto from meta.closed.
 --   laps -- circuit only: the payload override else meta.defaultLaps, clamped >= 1; sprint is always
 --           a single pass (laps = 1).
--- A circuit forced on a non-closed race cannot run as a loop, so it falls back to sprint and returns
--- a warning the caller surfaces (the client cannot reply in chat). Returns mode, laps, warning (nil).
+-- The pre-flight check (ADR-0019) refuses a circuit on an open race unless forced, so circuit here is
+-- either valid or a deliberate force -- kept as-is. The sprint fallback is defensive only. Returns
+-- mode, laps.
 local function resolve_mode(race, payload)
     local closed = race.meta and race.meta.closed
     local requested = payload.mode
@@ -81,9 +95,9 @@ local function resolve_mode(race, payload)
         mode = closed and "circuit" or "sprint"
     end
 
-    local warning
-    if mode == "circuit" and not closed then
-        warning = "circuit requested on a non-loop race -- running as sprint"
+    -- Defensive: a circuit on an open race only reaches here when forced; if some non-forced path ever
+    -- did, fall back to sprint rather than build an unloopable plan.
+    if mode == "circuit" and not closed and not payload.force then
         mode = "sprint"
     end
 
@@ -93,7 +107,7 @@ local function resolve_mode(race, payload)
         laps = math.max(1, math.min(MAX_LAPS, math.floor(requested_laps)))
     end
 
-    return mode, laps, warning
+    return mode, laps
 end
 
 -- A valid hold time from the payload, defaulted + clamped (ADR-0017).
@@ -114,30 +128,28 @@ local function resolve_assists(payload)
     }
 end
 
--- Build the race-start state for a raceStart payload, or return nil plus a reason.
-function M.prepare(payload)
-    if type(payload) ~= "table" or type(payload.race) ~= "string" then
-        return nil, "malformed raceStart payload"
-    end
-
-    -- Resolve against this map's races only (ADR-0005: only the client knows a race's map, and a
-    -- race only starts on its own map). Skip the map filter if the level is undetectable.
+-- Resolve a race payload to its parsed model + locator, or nil plus a reason. Shared by the pre-flight
+-- check (M.validate) and the actual start (M.prepare): both need the same map-scoped discovery + parse
+-- (ADR-0005) and the same not-found / wrong-map / ambiguous / parse-error reasons.
+local function resolve_race(payload)
+    -- Resolve against this map's races only (only the client knows a race's map, and a race only
+    -- starts on its own map). Skip the map filter if the level is undetectable.
     local loaded = maps.current()
     local locator, miss = discovery.resolve(payload.race, loaded)
     if not locator then
         if miss and miss.code == "ambiguous" then
-            return nil, "ambiguous race name '" .. payload.race .. "'"
+            return nil, nil, "ambiguous race name '" .. payload.race .. "'"
         end
         -- Not on this map: if the name does pick out a race elsewhere, say so -- more helpful
         -- than a bare "not found" on a multi-map server.
         if loaded then
             local elsewhere = discovery.resolve(payload.race)
             if elsewhere and elsewhere.map and not maps.matches(loaded, elsewhere.map) then
-                return nil, "race is on map '" .. elsewhere.map .. "' -- you are on '"
+                return nil, nil, "race is on map '" .. elsewhere.map .. "' -- you are on '"
                     .. loaded .. "'"
             end
         end
-        return nil, "race not found: '" .. payload.race .. "'"
+        return nil, nil, "race not found: '" .. payload.race .. "'"
     end
 
     log("I", LOG_TAG, "race map '" .. tostring(locator.map) .. "', loaded map '"
@@ -145,10 +157,49 @@ function M.prepare(payload)
 
     local race, parse_err = parser.parse(locator.raceFile)
     if not race then
-        return nil, "could not parse race: " .. tostring(parse_err)
+        return nil, nil, "could not parse race: " .. tostring(parse_err)
+    end
+    return race, locator, nil
+end
+
+-- The issuing client's pre-flight verdict on a /race's options (ADR-0019). The race-blind server relays
+-- the options here; we resolve + parse the race locally and report whether it can run as asked. A bad
+-- name / wrong map / ambiguous name, or a geometry mismatch the admin did not `force` (circuit on an
+-- open race, reverse on a non-reversible one), is refused with a reason; otherwise -- or with `force` --
+-- it is ok. Returns {ok = bool, reason = string?}.
+function M.validate(payload)
+    if type(payload) ~= "table" or type(payload.race) ~= "string" then
+        return {ok = false, reason = "malformed race request"}
+    end
+    local race, _, err = resolve_race(payload)
+    if not race then
+        return {ok = false, reason = err}
+    end
+    if not payload.force then
+        if payload.direction == "reverse" and not (race.meta and race.meta.reversible) then
+            return {ok = false, reason = "not reversible -- add 'force' to reverse it anyway"}
+        end
+        if payload.mode == "circuit" and not (race.meta and race.meta.closed) then
+            return {ok = false, reason = "not a loop -- add 'force' to run as circuit anyway"}
+        end
+    end
+    return {ok = true}
+end
+
+-- Build the race-start state for a raceStart payload, or return nil plus a reason.
+function M.prepare(payload)
+    if type(payload) ~= "table" or type(payload.race) ~= "string" then
+        return nil, "malformed raceStart payload"
     end
 
-    local base_pose, pose_err = default_start_pose(race)
+    local race, locator, err = resolve_race(payload)
+    if not race then
+        return nil, err
+    end
+
+    local direction = resolve_direction(payload)
+
+    local base_pose, pose_err = start_pose(race, direction)
     if not base_pose then
         return nil, pose_err
     end
@@ -167,15 +218,19 @@ function M.prepare(payload)
         return nil, "invalid slot " .. tostring(my_slot)
     end
 
-    local mode, laps, mode_warning = resolve_mode(race, payload)
-    local plan = checkpoints.plan(race.checkpoints, mode, laps)
-    if mode_warning then
-        log("W", LOG_TAG, "raceStart: " .. mode_warning)
+    local mode, laps = resolve_mode(race, payload)
+
+    -- Reverse drives the checkpoints backward (ADR-0018): derive the reversed list (order + negated
+    -- gate normals) before planning, so the plan, detector, and in-world markers all use it.
+    local race_checkpoints = race.checkpoints
+    if direction == "reverse" then
+        race_checkpoints = checkpoints.reverse(race.checkpoints, race.meta and race.meta.closed)
     end
+    local plan = checkpoints.plan(race_checkpoints, mode, laps)
 
     log("I", LOG_TAG, string.format(
-        "race '%s' ready: slot %d of %d, mode=%s laps=%d (%d crossings) at (%.1f, %.1f, %.1f)",
-        race.meta.name, my_slot, count, mode, laps, plan.count,
+        "race '%s' ready: slot %d of %d, mode=%s laps=%d dir=%s (%d crossings) at (%.1f, %.1f, %.1f)",
+        race.meta.name, my_slot, count, mode, laps, direction, plan.count,
         my_pose.pos.x, my_pose.pos.y, my_pose.pos.z))
 
     return {
@@ -185,15 +240,15 @@ function M.prepare(payload)
         myPose = my_pose,
         gridPoses = poses,
         roster = roster,
-        prefabFiles = forward_prefabs(race.props.prefabFiles),
+        prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
         -- Ordered, visible-only checkpoints with a stable 0-based index (ADR-0005); consumed by
-        -- the racing-phase checkpoint detector (race/checkpoints.lua).
-        checkpoints = race.checkpoints,
-        -- Resolved race mode + lap count and the detector's traversal plan (ADR-0013).
+        -- the racing-phase checkpoint detector (race/checkpoints.lua). Reversed for a reverse race.
+        checkpoints = race_checkpoints,
+        -- Resolved race mode + lap count, travel direction, and the detector's plan (ADR-0013/0018).
         mode = mode,
         laps = laps,
+        direction = direction,
         plan = plan,
-        modeWarning = mode_warning,
         -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.
         assists = resolve_assists(payload),
     }

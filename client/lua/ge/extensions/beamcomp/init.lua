@@ -223,15 +223,6 @@ local function handle_race_start(payload)
         msg = string.format("Slot %d -- start (%.0f, %.0f, %.0f)",
             race.mySlot, race.myPose.pos.x, race.myPose.pos.y, race.myPose.pos.z),
     })
-    -- The server can't validate the requested mode against geometry (race-blind); a fallback was
-    -- decided client-side in race/start (ADR-0013), so surface it here.
-    if race.modeWarning then
-        guihooks.trigger("toastrMsg", {
-            type = "warning",
-            title = "BeamComp",
-            msg = race.modeWarning,
-        })
-    end
 end
 
 -- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
@@ -355,6 +346,19 @@ local function handle_list_races(_payload)
     send_to_server("raceList", {lines = racelist.build(maps.current())})
 end
 
+-- Answer the server's pre-flight validateRace request (ADR-0019): the race-blind server relays the
+-- /race options here, we vet them against the locally-parsed race (race/start.validate) and report the
+-- verdict back. The server starts on ok, or posts our reason to the issuing admin on a refusal. The
+-- nonce is echoed so the server can match the reply to its in-flight check.
+local function handle_validate_race(payload)
+    local result = race_start.validate(payload)
+    send_to_server("raceValidation", {
+        nonce = type(payload) == "table" and payload.nonce or nil,
+        ok = result.ok,
+        reason = result.reason,
+    })
+end
+
 -- Store the server-issued finish-grace countdown (ADR-0014): once the first player finishes, every
 -- still-racing player has this many seconds to finish or be marked DNF. Ticked down locally in
 -- onUpdate; shown on the HUD only while the local player has not finished.
@@ -374,6 +378,7 @@ local HANDLERS = {
     racePhase = handle_race_phase,
     standings = handle_standings,
     listRaces = handle_list_races,
+    validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
 }
 
