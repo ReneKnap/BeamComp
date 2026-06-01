@@ -14,7 +14,11 @@
 -- from real world geometry, NOT from a guessed quaternion axis. Callers pass the start/finish gate
 -- normal (the direction of travel through CP0); the grid lays the field out behind it. When no gate
 -- normal exists the grid derives forward from the start pose itself (see forward_from_base_rot).
--- The headingDeg param rotates the whole grid (positions + car headings) about vertical on top of that.
+-- The headingDeg param rotates the whole grid (positions + car headings) about vertical on top of
+-- that. Each pose carries the grid's `forward` travel axis (the direction the car should face) when
+-- it comes from a gate normal -- the reliable source -- so the placement can orient the car to the
+-- grid instead of the authored start quaternion; `forward` is nil when there is no gate normal, in
+-- which case the placement keeps the start pose's own heading.
 
 local M = {}
 
@@ -182,14 +186,27 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
     local p = resolved_params(params)
     local heading_rad = math.rad(p.heading_deg)
 
+    -- The grid's forward axis (direction of travel off the line), preferring the gate normal. The
+    -- gate normal is the only reliable heading source; when it is present and horizontal that axis is
+    -- handed to the placement as `facing` so the car is oriented to the grid (the layout) rather than
+    -- the authored start quaternion. With no usable gate normal `facing` stays nil and the placement
+    -- keeps the start pose's heading (rot), so races with no gate normal are unchanged.
+    local facing = gate_normal and horizontal_unit(gate_normal) or nil
     local forward = resolve_forward(base_rot, gate_normal)
+
+    -- headingDeg rotates the whole grid -- layout axes and car headings alike -- on top of that.
     if p.heading_deg ~= 0 then
         forward = rotate_horizontal(forward, heading_rad)
+        if facing then
+            facing = rotate_horizontal(facing, heading_rad)
+        end
     end
     -- Right-hand horizontal perpendicular to forward (forward x up). Which column is left vs right is
     -- arbitrary -- the columns are symmetric -- so any consistent perpendicular is fine.
     local right = {x = forward.y, y = -forward.x, z = 0}
 
+    -- Fallback heading when there is no gate normal: the authored start pose, turned about vertical by
+    -- headingDeg (the historical behaviour). The placement uses this only when `facing` is nil.
     local rot = base_rot
     if p.heading_deg ~= 0 then
         rot = quat_mul(z_quat(heading_rad), base_rot)
@@ -217,6 +234,9 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
                 z = base_pos.z,
             },
             rot = {x = rot.x, y = rot.y, z = rot.z, w = rot.w},
+            -- The travel axis the car should face, from the gate normal (+ headingDeg); nil when no
+            -- gate normal, so the placement falls back to `rot`. Shared read-only across slots.
+            forward = facing,
         }
     end
     return poses

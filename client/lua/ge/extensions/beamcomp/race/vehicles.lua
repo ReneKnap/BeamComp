@@ -112,9 +112,57 @@ local function capture_own_spec()
     return spec
 end
 
--- Spawn one vehicle at a grid pose (plain {pos = {x,y,z}, rot = {x,y,z,w}} tables). Uses the
--- captured spec when present, else the engine's default model. Returns the new vehicle, or nil
--- plus a reason.
+-- The orientation quaternion for a grid pose, BEFORE the 180-degree Z flip each placement path
+-- applies. Prefer the grid's `forward` travel axis -- face the car down the grid via quatFromDir,
+-- the recipe verified in recover_to -- so the car is oriented to the grid, not the authored start
+-- quaternion. Fall back to the start rotation (`rot`) when the pose carries no forward (no gate
+-- normal). quatFromDir/vec3/quat are engine globals, kept here rather than in the pure grid module.
+local function pose_orientation(pose)
+    if pose.forward then
+        return quatFromDir(vec3(pose.forward.x, pose.forward.y, pose.forward.z), vec3(0, 0, 1))
+    end
+    return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
+end
+
+-- The world position to place the reference point at so the car's FRONT-centre lands on the grid
+-- pose, instead of the reference point BeamNG puts there (which sits mid-car, ~on the seats).
+--
+-- The spawn bounding box is measured from the car's CURRENT, pre-teleport transform -- a
+-- getSpawnWorldOOBB read right after setPositionRotation still reflects the old transform, so we must
+-- measure before moving. We learn the reference->front-centre offset there (decomposed along the
+-- car's current forward/right via the OOBB centre and its forward half-length, getHalfExtents().y),
+-- then re-apply it along the grid's target forward/right. This needs no vehicle-local axis or
+-- quaternion-flip assumption -- it reads the real geometry and re-projects it. Returns the grid pose
+-- unchanged when there is no forward axis or the bbox API is unavailable (keeps the centre anchor).
+local function front_anchored_target(veh, pose)
+    local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
+    if not pose.forward then
+        return base
+    end
+    local ok, target = pcall(function()
+        local bb = veh:getSpawnWorldOOBB()
+        local fwd = veh:getDirectionVector()
+        fwd = vec3(fwd.x, fwd.y, 0)
+        fwd:normalize()
+        local right = vec3(fwd.y, -fwd.x, 0)
+        local to_centre = bb:getCenter() - veh:getPosition()
+        -- reference -> front-centre, split into the car's own forward (+ half-length) and lateral.
+        local forward_dist = to_centre:dot(fwd) + bb:getHalfExtents().y
+        local lateral_dist = to_centre:dot(right)
+        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
+        target_fwd:normalize()
+        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
+        return base - (target_fwd * forward_dist + target_right * lateral_dist)
+    end)
+    if ok and target then
+        return target
+    end
+    log("W", LOG_TAG, "front-anchor unavailable; centre-anchoring: " .. tostring(target))
+    return base
+end
+
+-- Spawn one vehicle at a grid pose (plain {pos, rot, forward?} tables). Uses the captured spec when
+-- present, else the engine's default model. Returns the new vehicle, or nil plus a reason.
 local function spawn_vehicle_at(pose, spec)
     if type(core_vehicles) ~= "table" or type(core_vehicles.spawnNewVehicle) ~= "function" then
         return nil, "core_vehicles.spawnNewVehicle unavailable"
@@ -124,14 +172,13 @@ local function spawn_vehicle_at(pose, spec)
         return nil, "no vehicle model to spawn"
     end
 
-    -- spawnNewVehicle wants vec3/quat userdata, not the plain tables myPose carries. Heading
-    -- caveat: spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0)
-    -- * rot). We pass the pose rotation straight through; if spawned cars face opposite the
-    -- start direction, pre-multiply rot by quat(0,0,1,0) here -- the spawn analogue of
-    -- grid.lua's VEHICLE_FORWARD_LOCAL knob, only verifiable in-game.
+    -- spawnNewVehicle wants vec3/quat userdata, not the plain tables myPose carries. Heading caveat:
+    -- spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0) * rot), so we
+    -- pass pose_orientation straight through -- the internal flip then turns a forward-derived
+    -- quatFromDir into a car facing down the grid, matching repair_and_place's explicit flip.
     local opt = {
         pos = vec3(pose.pos.x, pose.pos.y, pose.pos.z),
-        rot = quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w),
+        rot = pose_orientation(pose),
     }
     if spec then
         opt.config = spec.config
@@ -203,8 +250,11 @@ end
 -- the spawn path applies internally and the engine's repair branch applies explicitly; verified
 -- in-game at handover.
 local function repair_and_place(veh, pose)
-    local rot = quat(0, 0, 1, 0) * quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
-    veh:setPositionRotation(pose.pos.x, pose.pos.y, pose.pos.z, rot.x, rot.y, rot.z, rot.w)
+    local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
+    -- Front-anchor the car: measure the target from its current transform BEFORE teleporting (the
+    -- world bbox is stale right after setPositionRotation), then place once.
+    local pos = front_anchored_target(veh, pose)
+    veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
 end
 
 -- Place this client's own car at `pose` (the grid start the server assigned). Two paths (ADR-0007):
