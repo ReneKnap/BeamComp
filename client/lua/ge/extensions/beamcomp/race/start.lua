@@ -21,12 +21,10 @@ local LOG_TAG = "beamcomp.race"
 -- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
 local MAX_LAPS = 1000
 
--- Metres the start grid is pushed back behind the start/finish line, straight back along the travel
--- axis (the start/finish gate normal, or the start pose when there is none -- grid.lua resolves it).
--- P1 ends up roughly where a later row stood. This clears the start volume and lets a circuit's lap-1
--- clock start on a real line crossing rather than at t=0 (ADR-0022). Applied to sprint and circuit
--- alike; tune if the front row still sits on/past the line.
-local GRID_START_SETBACK = 15.0
+-- The start grid's default 15 m setback behind the line (it clears CP0's volume so a circuit's lap-1
+-- clock starts on a real line crossing, ADR-0022) now lives in race/grid as the default offsetForward.
+-- A race with a server-stored custom grid relays its own params in raceStart.gridParams (ADR-0023);
+-- absent that, grid.poses falls back to the historical staggered two-column layout.
 
 -- Recover/repair assist hold-time bounds (ADR-0017). The server already clamps, but this is a trust
 -- boundary (ADR-0005), so the client re-clamps and defaults a missing/garbage value.
@@ -135,6 +133,20 @@ local function resolve_assists(payload)
     }
 end
 
+-- The grid param block to apply for `direction`, picked from a relayed raceStart.gridParams (ADR-0023).
+-- Forward uses the `forward` block; reverse uses the `reverse` block and, when a grid has none, returns
+-- nil so grid.poses falls back to the default layout for the reverse run. A nil gridParams (no custom
+-- grid for this race) returns nil too -- the historical procedural layout.
+local function grid_params_for(grid_params, direction)
+    if type(grid_params) ~= "table" then
+        return nil
+    end
+    if direction == "reverse" then
+        return grid_params.reverse
+    end
+    return grid_params.forward
+end
+
 -- Resolve a race payload to its parsed model + locator, or nil plus a reason. Shared by the pre-flight
 -- check (M.validate) and the actual start (M.prepare): both need the same map-scoped discovery + parse
 -- (ADR-0005) and the same not-found / wrong-map / ambiguous / parse-error reasons.
@@ -173,12 +185,14 @@ end
 -- the options here; we resolve + parse the race locally and report whether it can run as asked. A bad
 -- name / wrong map / ambiguous name, or a geometry mismatch the admin did not `force` (circuit on an
 -- open race, reverse on a non-reversible one), is refused with a reason; otherwise -- or with `force` --
--- it is ok. Returns {ok = bool, reason = string?}.
+-- it is ok. Returns {ok = bool, reason = string?, raceId = string?}. raceId is the canonical map-scoped
+-- id (ADR-0005) the server keys the default-grid lookup on (ADR-0023), so the default resolves whatever
+-- shorthand the admin typed for /race.
 function M.validate(payload)
     if type(payload) ~= "table" or type(payload.race) ~= "string" then
         return {ok = false, reason = "malformed race request"}
     end
-    local race, _, err = resolve_race(payload)
+    local race, locator, err = resolve_race(payload)
     if not race then
         return {ok = false, reason = err}
     end
@@ -190,7 +204,7 @@ function M.validate(payload)
             return {ok = false, reason = "not a loop -- add 'force' to run as circuit anyway"}
         end
     end
-    return {ok = true}
+    return {ok = true, raceId = locator.id}
 end
 
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
@@ -228,14 +242,14 @@ function M.prepare(payload)
         race_checkpoints = checkpoints.reverse(race.checkpoints, race.meta and race.meta.closed)
     end
 
-    -- Push the whole grid GRID_START_SETBACK metres straight back behind the line, along the travel
-    -- axis taken from the start/finish gate normal (CP0 = race_checkpoints[1], already reversed for a
-    -- reverse race) so the field sits behind the line and a circuit's lap-1 clock starts on a real
-    -- line crossing (ADR-0022). The normal is the direction of travel through the gate; grid.lua lays
-    -- the field out behind it and falls back to the start pose when a race has no gate normal. Applied
-    -- to sprint and circuit alike.
+    -- Lay the grid out behind the line along the travel axis taken from the start/finish gate normal
+    -- (CP0 = race_checkpoints[1], already reversed for a reverse race) so the field sits behind the line
+    -- and a circuit's lap-1 clock starts on a real line crossing (ADR-0022). A server-stored custom grid
+    -- relays its params per direction in raceStart.gridParams (ADR-0023): use the matching block, and for
+    -- a reverse race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
     local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
-    local poses = grid.poses(base_pose.pos, base_pose.rot, count, GRID_START_SETBACK, gate_normal)
+    local grid_params = grid_params_for(payload.gridParams, direction)
+    local poses = grid.poses(base_pose.pos, base_pose.rot, count, grid_params, gate_normal)
     local my_pose = poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
@@ -267,6 +281,52 @@ function M.prepare(payload)
         -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.
         assists = resolve_assists(payload),
     }
+end
+
+-- Resolve just the grid anchor for a race on this map: the base start pose + the start/finish gate
+-- normal the grid lays out behind, for `direction` ("forward"/"reverse"). Used by the in-game grid
+-- editor (race/grideditor) to preview poses against the same geometry a real race start uses, without
+-- spawning anything. Returns {base_pose = {pos, rot}, gate_normal = {x,y,z}|nil, raceId = string} or nil
+-- plus a reason. raceId is the canonical id the default-grid assignment is keyed on (ADR-0023).
+function M.anchor(race_name, direction)
+    if type(race_name) ~= "string" then
+        return nil, "no race name"
+    end
+    local race, locator, err = resolve_race({race = race_name})
+    if not race then
+        return nil, err
+    end
+
+    direction = (direction == "reverse") and "reverse" or "forward"
+    local base_pose, pose_err = start_pose(race, direction)
+    if not base_pose then
+        return nil, pose_err
+    end
+
+    local race_checkpoints = race.checkpoints
+    if direction == "reverse" then
+        race_checkpoints = checkpoints.reverse(race.checkpoints, race.meta and race.meta.closed)
+    end
+    local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
+
+    return {base_pose = base_pose, gate_normal = gate_normal, raceId = locator.id}
+end
+
+-- Resolve a race name/shorthand to its canonical map-scoped id without parsing it, for the grid
+-- editor's explicit assign (ADR-0023): it needs the id the server keys defaults on, even when not in an
+-- edit session. Discovery-only (no parser), scoped to the current map. Returns the id or nil + a reason.
+function M.resolve_id(race_name)
+    if type(race_name) ~= "string" or race_name == "" then
+        return nil, "no race name"
+    end
+    local locator, miss = discovery.resolve(race_name, maps.current())
+    if not locator then
+        if miss and miss.code == "ambiguous" then
+            return nil, "ambiguous race name '" .. race_name .. "'"
+        end
+        return nil, "race not found: '" .. race_name .. "'"
+    end
+    return locator.id
 end
 
 return M

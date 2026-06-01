@@ -43,6 +43,7 @@ local lock = require("beamcomp/race/lock")
 local hud = require("beamcomp/race/hud")
 local racelist = require("beamcomp/race/racelist")
 local maps = require("beamcomp/race/maps")
+local grideditor = require("beamcomp/race/grideditor")
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
 -- cone-spawn burst on every other client (race/spawn_mute, ADR-0020 finding #2b).
@@ -419,6 +420,11 @@ local function handle_validate_race(payload)
         nonce = type(payload) == "table" and payload.nonce or nil,
         ok = result.ok,
         reason = result.reason,
+        -- The server keys custom-grid resolution on the issuer's map + the canonical race id (ADR-0023):
+        -- only the client knows them. Sent on every verdict; harmless when no grid is configured. raceId
+        -- lets a default assigned for the full id resolve whatever shorthand was typed for /race.
+        map = maps.current(),
+        raceId = result.raceId,
     })
 end
 
@@ -443,6 +449,45 @@ local function handle_results_toggle()
     log("I", RACE_LOG_TAG, "results card " .. (M.state.results_hidden and "hidden" or "shown"))
 end
 
+-- Surface grid-editor feedback both as a toast (visible while in-game) and in the log (visible in the
+-- console where the command was typed). `kind` is a toastr type ("info"/"warning").
+local function editor_feedback(msg, kind)
+    if guihooks then
+        guihooks.trigger("toastrMsg", {type = kind or "info", title = "BeamComp grid", msg = msg})
+    end
+    log("I", RACE_LOG_TAG, "grid editor: " .. msg)
+end
+
+-- Open a saved grid the server returned for a beamcomp_grid_edit fetch (ADR-0023). `found` false means
+-- no such grid for this map; otherwise hand the record to the editor, which re-anchors to its race.
+local function handle_grid_data(payload)
+    if type(payload) ~= "table" or not payload.found then
+        local name = type(payload) == "table" and payload.name or "?"
+        editor_feedback("no saved grid '" .. tostring(name) .. "' on this map", "warning")
+        return
+    end
+    local ok, result = grideditor.open({
+        forward = payload.forward,
+        reverse = payload.reverse,
+        race = payload.race,
+    })
+    if ok then
+        editor_feedback("editing saved grid '" .. tostring(payload.name) .. "' for " .. tostring(result))
+    else
+        editor_feedback(tostring(result), "warning")
+    end
+end
+
+-- Post the current map's saved grid names from a beamcomp_grid_list request (ADR-0023).
+local function handle_grid_list(payload)
+    local names = type(payload) == "table" and payload.names or nil
+    if type(names) ~= "table" or #names == 0 then
+        editor_feedback("no saved grids on this map")
+        return
+    end
+    editor_feedback("saved grids: " .. table.concat(names, ", "))
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
@@ -452,6 +497,8 @@ local HANDLERS = {
     validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
     resultsToggle = handle_results_toggle,
+    gridData = handle_grid_data,
+    gridList = handle_grid_list,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -476,32 +523,22 @@ local function on_server_event(data)
     handler(payload)
 end
 
--- Draw a slot-colored pillar + label at every grid pose (own slot highlighted), harmonized with
--- the checkpoint columns. Immediate-mode: redrawn each frame from M.state, so there are no scene
--- objects to clean up -- clearing M.state.race removes the markers.
-local function draw_grid_markers(race)
-    local mine = ColorF(0.2, 1.0, 0.3, 0.9)
-    local other = ColorF(1.0, 0.8, 0.1, 0.7)
-    local centers = {}
-    for index, pose in ipairs(race.gridPoses) do
+-- Draw the grid editor's live preview poses as cyan pillars with P-slot labels (ADR-0023). Immediate-
+-- mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false) removes them
+-- with no scene objects to clean up.
+local function draw_editor_grid()
+    if not grideditor.state.active or not grideditor.state.poses then
+        return
+    end
+    local color = ColorF(0.2, 0.8, 1.0, 0.85)
+    local label_fg = ColorF(1, 1, 1, 1)
+    local label_bg = ColorI(0, 0, 0, 255)
+    for index, pose in ipairs(grideditor.state.poses) do
         local p = pose.pos
         local base = vec3(p.x, p.y, p.z)
         local top = vec3(p.x, p.y, p.z + GRID_COLUMN_HEIGHT)
-        centers[index] = top
-        local slot = index - 1
-        debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, (slot == race.mySlot) and mine or other)
-    end
-
-    -- Labels last + lower-confidence API: if drawTextAdvanced/ColorI mismatch here, the
-    -- pillars above have already drawn this frame (the onPreRender pcall warns once).
-    local label_fg = ColorF(1, 1, 1, 1)
-    local label_bg = ColorI(0, 0, 0, 255)
-    for index, center in ipairs(centers) do
-        local slot = index - 1
-        local entry = race.roster[index]
-        local name = entry and entry.name
-        local label = name and ("P" .. slot .. " " .. name) or ("P" .. slot)
-        debugDrawer:drawTextAdvanced(center, label, label_fg, true, false, label_bg)
+        debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, color)
+        debugDrawer:drawTextAdvanced(top, "P" .. (index - 1), label_fg, true, false, label_bg)
     end
 end
 
@@ -645,7 +682,7 @@ end
 
 -- Draw the next expected checkpoint -- and the one after it as a yellow-posted look-ahead -- as
 -- singleplayer-style gates, so the player sees where to head next and can plan the line. Immediate-
--- mode like draw_grid_markers (redrawn each frame, nothing to clean up). The next checkpoint is the
+-- mode (redrawn each frame, nothing to clean up). The next checkpoint is the
 -- plan entry at detection.seq + 1, the look-ahead the entry after it; each cursor indexes the
 -- checkpoints array (ADR-0013) -- so on a circuit they point at CP1 first and back at the start/
 -- finish line (CP0) for the final crossing.
@@ -1337,21 +1374,29 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
 end
 
 function M.onPreRender(dtReal, dtSim, dtRaw)
-    local race = M.state.race
-    if not race or not debugDrawer then
+    if not debugDrawer then
+        return
+    end
+    -- Nothing to draw with no race and no edit session (the common free-roam case): skip before building
+    -- the pcall closure so the idle path stays zero-work.
+    if not M.state.race and not grideditor.state.active then
         return
     end
     -- Guard the draws: debugDrawer's exact API is runtime-confirmed here, so a mismatch warns once
-    -- rather than spamming every frame. The next-checkpoint marker only shows while racing.
+    -- rather than spamming every frame. The editor preview draws independent of a race (it is used in
+    -- free-roam); the next-checkpoint marker only while a race is racing.
     local ok, err = pcall(function()
-        draw_grid_markers(race)
-        local detection = M.state.detection
-        if M.state.phase == "racing" and detection and not detection.done then
-            -- Use the same owned car the detector crosses checkpoints with (step_detection), so the
-            -- posts face the point that actually triggers the gate, not a different camera vehicle.
-            local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
-            local car_pos = own_car and own_car:getPosition()
-            draw_next_checkpoint(race, detection, car_pos, dtReal)
+        draw_editor_grid()
+        local race = M.state.race
+        if race then
+            local detection = M.state.detection
+            if M.state.phase == "racing" and detection and not detection.done then
+                -- Use the same owned car the detector crosses checkpoints with (step_detection), so the
+                -- posts face the point that actually triggers the gate, not a different camera vehicle.
+                local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+                local car_pos = own_car and own_car:getPosition()
+                draw_next_checkpoint(race, detection, car_pos, dtReal)
+            end
         end
     end)
     if not ok and not M.state.marker_warned then
@@ -1365,6 +1410,7 @@ function M.onExtensionUnloaded()
         RemoveEventHandler(EVENT_CHANNEL, "beamcomp")
     end
     M.state.registered = false
+    grideditor.clear()
     countdown.clear()
     hud.clear()
     hud.hide()
@@ -1391,6 +1437,124 @@ function M.onExtensionUnloaded()
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
     M.state.phase = nil
     log("I", LOG_TAG, "unloaded")
+end
+
+-- The grid-editor command surface (ADR-0023). These are intentionally GLOBAL so they can be typed
+-- straight into the BeamNG GE Lua console (the only authoring UI this iteration). Each is a thin
+-- wrapper over race/grideditor (preview, client-local), with save/assign/fetch/list going over
+-- send_to_server (server owns the shared grids file; save/assign are admin-gated server-side).
+-- Knobs (beamcomp_grid_set):
+--   offsetForward  -- shift the whole grid forward/back along the travel axis (m)
+--   offsetLateral  -- shift the whole grid left/right (m)
+--   rowGap         -- spacing between positions front-to-back (m)
+--   colGap         -- spacing between positions left-to-right (m)
+--   headingDeg     -- rotate the whole grid about vertical (deg)
+--   rows           -- number of rows (columns = ceil(field / rows); columns auto-stagger by rowGap/cols)
+
+-- GE console command (intentionally global): start a fresh grid from the track's generated layout.
+function beamcomp_grid_new(race_name)
+    local ok, reason = grideditor.start_fresh(race_name)
+    if ok then
+        editor_feedback("editing new grid for '" .. tostring(reason)
+            .. "' -- tune with beamcomp_grid_set(\"<knob>\", <value>)")
+    else
+        editor_feedback(tostring(reason), "warning")
+    end
+end
+
+-- GE console command (intentionally global): open a SAVED grid by name for further editing. The grid
+-- lives on the server, so we request it (gridFetch); handle_grid_data opens it when the reply arrives.
+function beamcomp_grid_edit(grid_name)
+    if type(grid_name) ~= "string" or grid_name == "" then
+        editor_feedback("usage: beamcomp_grid_edit(\"<gridname>\")", "warning")
+        return
+    end
+    local map = maps.current()
+    if not map then
+        editor_feedback("no map loaded", "warning")
+        return
+    end
+    send_to_server("gridFetch", {map = map, name = grid_name})
+    editor_feedback("opening saved grid '" .. grid_name .. "' ...")
+end
+
+-- GE console command (intentionally global): list the grids saved for the current map (gridListReq).
+function beamcomp_grid_list()
+    local map = maps.current()
+    if not map then
+        editor_feedback("no map loaded", "warning")
+        return
+    end
+    send_to_server("gridListReq", {map = map})
+end
+
+-- GE console command (intentionally global)
+function beamcomp_grid_set(knob, value)
+    local ok, applied = grideditor.set(knob, value)
+    if ok then
+        editor_feedback(tostring(knob) .. " = " .. tostring(applied))
+    else
+        -- On failure the second return is the reason string.
+        editor_feedback(tostring(applied), "warning")
+    end
+end
+
+-- GE console command (intentionally global)
+function beamcomp_grid_dir(direction)
+    local ok, reason = grideditor.set_direction(direction)
+    if ok then
+        editor_feedback("editing " .. tostring(direction) .. " block")
+    else
+        editor_feedback(tostring(reason), "warning")
+    end
+end
+
+-- GE console command (intentionally global)
+function beamcomp_grid_save(name)
+    if type(name) ~= "string" or name == "" then
+        editor_feedback("usage: beamcomp_grid_save(\"<name>\")", "warning")
+        return
+    end
+    if name:find("%s") then
+        -- A name with spaces could never be selected via /race grid=<name> (the arg parser splits on
+        -- whitespace), so reject it at the source.
+        editor_feedback("grid name must not contain spaces", "warning")
+        return
+    end
+    local snapshot = grideditor.snapshot(name)
+    if not snapshot then
+        editor_feedback("not editing -- beamcomp_grid_new(\"<race>\") first", "warning")
+        return
+    end
+    send_to_server("gridSave", snapshot)
+    editor_feedback("saving grid '" .. name .. "' ...")
+end
+
+-- GE console command (intentionally global): bind a saved grid as the default for a race. Race + grid
+-- are explicit, so it works without an active edit session; the race is resolved to its canonical id.
+function beamcomp_grid_assign(race_name, grid_name)
+    if type(race_name) ~= "string" or race_name == "" or type(grid_name) ~= "string" or grid_name == "" then
+        editor_feedback("usage: beamcomp_grid_assign(\"<race>\", \"<gridname>\")", "warning")
+        return
+    end
+    local map = maps.current()
+    if not map then
+        editor_feedback("no map loaded", "warning")
+        return
+    end
+    local race_id, reason = race_start.resolve_id(race_name)
+    if not race_id then
+        editor_feedback(tostring(reason), "warning")
+        return
+    end
+    send_to_server("gridAssign", {map = map, race = race_id, name = grid_name})
+    editor_feedback("assigning '" .. grid_name .. "' as default for " .. race_id .. " ...")
+end
+
+-- GE console command (intentionally global): despawn the preview pillars and leave edit mode.
+function beamcomp_grid_cancel()
+    grideditor.clear()
+    editor_feedback("grid editing ended -- pillars cleared")
 end
 
 return M
