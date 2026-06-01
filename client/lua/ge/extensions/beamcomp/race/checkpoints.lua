@@ -183,4 +183,9 @@ function M.step(state, checkpoints, veh_pos, dt)
     return event
 end
 
+-- The swept crossing predicate, exposed for non-scoring reuse (the HUD lap timer watches the
+-- start/finish line with it; ADR-0022). Detection/scoring still go through M.step -- this only
+-- shares the geometry, it does not advance any plan.
+M.segment_hits = segment_hits_checkpoint
+
 return M

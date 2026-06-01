@@ -38,6 +38,7 @@ local cones = require("beamcomp/race/cones")
 local spawn_mute = require("beamcomp/race/spawn_mute")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
+local laptimer = require("beamcomp/race/laptimer")
 local lock = require("beamcomp/race/lock")
 local hud = require("beamcomp/race/hud")
 local racelist = require("beamcomp/race/racelist")
@@ -106,6 +107,8 @@ M.state = {
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
+    laptimer = nil,      -- circuit lap-clock state (race/laptimer), armed on racing; display only (ADR-0022)
+    results_hidden = false,  -- local-only toggle: hide the finished results card via /results (ADR-0022)
     post_orient = nil,   -- smoothed gate-line angle per checkpoint index, for player-facing posts
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
@@ -152,6 +155,7 @@ local function handle_race_start(payload)
         M.state.race = nil
         M.state.race_car_id = nil
         M.state.detection = nil
+        M.state.laptimer = nil
         M.state.standings = nil
         M.state.grace = nil
         M.state.assist_armed = false
@@ -178,6 +182,7 @@ local function handle_race_start(payload)
     -- Reset checkpoint detection and any stale standings/grace; all are refreshed during the race (the
     -- abort-restart path is finished -> spawning, skipping the lobby reset, so clear them too).
     M.state.detection = nil
+    M.state.laptimer = nil
     M.state.standings = nil
     M.state.grace = nil
     M.state.staging = nil
@@ -306,6 +311,17 @@ local function handle_race_phase(payload)
         else
             log("W", RACE_LOG_TAG, "racing: no traversal plan; checkpoint detection disabled")
         end
+        -- Circuit only: arm the client-side lap clock on the start/finish line (ADR-0022). It is a
+        -- display-only derivation -- no server report -- so it never touches the scored plan above.
+        local race_state = M.state.race
+        if race_state and race_state.mode == "circuit" and race_state.checkpoints
+            and race_state.checkpoints[1] then
+            M.state.laptimer = laptimer.new(race_state.checkpoints[1])
+        else
+            M.state.laptimer = nil
+        end
+        -- Each race starts with its results card shown; a /results toggle only lasts that race.
+        M.state.results_hidden = false
         -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
         -- dedups, so a manually-added copy is not duplicated.
         hud.show()
@@ -336,6 +352,7 @@ local function handle_race_phase(payload)
         M.state.race = nil
         M.state.race_car_id = nil
         M.state.detection = nil
+        M.state.laptimer = nil
         M.state.standings = nil
         M.state.grace = nil
         M.state.staging = nil
@@ -418,6 +435,14 @@ local function handle_finish_grace(payload)
     log("I", RACE_LOG_TAG, string.format("finish grace: %.0fs to finish or DNF", duration))
 end
 
+-- Toggle the local finished-results card on/off (the server relays a /results from this player; ADR-0022).
+-- Local-only and per-player: it just flips a flag the HUD snapshot carries, so a player can look around
+-- after finishing without affecting anyone else.
+local function handle_results_toggle()
+    M.state.results_hidden = not M.state.results_hidden
+    log("I", RACE_LOG_TAG, "results card " .. (M.state.results_hidden and "hidden" or "shown"))
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
@@ -426,6 +451,7 @@ local HANDLERS = {
     listRaces = handle_list_races,
     validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
+    resultsToggle = handle_results_toggle,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -635,6 +661,17 @@ local function draw_next_checkpoint(race, detection, car_pos, dt)
     end
     local final_seq = #entries
 
+    -- Circuit: before the lap clock arms (the run-up from the grid to the line), also draw the
+    -- start/finish line itself, so the player sees the line the lap is counted from -- the scored
+    -- plan's next marker is CP1, not this line (ADR-0022). Once the line is crossed (lt.started) it
+    -- stops here and reappears later as the regular lap/finish marker. Stable index 0 keeps its own
+    -- post-orient cache key, distinct from the next/look-ahead checkpoints. Purely visual.
+    local lt = M.state.laptimer
+    if lt and not lt.started and lt.start_cp then
+        local start_angle = smooth_gate_angle(lt.start_cp, car_pos, dt, cache)
+        draw_checkpoint_marker(lt.start_cp, marker_style(lt.start_cp, false), car_pos, start_angle)
+    end
+
     local next_entry = entries[detection.seq + 1]
     local next_checkpoint = next_entry and race.checkpoints[next_entry.cursor]
     if not next_checkpoint then
@@ -790,6 +827,16 @@ local function on_checkpoint_reached(event, count)
         title = "BeamComp",
         msg = string.format("Checkpoint %d reached @ %.1fs", event.index, event.time),
     })
+    -- A scored crossing of the start/finish line closes a lap on the display clock (ADR-0022). The
+    -- start node is the only plan entry at that stable index, so this fires once per lap, never on the
+    -- body checkpoints. Done before the report so the report carries the just-completed lap's best.
+    local lt = M.state.laptimer
+    if lt and lt.start_cp and event.index == lt.start_cp.index then
+        laptimer.complete_lap(lt, event.time)
+    end
+    -- `bestLap` rides the existing report as an additive field: the server stores the latest per
+    -- player and relays it in the standings (ADR-0022) so the results card can show every player's
+    -- best lap. The server stays race-blind -- it just passes the number through (ADR-0005).
     send_to_server("checkpoint", {
         seq = event.seq,
         index = event.index,
@@ -797,6 +844,7 @@ local function on_checkpoint_reached(event, count)
         lap = event.lap,
         time = event.time,
         count = count,
+        bestLap = lt and lt.best or nil,
     })
 end
 
@@ -823,6 +871,13 @@ local function step_detection(dt_sim)
     local event = checkpoints.step(detection, race.checkpoints, veh_pos, dt_sim)
     if event then
         on_checkpoint_reached(event, detection.plan.count)
+    end
+
+    -- Advance the circuit lap clock with the same car position + race clock (ADR-0022). Until it
+    -- arms on the first start/finish crossing this watches the line; after that it is a no-op and
+    -- lap boundaries arrive through on_checkpoint_reached above.
+    if M.state.laptimer then
+        laptimer.step(M.state.laptimer, veh_pos, detection.elapsed)
     end
 end
 
@@ -874,8 +929,30 @@ local function build_hud_snapshot()
                 time = detection.elapsed
                 lap = detection_lap(detection)
             end
+            -- Lap clock (ADR-0022): best lap is the server-relayed per-player value (so every results
+            -- row has one); the local row prefers its own laptimer for an instant best + the live lap
+            -- time. The header CP count is per-lap on a circuit (resets each lap), cumulative on sprint.
+            local lap_time = nil
+            local best_lap = e.best_lap
+            local cp_in_lap = nil
+            local cp_per_lap = nil
             if is_local then
                 local_dnf = e.dnf and true or false
+                local lt = M.state.laptimer
+                if lt then
+                    best_lap = lt.best or best_lap
+                    if detection and phase == "racing" then
+                        lap_time = laptimer.current(lt, detection.elapsed)
+                    end
+                end
+                if detection and phase == "racing" then
+                    cp_per_lap = (race and race.checkpoints) and #race.checkpoints or checkpoint_count
+                    if (race and race.mode == "circuit") and cp_per_lap > 0 then
+                        cp_in_lap = detection.seq % cp_per_lap
+                    else
+                        cp_in_lap = detection.seq
+                    end
+                end
             end
             entries[i] = {
                 position = e.position,
@@ -888,6 +965,10 @@ local function build_hud_snapshot()
                 isLocal = is_local,
                 lap = lap,
                 lapCount = lap_count,
+                lapTime = lap_time,
+                bestLap = best_lap,
+                cpInLap = cp_in_lap,
+                cpPerLap = cp_per_lap,
                 splits = e.splits,
             }
         end
@@ -935,6 +1016,8 @@ local function build_hud_snapshot()
         entries = entries,
         grace = grace,
         graceCanFinish = grace_can_finish,
+        isCircuit = (race and race.mode == "circuit") or false,
+        resultsHidden = M.state.results_hidden or false,
     }
 end
 
@@ -1297,6 +1380,7 @@ function M.onExtensionUnloaded()
     M.state.race = nil
     M.state.race_car_id = nil
     M.state.detection = nil
+    M.state.laptimer = nil
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
