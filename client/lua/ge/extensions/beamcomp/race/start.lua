@@ -21,6 +21,13 @@ local LOG_TAG = "beamcomp.race"
 -- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
 local MAX_LAPS = 1000
 
+-- Metres the start grid is pushed back behind the start/finish line, along the grid's own row axis
+-- (the same axis the staggered rows already use, so the field keeps its good layout and just sits
+-- further back -- P1 ends up roughly where a later row stood). This clears the start volume and lets a
+-- circuit's lap-1 clock start on a real line crossing rather than at t=0 (ADR-0022). Applied to sprint
+-- and circuit alike; tune if the front row still sits on/past the line.
+local GRID_START_SETBACK = 15.0
+
 -- Recover/repair assist hold-time bounds (ADR-0017). The server already clamps, but this is a trust
 -- boundary (ADR-0005), so the client re-clamps and defaults a missing/garbage value.
 local ASSIST_DEFAULT_HOLD_SECONDS = 5
@@ -212,12 +219,6 @@ function M.prepare(payload)
         count = my_slot + 1
     end
 
-    local poses = grid.poses(base_pose.pos, base_pose.rot, count)
-    local my_pose = poses[my_slot + 1]
-    if not my_pose then
-        return nil, "invalid slot " .. tostring(my_slot)
-    end
-
     local mode, laps = resolve_mode(race, payload)
 
     -- Reverse drives the checkpoints backward (ADR-0018): derive the reversed list (order + negated
@@ -226,6 +227,17 @@ function M.prepare(payload)
     if direction == "reverse" then
         race_checkpoints = checkpoints.reverse(race.checkpoints, race.meta and race.meta.closed)
     end
+
+    -- Push the whole grid GRID_START_SETBACK metres back along its OWN row axis (handled inside
+    -- grid.poses, the exact transform the rows already use) so the field keeps its existing good
+    -- layout and just sits behind the line -- clearing the start/finish volume so a circuit's lap-1
+    -- clock starts on a real line crossing (ADR-0022). Applied to sprint and circuit alike.
+    local poses = grid.poses(base_pose.pos, base_pose.rot, count, GRID_START_SETBACK)
+    local my_pose = poses[my_slot + 1]
+    if not my_pose then
+        return nil, "invalid slot " .. tostring(my_slot)
+    end
+
     local plan = checkpoints.plan(race_checkpoints, mode, laps)
 
     log("I", LOG_TAG, string.format(

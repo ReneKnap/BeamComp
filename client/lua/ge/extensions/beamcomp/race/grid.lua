@@ -40,21 +40,25 @@ local function rotate_vector(q, v)
 end
 
 -- Local-frame offset for a 0-based slot: column from i % 2, row from floor(i / 2). Right
--- column (column 1) is set back by an extra STAGGER for the classic grid look.
-local function slot_offset(slot)
+-- column (column 1) is set back by an extra STAGGER for the classic grid look. `start_setback`
+-- shifts every slot back by the same extra distance along the grid's own longitudinal axis -- the
+-- exact axis the rows already use -- so the whole field keeps its layout and just sits further behind
+-- the line (clearing the start/finish volume; ADR-0022).
+local function slot_offset(slot, start_setback)
     local column = slot % COLUMNS
     local row = math.floor(slot / COLUMNS)
     local lateral = (column == 0) and -HALF_WIDTH or HALF_WIDTH
-    local setback = row * ROW_GAP + ((column == 1) and STAGGER or 0)
+    local setback = row * ROW_GAP + ((column == 1) and STAGGER or 0) + (start_setback or 0)
     return {x = lateral, y = LONGITUDINAL_SIGN * setback, z = 0}
 end
 
 -- Grid poses for `count` players behind base_pos/base_rot. Returns a list of
 -- { pos = {x, y, z}, rot = {x, y, z, w} } in slot order; every pose keeps the base heading.
-function M.poses(base_pos, base_rot, count)
+-- `start_setback` (optional, default 0) pushes the whole grid further back along the row axis.
+function M.poses(base_pos, base_rot, count, start_setback)
     local poses = {}
     for slot = 0, count - 1 do
-        local world_offset = rotate_vector(base_rot, slot_offset(slot))
+        local world_offset = rotate_vector(base_rot, slot_offset(slot, start_setback))
         poses[#poses + 1] = {
             pos = {
                 x = base_pos.x + world_offset.x,
