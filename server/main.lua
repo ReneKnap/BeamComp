@@ -17,7 +17,7 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race <name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]]
+--   /race <name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 from lobby/finished: assign every present player a slot, send each a
 --                 "raceStart" event (slot + grid roster + relayed overrides), and enter the spawning
@@ -73,6 +73,12 @@ local MSG_RACE_PHASE = "racePhase"
 local MSG_CHECKPOINT = "checkpoint"
 local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
 local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
+local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a map (ADR-0023; admin-gated)
+local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a map's default grid for a race (ADR-0023; admin-gated)
+local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its data (ADR-0023; read-only)
+local MSG_GRID_LIST_REQ = "gridListReq"  -- editor lists a map's saved grids (ADR-0023; read-only)
+local MSG_GRID_DATA = "gridData"      -- reply to gridFetch: a saved grid's params (server -> client)
+local MSG_GRID_LIST = "gridList"      -- reply to gridListReq: the map's saved grid names (server -> client)
 -- Server -> client broadcast/request types.
 local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadcast)
 local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
@@ -135,6 +141,8 @@ local session = {
     pending_race = nil,      -- race name queued by a /race re-issued while one is active
     pending_owner = nil,     -- player id of the queued race's issuer (owns its shared props), or nil
     pending_overrides = nil, -- queued race's relayed {mode, laps, direction, force, assists} (ADR-0018)
+    pending_map = nil,       -- queued race's issuer-reported map, for grid resolution (ADR-0023)
+    pending_race_id = nil,   -- queued race's canonical id, the default-grid lookup key (ADR-0023)
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
@@ -152,6 +160,26 @@ local CONFIG_CANDIDATE_PATHS = {
 -- Normalized (trimmed, lowercased) admin names -> true, and whether the gate is on.
 local race_admins = {}
 local race_admin_gate_active = false
+
+-- Named parametric start grids (ADR-0023). The server stores opaque grid params keyed by map + name,
+-- plus a per-map "which grid is default for this race" mapping, and relays the resolved params in
+-- raceStart -- it never interprets the numbers or parses a race, so race-blindness (ADR-0005) holds.
+-- Loaded on init and written by the in-game editor's gridSave/gridAssign. Candidate paths tolerate the
+-- unverified working directory exactly like the config file (ADR-0016); writes go back to the path we
+-- loaded from, else the first candidate that opens.
+local GRIDS_CANDIDATE_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.grids.json",
+    "beamcomp.grids.json",
+}
+
+-- grids[map][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
+local grid_store = {grids = {}, defaults = {}}
+local grids_file_path = nil
+-- Whether grid_store has been populated from disk in THIS Lua-state instance. A BeamMP file-watch
+-- reload (recon gotcha 12) re-runs this chunk -- resetting grid_store + this flag -- which is exactly
+-- what happens when the editor writes the grids file; lazy-loading on first access (ensure_grids_loaded)
+-- repopulates the store after such a reload, so a saved default is not lost.
+local grids_loaded = false
 
 
 local function log_info(subsystem, msg)
@@ -236,6 +264,150 @@ local function is_race_admin(player_name)
         return true
     end
     return race_admins[normalize_name(player_name)] == true
+end
+
+-- Read and JSON-decode the grids file from the first candidate path that opens (ADR-0023). Returns
+-- the decoded table + resolved path, or nil + path + error label ("parse"/"missing"). The decode is
+-- pcall-guarded so a malformed file never crashes the plugin load.
+local function read_grids()
+    for _, path in ipairs(GRIDS_CANDIDATE_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            local contents = file:read("*a")
+            file:close()
+            local ok, decoded = pcall(Util.JsonDecode, contents)
+            if not ok or type(decoded) ~= "table" then
+                return nil, path, "parse"
+            end
+            return decoded, path, nil
+        end
+    end
+    return nil, nil, "missing"
+end
+
+-- Populate grid_store from the grids file (ADR-0023). A missing or unparseable file leaves the store
+-- empty, so every race uses the procedural grid -- the safe default. The resolved path is logged so the
+-- write target is visible in the server console (recon TODO #4). Called from on_init.
+local function load_grids()
+    grid_store = {grids = {}, defaults = {}}
+
+    local data, path, err = read_grids()
+    grids_file_path = path
+    if not data then
+        if err == "parse" then
+            log_info("beamcomp.grid", "grids file at " .. tostring(path)
+                .. " is not valid JSON; using procedural grids")
+        else
+            log_info("beamcomp.grid", "no grids file found; using procedural grids")
+        end
+        return
+    end
+
+    if type(data.grids) == "table" then
+        grid_store.grids = data.grids
+    end
+    if type(data.defaults) == "table" then
+        grid_store.defaults = data.defaults
+    end
+    log_info("beamcomp.grid", "loaded grids from " .. path)
+end
+
+-- Populate grid_store once per Lua-state instance, lazily on first access. This makes grid resolution
+-- robust to a file-watch reload that resets the in-memory store without re-firing onInit (ADR-0023):
+-- the next save/resolve/fetch repopulates from disk.
+local function ensure_grids_loaded()
+    if grids_loaded then
+        return
+    end
+    grids_loaded = true
+    load_grids()
+end
+
+-- The grid param record for a race start, or nil to fall back to the procedural grid (ADR-0023).
+-- An explicit `grid_name` (from /race grid=<name>) wins; otherwise the map's default for this race is
+-- used. A requested-but-unknown name resolves to nil, so a typo'd /race grid= silently falls back
+-- rather than failing the start. The server never interprets the record -- it relays it verbatim.
+local function resolve_grid(map, race_name, grid_name)
+    ensure_grids_loaded()
+    if type(map) ~= "string" then
+        return nil
+    end
+    local map_grids = grid_store.grids[map]
+    if type(map_grids) ~= "table" then
+        log_info("beamcomp.grid", "resolve: no saved grids for map '" .. map .. "' -> procedural")
+        return nil
+    end
+
+    local name = grid_name
+    if not name then
+        local map_defaults = grid_store.defaults[map]
+        name = type(map_defaults) == "table" and map_defaults[race_name] or nil
+    end
+    if not name then
+        log_info("beamcomp.grid", "resolve: no grid for race '" .. tostring(race_name)
+            .. "' on '" .. map .. "' -> procedural")
+        return nil
+    end
+
+    local record = map_grids[name]
+    if type(record) ~= "table" then
+        log_info("beamcomp.grid", "resolve: grid '" .. name .. "' missing for '" .. map .. "' -> procedural")
+        return nil
+    end
+    log_info("beamcomp.grid", "resolve: using grid '" .. name .. "' for race '" .. tostring(race_name) .. "'")
+    return record
+end
+
+-- Serialize grid_store and write it back, trying the loaded path first then the candidates (ADR-0023).
+-- Returns true + path on success, false otherwise. pcall-guarded around the encode + file I/O so a
+-- write failure is reported, never thrown into the BeamMP runtime.
+local function write_grids()
+    local ok, encoded = pcall(Util.JsonEncode, {grids = grid_store.grids, defaults = grid_store.defaults})
+    if not ok then
+        log_info("beamcomp.grid", "could not encode grids: " .. tostring(encoded))
+        return false
+    end
+
+    local candidates = {}
+    if grids_file_path then
+        candidates[#candidates + 1] = grids_file_path
+    end
+    for _, path in ipairs(GRIDS_CANDIDATE_PATHS) do
+        candidates[#candidates + 1] = path
+    end
+
+    for _, path in ipairs(candidates) do
+        local file = io.open(path, "w")
+        if file then
+            file:write(encoded)
+            file:close()
+            grids_file_path = path
+            return true, path
+        end
+    end
+    log_info("beamcomp.grid", "could not open any grids path for writing")
+    return false
+end
+
+-- Store a named grid for a map and persist it (ADR-0023). `record` is {forward = <params>,
+-- reverse = <params>?}. Returns the write_grids result.
+local function save_grid(map, name, record)
+    ensure_grids_loaded()
+    if type(grid_store.grids[map]) ~= "table" then
+        grid_store.grids[map] = {}
+    end
+    grid_store.grids[map][name] = record
+    return write_grids()
+end
+
+-- Set a map's default grid for a race and persist it (ADR-0023). Returns the write_grids result.
+local function assign_default(map, race_name, name)
+    ensure_grids_loaded()
+    if type(grid_store.defaults[map]) ~= "table" then
+        grid_store.defaults[map] = {}
+    end
+    grid_store.defaults[map][race_name] = name
+    return write_grids()
 end
 
 local function now()
@@ -405,6 +577,8 @@ local function reset_to_lobby()
     session.pending_race = nil
     session.pending_owner = nil
     session.pending_overrides = nil
+    session.pending_map = nil
+    session.pending_race_id = nil
     session.cleanup_warned = false
     enter_phase(PHASE.lobby, nil)
     if had_race then
@@ -448,10 +622,15 @@ end
 -- race file, ADR-0013/0018). `owner_id` is the player that issued /race; exactly that player's
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
-local function start_race(race_name, owner_id, overrides)
+local function start_race(race_name, owner_id, overrides, map, race_id)
     local slots = build_slots(MP.GetPlayers())
     local roster = build_roster(slots)
     local assists = overrides.assists
+    -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). The default is
+    -- keyed by the canonical race id (race_id) so it resolves whatever shorthand was typed for /race;
+    -- fall back to the raw name if the client did not report an id. nil = no custom grid -> clients lay
+    -- out the procedural grid. The server relays the params verbatim and never interprets them (ADR-0005).
+    local grid_params = resolve_grid(map, race_id or race_name, overrides.grid)
 
     session.race = race_name
     session.roster = roster
@@ -460,6 +639,8 @@ local function start_race(race_name, owner_id, overrides)
     session.pending_race = nil
     session.pending_owner = nil
     session.pending_overrides = nil
+    session.pending_map = nil
+    session.pending_race_id = nil
     session.cleanup_warned = false
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
@@ -479,6 +660,9 @@ local function start_race(race_name, owner_id, overrides)
             recoverHoldSeconds = assists.recoverHoldSeconds,
             repairEnabled = assists.repairEnabled,
             repairHoldSeconds = assists.repairHoldSeconds,
+            -- Resolved custom-grid params (ADR-0023); nil = procedural grid. Same for every slot --
+            -- clients pick their own pose from the shared layout by slot.
+            gridParams = grid_params,
         })
     end
 
@@ -505,10 +689,14 @@ local function advance_from_finished()
     if pending then
         local owner = session.pending_owner
         local overrides = session.pending_overrides
+        local map = session.pending_map
+        local race_id = session.pending_race_id
         session.pending_race = nil
         session.pending_owner = nil
         session.pending_overrides = nil
-        start_race(pending, owner, overrides)
+        session.pending_map = nil
+        session.pending_race_id = nil
+        start_race(pending, owner, overrides, map, race_id)
         return
     end
     reset_to_lobby()
@@ -601,7 +789,7 @@ end
 
 local RACE_USAGE =
     "BeamComp: usage -- /race <name> [sprint|circuit] [laps] [reverse] [force] "
-    .. "[recover[:secs|off]] [repair[:secs|off]]"
+    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -705,8 +893,9 @@ end
 -- Parse a /race argument into the race name plus an overrides table (ADR-0013, ADR-0017, ADR-0018). The
 -- first whitespace token is the race name (slug-based, no spaces -- ADR-0005); each remaining token is
 -- an order-independent option, matched by unambiguous prefix across the whole keyword set:
--- sprint|circuit (mode), reverse (direction), force, recover|repair[:secs|off] (assists), or a bare
--- integer (lap count). Returns name (nil if the argument is empty), an overrides table (always present;
+-- sprint|circuit (mode), reverse (direction), force, recover|repair[:secs|off] (assists), a bare
+-- integer (lap count), or grid=<name> (a server-stored start grid, ADR-0023). Returns name (nil if the
+-- argument is empty), an overrides table (always present;
 -- mode/laps/direction nil = auto, force false, both assists ON at the default hold), and the first
 -- unrecognized token (or nil) so the caller can reply usage. Both assists default ON at the default
 -- hold; a recover:off / repair:off (or :-1 / :false) token turns one back off (ADR-0017 amendment).
@@ -751,6 +940,10 @@ local function parse_race_args(argument)
             end
         elseif token:match("^%d+$") then
             overrides.laps = math.floor(tonumber(token))
+        elseif token:match("^[Gg][Rr][Ii][Dd]=.+$") then
+            -- grid=<name> selects a server-stored grid for this race (ADR-0023); case-insensitive key,
+            -- value kept verbatim. An empty value (bare "grid=") is not this branch -> falls to bad_token.
+            overrides.grid = token:match("^[Gg][Rr][Ii][Dd]=(.+)$")
         elseif not bad_token then
             bad_token = token
         end
@@ -815,9 +1008,9 @@ end
 -- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
 -- phase is re-checked here, not at request time, since the race may have ended while the check was in
 -- flight: from lobby/finished start now; from an active phase queue + run the brief abort window.
-local function commit_validated_race(race_name, owner_id, overrides)
+local function commit_validated_race(race_name, owner_id, overrides, map, race_id)
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name, owner_id, overrides)
+        start_race(race_name, owner_id, overrides, map, race_id)
         MP.SendChatMessage(owner_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
@@ -825,6 +1018,8 @@ local function commit_validated_race(race_name, owner_id, overrides)
     session.pending_race = race_name
     session.pending_owner = owner_id
     session.pending_overrides = overrides
+    session.pending_map = map
+    session.pending_race_id = race_id
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
     MP.SendChatMessage(owner_id, "BeamComp: restarting with race '" .. race_name .. "'")
 end
@@ -840,7 +1035,11 @@ local function handle_race_validation(player_id, payload)
     session.pending_validation = nil
 
     if payload.ok then
-        commit_validated_race(pending.race, pending.owner_id, pending.overrides)
+        -- The client reports its map + canonical race id in the verdict (ADR-0023); the server keys the
+        -- grid lookup on them. Either missing just means no custom grid resolves (procedural fallback).
+        local map = type(payload.map) == "string" and payload.map or nil
+        local race_id = type(payload.raceId) == "string" and payload.raceId or nil
+        commit_validated_race(pending.race, pending.owner_id, pending.overrides, map, race_id)
     else
         local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
         MP.SendChatMessage(pending.owner_id, "BeamComp: " .. reason)
@@ -1123,6 +1322,117 @@ local function handle_race_list(player_id, payload)
     end
 end
 
+-- A connected player's display name by id, or nil if not present.
+local function player_name_of(player_id)
+    return MP.GetPlayers()[player_id]
+end
+
+-- Store a named grid sent by the in-game editor (ADR-0023). Admin-gated like /race (ADR-0016): only a
+-- race admin may write the shared grids file. The server validates shape but never interprets the param
+-- numbers (race-blind, ADR-0005). Payload: {map, name, forward = <params>, reverse = <params>?}.
+local function handle_grid_save(player_id, payload)
+    local player_name = player_name_of(player_id)
+    if not player_name or not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to save grids")
+        return
+    end
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
+        or type(payload.name) ~= "string" or payload.name == ""
+        or type(payload.race) ~= "string" or payload.race == ""
+        or type(payload.forward) ~= "table" then
+        MP.SendChatMessage(player_id, "BeamComp: grid save rejected -- bad data")
+        log_info("beamcomp.grid", "gridSave from id " .. tostring(player_id) .. " rejected: bad payload")
+        return
+    end
+
+    -- Store the race the grid was authored against (canonical id) so beamcomp_grid_edit can re-anchor a
+    -- reopened grid to the right start line (ADR-0023).
+    local record = {forward = payload.forward, race = payload.race}
+    if type(payload.reverse) == "table" then
+        record.reverse = payload.reverse
+    end
+
+    local ok, path = save_grid(payload.map, payload.name, record)
+    if ok then
+        MP.SendChatMessage(player_id, "BeamComp: saved grid '" .. payload.name .. "' for " .. payload.map)
+        log_info("beamcomp.grid", string.format("saved grid '%s' for map '%s' (%s) by %s",
+            payload.name, payload.map, tostring(path), player_name))
+    else
+        MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
+    end
+end
+
+-- Set a map's default grid for a race, sent by the editor (ADR-0023). Admin-gated. The grid must
+-- already exist for that map. Payload: {map, race, name}.
+local function handle_grid_assign(player_id, payload)
+    local player_name = player_name_of(player_id)
+    if not player_name or not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to assign grids")
+        return
+    end
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
+        or type(payload.race) ~= "string" or payload.race == ""
+        or type(payload.name) ~= "string" or payload.name == "" then
+        MP.SendChatMessage(player_id, "BeamComp: grid assign rejected -- bad data")
+        return
+    end
+
+    ensure_grids_loaded()
+    local map_grids = grid_store.grids[payload.map]
+    if type(map_grids) ~= "table" or type(map_grids[payload.name]) ~= "table" then
+        MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.map)
+        return
+    end
+
+    local ok = assign_default(payload.map, payload.race, payload.name)
+    if ok then
+        MP.SendChatMessage(player_id, string.format("BeamComp: '%s' is now the default grid for %s",
+            payload.name, payload.race))
+        log_info("beamcomp.grid", string.format("assigned grid '%s' as default for race '%s' on map '%s' by %s",
+            payload.name, payload.race, payload.map, player_name))
+    else
+        MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
+    end
+end
+
+-- Return a saved grid's data so the editor can reopen it (ADR-0023). Read-only, so ungated like
+-- /races. A missing map/name or unknown grid replies found = false rather than an error.
+local function handle_grid_fetch(player_id, payload)
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or type(payload.name) ~= "string" then
+        send_event(player_id, MSG_GRID_DATA, {found = false})
+        return
+    end
+    ensure_grids_loaded()
+    local map_grids = grid_store.grids[payload.map]
+    local record = type(map_grids) == "table" and map_grids[payload.name] or nil
+    if type(record) ~= "table" then
+        send_event(player_id, MSG_GRID_DATA, {name = payload.name, found = false})
+        return
+    end
+    send_event(player_id, MSG_GRID_DATA, {
+        name = payload.name,
+        found = true,
+        forward = record.forward,
+        reverse = record.reverse,
+        race = record.race,
+    })
+end
+
+-- Return the saved grid names for a map (ADR-0023). Read-only, sorted for a stable listing.
+local function handle_grid_list_request(player_id, payload)
+    ensure_grids_loaded()
+    local names = {}
+    local map = type(payload) == "table" and payload.map or nil
+    local map_grids = type(map) == "string" and grid_store.grids[map] or nil
+    if type(map_grids) == "table" then
+        for name in pairs(map_grids) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+    end
+    send_event(player_id, MSG_GRID_LIST, {names = names})
+end
+
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
 -- hand-decodes (it does not load the shared envelope module, ADR-0004); `data` arrives as a JSON
 -- string. A non-string `data` means the handler arg order differs from the assumed (player_id, data)
@@ -1146,6 +1456,14 @@ local function handle_client_event(player_id, data)
         handle_race_list(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_VALIDATION then
         handle_race_validation(player_id, decoded.payload)
+    elseif decoded.type == MSG_GRID_SAVE then
+        handle_grid_save(player_id, decoded.payload)
+    elseif decoded.type == MSG_GRID_ASSIGN then
+        handle_grid_assign(player_id, decoded.payload)
+    elseif decoded.type == MSG_GRID_FETCH then
+        handle_grid_fetch(player_id, decoded.payload)
+    elseif decoded.type == MSG_GRID_LIST_REQ then
+        handle_grid_list_request(player_id, decoded.payload)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
@@ -1154,6 +1472,7 @@ end
 local function on_init()
     log_info("beamcomp", "server plugin loaded v" .. PLUGIN_VERSION)
     load_config()
+    ensure_grids_loaded()
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
     -- fully up; the tick is a no-op while the session sits in lobby.
     MP.CreateEventTimer(TICK_EVENT, TICK_INTERVAL_MS, MP.CallStrategy.BestEffort)
