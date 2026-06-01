@@ -65,7 +65,7 @@ local CHECKPOINT_COLUMN_DOWN = 100.0    -- column reach below the checkpoint cen
 local GATE_POST_RADIUS = 0.15           -- radius of the thin left/right gate-side posts
 local CHECKPOINT_FADE_BAND = 30.0       -- meters above the radius over which the area cylinder fades
                                         -- in: full alpha at radius + this, alpha 0 at the volume edge
-local POST_MAX_TURN_RATE = math.rad(120) -- max rad/s the player-facing gate posts may rotate, so they
+local POST_MAX_TURN_RATE = math.rad(30) -- max rad/s the player-facing gate posts may rotate, so they
                                         -- ease toward the player instead of snapping near the center
 local GRID_COLUMN_HEIGHT = 2.5          -- height of a start-grid pillar (label sits on top)
 local GRID_COLUMN_RADIUS = 0.25         -- radius of a start-grid pillar
