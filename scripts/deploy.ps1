@@ -108,10 +108,27 @@ try {
     New-ModZip -SourceDir $stageClient -ZipPath $clientZip
 
     # --- Deploy the server plugin ---
+    # beamcomp.grids.json is runtime data the in-game editor writes (named grids + per-race defaults),
+    # not source. Preserve an existing one across the deploy (which otherwise wipes the folder and
+    # restores the empty repo seed), so authored grids survive a redeploy. Copy the file out byte-for-byte
+    # before the wipe and back after, rather than letting the repo seed overwrite it.
+    $gridsTarget = Join-Path $serverOut 'beamcomp.grids.json'
+    $gridsBackup = $null
+    if (Test-Path -LiteralPath $gridsTarget) {
+        $gridsBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("beamcomp_grids_" + [Guid]::NewGuid().ToString('N') + ".json")
+        Copy-Item -LiteralPath $gridsTarget -Destination $gridsBackup -Force
+    }
+
     if (Test-Path -LiteralPath $serverOut) { Remove-Item -LiteralPath $serverOut -Recurse -Force }
     New-Dir $serverOut
     Copy-Item -Path (Join-Path $serverDir '*') -Destination $serverOut -Recurse -Force
     Copy-Item -LiteralPath $envelope -Destination (Join-Path $serverOut 'envelope.lua') -Force
+
+    if ($null -ne $gridsBackup) {
+        Copy-Item -LiteralPath $gridsBackup -Destination $gridsTarget -Force
+        Remove-Item -LiteralPath $gridsBackup -Force
+        Write-Host "  preserved existing beamcomp.grids.json (editor-authored grids kept)"
+    }
 
     Write-Host "BeamComp deployed to: $resourcesDir"
     Write-Host "  client zip -> $clientZip"
