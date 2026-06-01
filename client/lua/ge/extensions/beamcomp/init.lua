@@ -66,8 +66,8 @@ local CHECKPOINT_COLUMN_DOWN = 100.0    -- column reach below the checkpoint cen
 local GATE_POST_RADIUS = 0.15           -- radius of the thin left/right gate-side posts
 local CHECKPOINT_FADE_BAND = 30.0       -- meters above the radius over which the area cylinder fades
                                         -- in: full alpha at radius + this, alpha 0 at the volume edge
-local POST_MAX_TURN_RATE = math.rad(30) -- max rad/s the player-facing gate posts may rotate, so they
-                                        -- ease toward the player instead of snapping near the center
+local POST_MAX_TURN_RATE = math.rad(7.5) -- max rad/s the player-facing gate posts may rotate, so they
+                                         -- ease toward the player instead of snapping near the center
 local GRID_COLUMN_HEIGHT = 2.5          -- height of a start-grid pillar (label sits on top)
 local GRID_COLUMN_RADIUS = 0.25         -- radius of a start-grid pillar
 
@@ -705,7 +705,16 @@ local function draw_next_checkpoint(race, detection, car_pos, dt)
     -- post-orient cache key, distinct from the next/look-ahead checkpoints. Purely visual.
     local lt = M.state.laptimer
     if lt and not lt.started and lt.start_cp then
-        local start_angle = smooth_gate_angle(lt.start_cp, car_pos, dt, cache)
+        -- First-lap run-up: the start/finish line holds its true gate orientation (fixed stored
+        -- normal, no car-tracking rotation) until the line is first crossed, so it reads as a proper
+        -- start line rather than swinging to face the grid. A nil angle makes post_edges fall back to
+        -- gate_edges (the stored normal). With no stored normal there is nothing to lock to, so keep
+        -- the smoothed car-facing angle (the prior behavior, avoids dropping the posts). Once crossed
+        -- (lt.started) the line reappears as the regular lap/finish marker and rotates normally again.
+        local start_angle = nil
+        if not lt.start_cp.normal then
+            start_angle = smooth_gate_angle(lt.start_cp, car_pos, dt, cache)
+        end
         draw_checkpoint_marker(lt.start_cp, marker_style(lt.start_cp, false), car_pos, start_angle)
     end
 
