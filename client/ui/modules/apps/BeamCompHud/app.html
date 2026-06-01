@@ -1,10 +1,10 @@
 <div class="beamcomp-root">
-  <!-- Single template root (replace:true forbids a leading comment/sibling). It hosts two regions:
-       the draggable race HUD (.beamcomp-hud, pushed by race/hud.lua via BeamCompHudUpdate) and a
-       screen-centered countdown overlay (.bc-countdown, pushed by race/countdown.lua via
-       BeamCompCountdown; ADR-0021). The root fills the app frame so the live HUD's bc-scroll body
-       can bound its overflow; the overlay is position:fixed, so it centers on the viewport
-       regardless of where the player dragged the app frame. -->
+  <!-- Single template root (replace:true forbids a leading comment/sibling). The live race HUD is
+       split into two screen-anchored, position:fixed regions (top-left: big position + standings;
+       top-right: big lap/CP + time block) so the readouts sit in the screen corners rather than in
+       the draggable app frame; the finished results card is a centered fixed panel. A separate
+       screen-centered countdown overlay (.bc-countdown, ADR-0021) is pushed by race/countdown.lua.
+       All are fed GE -> UI via guihooks (race/hud.lua, BeamCompHudUpdate). -->
   <style>
     .beamcomp-root {
       height: 100%;
@@ -44,49 +44,86 @@
     .beamcomp-root .bc-cd-staging .bc-cd-staging-time {
       font-size: 105px;
     }
+    /* The app frame is now just a logical container: the live regions and the results card are
+       position:fixed children, so the frame itself carries no background or size. */
     .beamcomp-hud {
       font-family: 'Segoe UI', Arial, sans-serif;
       color: #fff;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    }
+    /* Screen-anchored live regions. pointer-events:none so the empty corner area never eats clicks;
+       the panels re-enable events so the standings list can still scroll. */
+    .beamcomp-hud .bc-tl,
+    .beamcomp-hud .bc-tr {
+      position: fixed;
+      z-index: 900;
+      pointer-events: none;
+    }
+    /* Position sits higher (around the top eighth); lap/CP stays lower at the top fifth. Both clear
+       the very top corners (non-mod game UI). */
+    .beamcomp-hud .bc-tl {
+      top: 12%;
+      left: 12px;
+    }
+    .beamcomp-hud .bc-tr {
+      top: 20%;
+      right: 12px;
+      text-align: right;
+    }
+    /* Big no-background readouts (position top-left, lap/CP top-right), legible by text-shadow alone
+       like the countdown overlay. */
+    .beamcomp-hud .bc-pos-huge {
+      font-weight: bold;
+      font-size: 72px;
+      line-height: 1;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+    }
+    /* The "/N" field-size suffix, smaller than the position itself. */
+    .beamcomp-hud .bc-pos-huge .bc-pos-of {
+      font-size: 0.45em;
+      opacity: 0.8;
+    }
+    .beamcomp-hud .bc-lapcp-huge {
+      font-weight: bold;
+      font-size: 40px;
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+    }
+    .beamcomp-hud .bc-lapcp-huge .bc-cp-huge {
+      opacity: 0.92;
+    }
+    /* Darkened panels under each readout (standings list left, time block right) -- the old HUD box
+       look. pointer-events:auto so the list scrolls. */
+    .beamcomp-hud .bc-panel {
       background: rgba(0, 0, 0, 0.55);
       border-radius: 6px;
       padding: 6px 10px;
-      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+      /* Roomy gap below the big readouts; the standings list and the time block share it. */
+      margin-top: 28px;
       box-sizing: border-box;
-      display: flex;
-      flex-direction: column;
+      pointer-events: auto;
     }
-    /* Live: fill and stay bounded by the app frame so the row window scrolls within it. Finished:
-       let the results card grow past the frame (height:auto) up to a viewport cap, since covering
-       more screen for the final overview is acceptable. */
-    .beamcomp-hud.bc-phase-live {
-      height: 100%;
+    .beamcomp-hud .bc-standings-panel {
+      width: 22em;
+      display: inline-block;
+      text-align: left;
     }
-    .beamcomp-hud.bc-phase-finished {
-      height: auto;
-      max-height: 90vh;
+    .beamcomp-hud .bc-timepanel {
+      width: 12em;
+      display: inline-block;
+      text-align: left;
     }
-    .beamcomp-hud .bc-body {
-      display: flex;
-      flex-direction: column;
-      flex: 1 1 auto;
-      min-height: 0;
-    }
-    /* min-height:0 lets the scroll child shrink below its content height inside the flex column;
-       without it the table would push the frame and overflow-y would never engage. */
     .beamcomp-hud .bc-scroll {
-      flex: 1 1 auto;
-      min-height: 0;
       overflow-y: auto;
+      max-height: 60vh;
     }
-    .beamcomp-hud.bc-phase-live .bc-scroll {
-      max-height: 100%;
-    }
-    .beamcomp-hud.bc-phase-finished .bc-scroll {
-      max-height: 85vh;
-    }
+    /* table-layout:fixed pins the column widths to the rules below, so the bold local row no longer
+       widens a column and breaks alignment. */
     .beamcomp-hud table.bc-standings {
       width: 100%;
       border-collapse: collapse;
+      table-layout: fixed;
     }
     .beamcomp-hud table.bc-standings td {
       white-space: nowrap;
@@ -110,31 +147,44 @@
       padding: 1px 4px;
     }
     .beamcomp-hud .bc-pos {
+      width: 2.6em;
       font-weight: bold;
       text-align: right;
     }
     .beamcomp-hud .bc-name {
-      width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .beamcomp-hud .bc-cp {
-      opacity: 0.85;
-      text-align: right;
-    }
-    .beamcomp-hud .bc-lap {
-      opacity: 0.85;
-      text-align: right;
-    }
     .beamcomp-hud .bc-time {
+      width: 6.5em;
       font-variant-numeric: tabular-nums;
       text-align: right;
     }
-    .beamcomp-hud .bc-gap,
     .beamcomp-hud .bc-int {
+      width: 5.5em;
       font-variant-numeric: tabular-nums;
       text-align: right;
       opacity: 0.85;
+    }
+    /* Time block (Time / Lap / Best) in the top-right panel; circuit-only rows are ng-if'd off. */
+    .beamcomp-hud .bc-timeblock {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .beamcomp-hud .bc-timeblock td {
+      padding: 1px 0;
+    }
+    .beamcomp-hud .bc-timeblock .bc-tb-label {
+      opacity: 0.7;
+      letter-spacing: 0.04em;
+    }
+    .beamcomp-hud .bc-timeblock .bc-tb-value {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-timeblock .bc-tb-best .bc-tb-value {
+      color: #d4af37;
     }
     .beamcomp-hud tr.bc-local {
       background: rgba(63, 217, 107, 0.18);
@@ -162,10 +212,27 @@
       font-weight: bold;
     }
     .beamcomp-hud .bc-grace {
-      text-align: center;
       font-weight: bold;
       color: #ffcc33;
-      padding-bottom: 4px;
+      padding: 2px 0 4px 0;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+    }
+    /* Finished results card: a centered fixed panel with its own dark background (the app frame no
+       longer provides one). */
+    .beamcomp-hud .bc-results-card {
+      position: fixed;
+      top: 48px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 950;
+      min-width: 28em;
+      max-width: 90vw;
+      max-height: 85vh;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.7);
+      border-radius: 6px;
+      padding: 8px 14px;
+      box-sizing: border-box;
     }
     .beamcomp-hud .bc-results-title {
       text-align: center;
@@ -176,37 +243,84 @@
       border-bottom: 1px solid rgba(255, 255, 255, 0.25);
       margin-bottom: 4px;
     }
+    /* Per-player best lap column on the results card (circuit only), gold like the live Best row. */
+    .beamcomp-hud .bc-bestlap {
+      width: 7em;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: #d4af37;
+    }
+    .beamcomp-hud .bc-results-head td {
+      opacity: 0.7;
+      font-weight: bold;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+    }
+    .beamcomp-hud .bc-results-head .bc-bestlap {
+      color: inherit;
+    }
   </style>
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
-  <div class="bc-body" ng-if="hud.phase !== 'finished'">
-    <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
-    <div class="bc-scroll">
-      <table class="bc-standings">
-        <tr ng-repeat="e in hud.liveEntries"
-            ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
-          <td class="bc-pos">P{{e.position}}</td>
-          <td class="bc-name">{{e.name}}</td>
-          <td class="bc-cp">{{e.checkpoint}}/{{e.count}}</td>
-          <td class="bc-lap" ng-if="e.lapCount > 1">L{{e.lap}}/{{e.lapCount}}</td>
-          <td class="bc-time">{{e.dnf ? 'DNF' : formatTime(e.time)}}</td>
-          <td class="bc-gap">{{formatDelta(e.gap)}}</td>
-          <td class="bc-int">{{formatDelta(e.interval)}}</td>
-        </tr>
-      </table>
+  <!-- Live: two screen-anchored regions -->
+  <div ng-if="hud.phase !== 'finished'">
+    <div class="bc-tl">
+      <div class="bc-pos-huge" ng-if="hud.localEntry">P{{hud.localEntry.position}}<span class="bc-pos-of">/{{hud.entries.length}}</span></div>
+      <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
+      <div class="bc-panel bc-standings-panel">
+        <div class="bc-scroll">
+          <table class="bc-standings">
+            <tr ng-repeat="e in hud.liveEntries"
+                ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
+              <td class="bc-pos">P{{e.position}}</td>
+              <td class="bc-name">{{e.name}}</td>
+              <td class="bc-int">{{formatDelta(e.interval)}}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="bc-tr" ng-if="hud.localEntry">
+      <div class="bc-lapcp-huge">
+        <span ng-if="hud.isCircuit">LAP {{hud.localEntry.lap}}<span ng-if="hud.localEntry.lapCount > 1">/{{hud.localEntry.lapCount}}</span> </span>
+        <span class="bc-cp-huge">CP {{hud.localEntry.cpInLap}}/{{hud.localEntry.cpPerLap}}</span>
+      </div>
+      <div class="bc-panel bc-timepanel">
+        <table class="bc-timeblock">
+          <tr>
+            <td class="bc-tb-label">Time</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.time)}}</td>
+          </tr>
+          <tr ng-if="hud.isCircuit">
+            <td class="bc-tb-label">Lap</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.lapTime)}}</td>
+          </tr>
+          <tr class="bc-tb-best" ng-if="hud.isCircuit">
+            <td class="bc-tb-label">Best</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.bestLap)}}</td>
+          </tr>
+        </table>
+      </div>
     </div>
   </div>
-  <div class="bc-body" ng-if="hud.phase === 'finished'">
+  <!-- Finished: centered results card (hidden by /results, ADR-0022) -->
+  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsHidden">
     <div class="bc-results-title">Final Standings</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
+        <tr class="bc-results-head">
+          <td class="bc-pos"></td>
+          <td class="bc-name">Driver</td>
+          <td class="bc-time">Time</td>
+          <td class="bc-bestlap" ng-if="hud.isCircuit">Best Lap</td>
+          <td class="bc-int">Gap</td>
+        </tr>
         <tr ng-repeat="e in hud.entries"
             ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf,
                        'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
           <td class="bc-pos">P{{e.position}}</td>
           <td class="bc-name">{{e.name}}</td>
           <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
-          <td class="bc-gap">{{formatDelta(e.gap)}}</td>
+          <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
           <td class="bc-int">{{formatDelta(e.interval)}}</td>
         </tr>
       </table>

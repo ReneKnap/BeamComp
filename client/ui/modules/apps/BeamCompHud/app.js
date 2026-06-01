@@ -74,6 +74,21 @@ angular.module('beamng.apps')
     return 'dense';
   }
 
+  // The local player's full entry (the one flagged isLocal), or null. Resolved from the full field
+  // -- not the windowed live rows -- so the header, time block, and results best-lap bind to it even
+  // when the local player is scrolled out of the live row window.
+  function findLocalEntry(entries) {
+    if (!entries) {
+      return null;
+    }
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].isLocal) {
+        return entries[i];
+      }
+    }
+    return null;
+  }
+
   // Window the live standings to a fixed height: the leader pinned on the top row plus a slice
   // around the local player (2 ahead, self, 3 behind). Near an edge the slice slides to stay full,
   // so a front-runner still sees a full board (P1..P7). Fields up to MAX_LIVE_ROWS are shown whole.
@@ -121,6 +136,7 @@ angular.module('beamng.apps')
         scope.$evalAsync(function () {
           scope.hud = data || {active: false, entries: []};
           scope.hud.liveEntries = windowLiveEntries(scope.hud.entries);
+          scope.hud.localEntry = findLocalEntry(scope.hud.entries);
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
         });
