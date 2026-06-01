@@ -128,7 +128,7 @@ local function spawn_vehicle_at(pose, spec)
     -- caveat: spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0)
     -- * rot). We pass the pose rotation straight through; if spawned cars face opposite the
     -- start direction, pre-multiply rot by quat(0,0,1,0) here -- the spawn analogue of
-    -- grid.lua's LONGITUDINAL_SIGN, only verifiable in-game.
+    -- grid.lua's VEHICLE_FORWARD_LOCAL knob, only verifiable in-game.
     local opt = {
         pos = vec3(pose.pos.x, pose.pos.y, pose.pos.z),
         rot = quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w),

@@ -21,11 +21,11 @@ local LOG_TAG = "beamcomp.race"
 -- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
 local MAX_LAPS = 1000
 
--- Metres the start grid is pushed back behind the start/finish line, along the grid's own row axis
--- (the same axis the staggered rows already use, so the field keeps its good layout and just sits
--- further back -- P1 ends up roughly where a later row stood). This clears the start volume and lets a
--- circuit's lap-1 clock start on a real line crossing rather than at t=0 (ADR-0022). Applied to sprint
--- and circuit alike; tune if the front row still sits on/past the line.
+-- Metres the start grid is pushed back behind the start/finish line, straight back along the travel
+-- axis (the start/finish gate normal, or the start pose when there is none -- grid.lua resolves it).
+-- P1 ends up roughly where a later row stood. This clears the start volume and lets a circuit's lap-1
+-- clock start on a real line crossing rather than at t=0 (ADR-0022). Applied to sprint and circuit
+-- alike; tune if the front row still sits on/past the line.
 local GRID_START_SETBACK = 15.0
 
 -- Recover/repair assist hold-time bounds (ADR-0017). The server already clamps, but this is a trust
@@ -228,11 +228,14 @@ function M.prepare(payload)
         race_checkpoints = checkpoints.reverse(race.checkpoints, race.meta and race.meta.closed)
     end
 
-    -- Push the whole grid GRID_START_SETBACK metres back along its OWN row axis (handled inside
-    -- grid.poses, the exact transform the rows already use) so the field keeps its existing good
-    -- layout and just sits behind the line -- clearing the start/finish volume so a circuit's lap-1
-    -- clock starts on a real line crossing (ADR-0022). Applied to sprint and circuit alike.
-    local poses = grid.poses(base_pose.pos, base_pose.rot, count, GRID_START_SETBACK)
+    -- Push the whole grid GRID_START_SETBACK metres straight back behind the line, along the travel
+    -- axis taken from the start/finish gate normal (CP0 = race_checkpoints[1], already reversed for a
+    -- reverse race) so the field sits behind the line and a circuit's lap-1 clock starts on a real
+    -- line crossing (ADR-0022). The normal is the direction of travel through the gate; grid.lua lays
+    -- the field out behind it and falls back to the start pose when a race has no gate normal. Applied
+    -- to sprint and circuit alike.
+    local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
+    local poses = grid.poses(base_pose.pos, base_pose.rot, count, GRID_START_SETBACK, gate_normal)
     local my_pose = poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
