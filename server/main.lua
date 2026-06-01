@@ -40,6 +40,8 @@
 --                 player. Reply is to the asker only.
 --   /dnf          give up the current race: marks the issuing player DNF (did not finish). Racing
 --                 only (ADR-0014).
+--   /results      toggle the asking player's own finished-results card on/off (ADR-0022). Open to
+--                 all players; affects only that player's view (a "resultsToggle" event).
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
 -- All commands suppress their own chat echo. Anything else relays as normal chat.
@@ -53,6 +55,7 @@ local CHAT_COMMAND_RACEEND = "/raceend"
 local CHAT_COMMAND_RACES = "/races"
 local CHAT_COMMAND_DNF = "/dnf"
 local CHAT_COMMAND_PING = "/beamcomp"
+local CHAT_COMMAND_RESULTS = "/results"  -- toggle the asking player's finished-results card (ADR-0022)
 -- Manual race-start aliases (ADR-0021): any of these ends the staging wait early and starts the
 -- countdown. All three route to one handler.
 local CHAT_COMMAND_GO = "/go"
@@ -75,6 +78,7 @@ local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadc
 local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
 local MSG_FINISH_GRACE = "finishGrace"  -- the DNF-cutoff countdown duration, broadcast when armed (ADR-0014)
 local MSG_VALIDATE_RACE = "validateRace"  -- ask the issuer's client to vet /race options pre-start (ADR-0019)
+local MSG_RESULTS_TOGGLE = "resultsToggle"  -- tell one client to hide/show its finished-results card (ADR-0022)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -374,6 +378,7 @@ local function build_standings()
             finished = record.finished,
             dnf = record.dnf,
             lap = record.lap,
+            best_lap = record.best_lap,
             -- Cumulative race-relative time at each scored crossing (ADR-0015). Shallow reference --
             -- downstream readers must not mutate. DNF entries carry only the splits completed before
             -- DNF; the results UI derives segment deltas from this.
@@ -916,6 +921,14 @@ local function handle_ping_command(player_id, player_name)
     })
 end
 
+-- /results: toggle the asking player's own finished-results card (ADR-0022). Open to all (not
+-- admin-gated) -- it only affects that player's view. The client owns the on/off state; the server
+-- just relays the toggle to the sender.
+local function handle_results_command(player_id, player_name)
+    send_event(player_id, MSG_RESULTS_TOGGLE, {})
+    log_info("beamcomp.race", CHAT_COMMAND_RESULTS .. " toggle by " .. player_name)
+end
+
 -- True if no connected player other than `leaving_id` remains. onPlayerDisconnect may or may
 -- not still list the leaving player, so exclude it explicitly.
 local function is_server_empty_without(leaving_id)
@@ -991,6 +1004,11 @@ local function on_chat_message(player_id, player_name, message)
         handle_ping_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
+
+    if command == CHAT_COMMAND_RESULTS then
+        handle_results_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
     -- not a BeamComp command: return nothing so the message relays normally
 end
 
@@ -1040,6 +1058,9 @@ local function handle_checkpoint_report(player_id, payload)
     local time = tonumber(payload.time) or 0
     local lap = (type(payload.lap) == "number") and math.floor(payload.lap) or nil
     local index = (type(payload.index) == "number") and math.floor(payload.index) or nil
+    -- Client-reported best lap so far (circuit; ADR-0022). Relayed in standings, never interpreted --
+    -- the server stays race-blind (ADR-0005), it just stores the latest number this player sent.
+    local best_lap = tonumber(payload.bestLap)
 
     if seq ~= record.completed then
         log_info("beamcomp.race", string.format(
@@ -1054,6 +1075,9 @@ local function handle_checkpoint_report(player_id, payload)
     end
     if lap then
         record.lap = lap
+    end
+    if best_lap then
+        record.best_lap = best_lap
     end
     record.splits[record.completed] = time
     record.total_time = time
