@@ -1,17 +1,21 @@
 -- BeamComp -- GE-side time-trial race parser.
 --
 -- Lives at lua/ge/extensions/beamcomp/race/parser.lua inside the client mod zip.
--- Stateless: require it and call M.parse(raceFile). It holds no state and registers
+-- Stateless: require it and call M.parse(locator). It holds no state and registers
 -- nothing, so it needs no extension lifecycle (cf. the race-format reference note s9).
 --
--- Reuses BeamNG's own race loader (gameplay/race/path.lua) rather than reparsing the
--- race.race.json by hand -- the loader handles oldId remapping, segment ordering, and
--- classification. M.parse normalizes the loaded path object into a plain-Lua,
--- engine-handle-free table (ADR-0005): start positions, ordered visible checkpoints
--- with a stable 0-based index, prefab file references, and meta. The data-model
+-- Reuses BeamNG's own race loaders rather than reparsing by hand: path:onDeserialized for a
+-- race.race.json (missions + level .race.json), and the quickrace importer (race/quickrace ->
+-- path:fromTrack) for the legacy level quickrace tracks the Time Trial menu uses (ADR-0024). The
+-- loaders handle oldId remapping, segment ordering, and classification. M.parse dispatches by
+-- locator.format and normalizes the loaded path object into a plain-Lua, engine-handle-free table
+-- (ADR-0005): start positions, ordered visible checkpoints with a stable 0-based index, prefab file
+-- references, and meta (a mission's defaultLaps coming from its sibling info.json). The data-model
 -- contract lives in .claude/features/race-parser/2-architecture.md.
 
 local M = {}
+
+local quickrace = require("beamcomp/race/quickrace")
 
 local LOG_TAG = "beamcomp.race"
 local RACE_PATH_MODULE = "/lua/ge/extensions/gameplay/race/path"
@@ -143,26 +147,66 @@ local function build_prop_refs(folder)
     return {prefabFiles = prefab_files}
 end
 
-local function build_meta(path)
+-- A mission's authoritative default lap count, from the sibling info.json's missionTypeData (ADR-0024).
+-- BeamNG stores a mission's real default there; the race.race.json's own defaultLaps is an editor value
+-- that disagrees for stock closed circuits (e.g. 004-mediumcourse: info 1 vs race 2). Returns the
+-- number, or nil when there is no info.json or no usable value -- the caller then keeps the path
+-- object's value (mod races that ship only a race.race.json).
+local function mission_default_laps(folder)
+    if not folder then
+        return nil
+    end
+    local info_file = folder .. "info.json"
+    if not FS:fileExists(info_file) then
+        return nil
+    end
+    local info = jsonReadFile(info_file)
+    if type(info) ~= "table" or type(info.missionTypeData) ~= "table" then
+        return nil
+    end
+    return tonumber(info.missionTypeData.defaultLaps)
+end
+
+-- defaultLaps is the override (from the mission info.json) when given, else the path object's own value;
+-- closed/branching/reversible always come from the loaded path so meta stays consistent with the
+-- checkpoints/segments the path produced.
+local function build_meta(path, default_laps_override)
     return {
         name = path.name,
-        defaultLaps = path.defaultLaps,
+        defaultLaps = default_laps_override or path.defaultLaps,
         closed = path.config.closed and true or false,
         branching = path.config.branching and true or false,
         reversible = is_reversible(path),
     }
 end
 
--- Parse a time-trial race.race.json into the normalized BeamComp race-content table
--- (ADR-0005). Returns the table, or nil plus a reason string on failure.
-function M.parse(race_file)
-    if not race_file or race_file == "" then
+-- Parse a discovery locator into the normalized BeamComp race-content table (ADR-0005). Dispatches by
+-- locator.format: a "quickrace" track is loaded via the engine quickrace importer (race/quickrace), any
+-- other locator (a race.race.json -- mission or level .race.json) via path:onDeserialized; both reduce
+-- to the same model. A mission's default lap count is taken from its sibling info.json (ADR-0024).
+-- Quickrace props are the track's nested barrier prefabs (statics; its cone vehicles are not spawned --
+-- the cone partition is JSONL-only). Returns the table, or nil plus a reason string on failure.
+function M.parse(locator)
+    if type(locator) ~= "table" or not locator.raceFile or locator.raceFile == "" then
         return nil, "no race file given"
     end
 
-    local path = load_race_path(race_file)
-    if not path then
-        return nil, "could not load race file"
+    local race_file = locator.raceFile
+    local folder = locator.folder or folder_of(race_file)
+
+    local path, default_laps
+    if locator.format == "quickrace" then
+        local err
+        path, err = quickrace.load_path(locator)
+        if not path then
+            return nil, err
+        end
+    else
+        path = load_race_path(race_file)
+        if not path then
+            return nil, "could not load race file"
+        end
+        default_laps = mission_default_laps(folder)
     end
 
     if path.config.branching then
@@ -176,14 +220,15 @@ function M.parse(race_file)
         return nil, "race has no traversable path"
     end
 
-    local folder = folder_of(race_file)
+    local props = (locator.source == "quickrace") and quickrace.prop_refs(locator)
+        or build_prop_refs(folder)
     local race = {
         raceFile = race_file,
         folder = folder,
-        meta = build_meta(path),
+        meta = build_meta(path, default_laps),
         startPositions = build_start_positions(path),
         checkpoints = build_checkpoints(path),
-        props = build_prop_refs(folder),
+        props = props,
     }
 
     log("I", LOG_TAG, string.format(
