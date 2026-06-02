@@ -135,7 +135,10 @@ local function build_checkpoints(path)
     return checkpoints
 end
 
--- The prefab files that actually ship in the race folder (main + optional fwd/rev).
+-- The prefab files that actually ship in the race folder (main + optional fwd/rev). coneFiles is
+-- empty: a mission prefab is JSONL with its cones as sibling lines of the statics, so the host's
+-- full-prefab spawn already instantiates them (ADR-0020) -- no separate cone source is needed
+-- (the separate coneFiles source is only for the quickrace format, ADR-0025).
 local function build_prop_refs(folder)
     local prefab_files = {}
     for _, name in ipairs(PREFAB_FILENAMES) do
@@ -144,7 +147,7 @@ local function build_prop_refs(folder)
             prefab_files[#prefab_files + 1] = file
         end
     end
-    return {prefabFiles = prefab_files}
+    return {prefabFiles = prefab_files, coneFiles = {}}
 end
 
 -- A mission's authoritative default lap count, from the sibling info.json's missionTypeData (ADR-0024).
@@ -184,8 +187,9 @@ end
 -- locator.format: a "quickrace" track is loaded via the engine quickrace importer (race/quickrace), any
 -- other locator (a race.race.json -- mission or level .race.json) via path:onDeserialized; both reduce
 -- to the same model. A mission's default lap count is taken from its sibling info.json (ADR-0024).
--- Quickrace props are the track's nested barrier prefabs (statics; its cone vehicles are not spawned --
--- the cone partition is JSONL-only). Returns the table, or nil plus a reason string on failure.
+-- Quickrace props are the track's nested barrier prefabs (statics, all clients) plus the track prefab
+-- itself as a host-only cone source (coneFiles, ADR-0025). Returns the table, or nil plus a reason
+-- string on failure.
 function M.parse(locator)
     if type(locator) ~= "table" or not locator.raceFile or locator.raceFile == "" then
         return nil, "no race file given"

@@ -270,6 +270,10 @@ function M.prepare(payload)
         gridPoses = poses,
         roster = roster,
         prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
+        -- The host-only cone source (ADR-0025): the quickrace track prefab whose cone vehicles the host
+        -- spawns once for BeamMP to sync. Empty for missions (their cones ride in prefabFiles). Not run
+        -- through direction_prefabs -- track prefabs are not forward/reverse-named.
+        coneFiles = race.props.coneFiles or {},
         -- Ordered, visible-only checkpoints with a stable 0-based index (ADR-0005); consumed by
         -- the racing-phase checkpoint detector (race/checkpoints.lua). Reversed for a reverse race.
         checkpoints = race_checkpoints,

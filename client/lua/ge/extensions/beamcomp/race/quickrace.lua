@@ -84,21 +84,25 @@ function M.load_path(locator)
     return path_or_err
 end
 
--- The static-scenery prefabs a quickrace track places (ADR-0024), as a {prefabFiles = {...}} table
--- matching the parser's prop-ref shape. A legacy quickrace .prefab nests its barriers as
--- `new Prefab() { FileName = "<path>"; }` blocks; we pull those paths out and hand them to the prop
--- loader as statics. The track prefab's cone prop-vehicles (BeamNGVehicle, not FileName-referenced)
--- are deliberately NOT spawned -- the cone partition (race/prefab) is JSONL-only, and the nested
--- barrier prefabs are cone-free TSStatic, so they spawn safely on every client. A track with no
--- readable prefab or no nested refs simply gets no props.
+-- The prop references a quickrace track places (ADR-0024/0025), as a {prefabFiles, coneFiles} table
+-- matching the parser's prop-ref shape:
+--   * prefabFiles -- the track's static barriers, spawned on every client. A legacy quickrace .prefab
+--     nests its barriers as `new Prefab() { FileName = "<path>"; }` blocks; we pull those paths out.
+--     They are cone-free TSStatic, so they spawn safely on every client.
+--   * coneFiles -- the track prefab itself, whose cone prop-vehicles (BeamNGVehicle, NOT
+--     FileName-referenced) live as direct child blocks. The host spawns a cones-only copy of it so the
+--     cones exist once and BeamMP syncs them (ADR-0025); non-hosts never spawn it.
+-- A track with no readable prefab simply gets no props.
 function M.prop_refs(locator)
     local files = {}
+    local cone_files = {}
     if type(readFile) ~= "function" then
-        return {prefabFiles = files}
+        return {prefabFiles = files, coneFiles = cone_files}
     end
     for _, ext in ipairs({".prefab", ".prefab.json"}) do
         local track_prefab = locator.folder .. locator.trackName .. ext
         if FS:fileExists(track_prefab) then
+            cone_files[#cone_files + 1] = track_prefab
             local raw = readFile(track_prefab)
             if raw then
                 for nested in raw:gmatch('FileName%s*=%s*"([^"]+)"') do
@@ -109,7 +113,7 @@ function M.prop_refs(locator)
             end
         end
     end
-    return {prefabFiles = files}
+    return {prefabFiles = files, coneFiles = cone_files}
 end
 
 return M
