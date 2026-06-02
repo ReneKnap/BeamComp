@@ -174,7 +174,7 @@ local function resolve_race(payload)
     log("I", LOG_TAG, "race map '" .. tostring(locator.map) .. "', loaded map '"
         .. tostring(loaded) .. "'")
 
-    local race, parse_err = parser.parse(locator.raceFile)
+    local race, parse_err = parser.parse(locator)
     if not race then
         return nil, nil, "could not parse race: " .. tostring(parse_err)
     end

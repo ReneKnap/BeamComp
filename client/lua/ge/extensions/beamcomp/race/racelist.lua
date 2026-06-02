@@ -14,17 +14,29 @@ local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local maps = require("beamcomp/race/maps")
 
--- One chat line describing a race: "  <slug> [<short>] - circuit, 6 cp, 2 laps" (laps only for a
--- closed-loop circuit), or "  <slug> [<short>] - (unsupported)" when it can't be parsed (e.g. a
--- branching race). <short> is the tippable shortname for /race; it equals the slug when no shorter
--- unique form exists, in which case the bracket is dropped to avoid a redundant "[<slug>]".
+-- The user-facing word for a race's source (ADR-0024): the freeroam mission set is "map", the level
+-- quickrace set is "menu" -- matching the "map:"/"menu:" prefix /race accepts to pick same-named
+-- variants.
+local function source_label(source)
+    if source == "quickrace" then
+        return "menu"
+    end
+    return "map"
+end
+
+-- One chat line describing a race: "  <slug> [<short>] (menu) - circuit, 6 cp, 2 laps" (laps only for
+-- a closed-loop circuit), or "  <slug> [<short>] (menu) - (unsupported)" when it can't be parsed (e.g.
+-- a branching race). <short> is the tippable shortname for /race; it equals the slug when no shorter
+-- unique form exists, in which case the bracket is dropped to avoid a redundant "[<slug>]". The (map)/
+-- (menu) tag names the source so two same-named variants are distinguishable via the prefix.
 local function describe(locator, shortname)
     local label = locator.displayName
     if shortname and shortname ~= locator.displayName then
         label = label .. " [" .. shortname .. "]"
     end
+    label = label .. " (" .. source_label(locator.source) .. ")"
 
-    local race = parser.parse(locator.raceFile)
+    local race = parser.parse(locator)
     if not race then
         return "  " .. label .. " - (unsupported)"
     end
