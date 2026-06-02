@@ -3,8 +3,7 @@
 -- Lives at lua/ge/extensions/beamcomp/race/prefab.lua inside the client mod zip. Stateless and
 -- reload-safe (no M.state, no file-scope mutable state). Target: client GE (LuaJIT 5.1).
 --
--- A race prefab is newline-delimited JSON: one scene object per line, plus a SimGroup container line
--- the objects parent to (references/time-trial-race-format.md s4). The file mixes two kinds of object:
+-- A race prefab mixes two kinds of object:
 --   * static scenery -- `class == "TSStatic"` (the plastic barriers/markers), client-local, NOT
 --     BeamMP-propagated.
 --   * knockable cone prop-vehicles -- `class == "BeamNGVehicle"` (jbeam "cones", autoEnterVehicle),
@@ -12,25 +11,48 @@
 --
 -- ADR-0020: only the host instantiates the cones (BeamMP syncs them to everyone); non-hosts must
 -- NEVER instantiate them -- spawning N cones on every client only to despawn them does not scale.
--- This module writes a STATICS-ONLY copy of a prefab (cone-vehicle lines dropped) that non-hosts
--- spawn instead of the full file, so no cone vehicle is ever created on a non-host.
+-- Two filtered copies serve the two roles:
+--   * write_statics_only -- the cone-vehicle lines dropped, everything else kept. Non-hosts spawn this
+--     instead of the full mission prefab, so no cone vehicle is ever created on a non-host.
+--   * write_cones_only -- only the cone-vehicle objects kept (plus the SimGroup wrapper), everything
+--     else dropped. The host spawns this for the quickrace source, whose cones live in a separate
+--     legacy track prefab from its statics (ADR-0025) -- so the host gets the cones without re-spawning
+--     the barriers/spawn-spheres/waypoints that prefab also contains.
 --
--- The SimGroup container line is NOT necessarily the first line (in hirochi_raceway/004-mediumcourse
--- the cones precede it), so it is found by class, not position, and kept verbatim. Kept lines are
--- written back unchanged -- they are already valid prefab JSONL.
+-- Two on-disk formats are handled (ADR-0025):
+--   * JSONL `.prefab.json` -- newline-delimited JSON, one scene object per line, plus a SimGroup
+--     container line the objects parent to (references/time-trial-race-format.md s4). The SimGroup line
+--     is NOT necessarily first (in hirochi_raceway/004-mediumcourse the cones precede it), so it is
+--     found by class, not position. Kept lines are written back verbatim -- already valid prefab JSONL.
+--   * legacy `.prefab` (TorqueScript) -- a `$ThisPrefab = new SimGroup() { ... }` wrapper whose body is
+--     `new <Class>(<name>) { ... };` child blocks. The quickrace track prefabs use this. Block bounds
+--     are found by brace depth; BeamNG-generated prefabs are machine-formatted (one structural brace per
+--     line), so brace counting is reliable for this data. Kept blocks are written back verbatim.
 
 local M = {}
 
 local LOG_TAG = "beamcomp.prefab"
 
 -- The scene-object class of the prefab's knockable cone prop-vehicles. Confirmed against the real
--- hirochi_raceway/004-mediumcourse mainPrefab.prefab.json (14 cone lines, jbeam "cones").
+-- hirochi_raceway/004-mediumcourse mainPrefab.prefab.json (JSONL, 14 cone lines) and the quickrace
+-- track prefabs (legacy, e.g. mediumcircuit1.prefab: `new BeamNGVehicle(cone1) { JBeam = "cones"; }`).
 local CONE_OBJECT_CLASS = "BeamNGVehicle"
+
+-- The JSONL scene-object class of the prefab's SimGroup container, kept by both filters so the written
+-- copy stays a self-contained prefab.
+local SIMGROUP_OBJECT_CLASS = "SimGroup"
 
 -- Whether a decoded prefab object line is one of the cone prop-vehicles (the only thing non-hosts
 -- must not spawn). Anything that is not a cone -- TSStatic scenery, the SimGroup, decals -- is kept.
 local function is_cone_object(obj)
     return type(obj) == "table" and obj.class == CONE_OBJECT_CLASS
+end
+
+-- The number of `ch` (a single literal char) in `line`. gsub returns the substituted string plus a
+-- replacement count; the count is what we want (the string is discarded).
+local function char_count(line, ch)
+    local _, count = line:gsub(ch, "")
+    return count
 end
 
 -- Write a statics-only copy of `prefab_file` to `dest_file`: every line except the cone prop-vehicle
@@ -76,6 +98,125 @@ function M.write_statics_only(prefab_file, dest_file)
 
     log("I", LOG_TAG, string.format(
         "statics-only prefab: kept %d line(s), dropped %d cone(s) -> %s", #kept, dropped, dest_file))
+    return true
+end
+
+-- Keep only the SimGroup container line and the cone-vehicle lines of a JSONL prefab; drop the
+-- statics/decals/everything else. The inverse of write_statics_only. Returns the kept lines and the
+-- cone count. A bad line decodes to nil and is dropped (pcall is the boundary).
+local function filter_jsonl_cones(raw)
+    local kept = {}
+    local cones = 0
+    for line in (raw .. "\n"):gmatch("(.-)\n") do
+        local trimmed = line:gsub("\r$", "")
+        if trimmed ~= "" then
+            local ok, obj = pcall(jsonDecode, trimmed)
+            if ok and type(obj) == "table" then
+                if obj.class == SIMGROUP_OBJECT_CLASS then
+                    kept[#kept + 1] = trimmed
+                elseif is_cone_object(obj) then
+                    kept[#kept + 1] = trimmed
+                    cones = cones + 1
+                end
+            end
+        end
+    end
+    return kept, cones
+end
+
+-- Keep only the cone-vehicle child blocks of a legacy TorqueScript prefab, plus the enclosing SimGroup
+-- wrapper and its own scalar fields; drop every other child block (SpawnSphere, nested Prefab,
+-- BeamNGWaypoint, ...). Child blocks open with `new <Class>(...) {` at SimGroup body depth and close
+-- when brace depth returns to that level. Returns the kept lines and the cone count.
+local function filter_legacy_cones(raw)
+    local kept = {}
+    local cones = 0
+    local depth = 0
+    local in_child = false
+    local child_keep = false
+    local child_start_depth = 0
+    local child_lines = {}
+
+    local function close_child()
+        if child_keep then
+            for _, child_line in ipairs(child_lines) do
+                kept[#kept + 1] = child_line
+            end
+            cones = cones + 1
+        end
+        in_child = false
+        child_lines = {}
+    end
+
+    for line in (raw .. "\n"):gmatch("(.-)\n") do
+        local trimmed = line:gsub("\r$", "")
+        local net = char_count(trimmed, "%{") - char_count(trimmed, "%}")
+
+        if in_child then
+            child_lines[#child_lines + 1] = trimmed
+            depth = depth + net
+            if depth <= child_start_depth then
+                close_child()
+            end
+        else
+            local class = trimmed:match("^%s*new%s+(%w+)%s*%(")
+            if class and depth >= 1 then
+                in_child = true
+                child_keep = (class == CONE_OBJECT_CLASS)
+                child_start_depth = depth
+                child_lines = {trimmed}
+                depth = depth + net
+                -- A single-line child block (`new X(){...};`) closes on its own opening line.
+                if depth <= child_start_depth then
+                    close_child()
+                end
+            else
+                -- SimGroup wrapper/opening, its scalar fields, the closing `};`, and file comments.
+                kept[#kept + 1] = trimmed
+                depth = depth + net
+            end
+        end
+    end
+
+    return kept, cones
+end
+
+-- Write a cones-only copy of `prefab_file` to `dest_file`: only the cone prop-vehicle objects (plus
+-- the SimGroup wrapper), everything else dropped. Format is chosen by extension -- JSONL for
+-- `.prefab.json`, legacy TorqueScript otherwise (ADR-0025). Returns true on success, false (logged) if
+-- the file cannot be read/written or has no cones to keep. The host spawns `dest_file` so the
+-- quickrace cones exist once and BeamMP syncs them, without re-spawning the track's statics.
+function M.write_cones_only(prefab_file, dest_file)
+    if type(readFile) ~= "function" or type(writeFile) ~= "function" then
+        log("W", LOG_TAG, "readFile/writeFile unavailable -- cannot filter prefab")
+        return false
+    end
+
+    local raw = readFile(prefab_file)
+    if not raw then
+        log("W", LOG_TAG, "could not read prefab '" .. tostring(prefab_file) .. "'")
+        return false
+    end
+
+    local kept, cones
+    if prefab_file:find("%.prefab%.json$") then
+        kept, cones = filter_jsonl_cones(raw)
+    else
+        kept, cones = filter_legacy_cones(raw)
+    end
+
+    if cones == 0 then
+        log("W", LOG_TAG, "prefab '" .. tostring(prefab_file) .. "' had no cone vehicles to keep")
+        return false
+    end
+
+    if not writeFile(dest_file, table.concat(kept, "\n")) then
+        log("W", LOG_TAG, "could not write filtered prefab '" .. tostring(dest_file) .. "'")
+        return false
+    end
+
+    log("I", LOG_TAG, string.format(
+        "cones-only prefab: kept %d cone(s) -> %s", cones, dest_file))
     return true
 end
 
