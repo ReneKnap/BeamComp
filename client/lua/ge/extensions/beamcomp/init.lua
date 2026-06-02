@@ -255,6 +255,41 @@ local function handle_race_start(payload)
     })
 end
 
+-- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
+-- the player's own car exactly where it is (only unfrozen + unlocked, never despawned or moved).
+-- Idempotent: props.clear/cones.clear no-op on already-gone objects and set_vehicle_frozen no-ops on
+-- a nil car, so calling it when nothing is spawned is harmless. Shared by the lobby phase (regular
+-- end / raceend), onClientEndMission (left the session / changed level mid-race), and
+-- onExtensionUnloaded (Lua reload). Deliberately does NOT touch M.state.phase, the BeamMP event
+-- handler, or editor/spawn-mute state -- each caller owns those.
+local function teardown_race_world()
+    countdown.clear()
+    hud.clear()
+    hud.hide()
+    -- Lift the in-race vehicle-action lock and restore the seated car's vanilla recovery (ADR-0017).
+    lock.remove()
+    disarm_assist_ve()
+    -- Despawn the track props and the host's shared cones (idempotent on absent names/ids, ADR-0020).
+    props.clear(M.state.prop_names or {})
+    cones.clear(M.state.cone_ids or {})
+    M.state.prop_names = nil
+    M.state.cone_ids = nil
+    M.state.race = nil
+    M.state.race_car_id = nil
+    M.state.detection = nil
+    M.state.laptimer = nil
+    M.state.standings = nil
+    M.state.grace = nil
+    M.state.staging = nil
+    M.state.countdown = nil
+    M.state.assist_armed = false
+    M.state.assist_held = nil
+    M.state.assist_arming = nil
+    M.state.assist_notice = nil
+    -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
+    vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
+end
+
 -- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
 -- server broadcasts a racePhase on every transition (ADR-0006). The car is spawned frozen in
 -- handle_race_start and held through the countdown; here we release it on racing, and release
@@ -334,35 +369,11 @@ local function handle_race_phase(payload)
         lock.remove()
         disarm_assist_ve()
     elseif phase == "lobby" then
-        -- Race over (back to lobby): clear any countdown overlay, despawn the track props and stop
-        -- drawing the grid markers, but leave the player's vehicle exactly where it is -- never
-        -- despawn or move it. Release the start lock too, so a /raceend mid-countdown leaves the
-        -- preserved car drivable. The abort-restart path skips lobby (finished -> spawning), where
-        -- handle_race_start reloads props and re-freezes instead.
-        countdown.clear()
-        hud.clear()
-        hud.hide()
-        -- Lift the in-race vehicle-action lock (ADR-0017): switching/spawning/recover are free again.
-        lock.remove()
-        -- Restore the seated car's vanilla recovery before the race state is cleared below.
-        disarm_assist_ve()
-        props.clear(M.state.prop_names or {})
-        cones.clear(M.state.cone_ids or {})
-        M.state.prop_names = nil
-        M.state.cone_ids = nil
-        M.state.race = nil
-        M.state.race_car_id = nil
-        M.state.detection = nil
-        M.state.laptimer = nil
-        M.state.standings = nil
-        M.state.grace = nil
-        M.state.staging = nil
-        M.state.countdown = nil
-        M.state.assist_armed = false
-        M.state.assist_held = nil
-        M.state.assist_arming = nil
-        M.state.assist_notice = nil
-        vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
+        -- Race over (back to lobby): despawn the track props/cones and drop all race state, but leave
+        -- the player's vehicle exactly where it is -- never despawn or move it (only unfrozen, so a
+        -- /raceend mid-countdown leaves the preserved car drivable). The abort-restart path skips
+        -- lobby (finished -> spawning), where handle_race_start reloads props and re-freezes instead.
+        teardown_race_world()
     end
 
     -- Surface the phase as a toast, except staging/countdown/racing -- the centered overlay covers
@@ -1414,36 +1425,27 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
     end
 end
 
+-- The level is ending -- the player left the BeamMP session or changed level, possibly mid-race.
+-- The extension is pinned to manual unload (onExtensionLoaded) so it survives level switches during a
+-- race, which means onExtensionUnloaded does NOT fire here; without this hook a mid-race exit would
+-- orphan the spawned props/cones into the next singleplayer load of the same map. Tear the race world
+-- down but keep the BeamMP handler registered -- the extension lives on for the next race. Mirrors
+-- core/groundMarkers + core/checkpoints, which reset their scene state on onClientEndMission likewise.
+function M.onClientEndMission(_levelPath)
+    teardown_race_world()
+    M.state.phase = nil
+end
+
 function M.onExtensionUnloaded()
     if AddEventHandler and RemoveEventHandler then
         RemoveEventHandler(EVENT_CHANNEL, "beamcomp")
     end
     M.state.registered = false
     grideditor.clear()
-    countdown.clear()
-    hud.clear()
-    hud.hide()
-    -- Lift the in-race vehicle-action lock so a reload mid-race never leaves switching/spawning or the
-    -- guarded core_vehicles functions stuck blocked (ADR-0017), and restore the seated car's recovery.
-    lock.remove()
-    disarm_assist_ve()
     spawn_mute.restore()
-    props.clear(M.state.prop_names or {})
-    cones.clear(M.state.cone_ids or {})
-    M.state.prop_names = nil
-    M.state.cone_ids = nil
-    M.state.race = nil
-    M.state.race_car_id = nil
-    M.state.detection = nil
-    M.state.laptimer = nil
-    M.state.grace = nil
-    M.state.staging = nil
-    M.state.countdown = nil
-    M.state.assist_armed = false
-    M.state.assist_held = nil
-    M.state.assist_arming = nil
-    -- Release the start lock so a reload mid-countdown never leaves a stuck-frozen car.
-    vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
+    -- Despawn props/cones, lift the in-race lock + start freeze, and drop all race state so a reload
+    -- mid-race never leaves orphaned scenery or a stuck-frozen/locked car (ADR-0017).
+    teardown_race_world()
     M.state.phase = nil
     log("I", LOG_TAG, "unloaded")
 end
