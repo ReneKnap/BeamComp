@@ -17,8 +17,10 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race <name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
+--                 <name> may carry a "map:"/"menu:" source prefix (freeroam-mission vs Time-Trial-menu
+--                 set, ADR-0024); the server relays it verbatim and the client resolves it (race-blind).
 --                 from lobby/finished: assign every present player a slot, send each a
 --                 "raceStart" event (slot + grid roster + relayed overrides), and enter the spawning
 --                 phase. The client resolves and parses <name> locally (ADR-0005) and decides the
@@ -788,7 +790,7 @@ local function tick()
 end
 
 local RACE_USAGE =
-    "BeamComp: usage -- /race <name> [sprint|circuit] [laps] [reverse] [force] "
+    "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
