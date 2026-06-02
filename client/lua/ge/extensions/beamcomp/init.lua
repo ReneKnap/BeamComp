@@ -215,7 +215,8 @@ local function handle_race_start(payload)
     -- branch, so clearing here is what prevents host cone-stacking on a re-issued /race.
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
-    M.state.prop_names, M.state.cone_ids = props.load(race.prefabFiles or {}, payload.propOwner)
+    M.state.prop_names, M.state.cone_ids = props.load(race.prefabFiles or {}, payload.propOwner,
+        race.coneFiles or {})
 
     -- Place this client's own car at the assigned grid pose: the car the player is in is repaired +
     -- teleported in place (preserving its settings), or a fresh one is spawned as a fallback

@@ -38,10 +38,15 @@ local prefab = require("beamcomp/race/prefab")
 
 local LOG_TAG = "beamcomp.props"
 local PROP_NAME_PREFIX = "beamcomp_prop_"
+-- The host's cones-only prefab containers get their own name prefix so they are tracked and cleared
+-- alongside the statics, without colliding with the PROP_NAME_PREFIX names (ADR-0025).
+local CONE_PROP_NAME_PREFIX = "beamcomp_cone_"
 
--- Where the statics-only prefab copies non-hosts spawn are written (one per source prefab index).
--- A BeamNG temp vpath, overwritten each load -- no cleanup needed.
+-- Where the filtered prefab copies are written (one per source prefab index). BeamNG temp vpaths,
+-- overwritten each load -- no cleanup needed. statics-only for the non-host barriers, cones-only for
+-- the host's quickrace cone source.
 local STATICS_TMP_PREFIX = "/temp/beamcomp_statics_"
+local CONES_TMP_PREFIX = "/temp/beamcomp_cones_"
 
 -- The set of vehicle object IDs currently in the scene, so the cone prop-vehicles a subsequent
 -- prefab load creates can be told apart from pre-existing (player/synced) vehicles.
@@ -63,9 +68,12 @@ end
 -- `keep_cones` is true only on the host (ADR-0020): the host spawns the FULL prefab and keeps the
 -- knockable cones its load creates for BeamMP to sync; every other client spawns a STATICS-ONLY copy
 -- (race/prefab.lua) so it never instantiates a cone vehicle -- prevention, not spawn-then-delete.
+-- `cone_files` is the host-only quickrace cone source (ADR-0025): a separate track prefab whose cone
+-- vehicles the host spawns from a cones-only copy (so it does not re-spawn the track's statics/spheres);
+-- empty for missions, whose cones ride inside `prefab_files`. Non-hosts never spawn it.
 -- Returns the list of prefab names spawned (for prefab cleanup) and the list of kept cone vehicle ids
 -- (empty unless host; for cone cleanup). One bad prefab warns and is skipped rather than aborting.
-function M.load(prefab_files, keep_cones)
+function M.load(prefab_files, keep_cones, cone_files)
     if type(spawnPrefab) ~= "function" or type(removePrefab) ~= "function" then
         log("W", LOG_TAG, "spawnPrefab/removePrefab unavailable -- cannot load props")
         return {}, {}
@@ -109,8 +117,31 @@ function M.load(prefab_files, keep_cones)
         end
     end
 
+    -- Host only: spawn a cones-only copy of each quickrace cone source so the cone vehicles exist once
+    -- for BeamMP to sync, without re-spawning the statics/spheres/waypoints the source prefab also
+    -- contains (ADR-0025). Non-hosts never reach here, so they never instantiate a quickrace cone.
+    if keep_cones and type(cone_files) == "table" then
+        for i, file in ipairs(cone_files) do
+            local name = CONE_PROP_NAME_PREFIX .. i
+            pcall(removePrefab, name)
+            local dest_ext = file:find("%.prefab%.json$") and ".prefab.json" or ".prefab"
+            local cones_file = CONES_TMP_PREFIX .. i .. dest_ext
+            if prefab.write_cones_only(file, cones_file) then
+                local ok, obj = pcall(spawnPrefab, name, cones_file, "0 0 0", "0 0 1", "1 1 1")
+                if ok and obj then
+                    spawned[#spawned + 1] = name
+                else
+                    log("W", LOG_TAG, "failed to load cone prefab '" .. tostring(cones_file) .. "': "
+                        .. tostring(obj))
+                end
+            end
+        end
+    end
+
     -- Only the host instantiates cones, so only the host tracks their ids for cleanup; non-hosts
-    -- never spawned any and have nothing to track (ADR-0020).
+    -- never spawned any and have nothing to track (ADR-0020/0025). keep_new diffs every new cone
+    -- vehicle in the scene, so it captures both a mission's full-prefab cones and the quickrace
+    -- cones-only spawn above.
     local cone_ids = {}
     if keep_cones then
         cone_ids = cones.keep_new(vehicles_before)
