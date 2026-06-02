@@ -84,9 +84,12 @@ function M.load(prefab_files, keep_cones)
         pcall(removePrefab, name)
         -- Non-hosts spawn a statics-only copy so the cone vehicles are never created (ADR-0020). The
         -- host spawns the full file as-is. If the filter fails, degrade to the full prefab rather
-        -- than leave the client with no barriers (logged).
+        -- than leave the client with no barriers (logged). The statics filter is JSONL-only, so it is
+        -- applied only to .prefab.json files (the mission prefabs); a legacy .prefab (the cone-free
+        -- quickrace barriers, ADR-0024) has no cone vehicles to drop and is spawned full on every
+        -- client -- routing its TorqueScript through the JSONL filter would corrupt it.
         local source = file
-        if not keep_cones then
+        if not keep_cones and file:find("%.prefab%.json$") then
             local statics_file = STATICS_TMP_PREFIX .. i .. ".prefab.json"
             if prefab.write_statics_only(file, statics_file) then
                 source = statics_file
