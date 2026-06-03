@@ -47,6 +47,15 @@ local BLOCKED_ACTIONS = {
     "saveHome",
     "dropPlayerAtCamera",
     "dropPlayerAtCameraNoReset",
+    -- Node grabber (Ctrl + drag): applies an external force the soft start-freeze does not resist, so
+    -- it could drag the car off its grid slot during the lock (countdown-lock-leaks Finding #4). Its
+    -- render/activation action is blocked here. NOTE: the exact action name(s) for BeamNG 0.38.5 are to
+    -- be confirmed in-game (dump core_input_actionFilter / the inputmaps) -- a wrong name silently
+    -- no-ops the filter rather than erroring. If the grabber is not a filterable input action, disable
+    -- the GE-side grabber for the lock span instead.
+    "nodegrabRender",
+    "nodegrabStrength",
+    "nodegrabFixedFrame",
 }
 
 -- Keys for stashing the original core_vehicles functions. Stored ON the core_vehicles table (not in
