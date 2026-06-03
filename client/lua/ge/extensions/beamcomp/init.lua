@@ -416,10 +416,11 @@ end
 
 -- Answer the server's listRaces request: build this client's installed-race list for the loaded map
 -- and ship it back for the server to post to the asking player (ADR-0005: the server is race-blind,
--- so the client owns the list; ADR-0011: client->server reply). The request payload is empty -- it is
--- just the server asking us to report.
-local function handle_list_races(_payload)
-    send_to_server("raceList", {lines = racelist.build(maps.current())})
+-- so the client owns the list; ADR-0011: client->server reply). The relayed `all` flag (ADR-0026)
+-- includes the deprecated quickrace source in the listing; otherwise it is hidden with a count hint.
+local function handle_list_races(payload)
+    local include_deprecated = type(payload) == "table" and payload.all == true
+    send_to_server("raceList", {lines = racelist.build(maps.current(), include_deprecated)})
 end
 
 -- Answer the server's pre-flight validateRace request (ADR-0019): the race-blind server relays the

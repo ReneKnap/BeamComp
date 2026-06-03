@@ -28,13 +28,17 @@ end
 -- a closed-loop circuit), or "  <slug> [<short>] (menu) - (unsupported)" when it can't be parsed (e.g.
 -- a branching race). <short> is the tippable shortname for /race; it equals the slug when no shorter
 -- unique form exists, in which case the bracket is dropped to avoid a redundant "[<slug>]". The (map)/
--- (menu) tag names the source so two same-named variants are distinguishable via the prefix.
-local function describe(locator, shortname)
+-- (menu) tag names the source so two same-named variants are distinguishable via the prefix. Deprecated
+-- (quickrace) entries, only shown with "all", carry a "(deprecated)" marker (ADR-0026).
+local function describe(locator, shortname, deprecated)
     local label = locator.displayName
     if shortname and shortname ~= locator.displayName then
         label = label .. " [" .. shortname .. "]"
     end
     label = label .. " (" .. source_label(locator.source) .. ")"
+    if deprecated then
+        label = label .. " (deprecated)"
+    end
 
     local race = parser.parse(locator)
     if not race then
@@ -54,29 +58,54 @@ end
 -- of strings the server posts verbatim. Current-map races are listed with parsed detail; races on
 -- other maps are only counted (a race starts only on its own map). With no map context, every race is
 -- listed by id without parsing (a parse-all would be heavy and the map filter is unavailable).
-function M.build(loaded_map)
+--
+-- The deprecated quickrace source (ADR-0026) is hidden unless include_deprecated ("all") is set: shown
+-- entries then carry a "(deprecated)" marker, and a hidden one on this map is replaced by a count hint
+-- so the player learns "all" reveals more. Off-map deprecated races stay out of the count unless "all".
+function M.build(loaded_map, include_deprecated)
     local races = discovery.list()
 
     if not loaded_map then
-        local lines = {string.format("BeamComp: %d race(s) installed (map unknown - can't filter):",
-            #races)}
+        local visible, hidden = {}, 0
         for _, locator in ipairs(races) do
+            if include_deprecated or not discovery.is_deprecated(locator) then
+                visible[#visible + 1] = locator
+            else
+                hidden = hidden + 1
+            end
+        end
+        local lines = {string.format("BeamComp: %d race(s) installed (map unknown - can't filter):",
+            #visible)}
+        for _, locator in ipairs(visible) do
             lines[#lines + 1] = "  " .. locator.id
+        end
+        if hidden > 0 then
+            lines[#lines + 1] = string.format("(%d deprecated - /races all to show)", hidden)
         end
         return lines
     end
 
-    local here, elsewhere = {}, 0
+    -- Split this map's startable races from the rest; within this map separate the deprecated ones
+    -- (hidden unless "all") so they can be hinted at. Off-map deprecated races are out of default scope
+    -- exactly like on-map ones, so they only count toward "elsewhere" with "all".
+    local here, hidden_here, elsewhere = {}, 0, 0
     for _, locator in ipairs(races) do
-        if locator.map and maps.matches(loaded_map, locator.map) then
-            here[#here + 1] = locator
-        else
+        local on_map = locator.map and maps.matches(loaded_map, locator.map)
+        local shown = include_deprecated or not discovery.is_deprecated(locator)
+        if on_map then
+            if shown then
+                here[#here + 1] = locator
+            else
+                hidden_here = hidden_here + 1
+            end
+        elseif shown then
             elsewhere = elsewhere + 1
         end
     end
 
-    -- Shortnames over this map's races only: that's the set /race resolves against here, so the
-    -- shown form is the shortest that stays unambiguous among the startable races.
+    -- Shortnames over the visible on-map set: that's the set /race resolves against here, so the shown
+    -- form is the shortest that stays unambiguous among the startable races (ADR-0026 keeps the
+    -- deprecated source out of both unless "all", so the two stay consistent).
     local shortnames = discovery.shortnames(here)
 
     local lines = {}
@@ -85,8 +114,14 @@ function M.build(loaded_map)
     else
         lines[#lines + 1] = string.format("BeamComp races on %s (%d):", loaded_map, #here)
         for _, locator in ipairs(here) do
-            lines[#lines + 1] = describe(locator, shortnames[locator.id])
+            lines[#lines + 1] = describe(locator, shortnames[locator.id],
+                discovery.is_deprecated(locator))
         end
+    end
+
+    if hidden_here > 0 then
+        lines[#lines + 1] = string.format("(%d deprecated on this map - /races all to show)",
+            hidden_here)
     end
 
     if elsewhere > 0 then
