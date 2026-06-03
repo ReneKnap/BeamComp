@@ -120,6 +120,9 @@ M.state = {
     assist_arming = nil,   -- active recover/repair countdown {kind, remaining}, or nil (ADR-0017)
     assist_notice = nil,   -- which abort reason was last toasted this hold ("moving"), latches one-shot
     freeze_hold_armed = false,  -- whether the VE EV-throttle clamp has been armed for the frozen phases (ADR-0017 amendment)
+    restage_pending = false,  -- a staging car swap awaits re-placement at the grid slot once its bbox is ready (staging-allow-vehicle-swap)
+    restage_baseline = nil,   -- spawn-bbox forward half-length recorded at swap adoption, to detect the new jbeam loading
+    restage_wait = 0,         -- seconds left to wait for the swapped car's jbeam before placing anyway
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -202,6 +205,7 @@ local function handle_race_start(payload)
     -- Re-arm the EV freeze clamp for this race: cleared here so push_freeze_hold fires again in staging
     -- (the abort-restart path skips the lobby reset, ADR-0017 amendment).
     M.state.freeze_hold_armed = false
+    M.state.restage_pending = false
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
 
@@ -300,6 +304,7 @@ local function teardown_race_world()
     M.state.assist_arming = nil
     M.state.assist_notice = nil
     M.state.freeze_hold_armed = false
+    M.state.restage_pending = false
     -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
 end
@@ -328,17 +333,21 @@ local function handle_race_phase(payload)
     end
 
     if phase == "staging" then
-        -- Arm the in-race vehicle-action lock for the whole staging + countdown + racing span
-        -- (ADR-0017/0021): no switching, spawning, replacing, or alternative recover/reset until the
-        -- race returns to lobby. The car is already frozen at its grid slot (handle_race_start) and
-        -- stays so until racing. Force the HUD app visible now so the countdown overlay it hosts is
-        -- present before the count starts (ADR-0021), and seed the staging indicator (ticked locally).
-        lock.install()
+        -- Arm the in-race vehicle-action lock in swap-allowed mode for the staging wait
+        -- (ADR-0017/0021 amendments): the player may still change car (replace the model/config via the
+        -- vehicle/parts selector), but cannot spawn an extra car, switch, reset, recover, or grab. A
+        -- swap is re-staged in onUpdate (re-freeze + bounce target + VE re-arm). The lock upgrades to the
+        -- full fixed-car lock at countdown. The car is already frozen at its grid slot
+        -- (handle_race_start) and stays so until racing. Force the HUD app visible now so the countdown
+        -- overlay it hosts is present before the count starts (ADR-0021), and seed the staging indicator.
+        lock.install({allow_replace = true})
         hud.show()
         M.state.staging = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
     elseif phase == "countdown" then
-        -- Staging over: seed the start countdown; the local onUpdate tick renders each whole second
-        -- and plays the final beeps on the centered overlay (ADR-0021).
+        -- Staging over: upgrade the lock to the full fixed-car lock (no more replace or selector) for
+        -- the countdown + racing span, then seed the start countdown; the local onUpdate tick renders
+        -- each whole second and plays the final beeps on the centered overlay (ADR-0021).
+        lock.install()
         M.state.staging = nil
         M.state.countdown = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
     elseif phase == "racing" then
@@ -1380,6 +1389,94 @@ local function step_assist(dt_real)
     end
 end
 
+-- Forward half-length (metres) of a vehicle's spawn bounding box, or nil if the API is unavailable.
+-- This is the same measurement front_anchored_target uses to anchor the car's front on the grid line.
+-- pcall: the bbox API is engine-version-coupled, so a mismatch reads as "unknown" rather than erroring.
+local function spawn_oobb_forward(veh)
+    local ok, half_y = pcall(function()
+        return veh:getSpawnWorldOOBB():getHalfExtents().y
+    end)
+    if ok and type(half_y) == "number" then
+        return half_y
+    end
+    return nil
+end
+
+-- Seconds to wait for a swapped car's jbeam to finish loading before re-placing it anyway (fallback for
+-- a same-footprint swap, where the bbox never visibly changes). Forward half-length change (metres) that
+-- signals the new jbeam has loaded and the bbox now reflects the new car rather than the one it replaced.
+local RESTAGE_MAX_WAIT = 3.0
+local RESTAGE_MIN_DELTA = 0.2
+
+-- Re-stage the car the player swapped to during the staging wait (ADR-0021/0017 amendments,
+-- staging-allow-vehicle-swap). The swap-allowed lock leaves replaceVehicle open but wraps it to flag the
+-- replace (lock.consume_replace) -- the reliable trigger, since a replace keeps the SAME vehicle id, so
+-- an id comparison never fires (confirmed in-game: the swap produced no adoption). The replacement
+-- spawns unfrozen, would drive off in the countdown, and reloads its VE (losing the assist override + EV
+-- clamp), so on a replace we re-place it at the grid slot, re-freeze it, and clear the VE-arm flags so
+-- onUpdate re-arms the (new) VE.
+--
+-- The grid re-placement is DEFERRED: a freshly replaced car keeps reporting the OLD car's bounding box
+-- for a moment while the new jbeam loads, so front-anchoring immediately uses the wrong footprint and
+-- lands a differently-sized car offset (confirmed in-game: small -> large swap sat too far forward). We
+-- record the footprint on the first pending frame and wait until the spawn bbox's forward half-length
+-- changes by RESTAGE_MIN_DELTA (new jbeam loaded), or until RESTAGE_MAX_WAIT elapses (same-size swap,
+-- where placing with the unchanged box is correct anyway).
+local function restage_swapped_car(dt_real)
+    if not M.state.race_car_id then
+        return
+    end
+
+    -- A replace happened: (re)start a pending re-placement. Re-arming the VE waits until placement, when
+    -- the new jbeam is loaded -- queueing to a still-loading VE would be lost.
+    if lock.consume_replace() then
+        M.state.restage_pending = true
+        M.state.restage_baseline = nil
+        M.state.restage_wait = RESTAGE_MAX_WAIT
+        log("I", RACE_LOG_TAG, "staging vehicle replace detected; re-staging")
+    end
+
+    if not M.state.restage_pending then
+        return
+    end
+
+    local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own then
+        return
+    end
+
+    -- Record the footprint on the first pending frame (still the old car), then wait for it to change
+    -- (new jbeam loaded) or for the fallback timeout.
+    local current = spawn_oobb_forward(own)
+    if M.state.restage_baseline == nil then
+        M.state.restage_baseline = current
+    end
+    M.state.restage_wait = (M.state.restage_wait or 0) - (dt_real or 0)
+    local baseline = M.state.restage_baseline
+    local loaded = current ~= nil and baseline ~= nil and math.abs(current - baseline) > RESTAGE_MIN_DELTA
+    if not loaded and M.state.restage_wait > 0 then
+        return
+    end
+
+    -- Adopt the swapped car: re-point the bounce target, re-place front-anchored to its now-correct
+    -- footprint, re-freeze, and clear the VE-arm flags so onUpdate re-arms its VE this frame.
+    local own_id = own:getId()
+    M.state.race_car_id = own_id
+    M.state.current_vehicle_id = own_id
+    local pose = M.state.race and M.state.race.myPose
+    if pose then
+        local placed, place_err = vehicles.respawn_own_at(pose, own)
+        if not placed then
+            log("W", RACE_LOG_TAG, "could not re-place staging-swapped car: " .. tostring(place_err))
+        end
+    end
+    vehicles.set_vehicle_frozen(own, true)
+    M.state.assist_armed = false
+    M.state.freeze_hold_armed = false
+    M.state.restage_pending = false
+    log("I", RACE_LOG_TAG, "re-placed staging-swapped car at grid slot as race car " .. tostring(own_id))
+end
+
 -- Tick the staging-wait indicator in wall time (ADR-0021): count the local copy of the server's
 -- auto-start window down and push the remaining whole seconds to the centered overlay only when the
 -- shown second changes. The server stays authoritative on the actual staging->countdown transition.
@@ -1420,6 +1517,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if M.state.phase == "staging" and M.state.race then
         -- Tick the staging-wait indicator on the centered overlay (ADR-0021).
         step_staging(dtReal)
+        -- Adopt a staging car swap as the new race car (re-freeze + bounce target + VE re-arm).
+        restage_swapped_car(dtReal)
     elseif M.state.phase == "countdown" and M.state.race then
         -- Tick the start countdown on the centered overlay (ADR-0021).
         step_start_countdown(dtReal)
