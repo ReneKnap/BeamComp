@@ -17,6 +17,11 @@ local M = {}
 
 local LOG_TAG = "beamcomp.spawn"
 
+-- The car spawned when the player starts a race without a real own car to copy (on foot, free-cam, or
+-- nothing). Stock config -- model only. Without this the fresh-spawn fallback would copy whatever
+-- getPlayerVehicle(0) is (the walking unicycle, or a prop), so the player landed in a non-car.
+local DEFAULT_VEHICLE_MODEL = "etk800"
+
 -- Delete every owned vehicle except `keep_id` (pass nil to delete all). Returns the count deleted
 -- (0 is valid), or nil plus a reason when there is no MP session to act in. Shared by despawn_own
 -- and despawn_owned_except. getOwnMap is a BeamMP GE global that exists only inside an MP session;
@@ -83,15 +88,41 @@ function M.despawn_owned_except(keep_id)
     return removed
 end
 
+-- True when `veh` is a real, race-eligible owned car: present in this client's owned-vehicle map
+-- (so BeamMP-safe to touch) and not the walking unicycle. The single definition of "a real own car",
+-- shared by resolve_own_car (which car to keep) and capture_own_spec (which spec is worth copying) --
+-- it also keeps the shared prop cones out, since they are not owned (ADR-0009).
+local function is_owned_race_car(veh)
+    if not veh or type(getOwnMap) ~= "function" or not be then
+        return false
+    end
+    if veh.JBeam == "unicycle" then
+        return false
+    end
+    local own = getOwnMap()
+    if type(own) ~= "table" then
+        return false
+    end
+    local veh_id = veh:getId()
+    for game_vehicle_id in pairs(own) do
+        -- Compare as strings: own-map keys and getId() may differ in number/string type.
+        if tostring(game_vehicle_id) == tostring(veh_id) then
+            return true
+        end
+    end
+    return false
+end
+
 -- Snapshot the player's active vehicle so it can be respawned fresh after the despawn deletes
 -- it: model + part config + all three paint layers (mirrors core_vehicles.cloneCurrent).
--- Returns the spec table, or nil when the player has no active vehicle to copy.
+-- Returns the spec table, or nil when the player is not in a real own car worth copying (on foot,
+-- free-cam, a prop, or nothing) -- the caller then spawns DEFAULT_VEHICLE_MODEL instead.
 local function capture_own_spec()
     if type(getPlayerVehicle) ~= "function" then
         return nil
     end
     local veh = getPlayerVehicle(0)
-    if not veh then
+    if not is_owned_race_car(veh) then
         return nil
     end
 
@@ -167,7 +198,7 @@ local function spawn_vehicle_at(pose, spec)
     if type(core_vehicles) ~= "table" or type(core_vehicles.spawnNewVehicle) ~= "function" then
         return nil, "core_vehicles.spawnNewVehicle unavailable"
     end
-    local model = (spec and spec.model) or core_vehicles.defaultVehicleModel
+    local model = (spec and spec.model) or DEFAULT_VEHICLE_MODEL
     if not model then
         return nil, "no vehicle model to spawn"
     end
@@ -214,24 +245,15 @@ function M.resolve_own_car(preferred_id)
     if not be or type(getOwnMap) ~= "function" then
         return nil
     end
-    local own = getOwnMap()
-    if type(own) ~= "table" then
-        return nil
-    end
 
     -- The owned, non-unicycle vehicle object for `id`, or nil.
     local function owned_car(id)
         if id == nil then
             return nil
         end
-        for game_vehicle_id in pairs(own) do
-            if tostring(game_vehicle_id) == tostring(id) then
-                local veh = be:getObjectByID(game_vehicle_id)
-                if veh and veh.JBeam ~= "unicycle" then
-                    return veh
-                end
-                return nil
-            end
+        local veh = be:getObjectByID(tonumber(id) or id)
+        if is_owned_race_car(veh) then
+            return veh
         end
         return nil
     end
@@ -287,6 +309,10 @@ function M.respawn_own_at(pose, own_car)
     -- Fallback: no real own car (free-cam / walking / none) -- spawn a fresh one. Capturing before
     -- the despawn is required, since the despawn deletes the car we copy.
     local spec = capture_own_spec()
+    if not spec then
+        log("I", LOG_TAG, "no own car to copy; spawning default vehicle '" .. DEFAULT_VEHICLE_MODEL
+            .. "' at grid")
+    end
     M.despawn_own()
 
     local veh, reason = spawn_vehicle_at(pose, spec)
@@ -295,7 +321,7 @@ function M.respawn_own_at(pose, own_car)
         return nil, reason
     end
 
-    local model_name = (spec and spec.model) or "default"
+    local model_name = (spec and spec.model) or DEFAULT_VEHICLE_MODEL
     log("I", LOG_TAG, string.format("spawned fresh own '%s' at grid (%.1f, %.1f, %.1f)",
         tostring(model_name), pose.pos.x, pose.pos.y, pose.pos.z))
     return veh
