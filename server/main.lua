@@ -17,8 +17,10 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
+--                 the deprecated quickrace ("menu:") source is hidden from bare-name resolution unless
+--                 "all" is given or the name carries an explicit "menu:" prefix (ADR-0026).
 --                 <name> may carry a "map:"/"menu:" source prefix (freeroam-mission vs Time-Trial-menu
 --                 set, ADR-0024); the server relays it verbatim and the client resolves it (race-blind).
 --                 from lobby/finished: assign every present player a slot, send each a
@@ -36,10 +38,11 @@
 --   /go /start /racestart  start the race now: end the staging wait early and begin the countdown
 --                 (ADR-0021). Admin-gated like /race; only acts while a race is staging.
 --   /raceend      force the state machine back to lobby (safety hatch).
---   /races        list the time-trial races on the asking player's current map. The server is
+--   /races [all]  list the time-trial races on the asking player's current map. The server is
 --                 race-blind (ADR-0005), so it asks that client (a "listRaces" event); the client
 --                 builds the list and sends it back ("raceList"), and the server posts it to the
---                 player. Reply is to the asker only.
+--                 player. Reply is to the asker only. The deprecated quickrace ("menu") source is
+--                 hidden (shown as a count hint) unless "all" is given (ADR-0026).
 --   /dnf          give up the current race: marks the issuing player DNF (did not finish). Racing
 --                 only (ADR-0014).
 --   /results      toggle the asking player's own finished-results card on/off (ADR-0022). Open to
@@ -657,6 +660,7 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
             laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
             direction = overrides.direction,  -- nil = forward; "reverse" if reversible (ADR-0018)
             force = overrides.force,          -- override a geometry mismatch where possible (ADR-0018)
+            all = overrides.all,              -- opt the deprecated quickrace source into resolution (ADR-0026)
             -- Opt-in recover/repair assists (ADR-0017); clients enforce. Disabled by default.
             recoverEnabled = assists.recoverEnabled,
             recoverHoldSeconds = assists.recoverHoldSeconds,
@@ -791,7 +795,7 @@ end
 
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
-    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>]"
+    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -896,11 +900,12 @@ end
 -- first whitespace token is the race name (slug-based, no spaces -- ADR-0005); each remaining token is
 -- an order-independent option, matched by unambiguous prefix across the whole keyword set:
 -- sprint|circuit (mode), reverse (direction), force, recover|repair[:secs|off] (assists), a bare
--- integer (lap count), or grid=<name> (a server-stored start grid, ADR-0023). Returns name (nil if the
--- argument is empty), an overrides table (always present;
--- mode/laps/direction nil = auto, force false, both assists ON at the default hold), and the first
--- unrecognized token (or nil) so the caller can reply usage. Both assists default ON at the default
--- hold; a recover:off / repair:off (or :-1 / :false) token turns one back off (ADR-0017 amendment).
+-- integer (lap count), grid=<name> (a server-stored start grid, ADR-0023), or the literal "all" (opt
+-- the deprecated quickrace source into name resolution, ADR-0026). Returns name (nil if the argument is
+-- empty), an overrides table (always present; mode/laps/direction nil = auto, force/all false, both
+-- assists ON at the default hold), and the first unrecognized token (or nil) so the caller can reply
+-- usage. Both assists default ON at the default hold; a recover:off / repair:off (or :-1 / :false) token
+-- turns one back off (ADR-0017 amendment).
 local function parse_race_args(argument)
     local tokens = {}
     for token in argument:gmatch("%S+") do
@@ -911,6 +916,7 @@ local function parse_race_args(argument)
     local bad_token
     local overrides = {
         force = false,
+        all = false,
         assists = {
             recoverEnabled = true,
             recoverHoldSeconds = ASSIST_DEFAULT_HOLD_SECONDS,
@@ -940,6 +946,9 @@ local function parse_race_args(argument)
                     assists.repairHoldSeconds = value.hold
                 end
             end
+        elseif token:lower() == "all" then
+            -- Opt the deprecated quickrace source into name resolution (ADR-0026); relayed to the client.
+            overrides.all = true
         elseif token:match("^%d+$") then
             overrides.laps = math.floor(tonumber(token))
         elseif token:match("^[Gg][Rr][Ii][Dd]=.+$") then
@@ -1003,6 +1012,7 @@ local function handle_race_command(player_id, player_name, argument)
         laps = overrides.laps,
         direction = overrides.direction,
         force = overrides.force,
+        all = overrides.all,  -- opt the deprecated quickrace source into resolution (ADR-0026)
         nonce = nonce,
     })
 end
@@ -1166,6 +1176,17 @@ local function parse_command(message)
     return message:match("^(%S+)%s*(.-)%s*$")
 end
 
+-- Whether a command argument contains the literal "all" opt-in token (ADR-0026), case-insensitive. Used
+-- by /races to relay the deprecated-source opt-in; /race detects the same token in parse_race_args.
+local function has_all_token(argument)
+    for token in argument:gmatch("%S+") do
+        if token:lower() == "all" then
+            return true
+        end
+    end
+    return false
+end
+
 local function on_chat_message(player_id, player_name, message)
     if type(message) ~= "string" then
         return
@@ -1191,8 +1212,9 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_RACES then
         -- Race-blind (ADR-0005): ask the asking client to report its race list; it replies with a
-        -- raceList event we post back (handle_race_list).
-        send_event(player_id, MSG_LIST_RACES, {})
+        -- raceList event we post back (handle_race_list). A trailing "all" token (ADR-0026) opts the
+        -- deprecated quickrace source into the listing -- relayed as a flag the client interprets.
+        send_event(player_id, MSG_LIST_RACES, {all = has_all_token(argument)})
         return 1  -- suppress the command's own chat echo
     end
 
