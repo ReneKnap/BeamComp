@@ -119,6 +119,7 @@ M.state = {
     assist_held = nil,     -- kind ("recover"/"repair") of the assist key currently held, or nil (ADR-0017)
     assist_arming = nil,   -- active recover/repair countdown {kind, remaining}, or nil (ADR-0017)
     assist_notice = nil,   -- which abort reason was last toasted this hold ("moving"), latches one-shot
+    freeze_hold_armed = false,  -- whether the VE EV-throttle clamp has been armed for the frozen phases (ADR-0017 amendment)
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -128,6 +129,10 @@ local send_to_server
 -- Disarms the seated car's VE recovery override; defined far below (next to the assist push) but used
 -- earlier in handle_race_phase's lobby teardown, so forward-declared here (ADR-0017).
 local disarm_assist_ve
+
+-- Disarms the seated car's VE EV-throttle clamp; defined far below (next to the freeze-hold push) but
+-- used earlier in handle_race_phase / handle_race_start, so forward-declared here (ADR-0017 amendment).
+local disarm_freeze_hold_ve
 
 local function handle_ping(_payload)
     guihooks.trigger("toastrMsg", {
@@ -163,8 +168,10 @@ local function handle_race_start(payload)
         M.state.assist_held = nil
         M.state.assist_arming = nil
         M.state.assist_notice = nil
+        M.state.freeze_hold_armed = false
         lock.remove()
         disarm_assist_ve()
+        disarm_freeze_hold_ve()
         countdown.clear()
         hud.clear()
         return
@@ -192,6 +199,9 @@ local function handle_race_start(payload)
     M.state.assist_held = nil
     M.state.assist_arming = nil
     M.state.assist_notice = nil
+    -- Re-arm the EV freeze clamp for this race: cleared here so push_freeze_hold fires again in staging
+    -- (the abort-restart path skips the lobby reset, ADR-0017 amendment).
+    M.state.freeze_hold_armed = false
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
 
@@ -270,6 +280,8 @@ local function teardown_race_world()
     -- Lift the in-race vehicle-action lock and restore the seated car's vanilla recovery (ADR-0017).
     lock.remove()
     disarm_assist_ve()
+    -- Release the EV start-freeze throttle clamp too (ADR-0017 amendment); idempotent on absent cars.
+    disarm_freeze_hold_ve()
     -- Despawn the track props and the host's shared cones (idempotent on absent names/ids, ADR-0020).
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
@@ -287,6 +299,7 @@ local function teardown_race_world()
     M.state.assist_held = nil
     M.state.assist_arming = nil
     M.state.assist_notice = nil
+    M.state.freeze_hold_armed = false
     -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
 end
@@ -338,6 +351,10 @@ local function handle_race_phase(payload)
         if not released then
             log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
         end
+        -- Release the EV throttle clamp now the freeze is lifting, so the car can pull away (ADR-0017
+        -- amendment). Idempotent + a no-op on combustion cars / when never armed.
+        disarm_freeze_hold_ve()
+        M.state.freeze_hold_armed = false
         -- Arm checkpoint detection now the lock is released: it walks the race's traversal plan
         -- (sprint/circuit, ADR-0013), testing the local car against the planned-next checkpoint each
         -- frame (onUpdate) while racing (ADR-0010).
@@ -1162,6 +1179,43 @@ function disarm_assist_ve()
     end)
 end
 
+-- Arm the seated car's VE EV-throttle clamp for the frozen phases (ADR-0017 amendment). Mirrors
+-- push_assist_arm but is NOT gated on race.assists -- the EV creep guard applies to every race -- and
+-- is tracked separately (freeze_hold_armed). The VE detects the drivetrain once and clamps the throttle
+-- only on EVs, so a bare "arm" is all GE sends. Loads the VE extension first (not auto-loaded; see
+-- push_assist_arm) and retries from onUpdate until the own car resolves.
+local function push_freeze_hold()
+    if M.state.freeze_hold_armed then
+        return
+    end
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        return
+    end
+
+    local command = "if not beamcomp_init then extensions.load('beamcomp_init') end "
+        .. "if beamcomp_init then beamcomp_init.on_freeze_hold_arm() end"
+    local ok, err = pcall(function() own_car:queueLuaCommand(command) end)
+    if not ok then
+        log("W", RACE_LOG_TAG, "could not arm freeze hold on VE: " .. tostring(err))
+        return
+    end
+    M.state.freeze_hold_armed = true
+end
+
+-- Tell the seated car's VE to release the EV-throttle clamp (ADR-0017 amendment): the freeze is lifting
+-- (racing) or the race is over. Best-effort -- if the car is gone the clamp died with it. Assigns the
+-- forward-declared local so handle_race_phase / handle_race_start (above) can call it.
+function disarm_freeze_hold_ve()
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        return
+    end
+    pcall(function()
+        own_car:queueLuaCommand("if beamcomp_init then beamcomp_init.on_freeze_hold_disarm() end")
+    end)
+end
+
 -- Perform a recover/repair once its countdown completes (ADR-0017). GE owns the action: "repair"
 -- fixes the car in place (queued recovery.recoverInPlace), "recover" teleports + repairs to the last
 -- passed checkpoint (grid pose before the first). Reseed the detector so the teleport jump is not
@@ -1387,6 +1441,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing")
         and M.state.race then
         push_assist_arm()
+    end
+    -- Arm the EV start-freeze throttle clamp over the frozen phases only (staging + countdown), so it
+    -- lifts on racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs.
+    if (M.state.phase == "staging" or M.state.phase == "countdown") and M.state.race then
+        push_freeze_hold()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
     -- frozen final standings, not the last frame caught mid-racing.
