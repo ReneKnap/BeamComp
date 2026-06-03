@@ -18,6 +18,10 @@ local maps = require("beamcomp/race/maps")
 
 local LOG_TAG = "beamcomp.race"
 
+-- The deprecated race source (ADR-0026): the level quickrace ("menu:") set. Deprecated tracks are
+-- hidden from /races and /race by default; an "all" opt-in or an explicit "menu:" prefix includes them.
+local DEPRECATED_SOURCE = "quickrace"
+
 local MISSIONS_ROOT = "/gameplay/missions/"
 local LEVELS_ROOT = "/levels/"
 local RACE_FILENAME = "race.race.json"
@@ -124,6 +128,11 @@ function M.list()
     return locators
 end
 
+-- Whether a locator belongs to the deprecated source (ADR-0026): the level quickrace ("menu:") set.
+function M.is_deprecated(locator)
+    return locator.source == DEPRECATED_SOURCE
+end
+
 -- Collapse a list of matched locators into a resolve result: the single race if exactly one
 -- matched, else the {code = "ambiguous", candidates = {ids}} reason table. Shared by the slug
 -- and substring tiers so both report ambiguity identically.
@@ -167,7 +176,11 @@ end
 -- only starts on its own map anyway), which keeps the set small so shorter substrings stay
 -- unambiguous; with no map context every installed race is considered. On failure returns nil
 -- plus a reason table: {code = "ambiguous", candidates = {...}} or {code = "not_found"}.
-function M.resolve(name, loaded_map)
+--
+-- Deprecated races (the quickrace "menu:" source, ADR-0026) are excluded unless include_deprecated is
+-- truthy OR the name carries an explicit "menu:"/"map:" source prefix -- an explicit prefix is its own
+-- opt-in, so /race menu:<name> resolves without "all".
+function M.resolve(name, loaded_map, include_deprecated)
     if not name or name == "" then
         return nil, {code = "not_found"}
     end
@@ -197,6 +210,15 @@ function M.resolve(name, loaded_map)
             end
         end
         candidates = in_source
+    elseif not include_deprecated then
+        -- No explicit source prefix and no "all": drop the deprecated source from the match set.
+        local kept = {}
+        for _, race in ipairs(candidates) do
+            if not M.is_deprecated(race) then
+                kept[#kept + 1] = race
+            end
+        end
+        candidates = kept
     end
 
     for _, race in ipairs(candidates) do

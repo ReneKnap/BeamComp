@@ -152,9 +152,11 @@ end
 -- (ADR-0005) and the same not-found / wrong-map / ambiguous / parse-error reasons.
 local function resolve_race(payload)
     -- Resolve against this map's races only (only the client knows a race's map, and a race only
-    -- starts on its own map). Skip the map filter if the level is undetectable.
+    -- starts on its own map). Skip the map filter if the level is undetectable. The relayed "all" flag
+    -- (ADR-0026) opts the deprecated quickrace source back into the match set.
     local loaded = maps.current()
-    local locator, miss = discovery.resolve(payload.race, loaded)
+    local include_deprecated = payload.all == true
+    local locator, miss = discovery.resolve(payload.race, loaded, include_deprecated)
     if not locator then
         if miss and miss.code == "ambiguous" then
             return nil, nil, "ambiguous race name '" .. payload.race .. "'"
@@ -162,7 +164,7 @@ local function resolve_race(payload)
         -- Not on this map: if the name does pick out a race elsewhere, say so -- more helpful
         -- than a bare "not found" on a multi-map server.
         if loaded then
-            local elsewhere = discovery.resolve(payload.race)
+            local elsewhere = discovery.resolve(payload.race, nil, include_deprecated)
             if elsewhere and elsewhere.map and not maps.matches(loaded, elsewhere.map) then
                 return nil, nil, "race is on map '" .. elsewhere.map .. "' -- you are on '"
                     .. loaded .. "'"
@@ -296,7 +298,9 @@ function M.anchor(race_name, direction)
     if type(race_name) ~= "string" then
         return nil, "no race name"
     end
-    local race, locator, err = resolve_race({race = race_name})
+    -- The grid editor resolves any installed race, including the deprecated quickrace source (ADR-0026),
+    -- so an admin can configure grids for it -- pass all = true.
+    local race, locator, err = resolve_race({race = race_name, all = true})
     if not race then
         return nil, err
     end
@@ -323,7 +327,8 @@ function M.resolve_id(race_name)
     if type(race_name) ~= "string" or race_name == "" then
         return nil, "no race name"
     end
-    local locator, miss = discovery.resolve(race_name, maps.current())
+    -- Editor path (ADR-0023): resolve any installed race, including the deprecated source (ADR-0026).
+    local locator, miss = discovery.resolve(race_name, maps.current(), true)
     if not locator then
         if miss and miss.code == "ambiguous" then
             return nil, "ambiguous race name '" .. race_name .. "'"
