@@ -355,6 +355,76 @@ function M.recover_to(veh, pos, dir)
     return true
 end
 
+-- Best-effort "has this car been modified from stock parts" check for the records vehicle field
+-- (ADR-0027). Reads veh.partConfig (the same field capture_own_spec copies, so it is known to work
+-- under BeamMP): a string is a named preset config (.pc file) -> stock/preset, a table is an inline,
+-- customized parts blob -> modified. Returns nil (unknown) when the field is absent or any other type,
+-- so the server stores "unknown" rather than a guess. Heuristic -- confirm the string/table split
+-- in-game at handover.
+local function detect_modified(veh)
+    local ok, part_config = pcall(function() return veh.partConfig end)
+    if not ok or part_config == nil then
+        return nil
+    end
+    if type(part_config) == "string" then
+        return false
+    end
+    if type(part_config) == "table" then
+        return true
+    end
+    return nil
+end
+
+-- Collect this client's identity + vehicle metadata for the server's best-times records (ADR-0027).
+-- `veh` is the resolved race car (the caller already holds it). Every engine read is pcall-guarded and
+-- degrades to nil: the BeamNG globals for the license name and vehicle details are UNVERIFIED under
+-- BeamMP, so any gap yields a nil field rather than an error -- the server then falls back to the
+-- BeamMP name and stores nil vehicle fields. Returns {identity, vehicle = {model, type, modified}}.
+function M.collect_client_info(veh)
+    local info = {identity = nil, vehicle = {model = nil, type = nil, modified = nil}}
+    if not veh then
+        return info
+    end
+
+    -- Identity: the BeamNG license name -- the same player identity BeamNG's own race highscores use.
+    local ok_name, name = pcall(function()
+        if type(core_vehicles) == "table"
+                and type(core_vehicles.getVehicleLicenseText) == "function" then
+            return core_vehicles.getVehicleLicenseText(veh)
+        end
+        return nil
+    end)
+    if ok_name and type(name) == "string" and name ~= "" then
+        info.identity = name
+    end
+
+    -- Vehicle model: the JBeam name (e.g. "etk800"), read straight off the handle like elsewhere here.
+    local ok_model, model = pcall(function() return veh.JBeam end)
+    if ok_model and type(model) == "string" and model ~= "" then
+        info.vehicle.model = model
+    end
+
+    -- Vehicle type/class: the model's body style / type from its details, keyed by the vehicle id.
+    local ok_type, vtype = pcall(function()
+        if type(core_vehicles) == "table"
+                and type(core_vehicles.getVehicleDetails) == "function" then
+            local details = core_vehicles.getVehicleDetails(veh:getId())
+            local model_info = details and details.model
+            if type(model_info) == "table" then
+                return model_info.Type or model_info["Body Style"]
+            end
+        end
+        return nil
+    end)
+    if ok_type and type(vtype) == "string" and vtype ~= "" then
+        info.vehicle.type = vtype
+    end
+
+    info.vehicle.modified = detect_modified(veh)
+
+    return info
+end
+
 -- Freeze or release a vehicle in place using BeamNG's built-in controller.setFreeze -- the same
 -- lock the base game's quickrace / scenario countdowns use (e.g. scenario/quickRace.lua,
 -- gameplay/race/race.lua). It holds the car put while still letting the player rev and steer. The

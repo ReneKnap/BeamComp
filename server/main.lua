@@ -79,6 +79,7 @@ local MSG_CHECKPOINT = "checkpoint"
 local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
 local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
 local MSG_SPAWN_READY = "spawnReady"  -- a client's "car spawned + seated" ack, gating spawning (ADR-0006 amendment)
+local MSG_CLIENT_INFO = "clientInfo"  -- a client's identity + vehicle metadata for best-times records (ADR-0027)
 local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a map (ADR-0023; admin-gated)
 local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a map's default grid for a race (ADR-0023; admin-gated)
 local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its data (ADR-0023; read-only)
@@ -91,6 +92,7 @@ local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-
 local MSG_FINISH_GRACE = "finishGrace"  -- the DNF-cutoff countdown duration, broadcast when armed (ADR-0014)
 local MSG_VALIDATE_RACE = "validateRace"  -- ask the issuer's client to vet /race options pre-start (ADR-0019)
 local MSG_RESULTS_TOGGLE = "resultsToggle"  -- tell one client to hide/show its finished-results card (ADR-0022)
+local MSG_BEST_NOTICE = "bestNotice"  -- tell a finisher they set a personal best / track record (ADR-0027)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -154,6 +156,7 @@ local session = {
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
     spawn_pending = nil,      -- set of rostered player ids whose spawnReady ack is still awaited (ADR-0006 amendment)
     spawn_ready_count = 0,    -- how many distinct clients acked spawnReady this race (0 at timeout = empty race)
+    identities = nil,         -- per-player {identity, vehicle} reported via clientInfo, for records (ADR-0027)
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -188,6 +191,22 @@ local grids_file_path = nil
 -- what happens when the editor writes the grids file; lazy-loading on first access (ensure_grids_loaded)
 -- repopulates the store after such a reload, so a saved default is not lost.
 local grids_loaded = false
+
+-- Persistent best-times records (ADR-0027). A separate data file from the settings config (ADR-0016):
+-- records[race_name] = {track_best = {...}, players = {[identity] = {...}}}. The server stores only
+-- numbers + opaque client-reported strings keyed on the relayed race name, so race-blindness (ADR-0005)
+-- holds. Candidate paths tolerate the unverified working directory exactly like config + grids; writes
+-- go back to the loaded path, else the first candidate that opens. deploy.ps1 preserves this file
+-- across the server-folder wipe (like beamcomp.grids.json) so accumulated times survive a redeploy.
+local RECORDS_CANDIDATE_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.records.json",
+    "beamcomp.records.json",
+}
+
+-- records[race_name] = {...}; see capture_records. Empty until loaded from disk.
+local records_store = {}
+local records_file_path = nil
+local records_loaded = false
 
 
 local function log_info(subsystem, msg)
@@ -418,6 +437,88 @@ local function assign_default(map, race_name, name)
     return write_grids()
 end
 
+-- Read and JSON-decode the records file from the first candidate path that opens (ADR-0027). Returns
+-- the decoded table + resolved path, or nil + path + error label ("parse"/"missing"). pcall-guarded so
+-- a malformed file never crashes the plugin load -- mirrors read_config/read_grids.
+local function read_records()
+    for _, path in ipairs(RECORDS_CANDIDATE_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            local contents = file:read("*a")
+            file:close()
+            local ok, decoded = pcall(Util.JsonDecode, contents)
+            if not ok or type(decoded) ~= "table" then
+                return nil, path, "parse"
+            end
+            return decoded, path, nil
+        end
+    end
+    return nil, nil, "missing"
+end
+
+-- Populate records_store from the records file (ADR-0027). A missing or unparseable file leaves the
+-- store empty -- the first finish then seeds it. The resolved path is logged so the write target is
+-- visible in the server console (recon TODO #4). Called lazily via ensure_records_loaded.
+local function load_records()
+    records_store = {}
+
+    local data, path, err = read_records()
+    records_file_path = path
+    if not data then
+        if err == "parse" then
+            log_info("beamcomp.records", "records file at " .. tostring(path)
+                .. " is not valid JSON; starting empty")
+        else
+            log_info("beamcomp.records", "no records file found; starting empty")
+        end
+        return
+    end
+
+    records_store = data
+    log_info("beamcomp.records", "loaded records from " .. path)
+end
+
+-- Populate records_store once per Lua-state instance, lazily on first access -- robust to a file-watch
+-- reload that resets the in-memory store without re-firing onInit, exactly like ensure_grids_loaded.
+local function ensure_records_loaded()
+    if records_loaded then
+        return
+    end
+    records_loaded = true
+    load_records()
+end
+
+-- Serialize records_store and write it back, trying the loaded path first then the candidates
+-- (ADR-0027). Returns true + path on success, false otherwise. pcall-guarded around the encode + file
+-- I/O so a write failure is reported, never thrown into the BeamMP runtime -- mirrors write_grids.
+local function write_records()
+    local ok, encoded = pcall(Util.JsonEncode, records_store)
+    if not ok then
+        log_info("beamcomp.records", "could not encode records: " .. tostring(encoded))
+        return false
+    end
+
+    local candidates = {}
+    if records_file_path then
+        candidates[#candidates + 1] = records_file_path
+    end
+    for _, path in ipairs(RECORDS_CANDIDATE_PATHS) do
+        candidates[#candidates + 1] = path
+    end
+
+    for _, path in ipairs(candidates) do
+        local file = io.open(path, "w")
+        if file then
+            file:write(encoded)
+            file:close()
+            records_file_path = path
+            return true, path
+        end
+    end
+    log_info("beamcomp.records", "could not open any records path for writing")
+    return false
+end
+
 local function now()
     return clock:GetCurrent()
 end
@@ -590,6 +691,7 @@ local function reset_to_lobby()
     session.cleanup_warned = false
     session.spawn_pending = nil
     session.spawn_ready_count = 0
+    session.identities = nil
     enter_phase(PHASE.lobby, nil)
     if had_race then
         broadcast_chat("BeamComp: race cleared -- back in free roam")
@@ -660,6 +762,9 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
     for _, entry in ipairs(slots) do
         session.spawn_pending[entry.id] = true
     end
+    -- Drop any identity/vehicle reports from a prior race so a re-issue (abort path, no reset_to_lobby)
+    -- starts clean; each player re-reports clientInfo on the new spawn (ADR-0027).
+    session.identities = nil
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
@@ -789,6 +894,175 @@ local function advance_spawning()
     end
 end
 
+-- Lower each stored per-CP segment best with a faster one from this run (ADR-0027). In-place on
+-- `target`; keyed by CP index k. Used for a player's own best_segments, where the holder is implicit
+-- (the player owning the record).
+local function improve_segments(target, segments)
+    for k, seconds in pairs(segments) do
+        if type(seconds) == "number"
+                and (type(target[k]) ~= "number" or seconds < target[k]) then
+            target[k] = seconds
+        end
+    end
+end
+
+-- Lower a track record's per-CP segment best with a faster one from this run, recording who set it
+-- (ADR-0027). Unlike improve_segments (per-player, implicit holder), the cross-player track segments
+-- carry the holder identity. In-place on `target`; each entry is {time, holder}, keyed by CP index k.
+local function improve_track_segments(target, segments, holder)
+    for k, seconds in pairs(segments) do
+        if type(seconds) == "number" then
+            local current = target[k]
+            if type(current) ~= "table" or type(current.time) ~= "number"
+                    or seconds < current.time then
+                target[k] = {time = seconds, holder = holder}
+            end
+        end
+    end
+end
+
+-- Per-CP segment times from the cumulative race-relative splits (ADR-0015): segment[k] = splits[k] -
+-- splits[k-1], with splits[0] = 0. A finisher's splits are dense 1..count, so a numeric guard is
+-- enough. Returns a 1-based array.
+local function derive_segments(splits)
+    local segments = {}
+    if type(splits) ~= "table" then
+        return segments
+    end
+    local previous = 0
+    for k = 1, #splits do
+        local cumulative = splits[k]
+        if type(cumulative) == "number" then
+            segments[k] = cumulative - previous
+            previous = cumulative
+        end
+    end
+    return segments
+end
+
+-- Update one player's record for this race, returning true when `primary` is a new personal best.
+-- run_count increments on every finish; best_segments improve per CP independently of the headline
+-- time. A nil identity is not recorded (no stable key).
+local function update_player_record(players, identity, is_circuit, primary, segments, vehicle, date)
+    if not identity then
+        return false
+    end
+    local entry = players[identity]
+    if type(entry) ~= "table" then
+        entry = {run_count = 0, best_segments = {}}
+        players[identity] = entry
+    end
+    if type(entry.best_segments) ~= "table" then
+        entry.best_segments = {}
+    end
+    entry.run_count = (entry.run_count or 0) + 1
+
+    local field = is_circuit and "best_lap" or "best_total"
+    local is_pb = false
+    if type(primary) == "number" and (type(entry[field]) ~= "number" or primary < entry[field]) then
+        entry[field] = primary
+        entry.vehicle = vehicle
+        entry.date = date
+        is_pb = true
+    end
+
+    improve_segments(entry.best_segments, segments)
+    return is_pb
+end
+
+-- Update the race's cross-player track record, returning true when this run takes the overall best
+-- (total for a sprint, lap for a circuit). Per-CP segment records improve independently of the holder.
+local function update_track_best(track, is_circuit, primary, segments, identity, vehicle, date)
+    if type(track.segments) ~= "table" then
+        track.segments = {}
+    end
+    local field = is_circuit and "best_lap" or "total_time"
+    local is_record = false
+    if type(primary) == "number" and (type(track[field]) ~= "number" or primary < track[field]) then
+        track[field] = primary
+        track.holder = identity
+        track.vehicle = vehicle
+        track.date = date
+        is_record = true
+    end
+    improve_track_segments(track.segments, segments, identity)
+    return is_record
+end
+
+-- Capture every non-DNF finisher's best times into the persistent records at the racing -> finished
+-- seam (ADR-0027). One pass over session.progress, one file write. Per finisher: pick the primary
+-- metric (best lap for a circuit -- signalled by the non-nil best_lap the client reported -- else the
+-- total time), derive per-CP segments from the cumulative splits, and update the player record and the
+-- race's track record when improved. The server reads only numbers + the opaque client-reported
+-- identity/vehicle, keyed on session.race, so race-blindness (ADR-0005) holds. Improved finishers get
+-- a bestNotice. DNFs are not scored.
+local function capture_records()
+    if not session.race or not session.progress then
+        return
+    end
+
+    -- Nothing to record when no one finished (all DNF): skip the load + write and the empty race entry.
+    local has_finisher = false
+    for _, record in pairs(session.progress) do
+        if record.finished and not record.dnf then
+            has_finisher = true
+            break
+        end
+    end
+    if not has_finisher then
+        return
+    end
+
+    ensure_records_loaded()
+
+    local race = records_store[session.race]
+    if type(race) ~= "table" then
+        race = {players = {}, track_best = {}}
+        records_store[session.race] = race
+    end
+    if type(race.players) ~= "table" then
+        race.players = {}
+    end
+    if type(race.track_best) ~= "table" then
+        race.track_best = {}
+    end
+
+    local date = os.date("%Y-%m-%d")
+    local identities = session.identities or {}
+    local notify = {}
+
+    for id, record in pairs(session.progress) do
+        if record.finished and not record.dnf then
+            local info = identities[id]
+            local identity = (info and info.identity) or record.name
+            local vehicle = info and info.vehicle or nil
+            local is_circuit = record.best_lap ~= nil
+            local primary = is_circuit and record.best_lap or record.total_time
+            local segments = derive_segments(record.splits)
+
+            local is_pb = update_player_record(race.players, identity, is_circuit, primary,
+                segments, vehicle, date)
+            local is_track_record = update_track_best(race.track_best, is_circuit, primary,
+                segments, identity, vehicle, date)
+
+            if (is_pb or is_track_record) and identity then
+                notify[id] = {pb = is_pb, track_record = is_track_record}
+            end
+        end
+    end
+
+    local ok = write_records()
+    if not ok then
+        log_info("beamcomp.records", "capture: write failed; records kept in memory only")
+    else
+        log_info("beamcomp.records", "captured best times for race '" .. session.race .. "'")
+    end
+
+    for id, flags in pairs(notify) do
+        send_event(id, MSG_BEST_NOTICE, {pb = flags.pb, trackRecord = flags.track_record})
+    end
+end
+
 local function tick()
     expire_stale_validation()
     maybe_warn_cleanup()
@@ -803,6 +1077,7 @@ local function tick()
     if phase == PHASE.racing then
         if session.grace_deadline and now() >= session.grace_deadline then
             dnf_active_players("grace expired")
+            capture_records()
             enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
         end
         return
@@ -1111,6 +1386,31 @@ local function handle_spawn_ready(player_id, payload)
     end
     session.spawn_pending[player_id] = nil
     session.spawn_ready_count = session.spawn_ready_count + 1
+end
+
+-- Stash a client's reported identity + vehicle for this race's best-times records (ADR-0027). Guarded
+-- like the spawnReady ack -- accepted only during an active race for the matching race name -- so a
+-- stale report from a previous race is dropped. The values are opaque to the server (race-blind,
+-- ADR-0005); they are read at the finish capture, with a fallback to the BeamMP name. Logged once so
+-- the unverified client globals (license name, vehicle details) are visible in the server console.
+local function handle_client_info(player_id, payload)
+    if session.phase == PHASE.lobby or type(payload) ~= "table"
+        or payload.race ~= session.race then
+        return
+    end
+    local vehicle = type(payload.vehicle) == "table" and payload.vehicle or nil
+    session.identities = session.identities or {}
+    session.identities[player_id] = {
+        identity = type(payload.identity) == "string" and payload.identity or nil,
+        vehicle = vehicle,
+    }
+    log_info("beamcomp.records", string.format(
+        "clientInfo id=%s identity=%s vehicle=%s/%s modified=%s",
+        tostring(player_id),
+        tostring(session.identities[player_id].identity),
+        tostring(vehicle and vehicle.model),
+        tostring(vehicle and vehicle.type),
+        tostring(vehicle and vehicle.modified)))
 end
 
 -- /raceend: force the machine back to lobby from any active phase (safety hatch).
@@ -1541,6 +1841,8 @@ local function handle_client_event(player_id, data)
         handle_race_validation(player_id, decoded.payload)
     elseif decoded.type == MSG_SPAWN_READY then
         handle_spawn_ready(player_id, decoded.payload)
+    elseif decoded.type == MSG_CLIENT_INFO then
+        handle_client_info(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
         handle_grid_save(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_ASSIGN then
@@ -1558,6 +1860,7 @@ local function on_init()
     log_info("beamcomp", "server plugin loaded v" .. PLUGIN_VERSION)
     load_config()
     ensure_grids_loaded()
+    ensure_records_loaded()
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
     -- fully up; the tick is a no-op while the session sits in lobby.
     MP.CreateEventTimer(TICK_EVENT, TICK_INTERVAL_MS, MP.CallStrategy.BestEffort)

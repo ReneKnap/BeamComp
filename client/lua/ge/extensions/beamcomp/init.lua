@@ -291,6 +291,18 @@ local function handle_race_start(payload)
     -- runs after this and does not gate the ack. Echo payload.race (the exact name the server relayed,
     -- == session.race), not the resolved race.meta.name, so the server's stale-ack guard matches.
     send_to_server("spawnReady", {race = payload.race})
+
+    -- Report identity + vehicle metadata so the server can attribute this race's best times to a
+    -- stable, BeamNG-consistent name and record what car was driven (ADR-0027). A dedicated message,
+    -- not piggybacked on the ack above, so the spawnReady contract stays narrow. Echo payload.race like
+    -- the ack so the server's race-guard matches. Sent unconditionally; collect_client_info degrades
+    -- every field to nil on a spawn hiccup, and the server falls back to the BeamMP name.
+    local client_info = vehicles.collect_client_info(race_car)
+    send_to_server("clientInfo", {
+        race = payload.race,
+        identity = client_info.identity,
+        vehicle = client_info.vehicle,
+    })
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
@@ -550,6 +562,19 @@ local function handle_grid_list(payload)
     editor_feedback("saved grids: " .. table.concat(names, ", "))
 end
 
+-- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
+-- Surface it as a toast; the track record wins the message when both are set.
+local function handle_best_notice(payload)
+    if type(payload) ~= "table" or (not payload.pb and not payload.trackRecord) then
+        return
+    end
+    guihooks.trigger("toastrMsg", {
+        type = "success",
+        title = "BeamComp",
+        msg = payload.trackRecord and "New track record!" or "New personal best!",
+    })
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
@@ -561,6 +586,7 @@ local HANDLERS = {
     resultsToggle = handle_results_toggle,
     gridData = handle_grid_data,
     gridList = handle_grid_list,
+    bestNotice = handle_best_notice,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
