@@ -284,6 +284,13 @@ local function handle_race_start(payload)
         msg = string.format("Slot %d -- start (%.0f, %.0f, %.0f)",
             race.mySlot, race.myPose.pos.x, race.myPose.pos.y, race.myPose.pos.z),
     })
+
+    -- Tell the server this client is spawned + seated so it can leave the spawning phase once everyone
+    -- is ready instead of waiting a fixed delay (ADR-0006 amendment). Sent unconditionally -- even if
+    -- placement degraded above -- so a spawn hiccup never hangs the race; the deferred restage (if any)
+    -- runs after this and does not gate the ack. Echo payload.race (the exact name the server relayed,
+    -- == session.race), not the resolved race.meta.name, so the server's stale-ack guard matches.
+    send_to_server("spawnReady", {race = payload.race})
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving

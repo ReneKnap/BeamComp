@@ -78,6 +78,7 @@ local MSG_RACE_PHASE = "racePhase"
 local MSG_CHECKPOINT = "checkpoint"
 local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
 local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
+local MSG_SPAWN_READY = "spawnReady"  -- a client's "car spawned + seated" ack, gating spawning (ADR-0006 amendment)
 local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a map (ADR-0023; admin-gated)
 local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a map's default grid for a race (ADR-0023; admin-gated)
 local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its data (ADR-0023; read-only)
@@ -111,7 +112,7 @@ local PHASE = {
 
 -- Phase durations in seconds. Editable server config (ADR-0006); not a runtime/in-game UI.
 local PHASE_DURATIONS = {
-    spawning = 3.0,       -- fixed wait for clients to resolve/parse/spawn (acks deferred: backlog)
+    spawning = 10.0,      -- max wait for spawn-ready acks before proceeding anyway (ADR-0006 amendment)
     staging = 120.0,      -- pre-countdown staging wait; ends early on /go|/start|/racestart (ADR-0021)
     countdown = 8.0,      -- pre-race countdown (ADR-0021: was 3.0)
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
@@ -151,6 +152,8 @@ local session = {
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
+    spawn_pending = nil,      -- set of rostered player ids whose spawnReady ack is still awaited (ADR-0006 amendment)
+    spawn_ready_count = 0,    -- how many distinct clients acked spawnReady this race (0 at timeout = empty race)
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -585,6 +588,8 @@ local function reset_to_lobby()
     session.pending_map = nil
     session.pending_race_id = nil
     session.cleanup_warned = false
+    session.spawn_pending = nil
+    session.spawn_ready_count = 0
     enter_phase(PHASE.lobby, nil)
     if had_race then
         broadcast_chat("BeamComp: race cleared -- back in free roam")
@@ -647,6 +652,14 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
     session.pending_map = nil
     session.pending_race_id = nil
     session.cleanup_warned = false
+
+    -- Seed the spawn-ready gate: await one spawnReady ack per rostered player before leaving the
+    -- spawning phase (ADR-0006 amendment). A timeout caps the wait; 0 acks at that point = empty race.
+    session.spawn_pending = {}
+    session.spawn_ready_count = 0
+    for _, entry in ipairs(slots) do
+        session.spawn_pending[entry.id] = true
+    end
 
     log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
 
@@ -753,6 +766,29 @@ local function maybe_warn_cleanup()
     broadcast_chat("BeamComp: race props and results clear in 1 minute -- /raceend to clear now")
 end
 
+-- Leave the spawning phase once every rostered player is accounted for -- acked via spawnReady or
+-- gone (pruned on disconnect) -- or the spawning timeout caps the wait (ADR-0006 amendment). If not a
+-- single client acked by then, the roster never spawned (all left or none ran the mod), so abort to
+-- lobby instead of running an empty race until /raceend; otherwise proceed to staging. A no-op until
+-- the wait resolves, so it is safe to call every tick.
+local function advance_spawning()
+    if not session.spawn_pending then
+        return
+    end
+    local all_accounted = next(session.spawn_pending) == nil
+    local timed_out = session.phase_duration and phase_elapsed() >= session.phase_duration
+    if not all_accounted and not timed_out then
+        return
+    end
+    if session.spawn_ready_count == 0 then
+        log_info("beamcomp.race", "no players spawned; cancelling race")
+        broadcast_chat("BeamComp: no players spawned -- race cancelled")
+        reset_to_lobby()
+    else
+        enter_phase(PHASE.staging, PHASE_DURATIONS.staging)
+    end
+end
+
 local function tick()
     expire_stale_validation()
     maybe_warn_cleanup()
@@ -772,16 +808,19 @@ local function tick()
         return
     end
 
+    -- spawning ends on spawn-ready acks (or a timeout), not a fixed delay -- handled ahead of the
+    -- generic timed advance so a full ack set can leave early (ADR-0006 amendment).
+    if phase == PHASE.spawning then
+        advance_spawning()
+        return
+    end
+
     -- Every other active phase is timed: advance once its configured duration elapses.
     if not session.phase_duration or phase_elapsed() < session.phase_duration then
         return
     end
 
-    if phase == PHASE.spawning then
-        -- Spawned and placed: hold a staging wait so players can sort out, endable early by an admin
-        -- /go|/start|/racestart (ADR-0021).
-        enter_phase(PHASE.staging, PHASE_DURATIONS.staging)
-    elseif phase == PHASE.staging then
+    if phase == PHASE.staging then
         enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
     elseif phase == PHASE.countdown then
         -- The release signal itself is a later Phase-3 item; here we enter racing and send the
@@ -1059,6 +1098,21 @@ local function handle_race_validation(player_id, payload)
     end
 end
 
+-- A client reports its car is spawned + seated (ADR-0006 amendment). Counts toward the spawning gate
+-- only while spawning, from a rostered player still awaited, for the active race -- the phase/roster/
+-- race guards drop stale or duplicate acks (mirrors the raceValidation nonce/phase guards, ADR-0019).
+local function handle_spawn_ready(player_id, payload)
+    if session.phase ~= PHASE.spawning or type(payload) ~= "table"
+        or payload.race ~= session.race then
+        return
+    end
+    if not session.spawn_pending or not session.spawn_pending[player_id] then
+        return
+    end
+    session.spawn_pending[player_id] = nil
+    session.spawn_ready_count = session.spawn_ready_count + 1
+end
+
 -- /raceend: force the machine back to lobby from any active phase (safety hatch).
 local function handle_raceend_command(player_id, player_name)
     if not is_race_admin(player_name) then
@@ -1161,6 +1215,11 @@ local function on_player_disconnect(player_id)
         log_info("beamcomp.race", "all players gone; returning to lobby")
         reset_to_lobby()
         return
+    end
+    -- A player leaving during the spawning gate is no longer awaited, so the advance can resolve on the
+    -- remaining clients rather than waiting out the full timeout (ADR-0006 amendment).
+    if session.spawn_pending then
+        session.spawn_pending[player_id] = nil
     end
     local record = session.progress and session.progress[player_id]
     if record and not record.finished and not record.dnf then
@@ -1480,6 +1539,8 @@ local function handle_client_event(player_id, data)
         handle_race_list(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_VALIDATION then
         handle_race_validation(player_id, decoded.payload)
+    elseif decoded.type == MSG_SPAWN_READY then
+        handle_spawn_ready(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
         handle_grid_save(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_ASSIGN then
