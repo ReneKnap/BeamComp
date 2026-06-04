@@ -258,6 +258,95 @@
     .beamcomp-hud .bc-results-head .bc-bestlap {
       color: inherit;
     }
+    /* Post-race analysis overlay (ADR-0028): a wider centered fixed panel layered above the results
+       card, toggled by /analysis or the card's Analysis button. Scrolls for wide segment matrices. */
+    .beamcomp-hud .bc-analysis-card {
+      position: fixed;
+      top: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 960;
+      min-width: 32em;
+      max-width: 96vw;
+      max-height: 92vh;
+      overflow: auto;
+      background: rgba(0, 0, 0, 0.82);
+      border-radius: 6px;
+      padding: 10px 16px;
+      box-sizing: border-box;
+    }
+    .beamcomp-hud .bc-analysis-title {
+      text-align: center;
+      font-weight: bold;
+      font-size: 18px;
+      letter-spacing: 0.04em;
+      padding: 2px 0 6px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+      margin-bottom: 6px;
+    }
+    .beamcomp-hud .bc-analysis-section {
+      font-weight: bold;
+      opacity: 0.75;
+      letter-spacing: 0.04em;
+      margin: 10px 0 4px 0;
+    }
+    /* The analysis tables (segment matrix, metrics, deltas) share one tabular look. */
+    .beamcomp-hud table.bc-matrix {
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+      font-size: 13px;
+    }
+    .beamcomp-hud table.bc-matrix th,
+    .beamcomp-hud table.bc-matrix td {
+      padding: 2px 8px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    /* The driver column is left-aligned and pinned while the segment columns scroll horizontally. */
+    .beamcomp-hud table.bc-matrix .bc-matrix-driver {
+      text-align: left;
+      position: sticky;
+      left: 0;
+      background: rgba(0, 0, 0, 0.82);
+    }
+    .beamcomp-hud table.bc-matrix thead td {
+      opacity: 0.7;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+    }
+    .beamcomp-hud table.bc-matrix tr.bc-local td {
+      font-weight: bold;
+    }
+    /* Fastest segment in a column: purple, F1-style (ADR-0028). */
+    .beamcomp-hud table.bc-matrix td.bc-fastest {
+      color: #b06bff;
+      font-weight: bold;
+    }
+    .beamcomp-hud table.bc-matrix tr.bc-dnf td {
+      opacity: 0.5;
+    }
+    /* Delta cells: green = faster than the record, red = slower. */
+    .beamcomp-hud .bc-delta-neg {
+      color: #3fd96b;
+    }
+    .beamcomp-hud .bc-delta-pos {
+      color: #d9534f;
+    }
+    /* The Analysis open/close button (results card + overlay header). */
+    .beamcomp-hud .bc-analysis-btn {
+      display: block;
+      margin: 8px auto 0 auto;
+      padding: 3px 12px;
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 4px;
+      font: inherit;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .beamcomp-hud .bc-analysis-btn:hover {
+      background: rgba(255, 255, 255, 0.22);
+    }
   </style>
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
@@ -302,8 +391,9 @@
       </div>
     </div>
   </div>
-  <!-- Finished: centered results card (hidden by /results, ADR-0022) -->
-  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsHidden">
+  <!-- Finished: centered results card (hidden by /results, ADR-0022; replaced by the analysis overlay
+       while that is open, ADR-0028) -->
+  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsHidden && !hud.analysisOpen">
     <div class="bc-results-title">Final Standings</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
@@ -325,6 +415,76 @@
         </tr>
       </table>
     </div>
+    <button type="button" class="bc-analysis-btn" ng-if="hud.analysis" ng-click="toggleAnalysis()">&#9656; Analysis</button>
+  </div>
+  <!-- Finished: full analysis overlay (opened by the card button or /analysis, ADR-0028) -->
+  <div class="bc-analysis-card" ng-if="hud.phase === 'finished' && hud.analysisOpen && hud.analysis">
+    <div class="bc-analysis-title">Race Analysis</div>
+
+    <div class="bc-analysis-section">Segments</div>
+    <table class="bc-matrix">
+      <thead>
+        <tr>
+          <td class="bc-matrix-driver">Driver</td>
+          <td ng-repeat="label in hud.analysis.columns">{{label}}</td>
+        </tr>
+      </thead>
+      <tbody>
+        <tr ng-repeat="d in hud.analysis.drivers" ng-class="{'bc-local': d.isLocal, 'bc-dnf': d.dnf}">
+          <td class="bc-matrix-driver">P{{d.position}} {{d.name}}</td>
+          <td ng-repeat="cell in d.cells" ng-class="{'bc-fastest': cell.fastest}">{{cell.value != null ? formatSeconds(cell.value) : '--'}}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="bc-analysis-section">Metrics</div>
+    <table class="bc-matrix">
+      <thead>
+        <tr>
+          <td class="bc-matrix-driver">Driver</td>
+          <td>Best Seg</td>
+          <td>Avg Seg</td>
+          <td>Consistency</td>
+          <td>Progress</td>
+        </tr>
+      </thead>
+      <tbody>
+        <tr ng-repeat="d in hud.analysis.drivers" ng-class="{'bc-local': d.isLocal, 'bc-dnf': d.dnf}">
+          <td class="bc-matrix-driver">P{{d.position}} {{d.name}}</td>
+          <td>{{formatSeconds(d.metrics.fastestSeg)}}</td>
+          <td>{{formatSeconds(d.metrics.avgSeg)}}</td>
+          <td>{{d.metrics.consistency != null ? '±' + formatSeconds(d.metrics.consistency) : '--'}}</td>
+          <td>{{formatPercent(d.metrics.progressPct)}}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div ng-if="hud.analysis.deltas">
+      <div class="bc-analysis-section">Your deltas vs records</div>
+      <table class="bc-matrix">
+        <thead>
+          <tr>
+            <td class="bc-matrix-driver"></td>
+            <td ng-repeat="label in hud.analysis.columns">{{label}}</td>
+            <td>Total</td>
+          </tr>
+        </thead>
+        <tbody>
+          <tr ng-if="hud.analysis.deltas.pb">
+            <td class="bc-matrix-driver">PB</td>
+            <td ng-repeat="cell in hud.analysis.deltas.pb.cells" ng-class="deltaClass(cell.delta)">{{deltaCell(cell.delta)}}</td>
+            <td ng-class="deltaClass(hud.analysis.deltas.pb.headline)">{{deltaCell(hud.analysis.deltas.pb.headline)}}</td>
+          </tr>
+          <tr ng-if="hud.analysis.deltas.track">
+            <td class="bc-matrix-driver">Track<span ng-if="hud.analysis.deltas.track.holder"> ({{hud.analysis.deltas.track.holder}})</span></td>
+            <td ng-repeat="cell in hud.analysis.deltas.track.cells" ng-class="deltaClass(cell.delta)">{{deltaCell(cell.delta)}}</td>
+            <td ng-class="deltaClass(hud.analysis.deltas.track.headline)">{{deltaCell(hud.analysis.deltas.track.headline)}}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <button type="button" class="bc-analysis-btn" ng-click="toggleAnalysis()">Close</button>
   </div>
   </div><!-- .beamcomp-hud -->
   <div class="bc-countdown" ng-show="countdown.active" ng-class="'bc-cd-' + countdown.kind"

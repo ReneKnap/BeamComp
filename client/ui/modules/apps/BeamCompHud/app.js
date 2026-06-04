@@ -37,6 +37,29 @@ angular.module('beamng.apps')
     return sign + m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
   }
 
+  // Unsigned race time in seconds for the analysis matrix/metrics: "S.cs" under 60 s, "M:SS.cs" from
+  // 60 s (segments are usually a handful of seconds, but a long lap segment can exceed a minute).
+  // Placeholder when not a number.
+  function formatSeconds(s) {
+    if (typeof s !== 'number') {
+      return '--';
+    }
+    if (s < 60) {
+      return s.toFixed(2);
+    }
+    var m = Math.floor(s / 60);
+    var rest = s - m * 60;
+    return m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
+  }
+
+  // Whole-percent string for the analysis progress metric; placeholder when not a number.
+  function formatPercent(p) {
+    if (typeof p !== 'number') {
+      return '--';
+    }
+    return Math.round(p) + '%';
+  }
+
   // Staging-countdown remaining (seconds) -> "M:SS" in whole seconds (the GE side pushes ceil'd
   // seconds, so centiseconds would only ever read .00). Placeholder when not a number.
   function formatStaging(t) {
@@ -131,6 +154,30 @@ angular.module('beamng.apps')
       scope.formatTime = formatTime;
       scope.formatDelta = formatDelta;
       scope.formatStaging = formatStaging;
+      scope.formatSeconds = formatSeconds;
+      scope.formatPercent = formatPercent;
+
+      // Open/close the post-race analysis overlay via the GE flag (single source of truth, ADR-0028):
+      // the results-card button and the /analysis command both route through M.toggle_analysis. bngApi is
+      // referenced as the core UI global (not an injected service, which would fail to resolve for this
+      // late-loaded mod app and take the whole directive down) and typeof-guarded so a miss is inert --
+      // the /analysis chat command remains the reliable trigger either way.
+      scope.toggleAnalysis = function () {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.toggle_analysis() end');
+        }
+      };
+
+      // Analysis delta cell: signed delta or a placeholder, with a faster/slower colour class (ADR-0028).
+      scope.deltaCell = function (d) {
+        return typeof d === 'number' ? formatDelta(d) : '--';
+      };
+      scope.deltaClass = function (d) {
+        if (typeof d !== 'number' || d === 0) {
+          return '';
+        }
+        return d < 0 ? 'bc-delta-neg' : 'bc-delta-pos';
+      };
 
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
