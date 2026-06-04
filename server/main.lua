@@ -47,6 +47,8 @@
 --                 only (ADR-0014).
 --   /results      toggle the asking player's own finished-results card on/off (ADR-0022). Open to
 --                 all players; affects only that player's view (a "resultsToggle" event).
+--   /analysis     toggle the asking player's own post-race analysis overlay on/off (ADR-0028). Open to
+--                 all players; affects only that player's view (an "analysisToggle" event).
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
 -- All commands suppress their own chat echo. Anything else relays as normal chat.
@@ -61,6 +63,7 @@ local CHAT_COMMAND_RACES = "/races"
 local CHAT_COMMAND_DNF = "/dnf"
 local CHAT_COMMAND_PING = "/beamcomp"
 local CHAT_COMMAND_RESULTS = "/results"  -- toggle the asking player's finished-results card (ADR-0022)
+local CHAT_COMMAND_ANALYSIS = "/analysis"  -- toggle the asking player's post-race analysis overlay (ADR-0028)
 -- Manual race-start aliases (ADR-0021): any of these ends the staging wait early and starts the
 -- countdown. All three route to one handler.
 local CHAT_COMMAND_GO = "/go"
@@ -93,6 +96,8 @@ local MSG_FINISH_GRACE = "finishGrace"  -- the DNF-cutoff countdown duration, br
 local MSG_VALIDATE_RACE = "validateRace"  -- ask the issuer's client to vet /race options pre-start (ADR-0019)
 local MSG_RESULTS_TOGGLE = "resultsToggle"  -- tell one client to hide/show its finished-results card (ADR-0022)
 local MSG_BEST_NOTICE = "bestNotice"  -- tell a finisher they set a personal best / track record (ADR-0027)
+local MSG_RACE_RECORDS = "raceRecords"  -- ship a participant's pre-run PB + the race's track record at the finish seam (ADR-0028)
+local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close its post-race analysis overlay (ADR-0028)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -989,6 +994,36 @@ local function update_track_best(track, is_circuit, primary, segments, identity,
     return is_record
 end
 
+-- Ship each race participant their pre-run best times at the racing -> finished seam (ADR-0028): the
+-- player's own personal-best record plus the race's track record for session.race, both as the opaque
+-- numbers the records store already holds. Sent BEFORE capture_records folds this run in, so a client
+-- compares against the best that existed before the run -- a fresh PB then reads as a real delta, not
+-- zero. Read-only: no store write, race-blindness (ADR-0005) holds. Identity resolves via
+-- session.identities with the progress name as fallback, exactly like capture_records.
+local function send_race_records()
+    if not session.race or not session.progress then
+        return
+    end
+
+    ensure_records_loaded()
+
+    local race = records_store[session.race]
+    local players = (type(race) == "table" and type(race.players) == "table") and race.players or {}
+    local track_record = type(race) == "table" and race.track_best or nil
+    local identities = session.identities or {}
+
+    for id, record in pairs(session.progress) do
+        local info = identities[id]
+        local identity = (info and info.identity) or record.name
+        local pb = identity and players[identity] or nil
+        send_event(id, MSG_RACE_RECORDS, {
+            race = session.race,
+            pb = pb,
+            trackRecord = track_record,
+        })
+    end
+end
+
 -- Capture every non-DNF finisher's best times into the persistent records at the racing -> finished
 -- seam (ADR-0027). One pass over session.progress, one file write. Per finisher: pick the primary
 -- metric (best lap for a circuit -- signalled by the non-nil best_lap the client reported -- else the
@@ -1077,6 +1112,7 @@ local function tick()
     if phase == PHASE.racing then
         if session.grace_deadline and now() >= session.grace_deadline then
             dnf_active_players("grace expired")
+            send_race_records()
             capture_records()
             enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
         end
@@ -1494,6 +1530,13 @@ local function handle_results_command(player_id, player_name)
     log_info("beamcomp.race", CHAT_COMMAND_RESULTS .. " toggle by " .. player_name)
 end
 
+-- /analysis: toggle the asking player's own post-race analysis overlay (ADR-0028). Open to all and
+-- per-player like /results -- it only flips that player's local overlay flag; the client owns the state.
+local function handle_analysis_command(player_id, player_name)
+    send_event(player_id, MSG_ANALYSIS_TOGGLE, {})
+    log_info("beamcomp.race", CHAT_COMMAND_ANALYSIS .. " toggle by " .. player_name)
+end
+
 -- True if no connected player other than `leaving_id` remains. onPlayerDisconnect may or may
 -- not still list the leaving player, so exclude it explicitly.
 local function is_server_empty_without(leaving_id)
@@ -1589,6 +1632,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_RESULTS then
         handle_results_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == CHAT_COMMAND_ANALYSIS then
+        handle_analysis_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
     -- not a BeamComp command: return nothing so the message relays normally
