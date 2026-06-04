@@ -117,6 +117,8 @@ M.state = {
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     laptimer = nil,      -- circuit lap-clock state (race/laptimer), armed on racing; display only (ADR-0022)
     results_hidden = false,  -- local-only toggle: hide the finished results card via /results (ADR-0022)
+    race_records = nil,      -- pre-run PB + track record for the post-race analysis overlay (server raceRecords, ADR-0028), or nil
+    analysis_open = false,   -- local-only toggle: show the post-race analysis overlay via /analysis or the card button (ADR-0028)
     post_orient = nil,   -- smoothed gate-line angle per checkpoint index, for player-facing posts
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
@@ -173,6 +175,8 @@ local function handle_race_start(payload)
         M.state.detection = nil
         M.state.laptimer = nil
         M.state.standings = nil
+        M.state.race_records = nil
+        M.state.analysis_open = false
         M.state.grace = nil
         M.state.assist_armed = false
         M.state.assist_held = nil
@@ -202,6 +206,8 @@ local function handle_race_start(payload)
     M.state.detection = nil
     M.state.laptimer = nil
     M.state.standings = nil
+    M.state.race_records = nil
+    M.state.analysis_open = false
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
@@ -331,6 +337,8 @@ local function teardown_race_world()
     M.state.detection = nil
     M.state.laptimer = nil
     M.state.standings = nil
+    M.state.race_records = nil
+    M.state.analysis_open = false
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
@@ -418,8 +426,10 @@ local function handle_race_phase(payload)
         else
             M.state.laptimer = nil
         end
-        -- Each race starts with its results card shown; a /results toggle only lasts that race.
+        -- Each race starts with its results card shown and its analysis overlay closed; the /results and
+        -- /analysis toggles only last that race (ADR-0022/0028).
         M.state.results_hidden = false
+        M.state.analysis_open = false
         -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
         -- dedups, so a manually-added copy is not duplicated.
         hud.show()
@@ -523,6 +533,20 @@ local function handle_results_toggle()
     log("I", RACE_LOG_TAG, "results card " .. (M.state.results_hidden and "hidden" or "shown"))
 end
 
+-- Toggle the local post-race analysis overlay (ADR-0028). Public so the results-card button can call it
+-- via bngApi.engineLua (UI -> GE, ADR-0012); the /analysis command routes here through the
+-- analysisToggle handler. The overlay only renders in the finished phase (the snapshot gates it), so a
+-- flip in any other phase is inert -- it is reset to closed on each racing start and on lobby teardown.
+function M.toggle_analysis()
+    M.state.analysis_open = not M.state.analysis_open
+    log("I", RACE_LOG_TAG, "analysis overlay " .. (M.state.analysis_open and "shown" or "hidden"))
+end
+
+-- The /analysis relay (server -> this client) flips the same overlay flag as the results-card button.
+local function handle_analysis_toggle()
+    M.toggle_analysis()
+end
+
 -- Surface grid-editor feedback both as a toast (visible while in-game) and in the log (visible in the
 -- console where the command was typed). `kind` is a toastr type ("info"/"warning").
 local function editor_feedback(msg, kind)
@@ -575,6 +599,21 @@ local function handle_best_notice(payload)
     })
 end
 
+-- A server raceRecords: this race's pre-run best times for the post-race analysis overlay (ADR-0028) --
+-- the local player's own personal-best record (pb) and the cross-player track record (trackRecord),
+-- both as the opaque numbers the records store holds. Store as-is; build_hud_snapshot derives the
+-- per-CP deltas client-side. Cleared on lobby teardown.
+local function handle_race_records(payload)
+    if type(payload) ~= "table" then
+        return
+    end
+    M.state.race_records = {
+        race = payload.race,
+        pb = payload.pb,
+        trackRecord = payload.trackRecord,
+    }
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
@@ -584,9 +623,11 @@ local HANDLERS = {
     validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
     resultsToggle = handle_results_toggle,
+    analysisToggle = handle_analysis_toggle,
     gridData = handle_grid_data,
     gridList = handle_grid_list,
     bestNotice = handle_best_notice,
+    raceRecords = handle_race_records,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -1030,13 +1071,226 @@ local function detection_lap(detection)
     return last_entry and last_entry.lap or 1
 end
 
+-- Per-CP segment times from a cumulative splits array (ADR-0015): segment[k] = splits[k] - splits[k-1],
+-- with splits[0] = 0. Mirrors the server's derive_segments -- the analysis overlay derives everything
+-- client-side from the broadcast splits (ADR-0028). Returns a 1-based array.
+local function derive_segments(splits)
+    local segments = {}
+    if type(splits) ~= "table" then
+        return segments
+    end
+    local previous = 0
+    for k = 1, #splits do
+        local cumulative = splits[k]
+        if type(cumulative) == "number" then
+            segments[k] = cumulative - previous
+            previous = cumulative
+        end
+    end
+    return segments
+end
+
+-- Arithmetic mean of a dense numeric array, or nil when empty.
+local function mean_of(values)
+    local count = #values
+    if count == 0 then
+        return nil
+    end
+    local sum = 0
+    for i = 1, count do
+        sum = sum + values[i]
+    end
+    return sum / count
+end
+
+-- Population standard deviation of a dense numeric array, or nil for fewer than two samples (a single
+-- segment has no spread to measure). `average` is the precomputed mean.
+local function stddev_of(values, average)
+    local count = #values
+    if count < 2 then
+        return nil
+    end
+    local sq = 0
+    for i = 1, count do
+        local diff = values[i] - average
+        sq = sq + diff * diff
+    end
+    return math.sqrt(sq / count)
+end
+
+-- The local player's per-CP and headline deltas to the pre-run PB and track record (ADR-0028). Each row
+-- is segment_count aligned cells (local segment minus the stored best segment) plus a headline (local
+-- primary metric -- total for sprint, best lap for circuit -- minus the stored best). A row is nil when
+-- its record (and every cell) is absent. Negative = the local run was faster than the record. Cells are
+-- arrays of {delta} so the UI iterates rather than indexing across the Lua->JS bridge.
+local function build_record_deltas(entries, records, is_circuit, segment_count)
+    if type(records) ~= "table" then
+        return nil
+    end
+
+    local local_entry = nil
+    for _, e in ipairs(entries) do
+        if e.isLocal then
+            local_entry = e
+            break
+        end
+    end
+    if not local_entry then
+        return nil
+    end
+
+    local local_segments = derive_segments(local_entry.splits)
+    -- The headline delta only makes sense for a completed run: a DNF (or a circuit run with no finished
+    -- lap) has no comparable total/lap, so leave the primary nil and the headline renders a placeholder.
+    -- The per-CP segment deltas stay valid -- the segments the player did complete are real.
+    local local_finished = local_entry.finished and not local_entry.dnf
+    local local_primary = nil
+    if local_finished then
+        if is_circuit then
+            local_primary = local_entry.bestLap
+        else
+            local_primary = local_entry.time
+        end
+    end
+
+    -- read_time pulls the stored segment time (a plain number for the PB, a {time, holder} entry for the
+    -- track record). headline_best is the stored headline metric to diff against.
+    local function delta_row(best_segments, read_time, headline_best)
+        local cells = {}
+        local any = false
+        for k = 1, segment_count do
+            local ours = local_segments[k]
+            local reference = read_time(best_segments and best_segments[k])
+            local delta = nil
+            if type(ours) == "number" and type(reference) == "number" then
+                delta = ours - reference
+                any = true
+            end
+            cells[k] = {delta = delta}
+        end
+        local headline = nil
+        if type(local_primary) == "number" and type(headline_best) == "number" then
+            headline = local_primary - headline_best
+            any = true
+        end
+        if not any then
+            return nil
+        end
+        return {cells = cells, headline = headline}
+    end
+
+    local pb = records.pb
+    local track = records.trackRecord
+    local pb_row = nil
+    local track_row = nil
+
+    if type(pb) == "table" then
+        pb_row = delta_row(pb.best_segments, function(value) return value end,
+            is_circuit and pb.best_lap or pb.best_total)
+    end
+    if type(track) == "table" then
+        track_row = delta_row(track.segments, function(value)
+            return type(value) == "table" and value.time or nil
+        end, is_circuit and track.best_lap or track.total_time)
+        if track_row then
+            track_row.holder = track.holder
+        end
+    end
+
+    if not pb_row and not track_row then
+        return nil
+    end
+    return {pb = pb_row, track = track_row}
+end
+
+-- Build the post-race analysis block from the finished-phase standings and the pre-run records
+-- (ADR-0028). Pure client-side derivation -- the race-blind server only ships numbers (ADR-0005). Per
+-- driver: aligned segment cells (each {value, fastest}) and the four metrics (fastest segment, mean
+-- segment, consistency = segment stddev, progress% = crossings / total). The fastest-per-segment
+-- highlight is the column minimum across drivers. For the local driver: per-CP deltas to PB and track
+-- record. Cells are padded to segment_count so the UI iterates aligned arrays (no numeric indexing
+-- across the Lua->JS bridge) and a DNF's shorter run still lines up. Returns nil with nothing to show.
+local function build_analysis(entries, records, is_circuit)
+    if not entries or #entries == 0 then
+        return nil
+    end
+
+    local segment_count = 0
+    local drivers = {}
+    for i, e in ipairs(entries) do
+        local segments = derive_segments(e.splits)
+        if #segments > segment_count then
+            segment_count = #segments
+        end
+        local fastest_segment = nil
+        for _, seconds in ipairs(segments) do
+            if not fastest_segment or seconds < fastest_segment then
+                fastest_segment = seconds
+            end
+        end
+        local average = mean_of(segments)
+        local total = e.count or 0
+        drivers[i] = {
+            name = e.name,
+            isLocal = e.isLocal,
+            dnf = e.dnf,
+            position = e.position,
+            segments = segments,  -- scratch for the column-min pass; replaced by cells below
+            metrics = {
+                fastestSeg = fastest_segment,
+                avgSeg = average,
+                consistency = average and stddev_of(segments, average) or nil,
+                progressPct = total > 0 and (100 * #segments / total) or nil,
+            },
+        }
+    end
+
+    -- Fastest time in each segment column across drivers (the purple highlight, ADR-0028).
+    local column_best = {}
+    for k = 1, segment_count do
+        local best = nil
+        for _, driver in ipairs(drivers) do
+            local seconds = driver.segments[k]
+            if type(seconds) == "number" and (not best or seconds < best) then
+                best = seconds
+            end
+        end
+        column_best[k] = best
+    end
+
+    local columns = {}
+    for k = 1, segment_count do
+        columns[k] = "S" .. k
+    end
+    for _, driver in ipairs(drivers) do
+        local cells = {}
+        for k = 1, segment_count do
+            local seconds = driver.segments[k]
+            cells[k] = {
+                value = seconds,
+                fastest = type(seconds) == "number" and column_best[k] ~= nil
+                    and seconds == column_best[k],
+            }
+        end
+        driver.cells = cells
+        driver.segments = nil
+    end
+
+    return {
+        columns = columns,
+        drivers = drivers,
+        deltas = build_record_deltas(entries, records, is_circuit, segment_count),
+    }
+end
+
 -- Build the HUD snapshot for the render app (ADR-0012): the full ranked standings list, tagged
 -- with the current phase so the app can branch live-HUD vs results template. During racing the
 -- local player's row uses the live detector (ticking time, crossing count, lap); during finished
 -- it falls back to the server-broadcast values so the frozen final readout matches every other
 -- client. `lapCount` is the resolved race lap count (1 for sprint; the HUD shows a lap indicator
 -- only when > 1, ADR-0013). Per-entry `splits` (cumulative race-time at each crossing, ADR-0015)
--- rides through opaquely for the results template. Pure read of M.state; the server is unaffected.
+-- rides through opaquely for the results template; the finished phase also derives the analysis
+-- block (ADR-0028). Pure read of M.state; the server is unaffected.
 local function build_hud_snapshot()
     local race = M.state.race
     local detection = M.state.detection
@@ -1144,14 +1398,24 @@ local function build_hud_snapshot()
     local grace = M.state.grace and M.state.grace.remaining or nil
     local grace_can_finish = not local_finished and not local_dnf
 
+    -- The post-race analysis block is derived only in the finished phase (the overlay's only context),
+    -- so the live HUD frames skip the work (ADR-0028).
+    local is_circuit = (race and race.mode == "circuit") or false
+    local analysis = nil
+    if phase == "finished" then
+        analysis = build_analysis(entries, M.state.race_records, is_circuit)
+    end
+
     return {
         active = true,
         phase = phase,
         entries = entries,
         grace = grace,
         graceCanFinish = grace_can_finish,
-        isCircuit = (race and race.mode == "circuit") or false,
+        isCircuit = is_circuit,
         resultsHidden = M.state.results_hidden or false,
+        analysisOpen = M.state.analysis_open or false,
+        analysis = analysis,
     }
 end
 
