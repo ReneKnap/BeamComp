@@ -52,12 +52,22 @@ angular.module('beamng.apps')
     return m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
   }
 
-  // Whole-percent string for the analysis progress metric; placeholder when not a number.
-  function formatPercent(p) {
-    if (typeof p !== 'number') {
+  // Accumulated raced time (seconds) -> "h:mm:ss" past an hour, else "m:ss"; placeholder when not a
+  // positive number. Used for the Driver/Track time_sum totals, which can span many runs.
+  function formatDuration(t) {
+    if (typeof t !== 'number' || t <= 0) {
       return '--';
     }
-    return Math.round(p) + '%';
+    var total = Math.floor(t);
+    var h = Math.floor(total / 3600);
+    var m = Math.floor((total % 3600) / 60);
+    var s = total % 60;
+    var ss = (s < 10 ? '0' : '') + s;
+    if (h > 0) {
+      var mm = (m < 10 ? '0' : '') + m;
+      return h + ':' + mm + ':' + ss;
+    }
+    return m + ':' + ss;
   }
 
   // Staging-countdown remaining (seconds) -> "M:SS" in whole seconds (the GE side pushes ceil'd
@@ -155,7 +165,7 @@ angular.module('beamng.apps')
       scope.formatDelta = formatDelta;
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
-      scope.formatPercent = formatPercent;
+      scope.formatDuration = formatDuration;
 
       // Open/close the post-race analysis overlay via the GE flag (single source of truth, ADR-0028):
       // the results-card button and the /analysis command both route through M.toggle_analysis. bngApi is
@@ -177,6 +187,18 @@ angular.module('beamng.apps')
           return '';
         }
         return d < 0 ? 'bc-delta-neg' : 'bc-delta-pos';
+      };
+
+      // Format a Driver-table cell by its row kind (ADR-0030): plain count, accumulated duration, or a
+      // lap/total time. A nil time renders a placeholder; a nil count renders 0.
+      scope.metricCell = function (value, kind) {
+        if (kind === 'count') {
+          return value != null ? value : 0;
+        }
+        if (kind === 'duration') {
+          return formatDuration(value);
+        }
+        return value != null ? formatTime(value) : '--';
       };
 
       scope.$on('BeamCompHudUpdate', function (event, data) {

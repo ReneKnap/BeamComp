@@ -290,6 +290,23 @@
       letter-spacing: 0.04em;
       margin: 10px 0 4px 0;
     }
+    /* Key/value list for the Driver and Track sections (ADR-0029): dim label left, bold value right. */
+    .beamcomp-hud table.bc-metrics-kv {
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .beamcomp-hud table.bc-metrics-kv td {
+      padding: 1px 10px 1px 0;
+      white-space: nowrap;
+    }
+    .beamcomp-hud table.bc-metrics-kv td:first-child {
+      opacity: 0.7;
+    }
+    .beamcomp-hud table.bc-metrics-kv td:last-child {
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+      font-weight: bold;
+    }
     /* The analysis tables (segment matrix, metrics, deltas) share one tabular look. */
     .beamcomp-hud table.bc-matrix {
       border-collapse: collapse;
@@ -415,7 +432,7 @@
         </tr>
       </table>
     </div>
-    <button type="button" class="bc-analysis-btn" ng-if="hud.analysis" ng-click="toggleAnalysis()">&#9656; Analysis</button>
+    <button type="button" class="bc-analysis-btn" ng-if="hud.analysisAvailable" ng-click="toggleAnalysis()">&#9656; Analysis</button>
   </div>
   <!-- Finished: full analysis overlay (opened by the card button or /analysis, ADR-0028) -->
   <div class="bc-analysis-card" ng-if="hud.phase === 'finished' && hud.analysisOpen && hud.analysis">
@@ -437,48 +454,52 @@
       </tbody>
     </table>
 
-    <div class="bc-analysis-section">Metrics</div>
-    <table class="bc-matrix">
-      <thead>
-        <tr>
-          <td class="bc-matrix-driver">Driver</td>
-          <td>Best Seg</td>
-          <td>Avg Seg</td>
-          <td>Consistency</td>
-          <td>Progress</td>
-        </tr>
-      </thead>
-      <tbody>
-        <tr ng-repeat="d in hud.analysis.drivers" ng-class="{'bc-local': d.isLocal, 'bc-dnf': d.dnf}">
-          <td class="bc-matrix-driver">P{{d.position}} {{d.name}}</td>
-          <td>{{formatSeconds(d.metrics.fastestSeg)}}</td>
-          <td>{{formatSeconds(d.metrics.avgSeg)}}</td>
-          <td>{{d.metrics.consistency != null ? '±' + formatSeconds(d.metrics.consistency) : '--'}}</td>
-          <td>{{formatPercent(d.metrics.progressPct)}}</td>
-        </tr>
-      </tbody>
-    </table>
+    <div ng-if="hud.analysis.driver">
+      <div class="bc-analysis-section">Driver - {{hud.analysis.driver.name || 'you'}}<span ng-if="hud.analysis.driver.carLabel"> · this car: {{hud.analysis.driver.carLabel}}</span></div>
+      <table class="bc-matrix">
+        <thead>
+          <tr><td class="bc-matrix-driver"></td><td>any car</td><td>this car</td></tr>
+        </thead>
+        <tbody>
+          <tr ng-repeat="row in hud.analysis.driver.rows">
+            <td class="bc-matrix-driver">{{row.label}}</td>
+            <td>{{metricCell(row.any, row.kind)}}</td>
+            <td>{{metricCell(row.this, row.kind)}}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
-    <div ng-if="hud.analysis.deltas">
-      <div class="bc-analysis-section">Your deltas vs records</div>
+    <div ng-if="hud.analysis.track">
+      <div class="bc-analysis-section">Track - {{hud.analysis.track.name}}<span ng-if="hud.analysis.track.carLabel"> · this car: {{hud.analysis.track.carLabel}}</span></div>
+      <table class="bc-metrics-kv">
+        <tr><td>Runs / time (all players)</td><td>{{hud.analysis.track.trackRuns}} · {{formatDuration(hud.analysis.track.trackTime)}}</td></tr>
+        <tr><td>Runs (this car, all)</td><td>{{hud.analysis.track.carRuns}}</td></tr>
+        <tr><td>Record (any car)</td><td>{{hud.analysis.track.recordAnyCar != null ? formatTime(hud.analysis.track.recordAnyCar) : '--'}}<span ng-if="hud.analysis.track.recordAnyCarHolder"> - {{hud.analysis.track.recordAnyCarHolder}}</span></td></tr>
+        <tr><td>Record (this car)</td><td>{{hud.analysis.track.recordThisCar != null ? formatTime(hud.analysis.track.recordThisCar) : '--'}}<span ng-if="hud.analysis.track.recordThisCarHolder"> - {{hud.analysis.track.recordThisCarHolder}}</span></td></tr>
+      </table>
+    </div>
+
+    <div ng-if="hud.analysis.race">
+      <div class="bc-analysis-section">Race - {{hud.analysis.race.isCircuit ? 'laps' : 'run'}} (&Delta; vs your best {{hud.analysis.race.isCircuit ? 'lap' : 'run'}})</div>
       <table class="bc-matrix">
         <thead>
           <tr>
             <td class="bc-matrix-driver"></td>
-            <td ng-repeat="label in hud.analysis.columns">{{label}}</td>
+            <td ng-repeat="label in hud.analysis.race.columns">{{label}}</td>
             <td>Total</td>
           </tr>
         </thead>
         <tbody>
-          <tr ng-if="hud.analysis.deltas.pb">
-            <td class="bc-matrix-driver">PB</td>
-            <td ng-repeat="cell in hud.analysis.deltas.pb.cells" ng-class="deltaClass(cell.delta)">{{deltaCell(cell.delta)}}</td>
-            <td ng-class="deltaClass(hud.analysis.deltas.pb.headline)">{{deltaCell(hud.analysis.deltas.pb.headline)}}</td>
+          <tr>
+            <td class="bc-matrix-driver">Your best</td>
+            <td ng-repeat="cell in hud.analysis.race.yourBest.cells">{{cell.value != null ? formatSeconds(cell.value) : '--'}}</td>
+            <td>{{hud.analysis.race.yourBest.total != null ? formatSeconds(hud.analysis.race.yourBest.total) : '--'}}</td>
           </tr>
-          <tr ng-if="hud.analysis.deltas.track">
-            <td class="bc-matrix-driver">Track<span ng-if="hud.analysis.deltas.track.holder"> ({{hud.analysis.deltas.track.holder}})</span></td>
-            <td ng-repeat="cell in hud.analysis.deltas.track.cells" ng-class="deltaClass(cell.delta)">{{deltaCell(cell.delta)}}</td>
-            <td ng-class="deltaClass(hud.analysis.deltas.track.headline)">{{deltaCell(hud.analysis.deltas.track.headline)}}</td>
+          <tr ng-repeat="row in hud.analysis.race.rows">
+            <td class="bc-matrix-driver">{{row.label}}<span ng-if="row.holder"> ({{row.holder}})</span></td>
+            <td ng-repeat="cell in row.cells" ng-class="deltaClass(cell.delta)">{{deltaCell(cell.delta)}}</td>
+            <td ng-class="deltaClass(row.total)">{{deltaCell(row.total)}}</td>
           </tr>
         </tbody>
       </table>
