@@ -620,6 +620,29 @@ local function build_progress(slots)
     return progress
 end
 
+-- The per-car records key from a reported vehicle (ADR-0029): the model, plus the variant (partConfig
+-- preset name) when known. Inline-modified cars (no preset name) bucket under model-only; a nil vehicle
+-- or missing model yields nil, so the run is counted only at the player/track level (no car attribution).
+local function vehicle_car_key(vehicle)
+    if type(vehicle) ~= "table" or type(vehicle.model) ~= "string" or vehicle.model == "" then
+        return nil
+    end
+    if type(vehicle.variant) == "string" and vehicle.variant ~= "" then
+        return vehicle.model .. "/" .. vehicle.variant
+    end
+    return vehicle.model
+end
+
+-- A compact car descriptor for the standings entry and the records payload (ADR-0029): the records key
+-- plus the raw fields the overlay shows. nil when there is no usable vehicle.
+local function car_descriptor(vehicle)
+    local key = vehicle_car_key(vehicle)
+    if not key then
+        return nil
+    end
+    return {key = key, model = vehicle.model, variant = vehicle.variant, modified = vehicle.modified}
+end
+
 -- Build the live ranked standings from session.progress: a pure function over the per-player
 -- records (race-blind, ADR-0005). Sort key: non-DNF before DNF (ADR-0014), then most checkpoints
 -- completed, then earliest time at that checkpoint, then slot as a stable tiebreak -- so finishers and
@@ -633,13 +656,15 @@ local function build_standings()
 
     local ranked = {}
     local known_count
-    for _, record in pairs(session.progress) do
-        ranked[#ranked + 1] = record
+    local identities = session.identities or {}
+    for id, record in pairs(session.progress) do
+        ranked[#ranked + 1] = {id = id, record = record}
         if not known_count and record.count then
             known_count = record.count
         end
     end
     table.sort(ranked, function(a, b)
+        a, b = a.record, b.record
         if a.dnf ~= b.dnf then
             return not a.dnf  -- non-DNF ranks ahead of DNF (ADR-0014)
         end
@@ -653,7 +678,9 @@ local function build_standings()
     end)
 
     local entries = {}
-    for i, record in ipairs(ranked) do
+    for i, item in ipairs(ranked) do
+        local record = item.record
+        local info = identities[item.id]
         entries[i] = {
             position = i,
             slot = record.slot,
@@ -669,6 +696,9 @@ local function build_standings()
             -- downstream readers must not mutate. DNF entries carry only the splits completed before
             -- DNF; the results UI derives segment deltas from this.
             splits = record.splits,
+            -- The driver's car (ADR-0029), so the client can filter "best lap with the car" in the
+            -- analysis overlay. nil when no identity/vehicle was reported.
+            car = car_descriptor(info and info.vehicle),
         }
     end
     return entries
@@ -899,9 +929,8 @@ local function advance_spawning()
     end
 end
 
--- Lower each stored per-CP segment best with a faster one from this run (ADR-0027). In-place on
--- `target`; keyed by CP index k. Used for a player's own best_segments, where the holder is implicit
--- (the player owning the record).
+-- Lower each stored per-section best with a faster one from this run (ADR-0030). In-place on `target`,
+-- keyed by section index; the per-car section_best leaves use it for the "best lap with the car" rows.
 local function improve_segments(target, segments)
     for k, seconds in pairs(segments) do
         if type(seconds) == "number"
@@ -911,77 +940,164 @@ local function improve_segments(target, segments)
     end
 end
 
--- Lower a track record's per-CP segment best with a faster one from this run, recording who set it
--- (ADR-0027). Unlike improve_segments (per-player, implicit holder), the cross-player track segments
--- carry the holder identity. In-place on `target`; each entry is {time, holder}, keyed by CP index k.
-local function improve_track_segments(target, segments, holder)
-    for k, seconds in pairs(segments) do
-        if type(seconds) == "number" then
-            local current = target[k]
-            if type(current) ~= "table" or type(current.time) ~= "number"
-                    or seconds < current.time then
-                target[k] = {time = seconds, holder = holder}
+-- Split a cumulative splits array into per-lap section arrays (ADR-0030): lap l has section[s] =
+-- splits[(l-1)*cps + s] - splits[(l-1)*cps + s - 1] and total = splits[l*cps] - splits[(l-1)*cps]. Only
+-- fully-completed laps are returned. Mirrors the client's laps_from_splits; the server derives laps from
+-- the splits it already stored, with cps from count/lap -- no geometry parsing, so race-blindness holds.
+local function laps_from_splits(splits, cps)
+    local laps = {}
+    if type(splits) ~= "table" or type(cps) ~= "number" or cps < 1 then
+        return laps
+    end
+    local lap_index = 1
+    while lap_index * cps <= #splits do
+        local base = (lap_index - 1) * cps
+        local base_time = base == 0 and 0 or splits[base]
+        local sections = {}
+        local ok = type(base_time) == "number"
+        for s = 1, cps do
+            local cumulative = splits[base + s]
+            local prev = (s == 1) and base_time or splits[base + s - 1]
+            if ok and type(cumulative) == "number" and type(prev) == "number" then
+                sections[s] = cumulative - prev
+            else
+                ok = false
             end
         end
+        if ok then
+            laps[#laps + 1] = {sections = sections, total = splits[base + cps] - base_time}
+        end
+        lap_index = lap_index + 1
     end
+    return laps
 end
 
--- Per-CP segment times from the cumulative race-relative splits (ADR-0015): segment[k] = splits[k] -
--- splits[k-1], with splits[0] = 0. A finisher's splits are dense 1..count, so a numeric guard is
--- enough. Returns a 1-based array.
-local function derive_segments(splits)
-    local segments = {}
-    if type(splits) ~= "table" then
-        return segments
-    end
-    local previous = 0
-    for k = 1, #splits do
-        local cumulative = splits[k]
-        if type(cumulative) == "number" then
-            segments[k] = cumulative - previous
-            previous = cumulative
+-- Per-section minimum and sum over a run's laps (ADR-0030), plus the lap count -- the source for a car's
+-- persistent per-section best (#2/#5) and per-section average (#4). Returns {min = [cps], sum = [cps],
+-- lap_count}.
+local function aggregate_run_sections(laps, cps)
+    local mins, sums = {}, {}
+    for s = 1, cps do
+        local min_value, sum_value, has = nil, 0, false
+        for _, lap in ipairs(laps) do
+            local value = lap.sections[s]
+            if type(value) == "number" then
+                sum_value = sum_value + value
+                if not min_value or value < min_value then
+                    min_value = value
+                end
+                has = true
+            end
+        end
+        if has then
+            mins[s] = min_value
+            sums[s] = sum_value
         end
     end
-    return segments
+    return {min = mins, sum = sums, lap_count = #laps}
 end
 
--- Update one player's record for this race, returning true when `primary` is a new personal best.
--- run_count increments on every finish; best_segments improve per CP independently of the headline
--- time. A nil identity is not recorded (no stable key).
-local function update_player_record(players, identity, is_circuit, primary, segments, vehicle, date)
+-- The per-section aggregate for a finisher's run, or nil when it cannot be derived. cps = count/lap (the
+-- server learns the per-lap checkpoint count from the numbers the client already reported, ADR-0030);
+-- skipped when count/lap is missing or not cleanly divisible.
+local function run_section_aggregate(record)
+    local count, lap = record.count, record.lap
+    if type(count) ~= "number" or type(lap) ~= "number" or lap < 1 then
+        return nil
+    end
+    local cps = math.floor(count / lap)
+    if cps < 1 or cps * lap ~= count then
+        return nil
+    end
+    local laps = laps_from_splits(record.splits, cps)
+    if #laps == 0 then
+        return nil
+    end
+    return aggregate_run_sections(laps, cps)
+end
+
+-- Fold this run's per-section aggregate into a car leaf (ADR-0030): lower each section best, and -- for a
+-- player car leaf -- add the section sums and bump the lap count (the per-section average source). Track
+-- car leaves keep only the cross-player section best (with_average false).
+local function fold_car_sections(car, aggregate, with_average)
+    if type(car.section_best) ~= "table" then
+        car.section_best = {}
+    end
+    improve_segments(car.section_best, aggregate.min)
+    if with_average then
+        if type(car.section_sum) ~= "table" then
+            car.section_sum = {}
+        end
+        for s, sum in pairs(aggregate.sum) do
+            car.section_sum[s] = (car.section_sum[s] or 0) + sum
+        end
+        car.lap_count = (car.lap_count or 0) + (aggregate.lap_count or 0)
+    end
+end
+
+-- Fold one finisher's run into a best leaf (player or track; ADR-0029/0030): bump the run/time counters
+-- and lower the headline best. `field` is the headline key (best_total/total_time for sprint,
+-- best_lap for circuit). Returns true on a new headline best. Tolerant of a leaf with missing counters.
+local function bump_best_leaf(leaf, field, primary, time, date)
+    leaf.run_count = (leaf.run_count or 0) + 1
+    leaf.time_sum = (leaf.time_sum or 0) + (time or 0)
+    if type(primary) == "number" and (type(leaf[field]) ~= "number" or primary < leaf[field]) then
+        leaf[field] = primary
+        leaf.date = date
+        return true
+    end
+    return false
+end
+
+-- Update one player's record for this race (ADR-0030): the overall leaf (any car) and, when a car key is
+-- known, the per-car leaf with the per-section aggregate. Returns true on a new overall personal best.
+-- A nil identity is not recorded (no stable key).
+local function update_player_record(players, identity, car_key, is_circuit, primary, time, aggregate,
+        vehicle, date)
     if not identity then
         return false
     end
+    local field = is_circuit and "best_lap" or "best_total"
     local entry = players[identity]
     if type(entry) ~= "table" then
-        entry = {run_count = 0, best_segments = {}}
+        entry = {}
         players[identity] = entry
     end
-    if type(entry.best_segments) ~= "table" then
-        entry.best_segments = {}
-    end
-    entry.run_count = (entry.run_count or 0) + 1
 
-    local field = is_circuit and "best_lap" or "best_total"
-    local is_pb = false
-    if type(primary) == "number" and (type(entry[field]) ~= "number" or primary < entry[field]) then
-        entry[field] = primary
+    local is_pb = bump_best_leaf(entry, field, primary, time, date)
+    if is_pb then
         entry.vehicle = vehicle
-        entry.date = date
-        is_pb = true
     end
 
-    improve_segments(entry.best_segments, segments)
+    if car_key then
+        if type(entry.cars) ~= "table" then
+            entry.cars = {}
+        end
+        local car = entry.cars[car_key]
+        if type(car) ~= "table" then
+            car = {}
+            entry.cars[car_key] = car
+        end
+        if bump_best_leaf(car, field, primary, time, date) then
+            car.modified = vehicle and vehicle.modified or nil
+        end
+        if aggregate then
+            fold_car_sections(car, aggregate, true)
+        end
+    end
+
     return is_pb
 end
 
--- Update the race's cross-player track record, returning true when this run takes the overall best
--- (total for a sprint, lap for a circuit). Per-CP segment records improve independently of the holder.
-local function update_track_best(track, is_circuit, primary, segments, identity, vehicle, date)
-    if type(track.segments) ~= "table" then
-        track.segments = {}
-    end
+-- Update the race's cross-player track record (ADR-0030): the overall best (any car) plus the per-car
+-- best (with the cross-player per-section best) when a car key is known. Returns true on a new overall
+-- track record.
+local function update_track_best(track, car_key, is_circuit, primary, time, aggregate, identity, vehicle,
+        date)
     local field = is_circuit and "best_lap" or "total_time"
+    track.run_count = (track.run_count or 0) + 1
+    track.time_sum = (track.time_sum or 0) + (time or 0)
+
     local is_record = false
     if type(primary) == "number" and (type(track[field]) ~= "number" or primary < track[field]) then
         track[field] = primary
@@ -990,22 +1106,178 @@ local function update_track_best(track, is_circuit, primary, segments, identity,
         track.date = date
         is_record = true
     end
-    improve_track_segments(track.segments, segments, identity)
+
+    if car_key then
+        if type(track.cars) ~= "table" then
+            track.cars = {}
+        end
+        local car = track.cars[car_key]
+        if type(car) ~= "table" then
+            car = {}
+            track.cars[car_key] = car
+        end
+        car.run_count = (car.run_count or 0) + 1
+        car.time_sum = (car.time_sum or 0) + (time or 0)
+        if type(primary) == "number" and (type(car[field]) ~= "number" or primary < car[field]) then
+            car[field] = primary
+            car.holder = identity
+            car.modified = vehicle and vehicle.modified or nil
+            car.date = date
+        end
+        if aggregate then
+            fold_car_sections(car, aggregate, false)
+        end
+    end
+
     return is_record
 end
 
--- Ship each race participant their pre-run best times at the racing -> finished seam (ADR-0028): the
--- player's own personal-best record plus the race's track record for session.race, both as the opaque
--- numbers the records store already holds. Sent BEFORE capture_records folds this run in, so a client
--- compares against the best that existed before the run -- a fresh PB then reads as a real delta, not
--- zero. Read-only: no store write, race-blindness (ADR-0005) holds. Identity resolves via
--- session.identities with the progress name as fallback, exactly like capture_records.
-local function send_race_records()
+-- Shallow copy of a 1-based numeric array, or nil. Used to snapshot a section-best array before capture
+-- mutates it in place (ADR-0030).
+local function copy_array(array)
+    if type(array) ~= "table" then
+        return nil
+    end
+    local out = {}
+    for k, v in pairs(array) do
+        out[k] = v
+    end
+    return out
+end
+
+-- Snapshot each finisher's PRE-run per-car section bests (their own car leaf + the track car leaf) so
+-- the Race section can diff "vs your / anyone's best lap with the car" against the state BEFORE this run
+-- (ADR-0030). Must run before capture_records mutates the store; returns a map keyed by player id.
+local function snapshot_prerun_section_bests()
+    local snapshot = {}
+    if not session.race or not session.progress then
+        return snapshot
+    end
+    ensure_records_loaded()
+    local race = records_store[session.race]
+    local players = (type(race) == "table" and type(race.players) == "table") and race.players or {}
+    local track_cars = (type(race) == "table" and type(race.track_best) == "table"
+        and type(race.track_best.cars) == "table") and race.track_best.cars or {}
+    local identities = session.identities or {}
+
+    for id, record in pairs(session.progress) do
+        if record.finished and not record.dnf then
+            local info = identities[id]
+            local identity = (info and info.identity) or record.name
+            local car_key = vehicle_car_key(info and info.vehicle)
+            if car_key then
+                local entry = players[identity]
+                local player_car = type(entry) == "table" and type(entry.cars) == "table"
+                    and entry.cars[car_key] or nil
+                snapshot[id] = {
+                    playerCarSectionBest = copy_array(player_car and player_car.section_best),
+                    trackCarSectionBest = copy_array(track_cars[car_key]
+                        and track_cars[car_key].section_best),
+                }
+            end
+        end
+    end
+    return snapshot
+end
+
+-- Trim a player's track record to the push payload (ADR-0030): the overall headline + counters plus only
+-- the own-car slice (with the per-section average source), never the whole cars map. nil record -> nil.
+local function slim_player_record(record, car_key)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local cars = type(record.cars) == "table" and record.cars or {}
+    local car = car_key and cars[car_key] or nil
+    return {
+        run_count = record.run_count,
+        time_sum = record.time_sum,
+        best_total = record.best_total,
+        best_lap = record.best_lap,
+        car = car and {
+            run_count = car.run_count,
+            time_sum = car.time_sum,
+            best_total = car.best_total,
+            best_lap = car.best_lap,
+            section_sum = car.section_sum,
+            lap_count = car.lap_count,
+        } or nil,
+    }
+end
+
+-- Trim the race's track record to the push payload (ADR-0030): overall headline + counters plus the
+-- own-car slice (totals + holder only; the per-section best rides in the pre-run snapshot). nil -> nil.
+local function slim_track_record(track, car_key)
+    if type(track) ~= "table" then
+        return nil
+    end
+    local cars = type(track.cars) == "table" and track.cars or {}
+    local car = car_key and cars[car_key] or nil
+    return {
+        run_count = track.run_count,
+        time_sum = track.time_sum,
+        total_time = track.total_time,
+        best_lap = track.best_lap,
+        holder = track.holder,
+        car = car and {
+            total_time = car.total_time,
+            best_lap = car.best_lap,
+            holder = car.holder,
+            run_count = car.run_count,
+            time_sum = car.time_sum,
+        } or nil,
+    }
+end
+
+-- The player's cross-track aggregates for the Driver section (ADR-0030), split any-car / this-car:
+-- summed runs and raced time over every race, and the count of track records currently held (overall and
+-- with this car). Computed by scanning the loaded store -- a handful of races, off any hot path.
+local function compute_driver_totals(identity, car_key)
+    local any_car = {run_count = 0, time_sum = 0, records_held = 0}
+    local this_car = {run_count = 0, time_sum = 0, records_held = 0}
+    if not identity then
+        return {anyCar = any_car, thisCar = this_car}
+    end
+    for _, race_record in pairs(records_store) do
+        if type(race_record) == "table" then
+            local player = type(race_record.players) == "table" and race_record.players[identity] or nil
+            if type(player) == "table" then
+                any_car.run_count = any_car.run_count + (player.run_count or 0)
+                any_car.time_sum = any_car.time_sum + (player.time_sum or 0)
+                local player_car = car_key and type(player.cars) == "table"
+                    and player.cars[car_key] or nil
+                if type(player_car) == "table" then
+                    this_car.run_count = this_car.run_count + (player_car.run_count or 0)
+                    this_car.time_sum = this_car.time_sum + (player_car.time_sum or 0)
+                end
+            end
+            local track = race_record.track_best
+            if type(track) == "table" then
+                if track.holder == identity then
+                    any_car.records_held = any_car.records_held + 1
+                end
+                local track_car = car_key and type(track.cars) == "table"
+                    and track.cars[car_key] or nil
+                if type(track_car) == "table" and track_car.holder == identity then
+                    this_car.records_held = this_car.records_held + 1
+                end
+            end
+        end
+    end
+    return {anyCar = any_car, thisCar = this_car}
+end
+
+-- Ship each race participant their records for the analysis overlay at the racing -> finished seam
+-- (ADR-0028/0030). Sent AFTER capture_records, so counters, displayed bests, and the per-section average
+-- include this run (current-inclusive); the `prerun` section bests (captured before the fold) carry the
+-- pre-run "best lap with the car" references the Race section diffs against. Read-only here; identity
+-- resolves via session.identities with the progress name as fallback.
+local function send_race_records(prerun)
     if not session.race or not session.progress then
         return
     end
 
     ensure_records_loaded()
+    prerun = prerun or {}
 
     local race = records_store[session.race]
     local players = (type(race) == "table" and type(race.players) == "table") and race.players or {}
@@ -1015,11 +1287,15 @@ local function send_race_records()
     for id, record in pairs(session.progress) do
         local info = identities[id]
         local identity = (info and info.identity) or record.name
-        local pb = identity and players[identity] or nil
+        local car = car_descriptor(info and info.vehicle)
+        local car_key = car and car.key or nil
         send_event(id, MSG_RACE_RECORDS, {
             race = session.race,
-            pb = pb,
-            trackRecord = track_record,
+            car = car,
+            pb = slim_player_record(identity and players[identity] or nil, car_key),
+            trackRecord = slim_track_record(track_record, car_key),
+            driverTotals = compute_driver_totals(identity, car_key),
+            prerun = prerun[id] or {},
         })
     end
 end
@@ -1071,14 +1347,16 @@ local function capture_records()
             local info = identities[id]
             local identity = (info and info.identity) or record.name
             local vehicle = info and info.vehicle or nil
+            local car_key = vehicle_car_key(vehicle)
             local is_circuit = record.best_lap ~= nil
             local primary = is_circuit and record.best_lap or record.total_time
-            local segments = derive_segments(record.splits)
+            local time = record.total_time
+            local aggregate = run_section_aggregate(record)
 
-            local is_pb = update_player_record(race.players, identity, is_circuit, primary,
-                segments, vehicle, date)
-            local is_track_record = update_track_best(race.track_best, is_circuit, primary,
-                segments, identity, vehicle, date)
+            local is_pb = update_player_record(race.players, identity, car_key, is_circuit, primary,
+                time, aggregate, vehicle, date)
+            local is_track_record = update_track_best(race.track_best, car_key, is_circuit, primary,
+                time, aggregate, identity, vehicle, date)
 
             if (is_pb or is_track_record) and identity then
                 notify[id] = {pb = is_pb, track_record = is_track_record}
@@ -1112,8 +1390,12 @@ local function tick()
     if phase == PHASE.racing then
         if session.grace_deadline and now() >= session.grace_deadline then
             dnf_active_players("grace expired")
-            send_race_records()
+            -- Snapshot pre-run per-car section bests BEFORE capture folds this run in, so the Race
+            -- section can show "vs your/anyone's previous best lap with the car"; then capture (this run
+            -- now counts) and send the current-inclusive records (ADR-0030).
+            local prerun = snapshot_prerun_section_bests()
             capture_records()
+            send_race_records(prerun)
             enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
         end
         return
