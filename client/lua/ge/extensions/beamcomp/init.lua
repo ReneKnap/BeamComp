@@ -609,8 +609,11 @@ local function handle_race_records(payload)
     end
     M.state.race_records = {
         race = payload.race,
+        car = payload.car,
         pb = payload.pb,
         trackRecord = payload.trackRecord,
+        driverTotals = payload.driverTotals,
+        prerun = payload.prerun,
     }
 end
 
@@ -1090,127 +1093,276 @@ local function derive_segments(splits)
     return segments
 end
 
--- Arithmetic mean of a dense numeric array, or nil when empty.
-local function mean_of(values)
-    local count = #values
-    if count == 0 then
+-- A human label for a car descriptor (ADR-0029): "model / variant" with a "(mod)" suffix when parts were
+-- changed. nil when there is no car.
+local function car_label(car)
+    if type(car) ~= "table" then
         return nil
     end
-    local sum = 0
-    for i = 1, count do
-        sum = sum + values[i]
+    local label = car.model or "?"
+    if type(car.variant) == "string" and car.variant ~= "" then
+        label = label .. " / " .. car.variant
     end
-    return sum / count
+    if car.modified == true then
+        label = label .. " (mod)"
+    end
+    return label
 end
 
--- Population standard deviation of a dense numeric array, or nil for fewer than two samples (a single
--- segment has no spread to measure). `average` is the precomputed mean.
-local function stddev_of(values, average)
-    local count = #values
-    if count < 2 then
+-- Split a cumulative splits array into per-lap section arrays (ADR-0029): lap l has section[s] =
+-- splits[(l-1)*cps + s] - splits[(l-1)*cps + s - 1] and total = splits[l*cps] - splits[(l-1)*cps].
+-- Only fully-completed laps are returned (a partial final lap from a DNF is dropped). For a sprint
+-- (one lap of all CPs) this yields the single run. cps = checkpoints per lap.
+local function laps_from_splits(splits, cps)
+    local laps = {}
+    if type(splits) ~= "table" or type(cps) ~= "number" or cps < 1 then
+        return laps
+    end
+    local lap_index = 1
+    while lap_index * cps <= #splits do
+        local base = (lap_index - 1) * cps
+        local base_time = base == 0 and 0 or splits[base]
+        local sections = {}
+        local ok = type(base_time) == "number"
+        for s = 1, cps do
+            local cumulative = splits[base + s]
+            local prev = (s == 1) and base_time or splits[base + s - 1]
+            if ok and type(cumulative) == "number" and type(prev) == "number" then
+                sections[s] = cumulative - prev
+            else
+                ok = false
+            end
+        end
+        if ok then
+            laps[#laps + 1] = {sections = sections, total = splits[base + cps] - base_time}
+        end
+        lap_index = lap_index + 1
+    end
+    return laps
+end
+
+-- The fastest completed lap in a list (min total), or nil for an empty list.
+local function best_lap_of(laps)
+    local best = nil
+    for _, lap in ipairs(laps) do
+        if type(lap.total) == "number" and (not best or lap.total < best.total) then
+            best = lap
+        end
+    end
+    return best
+end
+
+-- The mean lap as a {sections, total} pseudo-lap (ADR-0029): each section/total averaged over the laps
+-- that have it. nil for an empty list.
+local function avg_lap(laps)
+    if #laps == 0 then
         return nil
     end
-    local sq = 0
-    for i = 1, count do
-        local diff = values[i] - average
-        sq = sq + diff * diff
+    local section_count = #laps[1].sections
+    local sections = {}
+    for s = 1, section_count do
+        local sum, n = 0, 0
+        for _, lap in ipairs(laps) do
+            local value = lap.sections[s]
+            if type(value) == "number" then
+                sum = sum + value
+                n = n + 1
+            end
+        end
+        sections[s] = n > 0 and (sum / n) or nil
     end
-    return math.sqrt(sq / count)
+    local total_sum, total_n = 0, 0
+    for _, lap in ipairs(laps) do
+        if type(lap.total) == "number" then
+            total_sum = total_sum + lap.total
+            total_n = total_n + 1
+        end
+    end
+    return {sections = sections, total = total_n > 0 and (total_sum / total_n) or nil}
 end
 
--- The local player's per-CP and headline deltas to the pre-run PB and track record (ADR-0028). Each row
--- is segment_count aligned cells (local segment minus the stored best segment) plus a headline (local
--- primary metric -- total for sprint, best lap for circuit -- minus the stored best). A row is nil when
--- its record (and every cell) is absent. Negative = the local run was faster than the record. Cells are
--- arrays of {delta} so the UI iterates rather than indexing across the Lua->JS bridge.
-local function build_record_deltas(entries, records, is_circuit, segment_count)
+-- A per-section + total delta row of `other` against the `reference` lap (ADR-0029): cell[s].delta =
+-- other.sections[s] - reference.sections[s]. Cells are an aligned array so the UI iterates (no numeric
+-- indexing across the Lua->JS bridge). Negative = faster than the reference. cps = section count.
+local function lap_delta_row(other, reference, cps)
+    local cells = {}
+    for s = 1, cps do
+        local a = other.sections[s]
+        local b = reference.sections[s]
+        cells[s] = {delta = (type(a) == "number" and type(b) == "number") and (a - b) or nil}
+    end
+    local total = (type(other.total) == "number" and type(reference.total) == "number")
+        and (other.total - reference.total) or nil
+    return {cells = cells, total = total}
+end
+
+-- The fastest lap across a set of standings entries (optionally filtered to a car key, optionally
+-- excluding the local player), as {lap, holder} or nil. Used for "best lap of the other drivers"
+-- (ADR-0030).
+local function fastest_lap_across(entries, cps, car_key, exclude_local)
+    local best, holder = nil, nil
+    for _, e in ipairs(entries) do
+        if (not exclude_local or not e.isLocal) and (not car_key or (e.car and e.car.key == car_key)) then
+            local candidate = best_lap_of(laps_from_splits(e.splits, cps))
+            if candidate and (not best or candidate.total < best.total) then
+                best, holder = candidate, e.name
+            end
+        end
+    end
+    if not best then
+        return nil
+    end
+    return {lap = best, holder = holder}
+end
+
+-- A pseudo-lap {sections, total} from a per-section array (e.g. a persistent section-best or average),
+-- for diffing against your best lap (ADR-0030). nil when the array is missing or has no numbers.
+local function pseudo_lap_from_sections(sections, cps)
+    if type(sections) ~= "table" then
+        return nil
+    end
+    local total, has = 0, false
+    for s = 1, cps do
+        if type(sections[s]) == "number" then
+            total = total + sections[s]
+            has = true
+        end
+    end
+    return has and {sections = sections, total = total} or nil
+end
+
+-- A pseudo-lap of per-section averages from accumulated section sums + lap count (ADR-0030, #4). nil when
+-- there is no data.
+local function avg_lap_from_sums(section_sum, lap_count, cps)
+    if type(section_sum) ~= "table" or type(lap_count) ~= "number" or lap_count < 1 then
+        return nil
+    end
+    local sections = {}
+    for s = 1, cps do
+        if type(section_sum[s]) == "number" then
+            sections[s] = section_sum[s] / lap_count
+        end
+    end
+    return pseudo_lap_from_sections(sections, cps)
+end
+
+-- Driver section (ADR-0030): the local player's own history as an any-car / this-car table -- runs and
+-- time over all tracks, track records held, runs here, and best time here. Each row carries `kind` so the
+-- UI formats it (count / duration / time). Tolerant of missing fields -> zeros / nil placeholders.
+local function build_driver_section(records, local_name)
     if type(records) ~= "table" then
         return nil
     end
+    local pb = type(records.pb) == "table" and records.pb or {}
+    local pb_car = type(pb.car) == "table" and pb.car or {}
+    local totals = type(records.driverTotals) == "table" and records.driverTotals or {}
+    local any = type(totals.anyCar) == "table" and totals.anyCar or {}
+    local this = type(totals.thisCar) == "table" and totals.thisCar or {}
+    return {
+        name = local_name,
+        carLabel = car_label(records.car),
+        rows = {
+            {label = "Runs (all tracks)", kind = "count",
+                any = any.run_count or 0, this = this.run_count or 0},
+            {label = "Time (all tracks)", kind = "duration",
+                any = any.time_sum or 0, this = this.time_sum or 0},
+            {label = "Track records held", kind = "count",
+                any = any.records_held or 0, this = this.records_held or 0},
+            {label = "Runs here", kind = "count",
+                any = pb.run_count or 0, this = pb_car.run_count or 0},
+            {label = "Best here", kind = "time",
+                any = pb.best_lap or pb.best_total, this = pb_car.best_lap or pb_car.best_total},
+        },
+    }
+end
 
-    local local_entry = nil
-    for _, e in ipairs(entries) do
-        if e.isLocal then
-            local_entry = e
-            break
-        end
+-- Track section (ADR-0029): this track's totals across all players, plus the track record (any car /
+-- this car) with holders. Tolerant of missing fields.
+local function build_track_section(records, race_name)
+    if type(records) ~= "table" then
+        return nil
     end
-    if not local_entry then
+    local track = type(records.trackRecord) == "table" and records.trackRecord or nil
+    local track_car = track and type(track.car) == "table" and track.car or nil
+    return {
+        name = race_name,
+        trackRuns = track and track.run_count or 0,
+        trackTime = track and track.time_sum or 0,
+        carRuns = track_car and track_car.run_count or 0,
+        recordAnyCar = track and (track.best_lap or track.total_time) or nil,
+        recordAnyCarHolder = track and track.holder or nil,
+        recordThisCar = track_car and (track_car.best_lap or track_car.total_time) or nil,
+        recordThisCarHolder = track_car and track_car.holder or nil,
+        carLabel = car_label(records.car),
+    }
+end
+
+-- Race section (ADR-0030): this race's lap analysis. Reference = your best lap this race (absolute
+-- sections + total). Then per-section delta rows against five references: the other drivers' best lap
+-- this race, your best lap with the car ever (pre-run), your average this race, your average with the car
+-- over all sessions here (persistent), and the car's track record (pre-run). The two average rows are
+-- dropped for a single-lap run (sprint). All derived client-side from the splits + the payload; nil when
+-- there is no local entry or no completed lap.
+local function build_race_section(entries, race, local_entry, records)
+    local cps = (race and race.checkpoints) and #race.checkpoints or 0
+    if cps < 1 or not local_entry then
+        return nil
+    end
+    local my_laps = laps_from_splits(local_entry.splits, cps)
+    local my_best = best_lap_of(my_laps)
+    if not my_best then
         return nil
     end
 
-    local local_segments = derive_segments(local_entry.splits)
-    -- The headline delta only makes sense for a completed run: a DNF (or a circuit run with no finished
-    -- lap) has no comparable total/lap, so leave the primary nil and the headline renders a placeholder.
-    -- The per-CP segment deltas stay valid -- the segments the player did complete are real.
-    local local_finished = local_entry.finished and not local_entry.dnf
-    local local_primary = nil
-    if local_finished then
-        if is_circuit then
-            local_primary = local_entry.bestLap
-        else
-            local_primary = local_entry.time
+    local columns = {}
+    local your_best_cells = {}
+    for s = 1, cps do
+        columns[s] = "S" .. s
+        your_best_cells[s] = {value = my_best.sections[s]}
+    end
+
+    local prerun = type(records) == "table" and type(records.prerun) == "table" and records.prerun or {}
+    local pb_car = type(records) == "table" and type(records.pb) == "table"
+        and type(records.pb.car) == "table" and records.pb.car or {}
+    local track_car = type(records) == "table" and type(records.trackRecord) == "table"
+        and type(records.trackRecord.car) == "table" and records.trackRecord.car or {}
+
+    local rows = {}
+    local function add_row(label, pseudo_lap, holder)
+        if pseudo_lap then
+            local row = lap_delta_row(pseudo_lap, my_best, cps)
+            row.label = label
+            row.holder = holder
+            rows[#rows + 1] = row
         end
     end
 
-    -- read_time pulls the stored segment time (a plain number for the PB, a {time, holder} entry for the
-    -- track record). headline_best is the stored headline metric to diff against.
-    local function delta_row(best_segments, read_time, headline_best)
-        local cells = {}
-        local any = false
-        for k = 1, segment_count do
-            local ours = local_segments[k]
-            local reference = read_time(best_segments and best_segments[k])
-            local delta = nil
-            if type(ours) == "number" and type(reference) == "number" then
-                delta = ours - reference
-                any = true
-            end
-            cells[k] = {delta = delta}
-        end
-        local headline = nil
-        if type(local_primary) == "number" and type(headline_best) == "number" then
-            headline = local_primary - headline_best
-            any = true
-        end
-        if not any then
-            return nil
-        end
-        return {cells = cells, headline = headline}
+    local others = fastest_lap_across(entries, cps, nil, true)
+    add_row("Other drivers", others and others.lap, others and others.holder)
+    add_row("You, best w/ car", pseudo_lap_from_sections(prerun.playerCarSectionBest, cps))
+    if #my_laps > 1 then
+        add_row("You, avg this race", avg_lap(my_laps))
     end
+    if (race and race.mode == "circuit") then
+        add_row("You, avg all-time", avg_lap_from_sums(pb_car.section_sum, pb_car.lap_count, cps))
+    end
+    add_row("Car record", pseudo_lap_from_sections(prerun.trackCarSectionBest, cps), track_car.holder)
 
-    local pb = records.pb
-    local track = records.trackRecord
-    local pb_row = nil
-    local track_row = nil
-
-    if type(pb) == "table" then
-        pb_row = delta_row(pb.best_segments, function(value) return value end,
-            is_circuit and pb.best_lap or pb.best_total)
-    end
-    if type(track) == "table" then
-        track_row = delta_row(track.segments, function(value)
-            return type(value) == "table" and value.time or nil
-        end, is_circuit and track.best_lap or track.total_time)
-        if track_row then
-            track_row.holder = track.holder
-        end
-    end
-
-    if not pb_row and not track_row then
-        return nil
-    end
-    return {pb = pb_row, track = track_row}
+    return {
+        isCircuit = (race and race.mode == "circuit") or false,
+        columns = columns,
+        yourBest = {cells = your_best_cells, total = my_best.total},
+        rows = rows,
+    }
 end
 
 -- Build the post-race analysis block from the finished-phase standings and the pre-run records
--- (ADR-0028). Pure client-side derivation -- the race-blind server only ships numbers (ADR-0005). Per
--- driver: aligned segment cells (each {value, fastest}) and the four metrics (fastest segment, mean
--- segment, consistency = segment stddev, progress% = crossings / total). The fastest-per-segment
--- highlight is the column minimum across drivers. For the local driver: per-CP deltas to PB and track
--- record. Cells are padded to segment_count so the UI iterates aligned arrays (no numeric indexing
--- across the Lua->JS bridge) and a DNF's shorter run still lines up. Returns nil with nothing to show.
-local function build_analysis(entries, records, is_circuit)
+-- (ADR-0028/0029). Pure client-side derivation -- the race-blind server only ships numbers (ADR-0005).
+-- Carries the cross-driver segment matrix (aligned {value, fastest} cells, fastest = column minimum) plus
+-- the three sections: Driver (your records), Track (all players), Race (this race's laps from the splits).
+-- All cells are aligned arrays so the UI iterates rather than indexing across the Lua->JS bridge. Returns
+-- nil with nothing to show.
+local function build_analysis(entries, records, race)
     if not entries or #entries == 0 then
         return nil
     end
@@ -1222,26 +1374,12 @@ local function build_analysis(entries, records, is_circuit)
         if #segments > segment_count then
             segment_count = #segments
         end
-        local fastest_segment = nil
-        for _, seconds in ipairs(segments) do
-            if not fastest_segment or seconds < fastest_segment then
-                fastest_segment = seconds
-            end
-        end
-        local average = mean_of(segments)
-        local total = e.count or 0
         drivers[i] = {
             name = e.name,
             isLocal = e.isLocal,
             dnf = e.dnf,
             position = e.position,
             segments = segments,  -- scratch for the column-min pass; replaced by cells below
-            metrics = {
-                fastestSeg = fastest_segment,
-                avgSeg = average,
-                consistency = average and stddev_of(segments, average) or nil,
-                progressPct = total > 0 and (100 * #segments / total) or nil,
-            },
         }
     end
 
@@ -1276,10 +1414,22 @@ local function build_analysis(entries, records, is_circuit)
         driver.segments = nil
     end
 
+    local local_entry = nil
+    local local_name = nil
+    for _, e in ipairs(entries) do
+        if e.isLocal then
+            local_entry = e
+            local_name = e.name
+            break
+        end
+    end
+
     return {
         columns = columns,
         drivers = drivers,
-        deltas = build_record_deltas(entries, records, is_circuit, segment_count),
+        driver = build_driver_section(records, local_name),
+        track = build_track_section(records, race and race.name or nil),
+        race = build_race_section(entries, race, local_entry, records),
     }
 end
 
@@ -1358,6 +1508,7 @@ local function build_hud_snapshot()
                 cpInLap = cp_in_lap,
                 cpPerLap = cp_per_lap,
                 splits = e.splits,
+                car = e.car,  -- driver's car (ADR-0029), for the Race section's "best lap with the car"
             }
         end
     end
@@ -1398,12 +1549,15 @@ local function build_hud_snapshot()
     local grace = M.state.grace and M.state.grace.remaining or nil
     local grace_can_finish = not local_finished and not local_dnf
 
-    -- The post-race analysis block is derived only in the finished phase (the overlay's only context),
-    -- so the live HUD frames skip the work (ADR-0028).
+    -- The post-race analysis block is derived only when the overlay is actually open in the finished
+    -- phase -- it runs every frame for the long finished window, so the closed-overlay default (and every
+    -- live frame) skips the work entirely (ADR-0028/0030). `analysisAvailable` is the cheap flag the card
+    -- button shows on, so the button appears without building the whole block.
     local is_circuit = (race and race.mode == "circuit") or false
+    local analysis_available = phase == "finished" and #entries > 0
     local analysis = nil
-    if phase == "finished" then
-        analysis = build_analysis(entries, M.state.race_records, is_circuit)
+    if analysis_available and M.state.analysis_open then
+        analysis = build_analysis(entries, M.state.race_records, race)
     end
 
     return {
@@ -1414,6 +1568,7 @@ local function build_hud_snapshot()
         graceCanFinish = grace_can_finish,
         isCircuit = is_circuit,
         resultsHidden = M.state.results_hidden or false,
+        analysisAvailable = analysis_available,
         analysisOpen = M.state.analysis_open or false,
         analysis = analysis,
     }
