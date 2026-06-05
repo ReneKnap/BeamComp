@@ -381,7 +381,7 @@ end
 -- BeamMP, so any gap yields a nil field rather than an error -- the server then falls back to the
 -- BeamMP name and stores nil vehicle fields. Returns {identity, vehicle = {model, type, modified}}.
 function M.collect_client_info(veh)
-    local info = {identity = nil, vehicle = {model = nil, type = nil, modified = nil}}
+    local info = {identity = nil, vehicle = {model = nil, type = nil, variant = nil, modified = nil}}
     if not veh then
         return info
     end
@@ -418,6 +418,14 @@ function M.collect_client_info(veh)
     end)
     if ok_type and type(vtype) == "string" and vtype ~= "" then
         info.vehicle.type = vtype
+    end
+
+    -- Vehicle variant: the named partConfig preset (e.g. "etk800_300d") when the car is a stock/preset
+    -- config (partConfig is a string); nil for an inline-customized parts blob, which buckets under the
+    -- model alone for records (ADR-0029). Same field detect_modified reads, so it is known to work here.
+    local ok_variant, part_config = pcall(function() return veh.partConfig end)
+    if ok_variant and type(part_config) == "string" and part_config ~= "" then
+        info.vehicle.variant = part_config
     end
 
     info.vehicle.modified = detect_modified(veh)
