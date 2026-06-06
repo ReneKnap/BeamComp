@@ -1400,7 +1400,10 @@ local function build_race_section(entries, race, local_entry, records)
     if #my_laps > 1 then
         add_row("You, avg this race", avg_lap(my_laps))
     end
-    if (race and race.mode == "circuit") then
+    -- Skip the all-time average on the first visit to this track: pb_car is current-inclusive, so with a
+    -- single run here the average is just this race's lap(s), making the delta ~0.00 in every section
+    -- (ADR-0030). Only meaningful once a prior run exists (run_count > 1).
+    if (race and race.mode == "circuit") and (tonumber(pb_car.run_count) or 0) > 1 then
         add_row("You, avg all-time", avg_lap_from_sums(pb_car.section_sum, pb_car.lap_count, cps))
     end
     add_row("Car record", pseudo_lap_from_sections(prerun.trackCarSectionBest, cps), track_car.holder)
@@ -1459,6 +1462,7 @@ local function build_analysis(entries, records, race)
     end
     for _, driver in ipairs(drivers) do
         local cells = {}
+        local total, has_total = 0, false
         for k = 1, segment_count do
             local seconds = driver.segments[k]
             cells[k] = {
@@ -1466,8 +1470,15 @@ local function build_analysis(entries, records, race)
                 fastest = type(seconds) == "number" and column_best[k] ~= nil
                     and seconds == column_best[k],
             }
+            if type(seconds) == "number" then
+                total = total + seconds
+                has_total = true
+            end
         end
         driver.cells = cells
+        -- Sum of the shown segments = the driver's total race/lap time (a DNF's partial segments sum to a
+        -- partial total). nil when no segment crossed, so the UI shows a placeholder rather than 0.
+        driver.total = has_total and total or nil
         driver.segments = nil
     end
 
@@ -1485,7 +1496,7 @@ local function build_analysis(entries, records, race)
         columns = columns,
         drivers = drivers,
         driver = build_driver_section(records, local_name),
-        track = build_track_section(records, race and race.name or nil),
+        track = build_track_section(records, race and (race.displayName or race.name) or nil),
         race = build_race_section(entries, race, local_entry, records),
     }
 end

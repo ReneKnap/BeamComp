@@ -266,6 +266,9 @@ function M.prepare(payload)
 
     return {
         name = race.meta.name,
+        -- The discovered track name (slug / quickrace file), for the analysis overlay's Track header. The
+        -- parsed race path's own name is often the generic "Path", so prefer this human-facing label.
+        displayName = locator.displayName,
         raceId = locator.id,
         mySlot = my_slot,
         myPose = my_pose,
