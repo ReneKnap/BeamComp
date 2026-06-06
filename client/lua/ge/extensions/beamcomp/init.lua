@@ -339,6 +339,9 @@ local function handle_race_start(payload)
     send_to_server("clientInfo", {
         race = payload.race,
         vehicle = client_info.vehicle,
+        -- Power-to-weight for the start-order pwr mode (ADR-0033); nil when unreadable. The server stores
+        -- it per player and only sorts by it -- it never reads the vehicle (race-blind, ADR-0005).
+        pwr = client_info.pwr,
     })
 
     -- Refresh the canonical identity from the race car now that it exists (ADR-0031): the license name
@@ -538,6 +541,41 @@ local function handle_list_vehicles(payload)
     send_to_server("vehicleList", {lines = carlist.build(model)})
 end
 
+-- The server re-gridded the start order (ADR-0033, order=pwr): adopt the new slot, re-place the race car
+-- at its new grid pose (picked from the pose set we already hold), and re-freeze. Mirrors
+-- restage_swapped_car; runs during staging, before the countdown. No-op if we are not in this race or the
+-- car/pose is unavailable -- the spawn-freeze on the old pose then just holds the car where it is.
+local function handle_regrid(payload)
+    if not M.state.race or type(payload) ~= "table" then
+        return
+    end
+    local slot = payload.slot
+    local poses = M.state.race.gridPoses
+    local pose = (type(slot) == "number" and poses) and poses[slot + 1] or nil
+    if not pose then
+        log("W", RACE_LOG_TAG, "regrid ignored: no pose for slot " .. tostring(slot))
+        return
+    end
+    M.state.race.mySlot = slot
+    M.state.race.myPose = pose
+    if type(payload.grid) == "table" then
+        M.state.race.roster = payload.grid
+    end
+
+    local race_car = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+    if not race_car then
+        log("W", RACE_LOG_TAG, "regrid: no race car to re-place")
+        return
+    end
+    local placed, place_err = vehicles.respawn_own_at(pose, race_car)
+    if not placed then
+        log("W", RACE_LOG_TAG, "regrid re-place failed: " .. tostring(place_err))
+        return
+    end
+    vehicles.set_vehicle_frozen(race_car, true)
+    log("I", RACE_LOG_TAG, string.format("re-gridded to slot %d", slot))
+end
+
 -- Answer the server's pre-flight validateRace request (ADR-0019): the race-blind server relays the
 -- /race options here, we vet them against the locally-parsed race (race/start.validate) and report the
 -- verdict back. The server starts on ok, or posts our reason to the issuing admin on a refusal. The
@@ -668,6 +706,7 @@ local HANDLERS = {
     standings = handle_standings,
     listRaces = handle_list_races,
     listVehicles = handle_list_vehicles,
+    regrid = handle_regrid,
     validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
     resultsToggle = handle_results_toggle,

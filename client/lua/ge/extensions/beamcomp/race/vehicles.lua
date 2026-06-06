@@ -505,6 +505,15 @@ function M.collect_client_info(veh)
 
     info.vehicle.modified = detect_modified(veh)
 
+    -- Power-to-weight (hp/kg) of the race car, for the start-order pwr mode (ADR-0033). Read client-side
+    -- here so the server stays vehicle-blind (ADR-0005); nil when power or weight is unreadable, in which
+    -- case the player sorts to the back of a pwr grid.
+    local power = vehiclespecs.vehicle_power(veh)
+    local weight = vehiclespecs.vehicle_weight(veh)
+    if type(power) == "number" and type(weight) == "number" and weight > 0 then
+        info.pwr = power / weight
+    end
+
     return info
 end
 
