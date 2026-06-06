@@ -17,11 +17,13 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) = per-player caps that keep a
 --                 compliant car or substitute one (Mode 3); none = keep own car (Mode 1). car= wins.
+--                 start order (ADR-0033): order=entry (default) | random | last (prev race result) |
+--                 pwr (power-to-weight); :rev flips a directional mode (last:rev/pwr:rev = handicap).
 --                 the deprecated quickrace ("menu:") source is hidden from bare-name resolution unless
 --                 "all" is given or the name carries an explicit "menu:" prefix (ADR-0026).
 --                 <name> may carry a "map:"/"menu:" source prefix (freeroam-mission vs Time-Trial-menu
@@ -108,6 +110,7 @@ local MSG_RESULTS_TOGGLE = "resultsToggle"  -- tell one client to hide/show its 
 local MSG_BEST_NOTICE = "bestNotice"  -- tell a finisher they set a personal best / track record (ADR-0027)
 local MSG_RACE_RECORDS = "raceRecords"  -- ship a participant's pre-run PB + the race's track record at the finish seam (ADR-0028)
 local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close its post-race analysis overlay (ADR-0028)
+local MSG_REGRID = "regrid"  -- tell one client its reassigned grid slot + the reordered roster for a pwr re-grid (ADR-0033)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -174,7 +177,9 @@ local session = {
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
     spawn_pending = nil,      -- set of rostered player ids whose spawnReady ack is still awaited (ADR-0006 amendment)
     spawn_ready_count = 0,    -- how many distinct clients acked spawnReady this race (0 at timeout = empty race)
-    identities = nil,         -- per-player {vehicle} reported via clientInfo, for records (ADR-0027); name moved to client_names (ADR-0031)
+    identities = nil,         -- per-player {vehicle, pwr} reported via clientInfo, for records (ADR-0027) + start-order (ADR-0033); name moved to client_names (ADR-0031)
+    order = nil,              -- this race's start-order {mode, rev} (ADR-0033), or nil = entry order
+    last_order = nil,         -- previous race's finishing order as a list of identities (ADR-0033); session-scoped, survives reset_to_lobby so order=last has a source
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -614,15 +619,72 @@ local function enter_phase(phase, duration)
     broadcast_event(MSG_RACE_PHASE, {phase = phase, duration = duration})
 end
 
--- Assign every connected player a 0-based slot, ordered by player id ascending. The
--- order is deterministic so every client computes the same grid from the same roster.
-local function build_slots(players)
+-- Shuffle an array in place (Fisher-Yates) using math.random (seeded in on_init). Used by the random
+-- start order and the no-source fallback for last (ADR-0033).
+local function shuffle(items)
+    for i = #items, 2, -1 do
+        local j = math.random(i)
+        items[i], items[j] = items[j], items[i]
+    end
+    return items
+end
+
+-- Order the player ids for slot assignment per the start-order mode (ADR-0033). `entry` (default) is id
+-- ascending -- the historical order and the stable base the other modes build on; `random` shuffles;
+-- `last` follows the previous race's finishing order (by identity, ADR-0031), with players absent from it
+-- appended at the back in entry order, and `:rev` reversing just the placed group. `pwr` orders as entry
+-- here -- it is resolved after staging by the re-grid -- and `last` with no source falls back to random.
+local function order_ids(players, order, last_order)
     local ids = {}
     for id in pairs(players) do
         ids[#ids + 1] = id
     end
     table.sort(ids)
 
+    local mode = order and order.mode or "entry"
+
+    if mode == "random" then
+        return shuffle(ids)
+    end
+
+    if mode == "last" then
+        if type(last_order) ~= "table" or #last_order == 0 then
+            return shuffle(ids)  -- no finishing-order source yet -> random fallback
+        end
+        local rank = {}
+        for pos, identity in ipairs(last_order) do
+            rank[identity] = pos
+        end
+        local placed, rest = {}, {}
+        for _, id in ipairs(ids) do  -- ids are in entry order, so rest stays entry-ordered
+            if rank[resolve_identity(id)] then
+                placed[#placed + 1] = id
+            else
+                rest[#rest + 1] = id
+            end
+        end
+        table.sort(placed, function(a, b)
+            return rank[resolve_identity(a)] < rank[resolve_identity(b)]
+        end)
+        if order.rev then
+            for i = 1, math.floor(#placed / 2) do
+                placed[i], placed[#placed - i + 1] = placed[#placed - i + 1], placed[i]
+            end
+        end
+        for _, id in ipairs(rest) do
+            placed[#placed + 1] = id
+        end
+        return placed
+    end
+
+    -- entry, or pwr (provisional entry order until the post-staging re-grid resolves it).
+    return ids
+end
+
+-- Assign every connected player a 0-based slot in the resolved start order (ADR-0033). The order is
+-- deterministic for a given mode + roster so every client computes the same grid from the same roster.
+local function build_slots(players, order, last_order)
+    local ids = order_ids(players, order, last_order)
     local slots = {}
     for index, id in ipairs(ids) do
         slots[#slots + 1] = {id = id, slot = index - 1, name = players[id]}
@@ -760,6 +822,86 @@ local function broadcast_standings()
     broadcast_event(MSG_STANDINGS, {entries = build_standings()})
 end
 
+-- Capture the just-finished race's order as a list of identities (ADR-0033), in build_standings rank
+-- order (finishers by time first, DNF last). Stored in session.last_order, which reset_to_lobby leaves
+-- intact so the next race's order=last has a source; overwritten on the next finish. Identities match
+-- what build_slots resolves (resolve_identity), so order=last maps players back to their finishing place.
+local function capture_finishing_order()
+    local order = {}
+    for _, entry in ipairs(build_standings()) do
+        if entry.name then
+            order[#order + 1] = entry.name
+        end
+    end
+    session.last_order = order
+end
+
+-- Resolve the pwr start order at the staging->countdown seam (ADR-0033): sort the rostered players by
+-- their reported power-to-weight (desc by default = strongest on pole, asc for :rev = weakest on pole),
+-- with players who reported none to the back in current slot order. Reassign slots, rebuild the roster,
+-- and send each client its new slot + the reordered roster so it re-places (regrid). A no-op for non-pwr
+-- orders or when nobody reported pwr (the provisional entry order then stands).
+local function regrid_by_pwr()
+    if not session.progress or not session.order or session.order.mode ~= "pwr" then
+        return
+    end
+    local identities = session.identities or {}
+    local players = MP.GetPlayers()
+
+    local ranked, unranked = {}, {}
+    for id, record in pairs(session.progress) do
+        local info = identities[id]
+        local pwr = info and tonumber(info.pwr)
+        if pwr then
+            ranked[#ranked + 1] = {id = id, pwr = pwr, slot = record.slot}
+        else
+            unranked[#unranked + 1] = {id = id, slot = record.slot}
+        end
+    end
+    if #ranked == 0 then
+        return  -- no pwr data -> keep the provisional order (fallback)
+    end
+
+    local rev = session.order.rev
+    table.sort(ranked, function(a, b)
+        if a.pwr ~= b.pwr then
+            if rev then
+                return a.pwr < b.pwr  -- weakest on pole (handicap)
+            end
+            return a.pwr > b.pwr      -- strongest on pole
+        end
+        return a.slot < b.slot         -- stable tiebreak on the provisional slot
+    end)
+    table.sort(unranked, function(a, b) return a.slot < b.slot end)
+
+    local slots = {}
+    for _, entry in ipairs(ranked) do
+        slots[#slots + 1] = {id = entry.id}
+    end
+    for _, entry in ipairs(unranked) do
+        slots[#slots + 1] = {id = entry.id}
+    end
+    for index, entry in ipairs(slots) do
+        entry.slot = index - 1
+        entry.name = players[entry.id]
+        session.progress[entry.id].slot = entry.slot
+    end
+    session.roster = build_roster(slots)
+
+    -- Tell each player its new slot + the reordered roster so it re-places before the countdown.
+    for _, entry in ipairs(slots) do
+        send_event(entry.id, MSG_REGRID, {slot = entry.slot, grid = session.roster})
+    end
+    log_info("beamcomp.race", string.format("pwr re-grid: %d ranked, %d unranked", #ranked, #unranked))
+end
+
+-- Leave staging for the countdown (ADR-0021), applying the pwr re-grid first when order=pwr (ADR-0033).
+-- The single seam both the staging timeout and the manual /go route through.
+local function enter_countdown_from_staging()
+    regrid_by_pwr()
+    enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+end
+
 -- Clear the session and announce the lobby phase. If a race was active, tell players the world is
 -- back to free-roam (B3) -- so a /raceend or the finished-window expiry has a visible close-out.
 local function reset_to_lobby()
@@ -820,7 +962,10 @@ end
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
 local function start_race(race_name, owner_id, overrides, map, race_id)
-    local slots = build_slots(MP.GetPlayers())
+    -- Resolve the grid start order (ADR-0033): entry/random/last are applied to the slot assignment now;
+    -- pwr is provisional here and re-gridded after staging. last reads the previous race's finishing order.
+    session.order = overrides.order
+    local slots = build_slots(MP.GetPlayers(), overrides.order, session.last_order)
     local roster = build_roster(slots)
     local assists = overrides.assists
     -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). The default is
@@ -1455,6 +1600,8 @@ local function tick()
             local prerun = snapshot_prerun_section_bests()
             capture_records()
             send_race_records(prerun)
+            -- Remember the finishing order so the next race's order=last can grid by it (ADR-0033).
+            capture_finishing_order()
             enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
         end
         return
@@ -1473,7 +1620,7 @@ local function tick()
     end
 
     if phase == PHASE.staging then
-        enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+        enter_countdown_from_staging()
     elseif phase == PHASE.countdown then
         -- The release signal itself is a later Phase-3 item; here we enter racing and send the
         -- baseline standings (every player at zero) so clients have a table to show from the start.
@@ -1487,7 +1634,7 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
-    .. "[maxhp=<n>] [maxpwr=<n>] [all]"
+    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -1588,6 +1735,27 @@ local function parse_option_token(token)
     return "assist", {keyword = keyword, enabled = assist.enabled, hold = assist.hold}
 end
 
+-- Start-order modes for /race order= (ADR-0033). entry/random are non-directional; last/pwr accept :rev.
+local ORDER_MODES = {entry = true, random = true, last = true, pwr = true}
+
+-- Parse an order= value "<mode>[:rev]" into {mode, rev}, or nil when the mode is unknown or a suffix
+-- other than "rev" is given. :rev flips a directional mode (last/pwr); entry/random ignore it (ADR-0033).
+local function parse_order_value(value)
+    local lowered = value:lower()
+    local mode, suffix = lowered:match("^(%a+):(%a+)$")
+    if mode then
+        if suffix ~= "rev" then
+            return nil
+        end
+    else
+        mode = lowered
+    end
+    if not ORDER_MODES[mode] then
+        return nil
+    end
+    return {mode = mode, rev = suffix == "rev"}
+end
+
 -- Parse a /race argument into the race name plus an overrides table (ADR-0013, ADR-0017, ADR-0018). The
 -- first whitespace token is the race name (slug-based, no spaces -- ADR-0005); each remaining token is
 -- an order-independent option, matched by unambiguous prefix across the whole keyword set:
@@ -1666,6 +1834,13 @@ local function parse_race_args(argument)
             if not overrides.maxpwr and not bad_token then
                 bad_token = token
             end
+        elseif token:match("^[Oo][Rr][Dd][Ee][Rr]=.+$") then
+            -- order=<mode>[:rev] sets the grid start order (ADR-0033); server-internal, not relayed. An
+            -- unknown mode or a bad suffix falls to bad_token.
+            overrides.order = parse_order_value(token:match("^[Oo][Rr][Dd][Ee][Rr]=(.+)$"))
+            if not overrides.order and not bad_token then
+                bad_token = token
+            end
         elseif not bad_token then
             bad_token = token
         end
@@ -1704,8 +1879,12 @@ local function handle_race_command(player_id, player_name, argument)
     end
 
     local assists = overrides.assists
+    local order_echo = ""
+    if overrides.order then
+        order_echo = " order=" .. overrides.order.mode .. (overrides.order.rev and ":rev" or "")
+    end
     log_info("beamcomp.race", string.format(
-        "/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s",
+        "/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
@@ -1715,7 +1894,8 @@ local function handle_race_command(player_id, player_name, argument)
         assists.repairEnabled and (assists.repairHoldSeconds .. "s") or "off",
         overrides.car and (" car=" .. overrides.car) or "",
         overrides.maxhp and (" maxhp=" .. overrides.maxhp) or "",
-        overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or ""))
+        overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or "",
+        order_echo))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
@@ -1809,7 +1989,9 @@ local function handle_client_info(player_id, payload)
     end
     local vehicle = type(payload.vehicle) == "table" and payload.vehicle or nil
     session.identities = session.identities or {}
-    session.identities[player_id] = {vehicle = vehicle}
+    -- pwr (power-to-weight) feeds the start-order pwr re-grid (ADR-0033); stored verbatim, never
+    -- interpreted (race-blind, ADR-0005). nil/non-number when the client could not read it.
+    session.identities[player_id] = {vehicle = vehicle, pwr = tonumber(payload.pwr)}
     log_info("beamcomp.records", string.format(
         "clientInfo id=%s vehicle=%s/%s modified=%s",
         tostring(player_id),
@@ -1868,7 +2050,7 @@ local function handle_start_command(player_id, player_name)
         return
     end
     log_info("beamcomp.race", "manual start by " .. player_name)
-    enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+    enter_countdown_from_staging()
     MP.SendChatMessage(player_id, "BeamComp: countdown started")
 end
 
@@ -2336,6 +2518,8 @@ end
 
 local function on_init()
     log_info("beamcomp", "server plugin loaded v" .. PLUGIN_VERSION)
+    -- Seed the RNG for the random / no-source-fallback start orders (ADR-0033).
+    math.randomseed(os.time())
     load_config()
     ensure_grids_loaded()
     ensure_records_loaded()
