@@ -1093,15 +1093,18 @@ local function derive_segments(splits)
     return segments
 end
 
--- A human label for a car descriptor (ADR-0029): "model / variant" with a "(mod)" suffix when parts were
--- changed. nil when there is no car.
+-- A human label for a car descriptor (ADR-0029): "model: variant" with a "(mod)" suffix when parts were
+-- changed. The variant is shown as its leaf preset name only -- any directory prefix and the ".pc"
+-- extension are stripped, so a full partConfig path like "vehicles/van/offroad_alt.pc" reads as
+-- "offroad_alt". nil when there is no car.
 local function car_label(car)
     if type(car) ~= "table" then
         return nil
     end
     local label = car.model or "?"
     if type(car.variant) == "string" and car.variant ~= "" then
-        label = label .. " / " .. car.variant
+        local short = (car.variant:gsub("^.*/", ""):gsub("%.pc$", ""))
+        label = label .. ": " .. short
     end
     if car.modified == true then
         label = label .. " (mod)"
@@ -1291,6 +1294,7 @@ local function build_track_section(records, race_name)
         carRuns = track_car and track_car.run_count or 0,
         recordAnyCar = track and (track.best_lap or track.total_time) or nil,
         recordAnyCarHolder = track and track.holder or nil,
+        recordAnyCarLabel = track and car_label(track.recordCar) or nil,
         recordThisCar = track_car and (track_car.best_lap or track_car.total_time) or nil,
         recordThisCarHolder = track_car and track_car.holder or nil,
         carLabel = car_label(records.car),

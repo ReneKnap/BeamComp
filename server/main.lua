@@ -1218,6 +1218,9 @@ local function slim_track_record(track, car_key)
         total_time = track.total_time,
         best_lap = track.best_lap,
         holder = track.holder,
+        -- The car that set the overall (any-car) record, so the overlay can label it like the this-car
+        -- record instead of only the holder identity. nil when the record-setter's vehicle is unknown.
+        recordCar = car_descriptor(track.vehicle),
         car = car and {
             total_time = car.total_time,
             best_lap = car.best_lap,

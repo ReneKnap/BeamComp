@@ -455,7 +455,7 @@
     </table>
 
     <div ng-if="hud.analysis.driver">
-      <div class="bc-analysis-section">Driver - {{hud.analysis.driver.name || 'you'}}<span ng-if="hud.analysis.driver.carLabel"> · this car: {{hud.analysis.driver.carLabel}}</span></div>
+      <div class="bc-analysis-section">Driver - {{hud.analysis.driver.name || 'you'}}<span ng-if="hud.analysis.driver.carLabel"> - (this car) {{hud.analysis.driver.carLabel}}</span></div>
       <table class="bc-matrix">
         <thead>
           <tr><td class="bc-matrix-driver"></td><td>any car</td><td>this car</td></tr>
@@ -471,12 +471,12 @@
     </div>
 
     <div ng-if="hud.analysis.track">
-      <div class="bc-analysis-section">Track - {{hud.analysis.track.name}}<span ng-if="hud.analysis.track.carLabel"> · this car: {{hud.analysis.track.carLabel}}</span></div>
+      <div class="bc-analysis-section">Track - {{hud.analysis.track.name}}<span ng-if="hud.analysis.track.carLabel"> - (this car) {{hud.analysis.track.carLabel}}</span></div>
       <table class="bc-metrics-kv">
         <tr><td>Runs / time (all players)</td><td>{{hud.analysis.track.trackRuns}} · {{formatDuration(hud.analysis.track.trackTime)}}</td></tr>
         <tr><td>Runs (this car, all)</td><td>{{hud.analysis.track.carRuns}}</td></tr>
-        <tr><td>Record (any car)</td><td>{{hud.analysis.track.recordAnyCar != null ? formatTime(hud.analysis.track.recordAnyCar) : '--'}}<span ng-if="hud.analysis.track.recordAnyCarHolder"> - {{hud.analysis.track.recordAnyCarHolder}}</span></td></tr>
-        <tr><td>Record (this car)</td><td>{{hud.analysis.track.recordThisCar != null ? formatTime(hud.analysis.track.recordThisCar) : '--'}}<span ng-if="hud.analysis.track.recordThisCarHolder"> - {{hud.analysis.track.recordThisCarHolder}}</span></td></tr>
+        <tr><td>Record (any car)<span ng-if="hud.analysis.track.recordAnyCarLabel"> {{hud.analysis.track.recordAnyCarLabel}}</span></td><td>{{hud.analysis.track.recordAnyCar != null ? formatTime(hud.analysis.track.recordAnyCar) : '--'}}</td></tr>
+        <tr><td>Record (this car)<span ng-if="hud.analysis.track.carLabel"> {{hud.analysis.track.carLabel}}</span></td><td>{{hud.analysis.track.recordThisCar != null ? formatTime(hud.analysis.track.recordThisCar) : '--'}}</td></tr>
       </table>
     </div>
 
