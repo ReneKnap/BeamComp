@@ -64,10 +64,10 @@ local MARKER_RADIUS = 0.6
 local CHECKPOINT_COLUMN_UP = 300.0      -- column reach above the checkpoint center
 local CHECKPOINT_COLUMN_DOWN = 100.0    -- column reach below the checkpoint center
 local GATE_POST_RADIUS = 0.15           -- radius of the thin left/right gate-side posts
-local CHECKPOINT_FADE_BAND = 30.0       -- meters above the radius over which the area cylinder fades
-                                        -- in: full alpha at radius + this, alpha 0 at the volume edge
-local POST_MAX_TURN_RATE = math.rad(7.5) -- max rad/s the player-facing gate posts may rotate, so they
-                                         -- ease toward the player instead of snapping near the center
+local CHECKPOINT_FADE_BAND = 60.0       -- meters above the radius over which the area cylinder fades
+                                        -- in: full alpha at radius + this, alpha 0 at the volume edge.
+                                        -- Doubles as the band over which the gate posts ease from
+                                        -- player-facing to the stored gate normal (gate_line_angle).
 local GRID_COLUMN_HEIGHT = 2.5          -- height of a start-grid pillar (label sits on top)
 local GRID_COLUMN_RADIUS = 0.25         -- radius of a start-grid pillar
 
@@ -119,7 +119,6 @@ M.state = {
     results_hidden = false,  -- local-only toggle: hide the finished results card via /results (ADR-0022)
     race_records = nil,      -- pre-run PB + track record for the post-race analysis overlay (server raceRecords, ADR-0028), or nil
     analysis_open = false,   -- local-only toggle: show the post-race analysis overlay via /analysis or the card button (ADR-0028)
-    post_orient = nil,   -- smoothed gate-line angle per checkpoint index, for player-facing posts
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
     staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
@@ -422,7 +421,6 @@ local function handle_race_phase(payload)
         local plan = M.state.race and M.state.race.plan
         if plan then
             M.state.detection = checkpoints.new(plan)
-            M.state.post_orient = {}
         else
             log("W", RACE_LOG_TAG, "racing: no traversal plan; checkpoint detection disabled")
         end
@@ -705,15 +703,18 @@ local function gate_edges(checkpoint)
     return left, right
 end
 
--- Smoothed gate-line angle (radians) for a checkpoint's player-facing posts: the line perpendicular
--- to the horizontal car->checkpoint direction, so the gate presents square-on to the approach. To
--- kill the fast swing as the car nears/crosses the center, the angle eases toward the target at no
--- more than POST_MAX_TURN_RATE and is frozen once the car is inside the volume (dist <= radius). A
--- gate line repeats every pi (the two posts are interchangeable), so the step is wrapped into
--- [-pi/2, pi/2] -- the shortest turn that lands on the same line. The per-checkpoint angle is cached
--- (keyed by stable index) in M.state.post_orient. Returns nil when there is no car position or the
--- car is horizontally at the center, signalling the caller to fall back to the stored-normal posts.
-local function smooth_gate_angle(checkpoint, car_pos, dt, cache)
+-- Gate-line angle (radians) for a checkpoint's player-facing posts, eased toward the gate's true
+-- orientation by distance. The far target is the line perpendicular to the horizontal car->checkpoint
+-- direction (the gate presents square-on to the approach); the near target is the line of the stored
+-- gate normal (its real orientation). Across the same band the area fade uses, the angle blends
+-- linearly from fully player-facing at radius + CHECKPOINT_FADE_BAND to fully normal-facing at the
+-- volume edge (dist <= radius), where it then rests -- so the closer the car, the less the gate swings
+-- and it ends square on its true line (the freeze edge = 100% normal). A gate line repeats every pi
+-- (the two posts are interchangeable), so the blend step is wrapped into [-pi/2, pi/2] -- the shortest
+-- turn onto the same line. A checkpoint without a stored normal has no true line to ease toward, so it
+-- stays fully player-facing. Returns nil when there is no car position or the car is horizontally at
+-- the center, signalling the caller to fall back to the stored-normal posts.
+local function gate_line_angle(checkpoint, car_pos)
     if not car_pos then
         return nil
     end
@@ -724,31 +725,34 @@ local function smooth_gate_angle(checkpoint, car_pos, dt, cache)
     if len < 1e-6 then
         return nil
     end
-    local target = math.atan2(dy, dx) + math.pi / 2
-    local key = checkpoint.index
-    local current = cache[key]
-    if current == nil then
-        cache[key] = target
-        return target
+    local player_angle = math.atan2(dy, dx) + math.pi / 2
+
+    -- No stored normal: nothing to ease toward, stay fully player-facing (the prior behavior).
+    local normal = checkpoint.normal
+    if not normal then
+        return player_angle
     end
+    local nlen = math.sqrt(normal.x * normal.x + normal.y * normal.y)
+    if nlen < 1e-6 then
+        return player_angle
+    end
+    -- The line of the stored normal, in the same angle convention post_edges expects (perp = the
+    -- gate line; gate_edges builds it from (normal.y, -normal.x)).
+    local normal_angle = math.atan2(-normal.x, normal.y)
+
+    -- Blend fraction by distance: 0 (player) at radius + band and beyond, 1 (normal) at the volume
+    -- edge and inside. Linear between, so 50% of the way through the band is a 50/50 mix.
     local radius = checkpoint.radius or MARKER_RADIUS
-    if len <= radius then
-        return current  -- frozen inside the volume: hold the last orientation
-    end
-    local diff = (target - current + math.pi / 2) % math.pi - math.pi / 2
-    local max_step = POST_MAX_TURN_RATE * (dt or 0)
-    if diff > max_step then
-        diff = max_step
-    elseif diff < -max_step then
-        diff = -max_step
-    end
-    current = current + diff
-    cache[key] = current
-    return current
+    local t = (radius + CHECKPOINT_FADE_BAND - len) / CHECKPOINT_FADE_BAND
+    t = math.max(0.0, math.min(1.0, t))
+
+    -- Shortest step from the player line onto the same pi-periodic normal line, scaled by t.
+    local diff = (normal_angle - player_angle + math.pi / 2) % math.pi - math.pi / 2
+    return player_angle + t * diff
 end
 
 -- The two horizontal points (left, right) to draw the side posts at, from a smoothed gate-line angle
--- (smooth_gate_angle). Falls back to the stored-normal placement (gate_edges) when the angle is nil
+-- (gate_line_angle). Falls back to the stored-normal placement (gate_edges) when the angle is nil
 -- (no car / degenerate) -- that fallback is itself nil for a pure-radius checkpoint, so no posts are
 -- drawn that frame, the prior behavior.
 local function post_edges(checkpoint, line_angle)
@@ -827,34 +831,28 @@ end
 -- plan entry at detection.seq + 1, the look-ahead the entry after it; each cursor indexes the
 -- checkpoints array (ADR-0013) -- so on a circuit they point at CP1 first and back at the start/
 -- finish line (CP0) for the final crossing.
-local function draw_next_checkpoint(race, detection, car_pos, dt)
+local function draw_next_checkpoint(race, detection, car_pos)
     local entries = detection.plan and detection.plan.entries
     if not entries then
         return
-    end
-    local cache = M.state.post_orient
-    if not cache then
-        cache = {}
-        M.state.post_orient = cache
     end
     local final_seq = #entries
 
     -- Circuit: before the lap clock arms (the run-up from the grid to the line), also draw the
     -- start/finish line itself, so the player sees the line the lap is counted from -- the scored
     -- plan's next marker is CP1, not this line (ADR-0022). Once the line is crossed (lt.started) it
-    -- stops here and reappears later as the regular lap/finish marker. Stable index 0 keeps its own
-    -- post-orient cache key, distinct from the next/look-ahead checkpoints. Purely visual.
+    -- stops here and reappears later as the regular lap/finish marker. Purely visual.
     local lt = M.state.laptimer
     if lt and not lt.started and lt.start_cp then
         -- First-lap run-up: the start/finish line holds its true gate orientation (fixed stored
         -- normal, no car-tracking rotation) until the line is first crossed, so it reads as a proper
         -- start line rather than swinging to face the grid. A nil angle makes post_edges fall back to
         -- gate_edges (the stored normal). With no stored normal there is nothing to lock to, so keep
-        -- the smoothed car-facing angle (the prior behavior, avoids dropping the posts). Once crossed
+        -- the car-facing angle (the prior behavior, avoids dropping the posts). Once crossed
         -- (lt.started) the line reappears as the regular lap/finish marker and rotates normally again.
         local start_angle = nil
         if not lt.start_cp.normal then
-            start_angle = smooth_gate_angle(lt.start_cp, car_pos, dt, cache)
+            start_angle = gate_line_angle(lt.start_cp, car_pos)
         end
         draw_checkpoint_marker(lt.start_cp, marker_style(lt.start_cp, false), car_pos, start_angle)
     end
@@ -865,13 +863,13 @@ local function draw_next_checkpoint(race, detection, car_pos, dt)
         return
     end
     local next_style = marker_style(next_checkpoint, detection.seq + 1 == final_seq)
-    local next_angle = smooth_gate_angle(next_checkpoint, car_pos, dt, cache)
+    local next_angle = gate_line_angle(next_checkpoint, car_pos)
     draw_checkpoint_marker(next_checkpoint, next_style, car_pos, next_angle)
 
     local ahead_entry = entries[detection.seq + 2]
     local ahead_checkpoint = ahead_entry and race.checkpoints[ahead_entry.cursor]
     if ahead_checkpoint then
-        local ahead_angle = smooth_gate_angle(ahead_checkpoint, car_pos, dt, cache)
+        local ahead_angle = gate_line_angle(ahead_checkpoint, car_pos)
         draw_checkpoint_marker(ahead_checkpoint, LOOKAHEAD_STYLE, car_pos, ahead_angle)
     end
 end
@@ -2109,7 +2107,7 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
                 -- posts face the point that actually triggers the gate, not a different camera vehicle.
                 local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
                 local car_pos = own_car and own_car:getPosition()
-                draw_next_checkpoint(race, detection, car_pos, dtReal)
+                draw_next_checkpoint(race, detection, car_pos)
             end
         end
     end)
