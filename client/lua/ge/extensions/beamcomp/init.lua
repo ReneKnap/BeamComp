@@ -1066,6 +1066,10 @@ local function on_checkpoint_reached(event, count)
     -- `bestLap` rides the existing report as an additive field: the server stores the latest per
     -- player and relays it in the standings (ADR-0022) so the results card can show every player's
     -- best lap. The server stays race-blind -- it just passes the number through (ADR-0005).
+    -- `runUp` rides along the same way: the gun -> start/finish line run-up (lap 1's real start), so
+    -- the analysis overlay can show it as S0 and clean it out of lap-1 times for every driver
+    -- (ADR-0028). Set once the line is crossed, which is before this first report, so it is present
+    -- from the first scored crossing onward.
     send_to_server("checkpoint", {
         seq = event.seq,
         index = event.index,
@@ -1074,6 +1078,7 @@ local function on_checkpoint_reached(event, count)
         time = event.time,
         count = count,
         bestLap = lt and lt.best or nil,
+        runUp = lt and lt.run_up or nil,
     })
 end
 
@@ -1167,7 +1172,12 @@ end
 -- splits[(l-1)*cps + s] - splits[(l-1)*cps + s - 1] and total = splits[l*cps] - splits[(l-1)*cps].
 -- Only fully-completed laps are returned (a partial final lap from a DNF is dropped). For a sprint
 -- (one lap of all CPs) this yields the single run. cps = checkpoints per lap.
-local function laps_from_splits(splits, cps)
+--
+-- `run_up` (optional, circuit only; ADR-0022/0028) is the gun -> start/finish-line time baked into
+-- lap 1: the scored plan starts at CP1 from the gun, so lap 1's first section and total carry the
+-- run-up from the grid to the real start of the lap. When given, it is subtracted from lap 1 (and
+-- only lap 1) so every lap reads as a clean line-to-line lap. nil / sprint -> no change.
+local function laps_from_splits(splits, cps, run_up)
     local laps = {}
     if type(splits) ~= "table" or type(cps) ~= "number" or cps < 1 then
         return laps
@@ -1188,7 +1198,12 @@ local function laps_from_splits(splits, cps)
             end
         end
         if ok then
-            laps[#laps + 1] = {sections = sections, total = splits[base + cps] - base_time}
+            local total = splits[base + cps] - base_time
+            if base == 0 and type(run_up) == "number" and type(sections[1]) == "number" then
+                sections[1] = sections[1] - run_up
+                total = total - run_up
+            end
+            laps[#laps + 1] = {sections = sections, total = total}
         end
         lap_index = lap_index + 1
     end
@@ -1257,7 +1272,7 @@ local function fastest_lap_across(entries, cps, car_key, exclude_local)
     local best, holder = nil, nil
     for _, e in ipairs(entries) do
         if (not exclude_local or not e.isLocal) and (not car_key or (e.car and e.car.key == car_key)) then
-            local candidate = best_lap_of(laps_from_splits(e.splits, cps))
+            local candidate = best_lap_of(laps_from_splits(e.splits, cps, e.run_up))
             if candidate and (not best or candidate.total < best.total) then
                 best, holder = candidate, e.name
             end
@@ -1363,7 +1378,8 @@ local function build_race_section(entries, race, local_entry, records)
     if cps < 1 or not local_entry then
         return nil
     end
-    local my_laps = laps_from_splits(local_entry.splits, cps)
+    -- Subtract the run-up so lap 1 is a clean line-to-line lap like the rest (circuit only; ADR-0022).
+    local my_laps = laps_from_splits(local_entry.splits, cps, local_entry.run_up)
     local my_best = best_lap_of(my_laps)
     if not my_best then
         return nil
@@ -1418,6 +1434,8 @@ end
 -- (ADR-0028/0029). Pure client-side derivation -- the race-blind server only ships numbers (ADR-0005).
 -- Carries the cross-driver segment matrix (aligned {value, fastest} cells, fastest = column minimum) plus
 -- the three sections: Driver (your records), Track (all players), Race (this race's laps from the splits).
+-- For circuits the matrix gains a leading S0 column -- the gun -> start/finish run-up -- and the first
+-- real segment is cleaned of it, so every lap reads from the real start of the lap (ADR-0022/0028).
 -- All cells are aligned arrays so the UI iterates rather than indexing across the Lua->JS bridge. Returns
 -- nil with nothing to show.
 local function build_analysis(entries, records, race)
@@ -1425,48 +1443,81 @@ local function build_analysis(entries, records, race)
         return nil
     end
 
-    local segment_count = 0
+    -- S0 = the gun -> start/finish-line run-up (ADR-0022/0028). In a circuit the scored splits start at
+    -- CP1, so this run-up is baked into the first segment. When any driver reported it, surface it as a
+    -- leading S0 column and subtract it from the first segment, so every segment reads from the real
+    -- start of a lap (S0 | S1=CP0->CP1 | ...). Sprints have no line crossing and keep S1.. unchanged.
+    local with_runup = false
+    if (race and race.mode == "circuit") then
+        for _, e in ipairs(entries) do
+            if type(e.run_up) == "number" then
+                with_runup = true
+                break
+            end
+        end
+    end
+
+    local max_seg = 0
     local drivers = {}
     for i, e in ipairs(entries) do
         local segments = derive_segments(e.splits)
-        if #segments > segment_count then
-            segment_count = #segments
+        if #segments > max_seg then
+            max_seg = #segments
         end
         drivers[i] = {
             name = e.name,
             isLocal = e.isLocal,
             dnf = e.dnf,
             position = e.position,
-            segments = segments,  -- scratch for the column-min pass; replaced by cells below
+            segments = segments,   -- scratch for the column passes; replaced by cells below
+            run_up = e.run_up,     -- scratch for the S0 column / first-segment cleanup
         }
     end
+    -- One extra leading column (S0) once the run-up is shown. Reading a driver's value at a 1-based
+    -- column maps S0 -> run_up and S{j-1} -> segments[j-1], with the first real segment cleaned of the
+    -- run-up so it is line-to-line. Without the run-up column, column j is simply segments[j].
+    local segment_count = with_runup and (max_seg + 1) or max_seg
+    local function column_value(driver, j)
+        if not with_runup then
+            return driver.segments[j]
+        end
+        if j == 1 then
+            return driver.run_up
+        end
+        local k = j - 1
+        local seconds = driver.segments[k]
+        if k == 1 and type(seconds) == "number" and type(driver.run_up) == "number" then
+            return seconds - driver.run_up
+        end
+        return seconds
+    end
 
-    -- Fastest time in each segment column across drivers (the purple highlight, ADR-0028).
+    -- Fastest time in each column across drivers (the purple highlight, ADR-0028).
     local column_best = {}
-    for k = 1, segment_count do
+    for j = 1, segment_count do
         local best = nil
         for _, driver in ipairs(drivers) do
-            local seconds = driver.segments[k]
+            local seconds = column_value(driver, j)
             if type(seconds) == "number" and (not best or seconds < best) then
                 best = seconds
             end
         end
-        column_best[k] = best
+        column_best[j] = best
     end
 
     local columns = {}
-    for k = 1, segment_count do
-        columns[k] = "S" .. k
+    for j = 1, segment_count do
+        columns[j] = "S" .. (with_runup and (j - 1) or j)
     end
     for _, driver in ipairs(drivers) do
         local cells = {}
         local total, has_total = 0, false
-        for k = 1, segment_count do
-            local seconds = driver.segments[k]
-            cells[k] = {
+        for j = 1, segment_count do
+            local seconds = column_value(driver, j)
+            cells[j] = {
                 value = seconds,
-                fastest = type(seconds) == "number" and column_best[k] ~= nil
-                    and seconds == column_best[k],
+                fastest = type(seconds) == "number" and column_best[j] ~= nil
+                    and seconds == column_best[j],
             }
             if type(seconds) == "number" then
                 total = total + seconds
@@ -1474,10 +1525,12 @@ local function build_analysis(entries, records, race)
             end
         end
         driver.cells = cells
-        -- Sum of the shown segments = the driver's total race/lap time (a DNF's partial segments sum to a
-        -- partial total). nil when no segment crossed, so the UI shows a placeholder rather than 0.
+        -- Sum of the shown columns = the driver's total race time (S0 + cleaned S1 == the original
+        -- first segment, so the run-up split changes nothing here). A DNF's partial columns sum to a
+        -- partial total; nil when nothing crossed, so the UI shows a placeholder rather than 0.
         driver.total = has_total and total or nil
         driver.segments = nil
+        driver.run_up = nil
     end
 
     local local_entry = nil
@@ -1574,6 +1627,7 @@ local function build_hud_snapshot()
                 cpInLap = cp_in_lap,
                 cpPerLap = cp_per_lap,
                 splits = e.splits,
+                run_up = e.run_up,  -- gun -> start/finish run-up (ADR-0022), for the analysis S0 column
                 car = e.car,  -- driver's car (ADR-0029), for the Race section's "best lap with the car"
             }
         end

@@ -727,6 +727,9 @@ local function build_standings()
             dnf = record.dnf,
             lap = record.lap,
             best_lap = record.best_lap,
+            -- Run-up time (gun -> start/finish line, circuit only; ADR-0022). Relayed for the analysis
+            -- overlay's S0 column and clean lap-1 derivation (ADR-0028). nil for sprints / pre-line.
+            run_up = record.run_up,
             -- Cumulative race-relative time at each scored crossing (ADR-0015). Shallow reference --
             -- downstream readers must not mutate. DNF entries carry only the splits completed before
             -- DNF; the results UI derives segment deltas from this.
@@ -2028,6 +2031,10 @@ local function handle_checkpoint_report(player_id, payload)
     -- Client-reported best lap so far (circuit; ADR-0022). Relayed in standings, never interpreted --
     -- the server stays race-blind (ADR-0005), it just stores the latest number this player sent.
     local best_lap = tonumber(payload.bestLap)
+    -- Client-reported run-up: the gun -> start/finish line time (lap 1's real start, circuit only;
+    -- ADR-0022). Same deal as best_lap -- stored and relayed verbatim for the analysis overlay's S0
+    -- column / clean lap-1 derivation (ADR-0028), never interpreted server-side (ADR-0005).
+    local run_up = tonumber(payload.runUp)
 
     if seq ~= record.completed then
         log_info("beamcomp.race", string.format(
@@ -2045,6 +2052,9 @@ local function handle_checkpoint_report(player_id, payload)
     end
     if best_lap then
         record.best_lap = best_lap
+    end
+    if run_up then
+        record.run_up = run_up
     end
     record.splits[record.completed] = time
     record.total_time = time

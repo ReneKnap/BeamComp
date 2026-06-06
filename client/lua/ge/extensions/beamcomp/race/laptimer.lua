@@ -27,6 +27,9 @@ function M.new(start_cp)
         started = false,      -- true once the first line crossing has armed the lap clock
         prev_pos = nil,       -- {x, y, z} previous-frame car position for the pre-start swept test
         lap_start = 0,        -- elapsed (sim-seconds) at the current lap's start
+        run_up = nil,         -- elapsed at the first line crossing: the run-up from the grid to the
+                              -- start/finish line (the gun -> real start of lap 1). Set once, kept for
+                              -- the analysis overlay's S0 column / clean lap-1 time (ADR-0022/0028).
         best = nil,           -- best completed lap time, or nil before the first completion
         last_lap = nil,       -- the most recently completed lap time, or nil
     }
@@ -50,6 +53,9 @@ function M.step(state, car_pos, elapsed)
     if state.prev_pos and checkpoints.segment_hits(state.prev_pos, car_pos, state.start_cp) then
         state.started = true
         state.lap_start = elapsed
+        -- The first crossing is the real start of lap 1; `elapsed` here (gun-relative) is the run-up
+        -- from the grid to the line. Captured once, before lap_start gets reused by complete_lap.
+        state.run_up = elapsed
         return
     end
 
