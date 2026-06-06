@@ -17,8 +17,11 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
+--                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
+--                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) = per-player caps that keep a
+--                 compliant car or substitute one (Mode 3); none = keep own car (Mode 1). car= wins.
 --                 the deprecated quickrace ("menu:") source is hidden from bare-name resolution unless
 --                 "all" is given or the name carries an explicit "menu:" prefix (ADR-0026).
 --                 <name> may carry a "map:"/"menu:" source prefix (freeroam-mission vs Time-Trial-menu
@@ -43,6 +46,9 @@
 --                 builds the list and sends it back ("raceList"), and the server posts it to the
 --                 player. Reply is to the asker only. The deprecated quickrace ("menu") source is
 --                 hidden (shown as a count hint) unless "all" is given (ADR-0026).
+--   /cars [model] list installed vehicles -- bare lists models, /cars <model> lists that model's
+--                 configs with power (and index). Vehicle-blind like /races (ADR-0005/0032): asks the
+--                 client ("listVehicles"), which replies ("vehicleList") and the server posts it back.
 --   /dnf          give up the current race: marks the issuing player DNF (did not finish). Racing
 --                 only (ADR-0014).
 --   /results      toggle the asking player's own finished-results card on/off (ADR-0022). Open to
@@ -60,6 +66,7 @@ local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
 local CHAT_COMMAND_RACEEND = "/raceend"
 local CHAT_COMMAND_RACES = "/races"
+local CHAT_COMMAND_CARS = "/cars"  -- list installed vehicle models, or one model's configs (ADR-0032)
 local CHAT_COMMAND_DNF = "/dnf"
 local CHAT_COMMAND_PING = "/beamcomp"
 local CHAT_COMMAND_RESULTS = "/results"  -- toggle the asking player's finished-results card (ADR-0022)
@@ -80,6 +87,7 @@ local MSG_RACE_PHASE = "racePhase"
 -- Client -> server message types (received on EVENT_CHANNEL; ADR-0011).
 local MSG_CHECKPOINT = "checkpoint"
 local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
+local MSG_VEHICLE_LIST = "vehicleList"  -- a client's /cars reply: pre-formatted chat lines to post back (ADR-0032)
 local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
 local MSG_SPAWN_READY = "spawnReady"  -- a client's "car spawned + seated" ack, gating spawning (ADR-0006 amendment)
 local MSG_CLIENT_INFO = "clientInfo"  -- a client's vehicle metadata for best-times records (ADR-0027)
@@ -93,6 +101,7 @@ local MSG_GRID_LIST = "gridList"      -- reply to gridListReq: the map's saved g
 -- Server -> client broadcast/request types.
 local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadcast)
 local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
+local MSG_LIST_VEHICLES = "listVehicles"  -- ask one client to report its installed vehicles/configs (/cars, ADR-0032)
 local MSG_FINISH_GRACE = "finishGrace"  -- the DNF-cutoff countdown duration, broadcast when armed (ADR-0014)
 local MSG_VALIDATE_RACE = "validateRace"  -- ask the issuer's client to vet /race options pre-start (ADR-0019)
 local MSG_RESULTS_TOGGLE = "resultsToggle"  -- tell one client to hide/show its finished-results card (ADR-0022)
@@ -102,6 +111,9 @@ local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close i
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
+
+-- Cap on /cars reply lines (ADR-0032): higher than races -- a stock install has more models/configs.
+local VEHICLE_LIST_MAX_LINES = 200
 
 -- State-machine tick. ~4x/second: fine enough for a 3-2-1-GO, idle cost is a nil-check.
 local TICK_EVENT = "beamcompTick"
@@ -860,6 +872,12 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
             -- Resolved custom-grid params (ADR-0023); nil = procedural grid. Same for every slot --
             -- clients pick their own pose from the shared layout by slot.
             gridParams = grid_params,
+            -- Vehicle policy (ADR-0032), relayed verbatim and never interpreted (ADR-0005): car =
+            -- fixed "model[:config]" for everyone (Mode 2); maxhp (hp) / maxpwr (power-to-weight, hp per
+            -- kg) = per-player caps (Mode 3). All nil = keep own car (Mode 1). car wins client-side.
+            car = overrides.car,
+            maxhp = overrides.maxhp,
+            maxpwr = overrides.maxpwr,
         })
     end
 
@@ -1468,7 +1486,8 @@ end
 
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
-    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [all]"
+    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
+    .. "[maxhp=<n>] [maxpwr=<n>] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -1628,6 +1647,25 @@ local function parse_race_args(argument)
             -- grid=<name> selects a server-stored grid for this race (ADR-0023); case-insensitive key,
             -- value kept verbatim. An empty value (bare "grid=") is not this branch -> falls to bad_token.
             overrides.grid = token:match("^[Gg][Rr][Ii][Dd]=(.+)$")
+        elseif token:match("^[Cc][Aa][Rr]=.+$") then
+            -- car=<model[:config]> forces one fixed car for every player (Mode 2, ADR-0032);
+            -- case-insensitive key, value (model or model:config) kept verbatim -- the client splits and
+            -- spawns it (race-blind, ADR-0005). A bare "car=" is not this branch -> falls to bad_token.
+            overrides.car = token:match("^[Cc][Aa][Rr]=(.+)$")
+        elseif token:match("^[Mm][Aa][Xx][Hh][Pp]=.+$") then
+            -- maxhp=<n> caps engine power per player (Mode 3, ADR-0032); the client keeps a compliant car
+            -- or substitutes one. Relayed as a number; a non-numeric value falls to bad_token.
+            overrides.maxhp = tonumber(token:match("^[Mm][Aa][Xx][Hh][Pp]=(.+)$"))
+            if not overrides.maxhp and not bad_token then
+                bad_token = token
+            end
+        elseif token:match("^[Mm][Aa][Xx][Pp][Ww][Rr]=.+$") then
+            -- maxpwr=<n> caps power-to-weight (hp per kg) per player (Mode 3, ADR-0032), analogous to
+            -- maxhp. Relayed as a number; a non-numeric value falls to bad_token.
+            overrides.maxpwr = tonumber(token:match("^[Mm][Aa][Xx][Pp][Ww][Rr]=(.+)$"))
+            if not overrides.maxpwr and not bad_token then
+                bad_token = token
+            end
         elseif not bad_token then
             bad_token = token
         end
@@ -1657,15 +1695,27 @@ local function handle_race_command(player_id, player_name, argument)
         return
     end
 
+    -- Vehicle-policy precedence (ADR-0032): a fixed car= wins over a power/power-to-weight cap. Drop the
+    -- caps so the relay is unambiguous and tell the admin. Pure option bookkeeping -- no vehicle reading.
+    if overrides.car and (overrides.maxhp or overrides.maxpwr) then
+        overrides.maxhp = nil
+        overrides.maxpwr = nil
+        MP.SendChatMessage(player_id, "BeamComp: car= set -- maxhp/maxpwr ignored")
+    end
+
     local assists = overrides.assists
-    log_info("beamcomp.race", string.format("/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s",
+    log_info("beamcomp.race", string.format(
+        "/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
         overrides.direction and (" dir=" .. overrides.direction) or "",
         overrides.force and " force" or "",
         assists.recoverEnabled and (assists.recoverHoldSeconds .. "s") or "off",
-        assists.repairEnabled and (assists.repairHoldSeconds .. "s") or "off"))
+        assists.repairEnabled and (assists.repairHoldSeconds .. "s") or "off",
+        overrides.car and (" car=" .. overrides.car) or "",
+        overrides.maxhp and (" maxhp=" .. overrides.maxhp) or "",
+        overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or ""))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
@@ -1960,6 +2010,15 @@ local function on_chat_message(player_id, player_name, message)
         return 1  -- suppress the command's own chat echo
     end
 
+    if command == CHAT_COMMAND_CARS then
+        -- Vehicle-blind (ADR-0005/0032): ask the asking client to report its installed vehicles; it
+        -- replies with a vehicleList event we post back (handle_vehicle_list). A bare /cars lists models;
+        -- /cars <model> lists that model's configs -- the model token is relayed verbatim, never read.
+        local model = argument:match("^%s*(%S+)")
+        send_event(player_id, MSG_LIST_VEHICLES, {model = model})
+        return 1  -- suppress the command's own chat echo
+    end
+
     if command == CHAT_COMMAND_DNF then
         handle_dnf_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
@@ -2100,6 +2159,26 @@ local function handle_race_list(player_id, payload)
     end
 end
 
+-- Post a client's /cars reply to that player (ADR-0032). The client owns all vehicle knowledge
+-- (ADR-0005), so it built the chat lines and sent them back (ADR-0011); the server only relays them.
+-- `player_id` is the responder -- the player who ran /cars -- so no request tracking is needed. Capped
+-- to VEHICLE_LIST_MAX_LINES so a misbehaving client cannot flood chat. Mirrors handle_race_list.
+local function handle_vehicle_list(player_id, payload)
+    local lines = type(payload) == "table" and payload.lines or nil
+    if type(lines) ~= "table" then
+        log_info("beamcomp.net", "vehicleList from id " .. tostring(player_id) .. " ignored: no lines")
+        return
+    end
+    for i, line in ipairs(lines) do
+        if i > VEHICLE_LIST_MAX_LINES then
+            break
+        end
+        if type(line) == "string" then
+            MP.SendChatMessage(player_id, line)
+        end
+    end
+end
+
 -- A connected player's display name by id, or nil if not present.
 local function player_name_of(player_id)
     return MP.GetPlayers()[player_id]
@@ -2232,6 +2311,8 @@ local function handle_client_event(player_id, data)
         handle_checkpoint_report(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_LIST then
         handle_race_list(player_id, decoded.payload)
+    elseif decoded.type == MSG_VEHICLE_LIST then
+        handle_vehicle_list(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_VALIDATION then
         handle_race_validation(player_id, decoded.payload)
     elseif decoded.type == MSG_SPAWN_READY then
