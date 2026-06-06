@@ -15,6 +15,8 @@
 
 local M = {}
 
+local vehiclespecs = require("beamcomp/race/vehiclespecs")
+
 local LOG_TAG = "beamcomp.spawn"
 
 -- The car spawned when the player starts a race without a real own car to copy (on foot, free-cam, or
@@ -279,52 +281,136 @@ local function repair_and_place(veh, pose)
     veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
 end
 
--- Place this client's own car at `pose` (the grid start the server assigned). Two paths (ADR-0007):
--- if `own_car` is the player's seated owned car (resolved by the caller via M.resolve_own_car with
--- the onVehicleSwitched-tracked id), keep it -- despawn only the OTHER owned cars, then repair +
--- teleport the kept car in place (preserving ESC/drive-mode and customization); otherwise fall back
--- to a fresh spawn (despawn all, spawn a new car). Returns the resolved race car (the caller enters
--- + freezes it), or nil plus a reason. BeamMP propagates the despawn ('Od:'), spawn ('Os:'), and the
--- kept car's teleport (via normal owned-vehicle position sync).
-function M.respawn_own_at(pose, own_car)
-    if type(getOwnMap) ~= "function" or not be then
-        return nil, "not in a multiplayer session"
+-- Split a car= token "model" or "model:config" into (model, config); config is nil when absent. Returns
+-- nil when there is no model part. Shared by the Mode-2 fixed car and the Mode-3 substitute (ADR-0032).
+local function parse_car_token(token)
+    if type(token) ~= "string" or token == "" then
+        return nil
     end
-    if type(pose) ~= "table" or type(pose.pos) ~= "table" or type(pose.rot) ~= "table" then
-        return nil, "invalid grid pose"
+    local colon = token:find(":", 1, true)
+    if not colon then
+        return token, nil
     end
+    local model = token:sub(1, colon - 1)
+    if model == "" then
+        return nil
+    end
+    local config = token:sub(colon + 1)
+    if config == "" then
+        config = nil
+    end
+    return model, config
+end
 
-    if own_car then
-        M.despawn_owned_except(own_car:getId())
-        local ok, err = pcall(repair_and_place, own_car, pose)
-        if not ok then
-            log("W", LOG_TAG, "repair+teleport failed: " .. tostring(err))
-            return nil, "repair+teleport failed: " .. tostring(err)
-        end
-        log("I", LOG_TAG, string.format("kept + placed own car id=%s at grid (%.1f, %.1f, %.1f)",
-            tostring(own_car:getId()), pose.pos.x, pose.pos.y, pose.pos.z))
-        return own_car
+-- Keep the player's seated owned car: despawn their other cars, then repair + teleport it onto the grid
+-- (ADR-0007 primary path). Returns the kept car, or nil plus a reason.
+local function keep_own(pose, own_car)
+    M.despawn_owned_except(own_car:getId())
+    local ok, err = pcall(repair_and_place, own_car, pose)
+    if not ok then
+        log("W", LOG_TAG, "repair+teleport failed: " .. tostring(err))
+        return nil, "repair+teleport failed: " .. tostring(err)
     end
+    log("I", LOG_TAG, string.format("kept + placed own car id=%s at grid (%.1f, %.1f, %.1f)",
+        tostring(own_car:getId()), pose.pos.x, pose.pos.y, pose.pos.z))
+    return own_car
+end
 
-    -- Fallback: no real own car (free-cam / walking / none) -- spawn a fresh one. Capturing before
-    -- the despawn is required, since the despawn deletes the car we copy.
+-- Despawn the player's cars and fresh-spawn a chosen {model, config} (stock paint) at the grid pose.
+-- Shared by Mode 2 (fixed car) and the Mode-3 substitute (ADR-0032). Returns the new car, or nil + reason.
+local function spawn_fixed(pose, model, config)
+    M.despawn_own()
+    local veh, reason = spawn_vehicle_at(pose, {model = model, config = config})
+    if not veh then
+        log("W", LOG_TAG, "policy spawn failed: " .. tostring(reason))
+        return nil, reason
+    end
+    log("I", LOG_TAG, string.format("policy spawned '%s%s' at grid (%.1f, %.1f, %.1f)",
+        tostring(model), config and (":" .. config) or "", pose.pos.x, pose.pos.y, pose.pos.z))
+    return veh
+end
+
+-- Fallback for Mode 1 when there is no real own car (free-cam / walking / none): copy the current car's
+-- spec if any, else the default model, and fresh-spawn it (ADR-0007 §2). Returns the new car, or nil +
+-- reason. Capturing before the despawn is required, since the despawn deletes the car we copy.
+local function fresh_spawn_own(pose)
     local spec = capture_own_spec()
     if not spec then
         log("I", LOG_TAG, "no own car to copy; spawning default vehicle '" .. DEFAULT_VEHICLE_MODEL
             .. "' at grid")
     end
     M.despawn_own()
-
     local veh, reason = spawn_vehicle_at(pose, spec)
     if not veh then
         log("W", LOG_TAG, "respawn failed: " .. tostring(reason))
         return nil, reason
     end
-
     local model_name = (spec and spec.model) or DEFAULT_VEHICLE_MODEL
     log("I", LOG_TAG, string.format("spawned fresh own '%s' at grid (%.1f, %.1f, %.1f)",
         tostring(model_name), pose.pos.x, pose.pos.y, pose.pos.z))
     return veh
+end
+
+-- Mode 3 (ADR-0032): keep the own car when it meets the power / power-to-weight cap, else substitute the
+-- first compliant car (own model's strongest legal trim first, then other models -- find_compliant), else
+-- abort the start for this player. Own-car power + weight are read from the spawned vehicle (reliable);
+-- candidates from config metadata. Returns the kept/spawned car, (nil, reason), or (nil, reason, true)
+-- where the third value flags the no-compliant-car abort so the caller warns and skips the spawn ack.
+local function respawn_for_cap(pose, own_car, policy)
+    local own_model = own_car and own_car.JBeam or nil
+    local own_power = own_car and vehiclespecs.vehicle_power(own_car) or nil
+    local own_weight = own_car and vehiclespecs.vehicle_weight(own_car) or nil
+
+    if own_car and vehiclespecs.is_compliant(own_power, own_weight, policy.maxhp, policy.maxpwr) then
+        log("I", LOG_TAG, string.format("own car '%s' meets the cap (power=%s, weight=%s) -- kept",
+            tostring(own_model), tostring(own_power), tostring(own_weight)))
+        return keep_own(pose, own_car)
+    end
+
+    local pick = vehiclespecs.find_compliant(own_model, policy.maxhp, policy.maxpwr)
+    if not pick then
+        local reason = "no installed car meets the limit"
+        log("W", LOG_TAG, "policy abort: " .. reason)
+        return nil, reason, true
+    end
+    log("I", LOG_TAG, string.format("own car over the cap -- substituting '%s:%s'",
+        tostring(pick.model), tostring(pick.config)))
+    return spawn_fixed(pose, pick.model, pick.config)
+end
+
+-- Place this client's own car at `pose` (the grid start the server assigned), per the relayed vehicle
+-- policy (ADR-0032; `policy` = {car, maxhp, maxpwr}, all nil = Mode 1). Modes:
+--   * Mode 1 (no policy) -- ADR-0007: keep the seated owned car (repair + teleport), else fresh-spawn one.
+--   * Mode 2 (car=) -- ignore the own car, fresh-spawn the fixed model[:config] for everyone.
+--   * Mode 3 (maxhp/maxpwr) -- keep the own car if compliant, else substitute, else abort.
+-- Returns the resolved race car (the caller enters + freezes it), or nil plus a reason, or nil + reason
+-- + true when Mode 3 aborts (no compliant car). BeamMP propagates the despawn ('Od:'), spawn ('Os:'),
+-- and a kept car's teleport (via normal owned-vehicle position sync).
+function M.respawn_own_at(pose, own_car, policy)
+    if type(getOwnMap) ~= "function" or not be then
+        return nil, "not in a multiplayer session"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" or type(pose.rot) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+    policy = policy or {}
+
+    if policy.car then
+        local model, config = parse_car_token(policy.car)
+        if not model then
+            return nil, "invalid car= '" .. tostring(policy.car) .. "'"
+        end
+        return spawn_fixed(pose, model, config)
+    end
+
+    if policy.maxhp or policy.maxpwr then
+        return respawn_for_cap(pose, own_car, policy)
+    end
+
+    if own_car then
+        return keep_own(pose, own_car)
+    end
+    return fresh_spawn_own(pose)
 end
 
 -- Teleport + repair a vehicle to a recover pose: `pos` ({x,y,z}) facing along `dir` ({x,y,z}, world

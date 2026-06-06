@@ -42,6 +42,7 @@ local laptimer = require("beamcomp/race/laptimer")
 local lock = require("beamcomp/race/lock")
 local hud = require("beamcomp/race/hud")
 local racelist = require("beamcomp/race/racelist")
+local carlist = require("beamcomp/race/carlist")
 local maps = require("beamcomp/race/maps")
 local grideditor = require("beamcomp/race/grideditor")
 
@@ -252,7 +253,35 @@ local function handle_race_start(payload)
     -- teleported in place (preserving its settings), or a fresh one is spawned as a fallback
     -- (ADR-0007). Owned-only + BeamMP-propagated (see race/vehicles.lua). The grid markers keep
     -- rendering from M.state.race regardless.
-    local race_car, respawn_err = vehicles.respawn_own_at(race.myPose, own_car)
+    -- The relayed vehicle policy (ADR-0032), read straight off the payload like propOwner (not via
+    -- race_start.prepare, which only handles race geometry): car = fixed car for all (Mode 2),
+    -- maxhp/maxpwr = per-player power / power-to-weight caps (Mode 3), all nil = keep own car (Mode 1).
+    local policy = {
+        car = payload.car,
+        maxhp = payload.maxhp,
+        maxpwr = payload.maxpwr,
+    }
+    local race_car, respawn_err, policy_abort = vehicles.respawn_own_at(race.myPose, own_car, policy)
+    if policy_abort then
+        -- Mode-3 abort: no installed car meets the cap (ADR-0032). Warn the player and bail BEFORE the
+        -- spawnReady ack so the server's spawning gate is not told we're in. The gate's timeout caps the
+        -- wait; if every player aborts, the 0-ack path cancels the race (ADR-0006). Drop the race state
+        -- so countdown/lock/HUD never target a car we never got.
+        log("W", RACE_LOG_TAG, "vehicle policy abort: " .. tostring(respawn_err))
+        guihooks.trigger("toastrMsg", {
+            type = "error",
+            title = "BeamComp -- " .. race.name,
+            msg = "No car under the limit -- you can't join (" .. tostring(respawn_err) .. ")",
+        })
+        M.state.race = nil
+        M.state.race_car_id = nil
+        M.state.detection = nil
+        M.state.laptimer = nil
+        lock.remove()
+        countdown.clear()
+        hud.clear()
+        return
+    end
     if race_car then
         -- Remember the race car as the bounce target for the in-race switch lock (onVehicleSwitched):
         -- during countdown/racing any switch to another vehicle is bounced back to this id.
@@ -501,6 +530,14 @@ local function handle_list_races(payload)
     send_to_server("raceList", {lines = racelist.build(maps.current(), include_deprecated)})
 end
 
+-- Answer the server's listVehicles request (/cars, ADR-0032): the vehicle-blind server (ADR-0005)
+-- relays the optional model token, we build the installed-vehicle listing locally and ship the chat
+-- lines back for the server to post (ADR-0011). A model lists that model's configs; nil lists all models.
+local function handle_list_vehicles(payload)
+    local model = type(payload) == "table" and payload.model or nil
+    send_to_server("vehicleList", {lines = carlist.build(model)})
+end
+
 -- Answer the server's pre-flight validateRace request (ADR-0019): the race-blind server relays the
 -- /race options here, we vet them against the locally-parsed race (race/start.validate) and report the
 -- verdict back. The server starts on ok, or posts our reason to the issuing admin on a refusal. The
@@ -630,6 +667,7 @@ local HANDLERS = {
     racePhase = handle_race_phase,
     standings = handle_standings,
     listRaces = handle_list_races,
+    listVehicles = handle_list_vehicles,
     validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
     resultsToggle = handle_results_toggle,
