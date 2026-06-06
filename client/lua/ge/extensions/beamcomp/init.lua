@@ -138,6 +138,10 @@ M.state = {
 -- HANDLERS table) above its definition can reference it.
 local send_to_server
 
+-- Reports this client's BeamNG license name as the canonical identity (ADR-0031); defined far below but
+-- called from handle_race_start (at spawn) above its definition, so forward-declared here.
+local report_identity
+
 -- Disarms the seated car's VE recovery override; defined far below (next to the assist push) but used
 -- earlier in handle_race_phase's lobby teardown, so forward-declared here (ADR-0017).
 local disarm_assist_ve
@@ -298,17 +302,22 @@ local function handle_race_start(payload)
     -- == session.race), not the resolved race.meta.name, so the server's stale-ack guard matches.
     send_to_server("spawnReady", {race = payload.race})
 
-    -- Report identity + vehicle metadata so the server can attribute this race's best times to a
-    -- stable, BeamNG-consistent name and record what car was driven (ADR-0027). A dedicated message,
-    -- not piggybacked on the ack above, so the spawnReady contract stays narrow. Echo payload.race like
-    -- the ack so the server's race-guard matches. Sent unconditionally; collect_client_info degrades
-    -- every field to nil on a spawn hiccup, and the server falls back to the BeamMP name.
+    -- Report the vehicle metadata so the server can record what car was driven (ADR-0027). A dedicated
+    -- message, not piggybacked on the ack above, so the spawnReady contract stays narrow. Echo
+    -- payload.race like the ack so the server's race-guard matches. Sent unconditionally;
+    -- collect_client_info degrades every field to nil on a spawn hiccup. The player identity rides a
+    -- separate clientIdentity message (below), since it is connection-scoped, not per-race (ADR-0031).
     local client_info = vehicles.collect_client_info(race_car)
     send_to_server("clientInfo", {
         race = payload.race,
-        identity = client_info.identity,
         vehicle = client_info.vehicle,
     })
+
+    -- Refresh the canonical identity from the race car now that it exists (ADR-0031): the license name
+    -- needs a vehicle, and this is the reliable point where one is guaranteed -- the connect-time report
+    -- is only best-effort. The server resolves identities live, so a name arriving here updates the
+    -- standings/records for this race.
+    report_identity(race_car)
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
@@ -884,6 +893,45 @@ local function ensure_registered()
     log("I", LOG_TAG, "registered handler on channel " .. EVENT_CHANNEL)
 end
 
+-- This client's BeamNG license name for the canonical identity (ADR-0031), or nil. The license name is
+-- what the player sets in BeamNG's options -- the same identity BeamNG's own race highscores use
+-- (raceHighscoresLap.lua). Read off the given vehicle's plate, pcall-guarded (the global is unverified
+-- under BeamMP). nil when there is no vehicle, no name set, or the read fails -- the server then falls
+-- back to the BeamMP name. Steam/online profile names are empty under BeamMP's guest login, so the
+-- license name is the only persistent client-side identity available (verified in-game 2026-06-06).
+local function collect_player_name(veh)
+    if not veh then
+        return nil
+    end
+    local ok, name = pcall(function()
+        if type(core_vehicles) == "table"
+                and type(core_vehicles.getVehicleLicenseText) == "function" then
+            return core_vehicles.getVehicleLicenseText(veh)
+        end
+        return nil
+    end)
+    if ok and type(name) == "string" and name ~= "" then
+        return name
+    end
+    return nil
+end
+
+-- Report this client's BeamNG license name to the server (ADR-0031), so it keys every identity -- live
+-- standings, results, records -- on the persistent license name instead of the rotating BeamMP guest
+-- name. Called at connect (the player's freeroam car, best-effort) and at race spawn (the race car), so
+-- a name set before the race is picked up early and reliably refreshed once the race car exists. A nil
+-- name is not sent and the server falls back to the BeamMP name. send_to_server is a no-op until the MP
+-- client is connected. Assigns the forward-declared local so handle_race_start can call it.
+function report_identity(veh)
+    local name = collect_player_name(veh)
+    if name then
+        log("I", LOG_TAG, "reporting client identity: " .. name)
+        send_to_server("clientIdentity", {name = name})
+    else
+        log("W", LOG_TAG, "no client name available; server will use the BeamMP name")
+    end
+end
+
 function M.onExtensionLoaded()
     -- Keep the extension across level/scenario switches (a race spans a level).
     setExtensionUnloadMode(M, "manual")
@@ -893,9 +941,14 @@ function M.onExtensionLoaded()
     M.state.registered = false
     ensure_registered()
     -- Seed the current-vehicle tracker; onVehicleSwitched keeps it current from here on.
-    if be and be:getPlayerVehicle(0) then
-        M.state.current_vehicle_id = be:getPlayerVehicle(0):getId()
+    local own = be and be:getPlayerVehicle(0)
+    if own then
+        M.state.current_vehicle_id = own:getId()
     end
+    -- Report our BeamNG license name so the server can use it as the canonical identity (ADR-0031).
+    -- Best-effort from the current freeroam car; refreshed reliably from the race car at spawn. Fires on
+    -- a Lua reload / reconnect too, so a reconnecting client re-reports.
+    report_identity(own)
     log("I", LOG_TAG, "loaded")
 end
 

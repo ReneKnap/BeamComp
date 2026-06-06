@@ -82,7 +82,8 @@ local MSG_CHECKPOINT = "checkpoint"
 local MSG_RACE_LIST = "raceList"  -- a client's /races reply: pre-formatted chat lines to post back
 local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
 local MSG_SPAWN_READY = "spawnReady"  -- a client's "car spawned + seated" ack, gating spawning (ADR-0006 amendment)
-local MSG_CLIENT_INFO = "clientInfo"  -- a client's identity + vehicle metadata for best-times records (ADR-0027)
+local MSG_CLIENT_INFO = "clientInfo"  -- a client's vehicle metadata for best-times records (ADR-0027)
+local MSG_CLIENT_IDENTITY = "clientIdentity"  -- a client's BeamNG name, reported on connect, for identity resolution (ADR-0031)
 local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a map (ADR-0023; admin-gated)
 local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a map's default grid for a race (ADR-0023; admin-gated)
 local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its data (ADR-0023; read-only)
@@ -161,7 +162,7 @@ local session = {
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
     spawn_pending = nil,      -- set of rostered player ids whose spawnReady ack is still awaited (ADR-0006 amendment)
     spawn_ready_count = 0,    -- how many distinct clients acked spawnReady this race (0 at timeout = empty race)
-    identities = nil,         -- per-player {identity, vehicle} reported via clientInfo, for records (ADR-0027)
+    identities = nil,         -- per-player {vehicle} reported via clientInfo, for records (ADR-0027); name moved to client_names (ADR-0031)
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -176,6 +177,29 @@ local CONFIG_CANDIDATE_PATHS = {
 -- Normalized (trimmed, lowercased) admin names -> true, and whether the gate is on.
 local race_admins = {}
 local race_admin_gate_active = false
+
+-- Whether player identity resolves to the client-reported BeamNG name instead of the BeamMP name
+-- (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the guest-name fix applies
+-- out of the box. Set false in beamcomp.config.json to fall back to BeamMP names everywhere.
+local use_client_name = true
+
+-- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
+-- and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is per race --
+-- so resolve_identity has the name from join onward. An opaque client string (race-blind, ADR-0005).
+local client_names = {}
+
+-- The canonical display/record identity for a player (ADR-0031): the client-reported BeamNG name when
+-- the option is on and one was reported, else the BeamMP name. The single chokepoint every name read
+-- goes through -- the option and the fallback live here only. nil only if BeamMP has no name for the id.
+local function resolve_identity(player_id)
+    if use_client_name then
+        local name = client_names[player_id]
+        if type(name) == "string" and name ~= "" then
+            return name
+        end
+    end
+    return MP.GetPlayers()[player_id]
+end
 
 -- Named parametric start grids (ADR-0023). The server stores opaque grid params keyed by map + name,
 -- plus a per-map "which grid is default for this race" mapping, and relays the resolved params in
@@ -249,6 +273,7 @@ end
 local function load_config()
     race_admins = {}
     race_admin_gate_active = false
+    use_client_name = true
 
     local config, path, err = read_config()
     if not config then
@@ -258,8 +283,13 @@ local function load_config()
         else
             log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
         end
+        log_info("beamcomp.cfg", "useClientName=on (default; no config)")
         return
     end
+
+    -- Default on (ADR-0031): only an explicit false turns it off; a missing key stays on.
+    use_client_name = config.useClientName ~= false
+    log_info("beamcomp.cfg", "useClientName=" .. (use_client_name and "on" or "off"))
 
     if type(config.raceAdmins) ~= "table" then
         log_info("beamcomp.cfg", "config at " .. path
@@ -589,11 +619,12 @@ local function build_slots(players)
 end
 
 -- The roster shipped to every client: each player's slot + name, in slot order. Used
--- client-side for the full grid layout and marker labels.
+-- client-side for the full grid layout and marker labels. The name resolves through resolve_identity
+-- (ADR-0031), so the grid labels show the client name like every other surface.
 local function build_roster(slots)
     local roster = {}
     for _, entry in ipairs(slots) do
-        roster[#roster + 1] = {slot = entry.slot, name = entry.name}
+        roster[#roster + 1] = {slot = entry.slot, name = resolve_identity(entry.id) or entry.name}
     end
     return roster
 end
@@ -607,6 +638,8 @@ local function build_progress(slots)
     local progress = {}
     for _, entry in ipairs(slots) do
         progress[entry.id] = {
+            -- The BeamMP name as a baseline (ADR-0031); standings and records resolve the canonical
+            -- client name live via resolve_identity, since it may only arrive at spawn (license name).
             name = entry.name,
             slot = entry.slot,
             completed = 0,
@@ -684,7 +717,9 @@ local function build_standings()
         entries[i] = {
             position = i,
             slot = record.slot,
-            name = record.name,
+            -- Resolve the canonical identity live (ADR-0031): the license name may have arrived only at
+            -- spawn, after this player's progress baseline was seeded with the BeamMP name.
+            name = resolve_identity(item.id) or record.name,
             completed = record.completed,
             count = record.count or known_count,
             total_time = record.total_time,
@@ -1163,7 +1198,7 @@ local function snapshot_prerun_section_bests()
     for id, record in pairs(session.progress) do
         if record.finished and not record.dnf then
             local info = identities[id]
-            local identity = (info and info.identity) or record.name
+            local identity = resolve_identity(id) or record.name
             local car_key = vehicle_car_key(info and info.vehicle)
             if car_key then
                 local entry = players[identity]
@@ -1289,7 +1324,7 @@ local function send_race_records(prerun)
 
     for id, record in pairs(session.progress) do
         local info = identities[id]
-        local identity = (info and info.identity) or record.name
+        local identity = resolve_identity(id) or record.name
         local car = car_descriptor(info and info.vehicle)
         local car_key = car and car.key or nil
         send_event(id, MSG_RACE_RECORDS, {
@@ -1348,7 +1383,7 @@ local function capture_records()
     for id, record in pairs(session.progress) do
         if record.finished and not record.dnf then
             local info = identities[id]
-            local identity = (info and info.identity) or record.name
+            local identity = resolve_identity(id) or record.name
             local vehicle = info and info.vehicle or nil
             local car_key = vehicle_car_key(vehicle)
             local is_circuit = record.best_lap ~= nil
@@ -1709,11 +1744,11 @@ local function handle_spawn_ready(player_id, payload)
     session.spawn_ready_count = session.spawn_ready_count + 1
 end
 
--- Stash a client's reported identity + vehicle for this race's best-times records (ADR-0027). Guarded
--- like the spawnReady ack -- accepted only during an active race for the matching race name -- so a
--- stale report from a previous race is dropped. The values are opaque to the server (race-blind,
--- ADR-0005); they are read at the finish capture, with a fallback to the BeamMP name. Logged once so
--- the unverified client globals (license name, vehicle details) are visible in the server console.
+-- Stash a client's reported vehicle for this race's best-times records (ADR-0027/0031). Guarded like
+-- the spawnReady ack -- accepted only during an active race for the matching race name -- so a stale
+-- report from a previous race is dropped. The values are opaque to the server (race-blind, ADR-0005);
+-- they are read at the finish capture. Identity is no longer carried here -- it is reported once on
+-- connect via clientIdentity (ADR-0031). Logged once so the unverified vehicle globals are visible.
 local function handle_client_info(player_id, payload)
     if session.phase == PHASE.lobby or type(payload) ~= "table"
         or payload.race ~= session.race then
@@ -1721,17 +1756,32 @@ local function handle_client_info(player_id, payload)
     end
     local vehicle = type(payload.vehicle) == "table" and payload.vehicle or nil
     session.identities = session.identities or {}
-    session.identities[player_id] = {
-        identity = type(payload.identity) == "string" and payload.identity or nil,
-        vehicle = vehicle,
-    }
+    session.identities[player_id] = {vehicle = vehicle}
     log_info("beamcomp.records", string.format(
-        "clientInfo id=%s identity=%s vehicle=%s/%s modified=%s",
+        "clientInfo id=%s vehicle=%s/%s modified=%s",
         tostring(player_id),
-        tostring(session.identities[player_id].identity),
         tostring(vehicle and vehicle.model),
         tostring(vehicle and vehicle.type),
         tostring(vehicle and vehicle.modified)))
+end
+
+-- Store a client's reported BeamNG name for identity resolution (ADR-0031). Connection-scoped: kept
+-- across races and lobby resets, cleared on disconnect, so the name is available from join onward. The
+-- value is opaque to the server (race-blind, ADR-0005) -- only echoed back as a display/record key.
+-- Logged once so the unverified client name source is visible in the server console.
+local function handle_client_identity(player_id, payload)
+    if type(payload) ~= "table" or type(payload.name) ~= "string" or payload.name == "" then
+        return
+    end
+    local changed = client_names[player_id] ~= payload.name
+    client_names[player_id] = payload.name
+    log_info("beamcomp.records", string.format("clientIdentity id=%s name=%s",
+        tostring(player_id), payload.name))
+    -- A name arriving mid-race (license name is reported at spawn) refreshes the live board so the
+    -- standings switch from the BeamMP name to the client name without waiting for the next checkpoint.
+    if changed and session.progress then
+        broadcast_standings()
+    end
 end
 
 -- /raceend: force the machine back to lobby from any active phase (safety hatch).
@@ -1836,6 +1886,8 @@ end
 -- A player leaving mid-race is marked DNF so the race can still settle; if they were the last one
 -- there is no one to race, so fall back to lobby instead (ADR-0014).
 local function on_player_disconnect(player_id)
+    -- Drop the connection-scoped name regardless of phase (ADR-0031) -- a player may leave in lobby too.
+    client_names[player_id] = nil
     if session.phase == PHASE.lobby then
         return
     end
@@ -2176,6 +2228,8 @@ local function handle_client_event(player_id, data)
         handle_spawn_ready(player_id, decoded.payload)
     elseif decoded.type == MSG_CLIENT_INFO then
         handle_client_info(player_id, decoded.payload)
+    elseif decoded.type == MSG_CLIENT_IDENTITY then
+        handle_client_identity(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
         handle_grid_save(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_ASSIGN then

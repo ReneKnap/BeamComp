@@ -375,27 +375,16 @@ local function detect_modified(veh)
     return nil
 end
 
--- Collect this client's identity + vehicle metadata for the server's best-times records (ADR-0027).
--- `veh` is the resolved race car (the caller already holds it). Every engine read is pcall-guarded and
--- degrades to nil: the BeamNG globals for the license name and vehicle details are UNVERIFIED under
--- BeamMP, so any gap yields a nil field rather than an error -- the server then falls back to the
--- BeamMP name and stores nil vehicle fields. Returns {identity, vehicle = {model, type, modified}}.
+-- Collect this client's vehicle metadata for the server's best-times records (ADR-0027). `veh` is the
+-- resolved race car (the caller already holds it). Every engine read is pcall-guarded and degrades to
+-- nil: the BeamNG globals for vehicle details are UNVERIFIED under BeamMP, so any gap yields a nil field
+-- rather than an error -- the server stores nil vehicle fields. Player identity is no longer collected
+-- here -- it is reported separately on connect (ADR-0031). Returns {vehicle = {model, type, variant,
+-- modified}}.
 function M.collect_client_info(veh)
-    local info = {identity = nil, vehicle = {model = nil, type = nil, variant = nil, modified = nil}}
+    local info = {vehicle = {model = nil, type = nil, variant = nil, modified = nil}}
     if not veh then
         return info
-    end
-
-    -- Identity: the BeamNG license name -- the same player identity BeamNG's own race highscores use.
-    local ok_name, name = pcall(function()
-        if type(core_vehicles) == "table"
-                and type(core_vehicles.getVehicleLicenseText) == "function" then
-            return core_vehicles.getVehicleLicenseText(veh)
-        end
-        return nil
-    end)
-    if ok_name and type(name) == "string" and name ~= "" then
-        info.identity = name
     end
 
     -- Vehicle model: the JBeam name (e.g. "etk800"), read straight off the handle like elsewhere here.
