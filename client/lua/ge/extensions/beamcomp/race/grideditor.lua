@@ -14,6 +14,7 @@
 local M = {}
 
 local grid = require("beamcomp/race/grid")
+local placement = require("beamcomp/race/placement")
 local start = require("beamcomp/race/start")
 local maps = require("beamcomp/race/maps")
 
@@ -51,8 +52,10 @@ M.state = {
 local function recompute()
     local anchor = M.state.anchors[M.state.direction]
     local block = M.state.blocks[M.state.direction]
-    M.state.poses = grid.poses(anchor.base_pose.pos, anchor.base_pose.rot, PREVIEW_COUNT, block,
-        anchor.gate_normal)
+    -- Ground + wall-clear the preview exactly as a real start does (ADR-0034), so the pillars sit where
+    -- cars actually spawn (the ADR-0023 preview-matches-spawn invariant).
+    M.state.poses = placement.resolve_all(grid.poses(anchor.base_pose.pos, anchor.base_pose.rot,
+        PREVIEW_COUNT, block, anchor.gate_normal))
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given param blocks, and

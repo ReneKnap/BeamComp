@@ -45,6 +45,7 @@ local racelist = require("beamcomp/race/racelist")
 local carlist = require("beamcomp/race/carlist")
 local maps = require("beamcomp/race/maps")
 local grideditor = require("beamcomp/race/grideditor")
+local placement = require("beamcomp/race/placement")
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
 -- cone-spawn burst on every other client (race/spawn_mute, ADR-0020 finding #2b).
@@ -1812,7 +1813,13 @@ local function recover_target(race, detection)
             z = face_pos.z - target_pos.z,
         })
     end
-    return {pos = target_pos, dir = dir}
+
+    -- Drop the recover target onto the real surface and clear of walls (ADR-0034): a checkpoint's
+    -- authored centre sits above the road, so a raw teleport there would bury the car. Pass the facing
+    -- as `forward` so the wall-nudge knows which way is down-track. (The seq <= 0 grid pose is already
+    -- grounded by start.prepare; re-grounding it is idempotent.)
+    local grounded = placement.resolve({pos = target_pos, forward = dir})
+    return {pos = grounded.pos, dir = dir}
 end
 
 -- Arm the seated car's VE key forwarders for the race (ADR-0017). GE owns the enable check, countdown,

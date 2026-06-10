@@ -13,6 +13,7 @@ local M = {}
 local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local grid = require("beamcomp/race/grid")
+local placement = require("beamcomp/race/placement")
 local checkpoints = require("beamcomp/race/checkpoints")
 local maps = require("beamcomp/race/maps")
 
@@ -251,7 +252,12 @@ function M.prepare(payload)
     -- a reverse race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
     local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
     local grid_params = grid_params_for(payload.gridParams, direction)
-    local poses = grid.poses(base_pose.pos, base_pose.rot, count, grid_params, gate_normal)
+    -- Drop every pose onto the real surface and clear of walls before anyone spawns on it (ADR-0034):
+    -- grid.poses is pure math at the start-line Z, so on undulating tracks the rear rows would bury or
+    -- float. front-anchoring (vehicles.lua) preserves Z, so grounding here flows through every placement
+    -- path (fresh/fixed/substitute spawn, keep+teleport, regrid, restage, recover-before-CP1).
+    local poses = placement.resolve_all(grid.poses(base_pose.pos, base_pose.rot, count, grid_params,
+        gate_normal))
     local my_pose = poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
