@@ -98,6 +98,13 @@ local LOOKAHEAD_STYLE = {
 -- flood (the bounce itself still fires every time).
 local SWITCH_BLOCK_TOAST_THROTTLE = 2.0
 
+-- How long to keep retrying BeamMP nametag suppression on a freshly synced cone before giving up. A
+-- remote-synced cone is registered in MPVehicleGE asynchronously, a frame or two after onVehicleSpawned
+-- fires, so the one-shot hide_nametag there misses it; we retry from onUpdate until it sticks. The
+-- timeout is only the give-up bound (registration normally settles almost immediately); on timeout the
+-- tag simply stays -- the same accepted fallback as before (ADR-0020 finding #4).
+local NAMETAG_RETRY_TIMEOUT = 10.0
+
 -- Seconds to wait for a (swapped or freshly-spawned) car's jbeam to finish loading before re-placing it
 -- anyway (fallback for a same-footprint swap, where the bbox never visibly changes). Forward
 -- half-length change (metres) that signals the new jbeam has loaded and the bbox now reflects the
@@ -114,6 +121,7 @@ M.state = {
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
     cone_ids = nil,      -- ids of the shared cone vehicles we spawned + must clear (host only, ADR-0020)
+    pending_nametag = nil,  -- map of cone game-id -> seconds waited for MPVehicleGE nametag suppression to stick; lazily created, nil when idle (ADR-0020)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
@@ -1085,18 +1093,65 @@ function M.onVehicleSwitched(_oldId, newId)
     M.state.current_vehicle_id = newId
 end
 
+-- Retry BeamMP nametag suppression for any cone still awaiting MPVehicleGE registration (queued by
+-- onVehicleSpawned). Zero-work on the idle path: pending_nametag is nil until a cone misses its
+-- one-shot hide, and is reset to nil once the set empties, so this only runs in the brief window after
+-- a cone-bearing race start. An id is dropped once its tag is hidden, its vehicle is gone, or the
+-- retry window elapses (the tag then stays -- the accepted fallback, ADR-0020 finding #4).
+local function retry_pending_nametags(dt)
+    local pending = M.state.pending_nametag
+    if not pending then
+        return
+    end
+    -- Collect ids to drop and remove them after the loop (never mutate the table mid-pairs).
+    local drop = nil
+    for id, waited in pairs(pending) do
+        local veh = be and be:getObjectByID(id)
+        if not veh or cones.hide_nametag(veh) then
+            drop = drop or {}
+            drop[#drop + 1] = id
+        else
+            local elapsed = waited + (dt or 0)
+            pending[id] = elapsed
+            if elapsed >= NAMETAG_RETRY_TIMEOUT then
+                drop = drop or {}
+                drop[#drop + 1] = id
+            end
+        end
+    end
+    if drop then
+        for _, id in ipairs(drop) do
+            pending[id] = nil
+        end
+    end
+    if next(pending) == nil then
+        M.state.pending_nametag = nil
+    end
+end
+
 -- As each shared cone appears -- the host's local set when its prefab load spawns them, and the
 -- remote synced set on every other client (BeamMP vehicle spawns fire this hook too) -- keep it out
--- of the Tab vehicle cycle and suppress BeamMP's owner nametag on it. Both are best-effort layers
--- (the onVehicleSwitched bounce is the non-enterable guarantee; the tag may stay if the cone is not
--- yet registered in MPVehicleGE -- accepted, ADR-0020).
+-- of the Tab vehicle cycle and suppress BeamMP's owner nametag on it. The bounce (onVehicleSwitched)
+-- is the non-enterable guarantee; the nametag suppression is best-effort but no longer one-shot: a
+-- remote-synced cone is registered in MPVehicleGE asynchronously, so the first hide here misses it and
+-- the cone is queued for retry_pending_nametags (onUpdate) until registration lands (ADR-0020).
 function M.onVehicleSpawned(vehicleId)
     if not be then
         return
     end
     local veh = be:getObjectByID(vehicleId)
     cones.exclude_from_cycle(veh)
-    cones.hide_nametag(veh)
+    if not cones.is_cone(veh) then
+        return
+    end
+    if cones.hide_nametag(veh) then
+        if M.state.pending_nametag then
+            M.state.pending_nametag[vehicleId] = nil
+        end
+    else
+        M.state.pending_nametag = M.state.pending_nametag or {}
+        M.state.pending_nametag[vehicleId] = 0
+    end
 end
 
 -- Send a typed { type, payload } envelope to the server -- the client->server mirror of the server's
@@ -2184,6 +2239,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
     end
+    -- Phase-independent: a synced cone's MPVehicleGE registration can land a frame or two after its
+    -- spawn, so this runs until the queued nametag suppressions stick (no-op when nothing is pending).
+    retry_pending_nametags(dtReal)
     if M.state.phase == "staging" and M.state.race then
         -- Tick the staging-wait indicator on the centered overlay (ADR-0021).
         step_staging(dtReal)
