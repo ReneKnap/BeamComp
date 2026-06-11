@@ -1346,9 +1346,24 @@ local function copy_array(array)
     return out
 end
 
--- Snapshot each finisher's PRE-run per-car section bests (their own car leaf + the track car leaf) so
--- the Race section can diff "vs your / anyone's best lap with the car" against the state BEFORE this run
--- (ADR-0030). Must run before capture_records mutates the store; returns a map keyed by player id.
+-- The pre-run headline of a track-record leaf (the overall record or a per-car leaf): primary metric +
+-- holder, captured before the fold so the Track section can show the OLD record once a run beats it
+-- (ADR-0030). Same fields slim_track_record ships for the post-fold record. nil leaf -> nil.
+local function old_record_headline(leaf)
+    if type(leaf) ~= "table" then
+        return nil
+    end
+    return {
+        best_lap = leaf.best_lap,
+        total_time = leaf.total_time,
+        holder = leaf.holder,
+    }
+end
+
+-- Snapshot each finisher's PRE-run records (their own car + track car section bests for the Race
+-- section deltas, plus the track-record headline any-car / this-car for the Track section's "old record"
+-- after a run beats it) so everything diffs against the state BEFORE this run (ADR-0030). Must run
+-- before capture_records mutates the store; returns a map keyed by player id.
 local function snapshot_prerun_section_bests()
     local snapshot = {}
     if not session.race or not session.progress then
@@ -1357,8 +1372,10 @@ local function snapshot_prerun_section_bests()
     ensure_records_loaded()
     local race = records_store[session.race]
     local players = (type(race) == "table" and type(race.players) == "table") and race.players or {}
-    local track_cars = (type(race) == "table" and type(race.track_best) == "table"
-        and type(race.track_best.cars) == "table") and race.track_best.cars or {}
+    local track_best = (type(race) == "table" and type(race.track_best) == "table")
+        and race.track_best or nil
+    local track_cars = (type(track_best) == "table" and type(track_best.cars) == "table")
+        and track_best.cars or {}
     local identities = session.identities or {}
 
     for id, record in pairs(session.progress) do
@@ -1374,6 +1391,8 @@ local function snapshot_prerun_section_bests()
                     playerCarSectionBest = copy_array(player_car and player_car.section_best),
                     trackCarSectionBest = copy_array(track_cars[car_key]
                         and track_cars[car_key].section_best),
+                    trackRecordAnyCarOld = old_record_headline(track_best),
+                    trackRecordThisCarOld = old_record_headline(track_cars[car_key]),
                 }
             end
         end

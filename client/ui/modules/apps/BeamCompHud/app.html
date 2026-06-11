@@ -478,7 +478,9 @@
         <tr><td>Runs / time (all players)</td><td>{{hud.analysis.track.trackRuns}} · {{formatDuration(hud.analysis.track.trackTime)}}</td></tr>
         <tr><td>Runs (this car, all)</td><td>{{hud.analysis.track.carRuns}}</td></tr>
         <tr><td>Record (any car)<span ng-if="hud.analysis.track.recordAnyCarLabel"> {{hud.analysis.track.recordAnyCarLabel}}</span></td><td>{{hud.analysis.track.recordAnyCar != null ? formatTime(hud.analysis.track.recordAnyCar) : '--'}}<span ng-if="hud.analysis.track.recordAnyCar != null && hud.analysis.track.recordAnyCarHolder"> ({{hud.analysis.track.recordAnyCarHolder}})</span></td></tr>
+        <tr ng-if="hud.analysis.track.recordAnyCarOld != null"><td>Alter Record (any car)</td><td>{{formatTime(hud.analysis.track.recordAnyCarOld)}}<span ng-if="hud.analysis.track.recordAnyCarOldHolder"> ({{hud.analysis.track.recordAnyCarOldHolder}})</span></td></tr>
         <tr><td>Record (this car)<span ng-if="hud.analysis.track.carLabel"> {{hud.analysis.track.carLabel}}</span></td><td>{{hud.analysis.track.recordThisCar != null ? formatTime(hud.analysis.track.recordThisCar) : '--'}}<span ng-if="hud.analysis.track.recordThisCar != null && hud.analysis.track.recordThisCarHolder"> ({{hud.analysis.track.recordThisCarHolder}})</span></td></tr>
+        <tr ng-if="hud.analysis.track.recordThisCarOld != null"><td>Alter Record (this car)</td><td>{{formatTime(hud.analysis.track.recordThisCarOld)}}<span ng-if="hud.analysis.track.recordThisCarOldHolder"> ({{hud.analysis.track.recordThisCarOldHolder}})</span></td></tr>
       </table>
     </div>
 

@@ -1478,24 +1478,49 @@ local function build_driver_section(records, local_name)
     }
 end
 
+-- The pre-run headline value of a record leaf (best lap on a circuit, else total time), or nil.
+local function old_record_value(leaf)
+    if type(leaf) ~= "table" then
+        return nil
+    end
+    return leaf.best_lap or leaf.total_time
+end
+
 -- Track section (ADR-0029): this track's totals across all players, plus the track record (any car /
--- this car) with holders. Tolerant of missing fields.
+-- this car) with holders, and the pre-run "old record" headline when this run beat it. Tolerant of
+-- missing fields.
 local function build_track_section(records, race_name)
     if type(records) ~= "table" then
         return nil
     end
     local track = type(records.trackRecord) == "table" and records.trackRecord or nil
     local track_car = track and type(track.car) == "table" and track.car or nil
+    -- Pre-run record headlines (captured before this run folded in): show "old record" only when this
+    -- run actually beat the standing one, i.e. an old value exists and differs from the current. Same
+    -- opaque store number on both sides, so an exact compare is safe (no float tolerance needed).
+    local prerun = type(records.prerun) == "table" and records.prerun or {}
+    local record_any_car = track and (track.best_lap or track.total_time) or nil
+    local record_this_car = track_car and (track_car.best_lap or track_car.total_time) or nil
+    local old_any = prerun.trackRecordAnyCarOld
+    local old_this = prerun.trackRecordThisCarOld
+    local old_any_val = old_record_value(old_any)
+    local old_this_val = old_record_value(old_this)
+    local beat_any = old_any_val ~= nil and old_any_val ~= record_any_car
+    local beat_this = old_this_val ~= nil and old_this_val ~= record_this_car
     return {
         name = race_name,
         trackRuns = track and track.run_count or 0,
         trackTime = track and track.time_sum or 0,
         carRuns = track_car and track_car.run_count or 0,
-        recordAnyCar = track and (track.best_lap or track.total_time) or nil,
+        recordAnyCar = record_any_car,
         recordAnyCarHolder = track and track.holder or nil,
         recordAnyCarLabel = track and car_label(track.recordCar) or nil,
-        recordThisCar = track_car and (track_car.best_lap or track_car.total_time) or nil,
+        recordAnyCarOld = beat_any and old_any_val or nil,
+        recordAnyCarOldHolder = beat_any and old_any.holder or nil,
+        recordThisCar = record_this_car,
         recordThisCarHolder = track_car and track_car.holder or nil,
+        recordThisCarOld = beat_this and old_this_val or nil,
+        recordThisCarOldHolder = beat_this and old_this.holder or nil,
         carLabel = car_label(records.car),
     }
 end
