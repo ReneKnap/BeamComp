@@ -14,12 +14,15 @@ local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local maps = require("beamcomp/race/maps")
 
--- The user-facing word for a race's source (ADR-0024): the freeroam mission set is "map", the level
--- quickrace set is "menu" -- matching the "map:"/"menu:" prefix /race accepts to pick same-named
--- variants.
+-- The user-facing word for a race's source (ADR-0024/0035): the freeroam timeTrial set is "map", the
+-- aiRace set is "ai", the level quickrace set is "menu" -- matching the "map:"/"ai:"/"menu:" prefix
+-- /race accepts to pick same-named variants.
 local function source_label(source)
     if source == "quickrace" then
         return "menu"
+    end
+    if source == "aiRace" then
+        return "ai"
     end
     return "map"
 end

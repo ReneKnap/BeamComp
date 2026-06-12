@@ -19,11 +19,6 @@ local quickrace = require("beamcomp/race/quickrace")
 
 local LOG_TAG = "beamcomp.race"
 local RACE_PATH_MODULE = "/lua/ge/extensions/gameplay/race/path"
-local PREFAB_FILENAMES = {
-    "mainPrefab.prefab.json",
-    "forwardPrefab.prefab.json",
-    "reversePrefab.prefab.json",
-}
 
 -- Flatten an engine vec3 to a plain {x, y, z} table.
 local function vec3_to_table(v)
@@ -135,26 +130,26 @@ local function build_checkpoints(path)
     return checkpoints
 end
 
--- The prefab files that actually ship in the race folder (main + optional fwd/rev). coneFiles is
--- empty: a mission prefab is JSONL with its cones as sibling lines of the statics, so the host's
--- full-prefab spawn already instantiates them (ADR-0020) -- no separate cone source is needed
--- (the separate coneFiles source is only for the quickrace format, ADR-0025).
+-- Every prefab file shipped in the race folder, as the race props. A mission's props live in its
+-- sibling *.prefab.json files (the path object's own prefab lists are usually empty -- ADR-0024/
+-- format ref s8.9), and mission types name them differently (timeTrial: mainPrefab.prefab.json;
+-- aiRace: its own names, ADR-0035), so the folder is globbed rather than probing fixed names. Sorted
+-- for a deterministic spawn order across clients. coneFiles is empty: a mission prefab is JSONL with
+-- its cones as sibling lines of the statics, so the host's full-prefab spawn already instantiates them
+-- (ADR-0020) -- the separate coneFiles source is only for the quickrace format (ADR-0025).
 local function build_prop_refs(folder)
-    local prefab_files = {}
-    for _, name in ipairs(PREFAB_FILENAMES) do
-        local file = folder .. name
-        if FS:fileExists(file) then
-            prefab_files[#prefab_files + 1] = file
-        end
-    end
+    local prefab_files = FS:findFiles(folder, "*.prefab.json", -1, true, false)
+    table.sort(prefab_files)
     return {prefabFiles = prefab_files, coneFiles = {}}
 end
 
 -- A mission's authoritative default lap count, from the sibling info.json's missionTypeData (ADR-0024).
 -- BeamNG stores a mission's real default there; the race.race.json's own defaultLaps is an editor value
--- that disagrees for stock closed circuits (e.g. 004-mediumcourse: info 1 vs race 2). Returns the
--- number, or nil when there is no info.json or no usable value -- the caller then keeps the path
--- object's value (mod races that ship only a race.race.json).
+-- that disagrees for stock closed circuits (e.g. 004-mediumcourse: info 1 vs race 2). The field name is
+-- mission-type-specific: timeTrial uses "defaultLaps", aiRace uses "lapCount" (ADR-0035; its goalLaps/
+-- goalTime are challenge targets, not the race length). Returns the number, or nil when there is no
+-- info.json or no usable value -- the caller then keeps the path object's value (mod races that ship
+-- only a race.race.json).
 local function mission_default_laps(folder)
     if not folder then
         return nil
@@ -167,7 +162,8 @@ local function mission_default_laps(folder)
     if type(info) ~= "table" or type(info.missionTypeData) ~= "table" then
         return nil
     end
-    return tonumber(info.missionTypeData.defaultLaps)
+    local mission_type_data = info.missionTypeData
+    return tonumber(mission_type_data.defaultLaps or mission_type_data.lapCount)
 end
 
 -- defaultLaps is the override (from the mission info.json) when given, else the path object's own value;
