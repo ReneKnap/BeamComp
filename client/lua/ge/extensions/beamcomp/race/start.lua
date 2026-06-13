@@ -148,6 +148,23 @@ local function grid_params_for(grid_params, direction)
     return grid_params.forward
 end
 
+-- The AI race line for `direction` (ADR-0036): the parser's forward route as-is, or a plain order
+-- reversal for a reverse race (driving needs only the order, not the checkpoint CP0-first semantics).
+-- Returns a new list; tolerant of a nil route.
+local function reverse_route(route_points, direction)
+    if type(route_points) ~= "table" then
+        return {}
+    end
+    if direction ~= "reverse" then
+        return route_points
+    end
+    local reversed = {}
+    for i = #route_points, 1, -1 do
+        reversed[#reversed + 1] = route_points[i]
+    end
+    return reversed
+end
+
 -- Resolve a race payload to its parsed model + locator, or nil plus a reason. Shared by the pre-flight
 -- check (M.validate) and the actual start (M.prepare): both need the same map-scoped discovery + parse
 -- (ADR-0005) and the same not-found / wrong-map / ambiguous / parse-error reasons.
@@ -288,6 +305,10 @@ function M.prepare(payload)
         -- Ordered, visible-only checkpoints with a stable 0-based index (ADR-0005); consumed by
         -- the racing-phase checkpoint detector (race/checkpoints.lua). Reversed for a reverse race.
         checkpoints = race_checkpoints,
+        -- Dense authored race line for the host-driven AI opponents (ADR-0036): every path node, not just
+        -- the visible checkpoints, so the AI hugs the line. Reversed in lock-step with a reverse race
+        -- (plain order reversal is enough for driving). Display/scoring keep using `checkpoints`.
+        routePoints = reverse_route(race.routePoints, direction),
         -- Resolved race mode + lap count, travel direction, and the detector's plan (ADR-0013/0018).
         mode = mode,
         laps = laps,

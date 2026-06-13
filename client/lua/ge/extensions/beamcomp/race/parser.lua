@@ -130,6 +130,26 @@ local function build_checkpoints(path)
     return checkpoints
 end
 
+-- The full ordered race line as plain {pos = {x,y,z}} points -- every path node in traversal order,
+-- visible AND invisible, deduped against the immediately preceding node (a closed loop repeats the start
+-- node). This is the authored racing line (ADR-0036): denser than the visible checkpoints, so a waypoint-
+-- following AI hugs the line instead of cutting between sparse checkpoints. Display + scoring still use
+-- build_checkpoints (visible only); this list is used only to drive the AI opponents. Same shape as a
+-- checkpoint (`.pos`) so the AI driver consumes either.
+local function build_route_points(path)
+    local points = {}
+    local nodes = path.pathnodes.objects
+    local last_id = nil
+    for _, node_id in ipairs(path.config.linearSegments) do
+        local node = nodes[node_id]
+        if node and node_id ~= last_id then
+            points[#points + 1] = {pos = vec3_to_table(node.pos)}
+            last_id = node_id
+        end
+    end
+    return points
+end
+
 -- Every prefab file shipped in the race folder, as the race props. A mission's props live in its
 -- sibling *.prefab.json files (the path object's own prefab lists are usually empty -- ADR-0024/
 -- format ref s8.9), and mission types name them differently (timeTrial: mainPrefab.prefab.json;
@@ -228,12 +248,14 @@ function M.parse(locator)
         meta = build_meta(path, default_laps),
         startPositions = build_start_positions(path),
         checkpoints = build_checkpoints(path),
+        -- The dense authored race line for AI driving (ADR-0036); display/scoring use checkpoints.
+        routePoints = build_route_points(path),
         props = props,
     }
 
     log("I", LOG_TAG, string.format(
-        "parsed race '%s': %d checkpoints, %d start positions, %d prefab(s)",
-        tostring(race.meta.name), #race.checkpoints, #race.startPositions.list,
+        "parsed race '%s': %d checkpoints, %d route points, %d start positions, %d prefab(s)",
+        tostring(race.meta.name), #race.checkpoints, #race.routePoints, #race.startPositions.list,
         #race.props.prefabFiles))
     return race
 end

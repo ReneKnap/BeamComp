@@ -211,6 +211,12 @@
       color: #d9534f;
       font-weight: bold;
     }
+    /* Synthetic host-driven AI opponents (ADR-0036): the name already reads "AI N"; dim + italicise the
+       row so a human can tell the field apart from the AI at a glance. */
+    .beamcomp-hud tr.bc-ai .bc-name {
+      font-style: italic;
+      opacity: 0.85;
+    }
     .beamcomp-hud .bc-grace {
       font-weight: bold;
       color: #ffcc33;
@@ -376,7 +382,7 @@
         <div class="bc-scroll">
           <table class="bc-standings">
             <tr ng-repeat="e in hud.liveEntries"
-                ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf}">
+                ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai}">
               <td class="bc-pos">P{{e.position}}</td>
               <td class="bc-name">{{e.name}}</td>
               <td class="bc-int">{{formatDelta(e.interval)}}</td>
@@ -422,7 +428,7 @@
           <td class="bc-int">Gap</td>
         </tr>
         <tr ng-repeat="e in hud.entries"
-            ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf,
+            ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai,
                        'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
           <td class="bc-pos">P{{e.position}}</td>
           <td class="bc-name">{{e.name}}</td>

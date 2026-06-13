@@ -46,6 +46,7 @@ local carlist = require("beamcomp/race/carlist")
 local maps = require("beamcomp/race/maps")
 local grideditor = require("beamcomp/race/grideditor")
 local placement = require("beamcomp/race/placement")
+local ai = require("beamcomp/race/ai")
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
 -- cone-spawn burst on every other client (race/spawn_mute, ADR-0020 finding #2b).
@@ -141,6 +142,11 @@ M.state = {
     restage_pending = false,  -- a staging car (swap or fresh-spawn default) awaits re-placement at the grid slot once its bbox is ready
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
+    ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
+    ai_detections = nil,      -- host only: per-AI checkpoint-detection state keyed by AI id, armed on racing (ADR-0036), or nil
+    ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
+    ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
+    ai_server_ids = nil,      -- non-owner: set of BeamMP server ids from the latest aiMap awaiting local resolution (ADR-0036), or nil
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -196,6 +202,15 @@ local function handle_race_start(payload)
         M.state.assist_arming = nil
         M.state.assist_notice = nil
         M.state.freeze_hold_armed = false
+        -- Clear any AI cars from a prior race too (ADR-0036): on an abort-restart this client may have
+        -- been the previous owner, so its host-spawned AI must not linger into a race it is not in.
+        ai.stop(M.state.ai_cars or {})
+        ai.clear(M.state.ai_cars or {})
+        M.state.ai_cars = nil
+        M.state.ai_detections = nil
+        M.state.ai_map_pending = false
+        M.state.ai_remote_ids = nil
+        M.state.ai_server_ids = nil
         lock.remove()
         disarm_assist_ve()
         disarm_freeze_hold_ve()
@@ -257,6 +272,17 @@ local function handle_race_start(payload)
     cones.clear(M.state.cone_ids or {})
     M.state.prop_names, M.state.cone_ids = props.load(race.prefabFiles or {}, payload.propOwner,
         race.coneFiles or {})
+
+    -- Clear any AI cars from a prior race up front so a re-issued /race never stacks them (ADR-0036), the
+    -- same reason cones are cleared here. Host-only state; all nil on a non-owner. The new AI cars are
+    -- spawned at the end, once this client's own car is placed.
+    ai.stop(M.state.ai_cars or {})
+    ai.clear(M.state.ai_cars or {})
+    M.state.ai_cars = nil
+    M.state.ai_detections = nil
+    M.state.ai_map_pending = false
+    M.state.ai_remote_ids = nil
+    M.state.ai_server_ids = nil
 
     -- Place this client's own car at the assigned grid pose: the car the player is in is repaired +
     -- teleported in place (preserving its settings), or a fresh one is spawned as a fallback
@@ -358,6 +384,34 @@ local function handle_race_start(payload)
     -- is only best-effort. The server resolves identities live, so a name arriving here updates the
     -- standings/records for this race.
     report_identity(race_car)
+
+    -- Host only: spawn the AI opponents the server assigned this client (ADR-0036). Only the owner's
+    -- raceStart carries aiSlots, so non-owners skip this entirely -- they just receive the synced cars and
+    -- the aiMap. The cars spawn frozen at their grid poses (held through staging/countdown, released on
+    -- racing), are kept out of this client's Tab cycle, and are queued for the aiMap broadcast that lets
+    -- remotes label + suppress them. The spawn-notification mute armed above also covers their burst.
+    if type(payload.aiSlots) == "table" and #payload.aiSlots > 0 then
+        local cars = ai.spawn(payload.aiSlots, race.gridPoses)
+        if #cars > 0 then
+            ai.set_frozen(cars, true)
+            for _, car in ipairs(cars) do
+                local veh = be and be:getObjectByID(car.veh_id)
+                if veh then
+                    ai.suppress(veh)
+                end
+            end
+            M.state.ai_cars = cars
+            M.state.ai_map_pending = true  -- broadcast the server-id map once BeamMP registers the cars
+            -- Spawning a car auto-enters the player into it, so after the AI burst the player can be
+            -- sitting in the last AI car. Re-seat them in their own race car and re-assert it as the
+            -- tracked seated car so the detector keeps reading the right vehicle.
+            if race_car and be then
+                pcall(function() be:enterVehicle(0, race_car) end)
+                M.state.current_vehicle_id = race_car:getId()
+            end
+            log("I", RACE_LOG_TAG, string.format("spawned %d AI opponent(s)", #cars))
+        end
+    end
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
@@ -379,6 +433,15 @@ local function teardown_race_world()
     -- Despawn the track props and the host's shared cones (idempotent on absent names/ids, ADR-0020).
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
+    -- Despawn the host's AI cars (ADR-0036): stop them first so none lurches on the delete frame.
+    -- Idempotent + host-only (all nil on a non-owner). Remote AI id sets are just dropped below.
+    ai.stop(M.state.ai_cars or {})
+    ai.clear(M.state.ai_cars or {})
+    M.state.ai_cars = nil
+    M.state.ai_detections = nil
+    M.state.ai_map_pending = false
+    M.state.ai_remote_ids = nil
+    M.state.ai_server_ids = nil
     M.state.prop_names = nil
     M.state.cone_ids = nil
     M.state.race = nil
@@ -464,6 +527,21 @@ local function handle_race_phase(payload)
             M.state.detection = checkpoints.new(plan)
         else
             log("W", RACE_LOG_TAG, "racing: no traversal plan; checkpoint detection disabled")
+        end
+        -- Host only: release the AI cars, hand them to BeamNG's AI to drive the route, and arm one
+        -- checkpoint detector per AI so the host scores them by proxy each frame (ADR-0036). Non-owners
+        -- have no ai_cars, so this is inert for them -- the AI cars just sync in and drive on the owner.
+        if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
+            ai.set_frozen(M.state.ai_cars, false)
+            -- Drive the dense authored race line (route points), falling back to the visible checkpoints
+            -- if a race ships none, for the race's full lap count so the AI runs every lap (ADR-0036).
+            ai.drive(M.state.ai_cars, M.state.race.routePoints or M.state.race.checkpoints,
+                M.state.race.laps)
+            local detections = {}
+            for _, car in ipairs(M.state.ai_cars) do
+                detections[car.id] = checkpoints.new(plan)
+            end
+            M.state.ai_detections = detections
         end
         -- Circuit only: arm the client-side lap clock on the start/finish line (ADR-0022). It is a
         -- display-only derivation -- no server report -- so it never touches the scored plan above.
@@ -708,6 +786,54 @@ local function handle_race_records(payload)
     }
 end
 
+-- Non-owner: resolve the relayed aiMap (BeamMP server ids) to local synced game ids, marking each AI car
+-- so it is kept out of the Tab cycle and the owner's nametag is suppressed on it (ADR-0036). Scans the
+-- scene for a vehicle whose cross-client server id is in the pending set; a match is recorded in
+-- ai_remote_ids and dropped from the pending set, so the scan shrinks and stops once all resolve.
+-- Retried from onUpdate + onVehicleSpawned, since a synced car may not exist yet at relay time. The
+-- server-id read is SPIKE #2 (race/ai): if it never resolves, the cars keep the owner's tag -- the same
+-- accepted fallback as the cones (ADR-0020). No-op when nothing is pending.
+local function resolve_remote_ai()
+    local pending = M.state.ai_server_ids
+    if not pending or not be then
+        return
+    end
+    M.state.ai_remote_ids = M.state.ai_remote_ids or {}
+    for i = 0, be:getObjectCount() - 1 do
+        local veh = be:getObject(i)
+        local server_id = veh and ai.server_id_of(veh) or nil
+        if server_id ~= nil and pending[tostring(server_id)] then
+            M.state.ai_remote_ids[veh:getID()] = true
+            ai.suppress(veh)
+            pending[tostring(server_id)] = nil
+        end
+    end
+    if next(pending) == nil then
+        M.state.ai_server_ids = nil
+    end
+end
+
+-- Non-owner handler for the owner's aiMap (ADR-0036): the server ids of the synced AI cars. Store them as
+-- a pending set and resolve to local handles now (retried until the synced cars exist). The owner ignores
+-- its own relayed map -- it already tracks ai_cars locally.
+local function handle_ai_map(payload)
+    if M.state.ai_cars then
+        return
+    end
+    local entries = type(payload) == "table" and payload.entries or nil
+    if type(entries) ~= "table" then
+        return
+    end
+    local pending = {}
+    for _, entry in ipairs(entries) do
+        if entry.serverId ~= nil then
+            pending[tostring(entry.serverId)] = true
+        end
+    end
+    M.state.ai_server_ids = pending
+    resolve_remote_ai()
+end
+
 local HANDLERS = {
     ping = handle_ping,
     raceStart = handle_race_start,
@@ -716,6 +842,7 @@ local HANDLERS = {
     listRaces = handle_list_races,
     listVehicles = handle_list_vehicles,
     regrid = handle_regrid,
+    aiMap = handle_ai_map,
     validateRace = handle_validate_race,
     finishGrace = handle_finish_grace,
     resultsToggle = handle_results_toggle,
@@ -1078,6 +1205,48 @@ end
 -- in-game). A switch into a cone bounces back to the last real car and is NOT recorded -- the
 -- guaranteed non-enterable layer (ADR-0009). A blocked switch likewise never updates current_vehicle_id
 -- (the checkpoint detector must keep reading the race car).
+-- Whether a game vehicle id is one of this client's AI cars (ADR-0036): the host's spawned ai_cars or, on
+-- a non-owner, a synced car resolved from the relayed aiMap (ai_remote_ids). Used to keep the player out
+-- of an AI car the same way cones are kept non-enterable.
+local function is_ai_game_id(game_id)
+    if game_id == nil then
+        return false
+    end
+    local cars = M.state.ai_cars
+    if cars then
+        for _, car in ipairs(cars) do
+            if tostring(car.veh_id) == tostring(game_id) then
+                return true
+            end
+        end
+    end
+    local remote = M.state.ai_remote_ids
+    if remote then
+        for id in pairs(remote) do
+            if tostring(id) == tostring(game_id) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Put the player back into their last real car after they switched into an AI car (ADR-0036), the cone
+-- bounce generalized to the AI cars (which are real models, so cones.enforce_non_enterable -- gated on
+-- is_cone -- does not catch them). No fallback car id -> no-op so the player is never trapped. Returns
+-- true if it bounced.
+local function bounce_off_ai(new_id)
+    local fallback_id = M.state.current_vehicle_id
+    if not be or fallback_id == nil or tostring(new_id) == tostring(fallback_id) then
+        return false
+    end
+    local fallback = be:getObjectByID(fallback_id)
+    if not fallback then
+        return false
+    end
+    return pcall(function() be:enterVehicle(0, fallback) end)
+end
+
 function M.onVehicleSwitched(_oldId, newId)
     local phase = M.state.phase
     if (phase == "countdown" or phase == "racing") and M.state.race_car_id ~= nil
@@ -1088,6 +1257,12 @@ function M.onVehicleSwitched(_oldId, newId)
     end
     if cones.is_cone(be and be:getObjectByID(newId)) then
         cones.enforce_non_enterable(newId, M.state.current_vehicle_id)
+        return
+    end
+    -- Keep the player out of an AI car (ADR-0036) and never record it as the seated car, so the detector
+    -- keeps reading the real own car.
+    if is_ai_game_id(newId) then
+        bounce_off_ai(newId)
         return
     end
     M.state.current_vehicle_id = newId
@@ -1141,6 +1316,10 @@ function M.onVehicleSpawned(vehicleId)
     end
     local veh = be:getObjectByID(vehicleId)
     cones.exclude_from_cycle(veh)
+    -- A freshly synced vehicle may be one of the owner's AI cars (ADR-0036): try to resolve the pending
+    -- aiMap now so it is labelled + nametag-suppressed as soon as it appears. No-op when nothing pending
+    -- or on the owner (it has no ai_server_ids).
+    resolve_remote_ai()
     if not cones.is_cone(veh) then
         return
     end
@@ -1245,6 +1424,49 @@ local function step_detection(dt_sim)
     -- lap boundaries arrive through on_checkpoint_reached above.
     if M.state.laptimer then
         laptimer.step(M.state.laptimer, veh_pos, detection.elapsed)
+    end
+end
+
+-- Host only: step each AI car's checkpoint detector and report its crossings to the server by proxy
+-- (ADR-0036). The owner drives the AI cars locally, so it reads each car's position and runs the same
+-- ADR-0010 detector against the same plan as a player, sending every crossing as a normal checkpoint
+-- report tagged with aiId -- the server routes it into that AI's progress record. Race-blind: an
+-- identical report plus one field. No-op for non-owners (no ai_detections) and once a detector is done.
+local function step_ai_detections(dt_sim)
+    local detections = M.state.ai_detections
+    local cars = M.state.ai_cars
+    local race = M.state.race
+    if not detections or not cars or not race or not race.checkpoints then
+        return
+    end
+    for _, car in ipairs(cars) do
+        local detection = detections[car.id]
+        if detection and not detection.done then
+            local veh_pos = nil
+            local veh = be and be:getObjectByID(car.veh_id)
+            if veh then
+                local ok, pos = pcall(function() return veh:getPosition() end)
+                if ok then
+                    veh_pos = pos
+                end
+            end
+            local event = checkpoints.step(detection, race.checkpoints, veh_pos, dt_sim)
+            if event then
+                send_to_server("checkpoint", {
+                    -- Proxy tag (ADR-0036): the server records this crossing into the AI slot's progress,
+                    -- not the owner's. Accepted only from the race owner for a known AI id (server-side).
+                    aiId = car.id,
+                    seq = event.seq,
+                    index = event.index,
+                    name = event.name,
+                    lap = event.lap,
+                    time = event.time,
+                    count = detection.plan.count,
+                })
+                log("I", RACE_LOG_TAG, string.format("AI '%s' checkpoint seq %d @ %.2fs",
+                    tostring(car.label), event.seq, event.time))
+            end
+        end
     end
 end
 
@@ -1787,6 +2009,7 @@ local function build_hud_snapshot()
                 splits = e.splits,
                 run_up = e.run_up,  -- gun -> start/finish run-up (ADR-0022), for the analysis S0 column
                 car = e.car,  -- driver's car (ADR-0029), for the Race section's "best lap with the car"
+                ai = e.ai or nil,  -- synthetic host-driven AI slot (ADR-0036), so the row can be tagged
             }
         end
     end
@@ -2277,6 +2500,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         step_start_countdown(dtReal)
     elseif M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
+        -- Host only: step the AI detectors + proxy-report their crossings (ADR-0036). Inert otherwise.
+        step_ai_detections(dtSim)
         -- Drive the held recover/repair countdown (ADR-0017).
         step_assist(dtReal)
         -- Tick the finish-grace countdown in wall time (the server's cutoff is wall-time; ADR-0014).
@@ -2284,6 +2509,25 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         if M.state.grace then
             M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
         end
+    end
+    -- Host only: once BeamMP has registered the spawned AI cars, broadcast their server ids so remotes can
+    -- label + suppress them (ADR-0036). Registration is async, so this retries while pending until every
+    -- AI car resolves a server id (SPIKE #2); if one never resolves, the map is simply not sent and the
+    -- owner's tag stays on the cars (the accepted cone fallback, ADR-0020).
+    if M.state.ai_map_pending and M.state.ai_cars then
+        local entries = ai.server_map(M.state.ai_cars)
+        if #entries == #M.state.ai_cars then
+            send_to_server("aiMap", {entries = entries})
+            M.state.ai_map_pending = false
+            log("I", RACE_LOG_TAG, string.format("broadcast aiMap for %d AI car(s)", #entries))
+        end
+    end
+    -- Non-owner: keep resolving the relayed aiMap to local handles until every synced AI car is found.
+    resolve_remote_ai()
+    -- Host only: deferred front-anchor restage of the AI cars onto the grid over the frozen phases, once
+    -- each car's jbeam has loaded (ADR-0036) -- the per-car mirror of the player restage above.
+    if (M.state.phase == "staging" or M.state.phase == "countdown") and M.state.ai_cars then
+        ai.restage(M.state.ai_cars, dtReal)
     end
     -- Arm the seated car's VE key forwarders across the locked sequence (staging + countdown + racing).
     -- The first successful arm installs the override + reset guard, so vanilla recover/reset is never

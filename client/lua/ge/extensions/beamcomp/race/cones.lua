@@ -127,14 +127,15 @@ function M.exclude_from_cycle(veh)
     return true
 end
 
--- Suppress BeamMP's floating player-nametag + "spawned a vehicle" label on a synced cone (ADR-0020,
--- finding #2). BeamMP's nametag draw loop skips a vehicle whose MPVehicleGE Vehicle entry has
--- `hideNametag` set; BeamMP never sets the field itself, so it is the sanctioned per-vehicle opt-out.
--- Best-effort, fully guarded: a freshly synced cone may not be registered in MPVehicleGE yet at spawn
--- time, in which case this no-ops (the accepted fallback is that the tag stays). No-op for non-cones
--- or outside a BeamMP session. Returns true if the tag was hidden.
-function M.hide_nametag(veh)
-    if not M.is_cone(veh) then
+-- Suppress BeamMP's floating owner-nametag + "spawned a vehicle" label on any synced vehicle (ADR-0020,
+-- finding #2). BeamMP's nametag draw loop skips a vehicle whose MPVehicleGE entry has `hideNametag` set;
+-- BeamMP never sets the field itself, so it is the sanctioned per-vehicle opt-out. Generic over the
+-- vehicle (no cone check), so the AI module (race/ai, ADR-0036) reuses it on host-owned AI cars. Best-
+-- effort, fully guarded: a freshly synced vehicle may not be registered in MPVehicleGE yet, in which case
+-- this no-ops (the accepted fallback is that the tag stays). No-op outside a BeamMP session or for a nil
+-- vehicle. Returns true if the tag was hidden.
+function M.hide_vehicle_nametag(veh)
+    if not veh then
         return false
     end
     if type(MPVehicleGE) ~= "table" or type(MPVehicleGE.getVehicleByGameID) ~= "function" then
@@ -149,10 +150,19 @@ function M.hide_nametag(veh)
         return false
     end)
     if not ok then
-        log("W", LOG_TAG, "hide_nametag attempt failed: " .. tostring(hidden))
+        log("W", LOG_TAG, "hide_vehicle_nametag attempt failed: " .. tostring(hidden))
         return false
     end
     return hidden
+end
+
+-- Cone wrapper over M.hide_vehicle_nametag: the cone-spawn paths call this so a non-cone is never
+-- touched. No-op for non-cones; otherwise defers to the generic suppressor above.
+function M.hide_nametag(veh)
+    if not M.is_cone(veh) then
+        return false
+    end
+    return M.hide_vehicle_nametag(veh)
 end
 
 return M

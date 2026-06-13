@@ -111,6 +111,7 @@ local MSG_BEST_NOTICE = "bestNotice"  -- tell a finisher they set a personal bes
 local MSG_RACE_RECORDS = "raceRecords"  -- ship a participant's pre-run PB + the race's track record at the finish seam (ADR-0028)
 local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close its post-race analysis overlay (ADR-0028)
 local MSG_REGRID = "regrid"  -- tell one client its reassigned grid slot + the reordered roster for a pwr re-grid (ADR-0033)
+local MSG_AI_MAP = "aiMap"  -- owner -> all: which synced vehicles are AI cars, so remotes label/suppress them (ADR-0036)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -180,6 +181,7 @@ local session = {
     identities = nil,         -- per-player {vehicle, pwr} reported via clientInfo, for records (ADR-0027) + start-order (ADR-0033); name moved to client_names (ADR-0031)
     order = nil,              -- this race's start-order {mode, rev} (ADR-0033), or nil = entry order
     last_order = nil,         -- previous race's finishing order as a list of identities (ADR-0033); session-scoped, survives reset_to_lobby so order=last has a source
+    owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
@@ -681,6 +683,38 @@ local function order_ids(players, order, last_order)
     return ids
 end
 
+-- Synthetic AI participants (ADR-0036): host-driven opponents that fill the grid for small lobbies. They
+-- are ordinary id-keyed participant records whose id is a string "ai:<k>" (so a numeric player id never
+-- collides), whose grid car the race owner spawns + drives, and whose progress the owner reports by
+-- proxy. The server never drives or reads them -- race-blindness (ADR-0005) holds; AI are just a
+-- participant kind kept out of every per-client path (no client backs an AI slot).
+local AI_ID_PREFIX = "ai:"
+local MAX_AI = 8
+local DEFAULT_AI_COUNT = 1
+
+-- Whether a participant id is a synthetic AI slot rather than a real player id (a BeamMP numeric id).
+local function is_ai_id(id)
+    return type(id) == "string" and id:sub(1, #AI_ID_PREFIX) == AI_ID_PREFIX
+end
+
+-- Append `ai_count` synthetic AI slots after the human slots, continuing the 0-based slot numbering
+-- (ADR-0036). AI fill the back of the grid: they carry no pwr/last history, so this matches where the
+-- order modes would sort them, and it avoids the mixed string/number id sort order_ids would hit if AI
+-- ids flowed through it (full order integration is deferred to Etappe B). Each entry mirrors a player
+-- slot plus ai = true and the display name "AI <k>". No-op for a nil/zero count.
+local function append_ai_slots(slots, ai_count)
+    local count = tonumber(ai_count) or 0
+    for k = 1, count do
+        slots[#slots + 1] = {
+            id = AI_ID_PREFIX .. k,
+            slot = #slots,
+            name = "AI " .. k,
+            ai = true,
+        }
+    end
+    return slots
+end
+
 -- Assign every connected player a 0-based slot in the resolved start order (ADR-0033). The order is
 -- deterministic for a given mode + roster so every client computes the same grid from the same roster.
 local function build_slots(players, order, last_order)
@@ -722,6 +756,9 @@ local function build_progress(slots)
             finished = false,
             dnf = false,
             lap = 1,
+            -- Synthetic host-driven AI participant (ADR-0036): excluded from records + the pwr re-grid,
+            -- flagged in the standings. nil for real players, so the record is otherwise identical.
+            ai = entry.ai or nil,
         }
     end
     return progress
@@ -811,6 +848,8 @@ local function build_standings()
             -- The driver's car (ADR-0029), so the client can filter "best lap with the car" in the
             -- analysis overlay. nil when no identity/vehicle was reported.
             car = car_descriptor(info and info.vehicle),
+            -- Synthetic host-driven AI slot (ADR-0036), so the HUD can tag it; nil for real players.
+            ai = record.ai or nil,
         }
     end
     return entries
@@ -888,9 +927,13 @@ local function regrid_by_pwr()
     end
     session.roster = build_roster(slots)
 
-    -- Tell each player its new slot + the reordered roster so it re-places before the countdown.
+    -- Tell each player its new slot + the reordered roster so it re-places before the countdown. AI
+    -- slots have no client to notify (ADR-0036): their record slot still updates above so the roster
+    -- stays consistent, but the owner is not asked to re-place them under pwr (an Etappe-B refinement).
     for _, entry in ipairs(slots) do
-        send_event(entry.id, MSG_REGRID, {slot = entry.slot, grid = session.roster})
+        if not is_ai_id(entry.id) then
+            send_event(entry.id, MSG_REGRID, {slot = entry.slot, grid = session.roster})
+        end
     end
     log_info("beamcomp.race", string.format("pwr re-grid: %d ranked, %d unranked", #ranked, #unranked))
 end
@@ -919,6 +962,7 @@ local function reset_to_lobby()
     session.spawn_pending = nil
     session.spawn_ready_count = 0
     session.identities = nil
+    session.owner_id = nil
     enter_phase(PHASE.lobby, nil)
     if had_race then
         broadcast_chat("BeamComp: race cleared -- back in free roam")
@@ -966,6 +1010,9 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
     -- pwr is provisional here and re-gridded after staging. last reads the previous race's finishing order.
     session.order = overrides.order
     local slots = build_slots(MP.GetPlayers(), overrides.order, session.last_order)
+    -- Append the requested AI opponents as synthetic back-of-grid slots (ADR-0036), so the roster, grid
+    -- layout, and standings include them like any participant. The owner spawns + drives them.
+    append_ai_slots(slots, overrides.ai and overrides.ai.count)
     local roster = build_roster(slots)
     local assists = overrides.assists
     -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). The default is
@@ -976,6 +1023,7 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
 
     session.race = race_name
     session.roster = roster
+    session.owner_id = owner_id
     session.progress = build_progress(slots)
     session.grace_deadline = nil
     session.pending_race = nil
@@ -990,40 +1038,60 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
     session.spawn_pending = {}
     session.spawn_ready_count = 0
     for _, entry in ipairs(slots) do
-        session.spawn_pending[entry.id] = true
+        -- AI slots have no client to ack spawnReady (ADR-0036), so they must not gate the spawning phase.
+        if not is_ai_id(entry.id) then
+            session.spawn_pending[entry.id] = true
+        end
+    end
+
+    -- The AI slots the owner spawns + drives (ADR-0036): only the owner's raceStart carries them; every
+    -- other client just sees the AI in the roster. Built once from the appended back-of-grid slots.
+    local ai_slots = {}
+    for _, entry in ipairs(slots) do
+        if is_ai_id(entry.id) then
+            ai_slots[#ai_slots + 1] = {slot = entry.slot, id = entry.id, label = entry.name}
+        end
     end
     -- Drop any identity/vehicle reports from a prior race so a re-issue (abort path, no reset_to_lobby)
     -- starts clean; each player re-reports clientInfo on the new spawn (ADR-0027).
     session.identities = nil
 
-    log_info("beamcomp.race", "starting '" .. race_name .. "' for " .. #slots .. " player(s)")
+    log_info("beamcomp.race", string.format("starting '%s' for %d player(s) + %d AI",
+        race_name, #slots - #ai_slots, #ai_slots))
 
     for _, entry in ipairs(slots) do
-        send_event(entry.id, MSG_RACE_START, {
-            race = race_name,
-            slot = entry.slot,
-            grid = roster,
-            propOwner = entry.id == owner_id,
-            mode = overrides.mode,            -- nil = auto (client derives from meta.closed); ADR-0013
-            laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
-            direction = overrides.direction,  -- nil = forward; "reverse" if reversible (ADR-0018)
-            force = overrides.force,          -- override a geometry mismatch where possible (ADR-0018)
-            all = overrides.all,              -- opt the deprecated quickrace source into resolution (ADR-0026)
-            -- Opt-in recover/repair assists (ADR-0017); clients enforce. Disabled by default.
-            recoverEnabled = assists.recoverEnabled,
-            recoverHoldSeconds = assists.recoverHoldSeconds,
-            repairEnabled = assists.repairEnabled,
-            repairHoldSeconds = assists.repairHoldSeconds,
-            -- Resolved custom-grid params (ADR-0023); nil = procedural grid. Same for every slot --
-            -- clients pick their own pose from the shared layout by slot.
-            gridParams = grid_params,
-            -- Vehicle policy (ADR-0032), relayed verbatim and never interpreted (ADR-0005): car =
-            -- fixed "model[:config]" for everyone (Mode 2); maxhp (hp) / maxpwr (power-to-weight, hp per
-            -- kg) = per-player caps (Mode 3). All nil = keep own car (Mode 1). car wins client-side.
-            car = overrides.car,
-            maxhp = overrides.maxhp,
-            maxpwr = overrides.maxpwr,
-        })
+        -- AI slots have no client (ADR-0036): skip them. The owner alone receives aiSlots, so it spawns
+        -- and drives the AI cars; everyone else just sees them in the roster + standings.
+        if not is_ai_id(entry.id) then
+            send_event(entry.id, MSG_RACE_START, {
+                race = race_name,
+                slot = entry.slot,
+                grid = roster,
+                propOwner = entry.id == owner_id,
+                -- The synthetic AI participants this client must spawn + drive (ADR-0036); owner-only,
+                -- absent for everyone else and when no AI were requested.
+                aiSlots = (entry.id == owner_id and #ai_slots > 0) and ai_slots or nil,
+                mode = overrides.mode,            -- nil = auto (client derives from meta.closed); ADR-0013
+                laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
+                direction = overrides.direction,  -- nil = forward; "reverse" if reversible (ADR-0018)
+                force = overrides.force,          -- override a geometry mismatch where possible (ADR-0018)
+                all = overrides.all,              -- opt the deprecated quickrace source into resolution (ADR-0026)
+                -- Opt-in recover/repair assists (ADR-0017); clients enforce. Disabled by default.
+                recoverEnabled = assists.recoverEnabled,
+                recoverHoldSeconds = assists.recoverHoldSeconds,
+                repairEnabled = assists.repairEnabled,
+                repairHoldSeconds = assists.repairHoldSeconds,
+                -- Resolved custom-grid params (ADR-0023); nil = procedural grid. Same for every slot --
+                -- clients pick their own pose from the shared layout by slot.
+                gridParams = grid_params,
+                -- Vehicle policy (ADR-0032), relayed verbatim and never interpreted (ADR-0005): car =
+                -- fixed "model[:config]" for everyone (Mode 2); maxhp (hp) / maxpwr (power-to-weight, hp
+                -- per kg) = per-player caps (Mode 3). All nil = keep own car (Mode 1). car wins client-side.
+                car = overrides.car,
+                maxhp = overrides.maxhp,
+                maxpwr = overrides.maxpwr,
+            })
+        end
     end
 
     enter_phase(PHASE.spawning, PHASE_DURATIONS.spawning)
@@ -1508,18 +1576,21 @@ local function send_race_records(prerun)
     local identities = session.identities or {}
 
     for id, record in pairs(session.progress) do
-        local info = identities[id]
-        local identity = resolve_identity(id) or record.name
-        local car = car_descriptor(info and info.vehicle)
-        local car_key = car and car.key or nil
-        send_event(id, MSG_RACE_RECORDS, {
-            race = session.race,
-            car = car,
-            pb = slim_player_record(identity and players[identity] or nil, car_key),
-            trackRecord = slim_track_record(track_record, car_key),
-            driverTotals = compute_driver_totals(identity, car_key),
-            prerun = prerun[id] or {},
-        })
+        -- AI slots have no client and hold no records (ADR-0036/0027): nothing to ship them.
+        if not record.ai then
+            local info = identities[id]
+            local identity = resolve_identity(id) or record.name
+            local car = car_descriptor(info and info.vehicle)
+            local car_key = car and car.key or nil
+            send_event(id, MSG_RACE_RECORDS, {
+                race = session.race,
+                car = car,
+                pb = slim_player_record(identity and players[identity] or nil, car_key),
+                trackRecord = slim_track_record(track_record, car_key),
+                driverTotals = compute_driver_totals(identity, car_key),
+                prerun = prerun[id] or {},
+            })
+        end
     end
 end
 
@@ -1535,10 +1606,11 @@ local function capture_records()
         return
     end
 
-    -- Nothing to record when no one finished (all DNF): skip the load + write and the empty race entry.
+    -- Nothing to record when no real player finished (all DNF / AI only): skip the load + write. AI never
+    -- hold records (ADR-0036/0027), so an AI finisher does not count here.
     local has_finisher = false
     for _, record in pairs(session.progress) do
-        if record.finished and not record.dnf then
+        if record.finished and not record.dnf and not record.ai then
             has_finisher = true
             break
         end
@@ -1566,7 +1638,7 @@ local function capture_records()
     local notify = {}
 
     for id, record in pairs(session.progress) do
-        if record.finished and not record.dnf then
+        if record.finished and not record.dnf and not record.ai then
             local info = identities[id]
             local identity = resolve_identity(id) or record.name
             local vehicle = info and info.vehicle or nil
@@ -1653,7 +1725,7 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
-    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [all]"
+    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [ai <n>] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -1785,6 +1857,28 @@ end
 -- assists ON at the default hold), and the first unrecognized token (or nil) so the caller can reply
 -- usage. Both assists default ON at the default hold; a recover:off / repair:off (or :-1 / :false) token
 -- turns one back off (ADR-0017 amendment).
+-- Extract the optional "ai <n>" opponent request before the generic option scan (ADR-0036): its count is
+-- a following bare integer that the lap-count parser would otherwise claim, so it is pulled out here and
+-- both tokens removed. A missing/non-integer count defaults to one AI; the count is clamped to
+-- [1, MAX_AI]. Returns {count} or nil when no ai token is present. (The Etappe-B difficulty token is not
+-- consumed here yet -- it falls through to the unknown-option path for now.)
+local function extract_ai_request(tokens)
+    for i = 2, #tokens do
+        if tokens[i]:lower() == "ai" then
+            local next_token = tokens[i + 1]
+            local has_count = next_token ~= nil and next_token:match("^%d+$") ~= nil
+            local count = has_count and math.floor(tonumber(next_token)) or DEFAULT_AI_COUNT
+            count = math.max(1, math.min(MAX_AI, count))
+            table.remove(tokens, i)       -- drop "ai"
+            if has_count then
+                table.remove(tokens, i)   -- drop the consumed count (now shifted to index i)
+            end
+            return {count = count}
+        end
+    end
+    return nil
+end
+
 local function parse_race_args(argument)
     local tokens = {}
     for token in argument:gmatch("%S+") do
@@ -1792,10 +1886,13 @@ local function parse_race_args(argument)
     end
 
     local name = tokens[1]
+    local ai = extract_ai_request(tokens)
     local bad_token
     local overrides = {
         force = false,
         all = false,
+        -- Host-driven AI opponents (ADR-0036), extracted above; nil = none. Relayed only to the owner.
+        ai = ai,
         assists = {
             recoverEnabled = true,
             recoverHoldSeconds = ASSIST_DEFAULT_HOLD_SECONDS,
@@ -1903,7 +2000,7 @@ local function handle_race_command(player_id, player_name, argument)
         order_echo = " order=" .. overrides.order.mode .. (overrides.order.rev and ":rev" or "")
     end
     log_info("beamcomp.race", string.format(
-        "/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s",
+        "/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
@@ -1914,7 +2011,8 @@ local function handle_race_command(player_id, player_name, argument)
         overrides.car and (" car=" .. overrides.car) or "",
         overrides.maxhp and (" maxhp=" .. overrides.maxhp) or "",
         overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or "",
-        order_echo))
+        order_echo,
+        overrides.ai and (" ai=" .. overrides.ai.count) or ""))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
@@ -2263,9 +2361,22 @@ local function handle_checkpoint_report(player_id, payload)
         return
     end
 
-    local record = session.progress and session.progress[player_id]
+    -- Route an AI-proxied report (ADR-0036): the race owner reports a synthetic AI slot's crossing with
+    -- aiId set. Accept it only from the owner and only for a known AI slot -- otherwise a client could
+    -- spoof another participant's progress. A normal report keys on the sender's own id.
+    local subject_id = player_id
+    if payload.aiId ~= nil then
+        if player_id ~= session.owner_id or not is_ai_id(payload.aiId) then
+            log_info("beamcomp.race", "ai checkpoint from id " .. tostring(player_id)
+                .. " ignored: not the owner or bad aiId " .. tostring(payload.aiId))
+            return
+        end
+        subject_id = payload.aiId
+    end
+
+    local record = session.progress and session.progress[subject_id]
     if not record then
-        log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
+        log_info("beamcomp.race", "checkpoint report for " .. tostring(subject_id)
             .. " ignored: no race record")
         return
     end
@@ -2274,7 +2385,7 @@ local function handle_checkpoint_report(player_id, payload)
     -- driving can never progress or set finished. (Finished players' clients stop sending; this also
     -- guards a DNF'd player whose detector is still armed.)
     if record.finished or record.dnf then
-        log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
+        log_info("beamcomp.race", "checkpoint report for " .. tostring(subject_id)
             .. " ignored: already " .. (record.finished and "finished" or "DNF"))
         return
     end
@@ -2298,8 +2409,8 @@ local function handle_checkpoint_report(player_id, payload)
 
     if seq ~= record.completed then
         log_info("beamcomp.race", string.format(
-            "player %d out-of-order checkpoint: got seq %d, expected %d",
-            player_id, seq, record.completed))
+            "%s out-of-order checkpoint: got seq %d, expected %d",
+            tostring(subject_id), seq, record.completed))
         return
     end
 
@@ -2328,8 +2439,8 @@ local function handle_checkpoint_report(player_id, payload)
     local progress_label = record.count
         and string.format("%d/%d", record.completed, record.count)
         or tostring(record.completed)
-    log_info("beamcomp.race", string.format("player %d checkpoint %s%s%s @ %.2fs%s",
-        player_id, progress_label,
+    log_info("beamcomp.race", string.format("%s checkpoint %s%s%s @ %.2fs%s",
+        tostring(subject_id), progress_label,
         lap and string.format(" lap %d", lap) or "",
         index and string.format(" (cp %d)", index) or "",
         time, final and " (final)" or ""))
@@ -2338,6 +2449,23 @@ local function handle_checkpoint_report(player_id, payload)
     if final then
         maybe_end_race()
     end
+end
+
+-- Relay the owner's AI-vehicle map to every client (ADR-0036): the owner spawned the AI cars and resolved
+-- their BeamMP-synced ids, and the other clients need that set to label the cars "AI N" and suppress the
+-- owner's nametag on them (their own race car must keep its tag). Accepted only from the active race's
+-- owner; the opaque entries are rebroadcast verbatim (race-blind, ADR-0005 -- the server reads no vehicle).
+local function handle_ai_map(player_id, payload)
+    if session.phase == PHASE.lobby or player_id ~= session.owner_id then
+        log_info("beamcomp.net", "aiMap from id " .. tostring(player_id)
+            .. " ignored: not the active race owner")
+        return
+    end
+    local entries = type(payload) == "table" and payload.entries or nil
+    if type(entries) ~= "table" then
+        return
+    end
+    broadcast_event(MSG_AI_MAP, {entries = entries})
 end
 
 -- Post a client's /races reply to that player. The client (which owns race knowledge, ADR-0005) built
@@ -2510,6 +2638,8 @@ local function handle_client_event(player_id, data)
 
     if decoded.type == MSG_CHECKPOINT then
         handle_checkpoint_report(player_id, decoded.payload)
+    elseif decoded.type == MSG_AI_MAP then
+        handle_ai_map(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_LIST then
         handle_race_list(player_id, decoded.payload)
     elseif decoded.type == MSG_VEHICLE_LIST then

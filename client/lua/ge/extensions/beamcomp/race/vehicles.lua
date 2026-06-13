@@ -233,6 +233,14 @@ local function spawn_vehicle_at(pose, spec)
     return veh
 end
 
+-- Spawn one vehicle at a grid pose with a chosen model[:config] and stock paint, returning the new
+-- vehicle (or nil + reason). The public seam over the internal spawn_vehicle_at so the AI module
+-- (race/ai, ADR-0036) spawns host-owned AI cars through the exact front-anchored / grid-oriented path a
+-- player car uses, and BeamMP propagates them the same way ('Os:'). Owned by the spawning client.
+function M.spawn_at(pose, model, config)
+    return spawn_vehicle_at(pose, {model = model, config = config})
+end
+
 -- Return the car the player is currently in, iff it is a real owned car worth keeping for the race
 -- (in the owned-vehicle map and not the walking unicycle); else nil (which selects the fresh-spawn
 -- fallback). Owned membership is what makes it BeamMP-safe to touch.
@@ -279,6 +287,25 @@ local function repair_and_place(veh, pose)
     -- world bbox is stale right after setPositionRotation), then place once.
     local pos = front_anchored_target(veh, pose)
     veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+end
+
+-- Front-anchored, grounded placement of ANY vehicle at a grid pose -- the same repair+teleport
+-- (front-anchor, ADR-0034) the player's restage uses, but WITHOUT touching other owned cars (unlike
+-- respawn_own_at, which despawns the player's other vehicles). The AI module (race/ai, ADR-0036)
+-- re-places each host-owned AI car here once its jbeam has loaded, so the AI cars sit on the grid exactly
+-- like the players' cars instead of the center-anchored spawn pose. Returns true, or nil plus a reason.
+function M.place_at_grid(veh, pose)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+    local ok, err = pcall(repair_and_place, veh, pose)
+    if not ok then
+        return nil, "place_at_grid failed: " .. tostring(err)
+    end
+    return true
 end
 
 -- Split a car= token "model" or "model:config" into (model, config); config is nil when absent. Returns
