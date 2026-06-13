@@ -193,25 +193,45 @@ local function drive_command(names_literal)
         AI_AGGRESSION, names_literal, AI_AGGRESSION)
 end
 
--- Arm BeamNG's vehicle AI to drive each car along the race route (SPIKE #1, ADR-0036). Resolves the route
--- to navgraph waypoint names GE-side, then queues the trivial drive command to each car's VE
--- (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). For a multi-lap race the lap's
--- waypoints are laid out `laps` times (BeamNG's noOfLaps does not loop a wpTargetList -- verified
--- in-game), consecutive duplicates dropped at the lap seam, so the AI drives every lap. pcall-guarded.
+-- Append `name` to `names` unless it repeats the current tail. ai.driveUsingPath dislikes
+-- two identical consecutive waypoints, so every layout path funnels through this.
+local function append_waypoint(names, name)
+    if names[#names] ~= name then
+        names[#names + 1] = name
+    end
+end
+
+-- Lay the resolved single-lap waypoint sequence out across `lap_count` laps (ADR-0036). The
+-- first lap drives the full resolved route -- lap_names[1] is the start/finish node the car is
+-- spawned on. Every later lap drops that leading start/finish node, so the AI never steers back
+-- to the start line at the lap seam: it crosses the line naturally on the racing line between the
+-- previous lap's last node and this lap's first corner. laps=1 is byte-for-byte the proven
+-- single-lap path. Consecutive duplicates are dropped throughout. Pure; returns the name list.
+local function lay_out_lap_waypoints(lap_names, lap_count)
+    local names = {}
+    for _, name in ipairs(lap_names) do
+        append_waypoint(names, name)
+    end
+    for _ = 2, lap_count do
+        for i = 2, #lap_names do
+            append_waypoint(names, lap_names[i])
+        end
+    end
+    return names
+end
+
+-- Arm BeamNG's vehicle AI to drive each car along the race route (SPIKE #1, ADR-0036). Resolves
+-- the route to navgraph waypoint names GE-side, lays them out over the lap count
+-- (lay_out_lap_waypoints), then queues the trivial drive command to each car's VE (queueLuaCommand,
+-- the channel vehicles.set_vehicle_frozen uses). BeamNG's noOfLaps does not loop a wpTargetList
+-- (verified in-game), so every lap is laid out explicitly. pcall-guarded.
 function M.drive(cars, route, laps)
     if type(cars) ~= "table" or type(route) ~= "table" then
         return
     end
     local lap_count = math.max(1, math.floor(tonumber(laps) or 1))
     local lap_names = resolve_waypoint_names(route)
-    local names = {}
-    for _ = 1, lap_count do
-        for _, name in ipairs(lap_names) do
-            if names[#names] ~= name then
-                names[#names + 1] = name
-            end
-        end
-    end
+    local names = lay_out_lap_waypoints(lap_names, lap_count)
     local quoted = {}
     for _, name in ipairs(names) do
         quoted[#quoted + 1] = string.format("%q", name)
@@ -220,6 +240,9 @@ function M.drive(cars, route, laps)
     log("I", LOG_TAG, string.format(
         "AI route: %d waypoint(s)/lap from %d point(s), %d lap(s) -> %d total",
         #lap_names, #route, lap_count, #names))
+    log("I", LOG_TAG, string.format(
+        "AI lap layout: lap_count=%d, lap_names=[%s]",
+        lap_count, table.concat(lap_names, ", ")))
     for _, car in ipairs(cars) do
         local veh = be and be:getObjectByID(car.veh_id)
         if veh then
