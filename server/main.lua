@@ -17,11 +17,15 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) = per-player caps that keep a
 --                 compliant car or substitute one (Mode 3); none = keep own car (Mode 1). car= wins.
+--                 AI opponents (ADR-0036): ai <n> [preset] adds n host-driven AI (no count = content
+--                 default, [1..16]); preset easy|medium|hard, aicar=/aiaggr=/aiskill=/airubber=/aiavoid=/
+--                 aispeed= configure their vehicle + driving. AI mix into random and sort by reported pwr;
+--                 else back of grid.
 --                 start order (ADR-0033): order=entry (default) | random | last (prev race result) |
 --                 pwr (power-to-weight); :rev flips a directional mode (last:rev/pwr:rev = handicap).
 --                 the deprecated quickrace ("menu:") source is hidden from bare-name resolution unless
@@ -689,7 +693,7 @@ end
 -- proxy. The server never drives or reads them -- race-blindness (ADR-0005) holds; AI are just a
 -- participant kind kept out of every per-client path (no client backs an AI slot).
 local AI_ID_PREFIX = "ai:"
-local MAX_AI = 8
+local MAX_AI = 16
 local DEFAULT_AI_COUNT = 1
 
 -- Whether a participant id is a synthetic AI slot rather than a real player id (a BeamMP numeric id).
@@ -697,31 +701,50 @@ local function is_ai_id(id)
     return type(id) == "string" and id:sub(1, #AI_ID_PREFIX) == AI_ID_PREFIX
 end
 
--- Append `ai_count` synthetic AI slots after the human slots, continuing the 0-based slot numbering
--- (ADR-0036). AI fill the back of the grid: they carry no pwr/last history, so this matches where the
--- order modes would sort them, and it avoids the mixed string/number id sort order_ids would hit if AI
--- ids flowed through it (full order integration is deferred to Etappe B). Each entry mirrors a player
--- slot plus ai = true and the display name "AI <k>". No-op for a nil/zero count.
-local function append_ai_slots(slots, ai_count)
-    local count = tonumber(ai_count) or 0
-    for k = 1, count do
-        slots[#slots + 1] = {
-            id = AI_ID_PREFIX .. k,
-            slot = #slots,
-            name = "AI " .. k,
-            ai = true,
-        }
+-- The synthetic AI ids "ai:1".."ai:<n>" for a count (ADR-0036). Empty for a nil/zero count.
+local function ai_id_list(ai_count)
+    local ids = {}
+    for k = 1, (tonumber(ai_count) or 0) do
+        ids[#ids + 1] = AI_ID_PREFIX .. k
     end
-    return slots
+    return ids
 end
 
--- Assign every connected player a 0-based slot in the resolved start order (ADR-0033). The order is
--- deterministic for a given mode + roster so every client computes the same grid from the same roster.
-local function build_slots(players, order, last_order)
-    local ids = order_ids(players, order, last_order)
+-- One slot record for an id at a 0-based slot. AI ids (ADR-0036) carry the "AI <k>" display name and the
+-- ai flag; real players carry their connected name. Keeps build_slots free of the player/AI branch.
+local function make_slot_entry(id, slot, players)
+    if is_ai_id(id) then
+        return {id = id, slot = slot, name = "AI " .. id:sub(#AI_ID_PREFIX + 1), ai = true}
+    end
+    return {id = id, slot = slot, name = players[id]}
+end
+
+-- Assign every participant (connected players + the requested AI, ADR-0036 Etappe B) a 0-based slot in
+-- the resolved start order (ADR-0033). For `random` the AI shuffle into the field with the players; for
+-- entry/last/pwr the players are ordered first and the AI appended at the back -- their natural position
+-- (no entry/finish history) and it avoids the mixed numeric/string id sort. pwr re-sorts the AI into the
+-- field after staging (regrid_by_pwr). Deterministic for a given mode + roster so every client computes
+-- the same grid.
+local function build_slots(players, order, last_order, ai_count)
+    local ids
+    if order and order.mode == "random" then
+        ids = {}
+        for id in pairs(players) do
+            ids[#ids + 1] = id
+        end
+        for _, ai_id in ipairs(ai_id_list(ai_count)) do
+            ids[#ids + 1] = ai_id
+        end
+        ids = shuffle(ids)
+    else
+        ids = order_ids(players, order, last_order)
+        for _, ai_id in ipairs(ai_id_list(ai_count)) do
+            ids[#ids + 1] = ai_id
+        end
+    end
     local slots = {}
     for index, id in ipairs(ids) do
-        slots[#slots + 1] = {id = id, slot = index - 1, name = players[id]}
+        slots[index] = make_slot_entry(id, index - 1, players)
     end
     return slots
 end
@@ -927,12 +950,22 @@ local function regrid_by_pwr()
     end
     session.roster = build_roster(slots)
 
-    -- Tell each player its new slot + the reordered roster so it re-places before the countdown. AI
-    -- slots have no client to notify (ADR-0036): their record slot still updates above so the roster
-    -- stays consistent, but the owner is not asked to re-place them under pwr (an Etappe-B refinement).
+    -- Tell each player its new slot + the reordered roster so it re-places before the countdown. AI slots
+    -- have no client (ADR-0036): the owner re-places them, so its regrid also carries the AI slots' new
+    -- positions (id + slot) for it to re-place its host-driven cars (ADR-0036 Etappe B).
+    local ai_regrid = {}
+    for _, entry in ipairs(slots) do
+        if is_ai_id(entry.id) then
+            ai_regrid[#ai_regrid + 1] = {id = entry.id, slot = entry.slot}
+        end
+    end
     for _, entry in ipairs(slots) do
         if not is_ai_id(entry.id) then
-            send_event(entry.id, MSG_REGRID, {slot = entry.slot, grid = session.roster})
+            local payload = {slot = entry.slot, grid = session.roster}
+            if entry.id == session.owner_id and #ai_regrid > 0 then
+                payload.aiSlots = ai_regrid
+            end
+            send_event(entry.id, MSG_REGRID, payload)
         end
     end
     log_info("beamcomp.race", string.format("pwr re-grid: %d ranked, %d unranked", #ranked, #unranked))
@@ -1009,10 +1042,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
     -- Resolve the grid start order (ADR-0033): entry/random/last are applied to the slot assignment now;
     -- pwr is provisional here and re-gridded after staging. last reads the previous race's finishing order.
     session.order = overrides.order
-    local slots = build_slots(MP.GetPlayers(), overrides.order, session.last_order)
-    -- Append the requested AI opponents as synthetic back-of-grid slots (ADR-0036), so the roster, grid
-    -- layout, and standings include them like any participant. The owner spawns + drives them.
-    append_ai_slots(slots, overrides.ai and overrides.ai.count)
+    -- The requested AI opponents become synthetic participant slots (ADR-0036), so the roster, grid
+    -- layout, and standings include them like any participant; the owner spawns + drives them. They mix
+    -- into a random order and sort by reported pwr; otherwise they take the back of the grid.
+    local slots = build_slots(MP.GetPlayers(), overrides.order, session.last_order,
+        overrides.ai and overrides.ai.count)
     local roster = build_roster(slots)
     local assists = overrides.assists
     -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). The default is
@@ -1071,6 +1105,13 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
                 -- The synthetic AI participants this client must spawn + drive (ADR-0036); owner-only,
                 -- absent for everyone else and when no AI were requested.
                 aiSlots = (entry.id == owner_id and #ai_slots > 0) and ai_slots or nil,
+                -- The resolved AI difficulty + vehicle config (ADR-0036 Etappe B); owner-only, relayed
+                -- verbatim (race-blind). The owner fills any gaps from the race's content defaults.
+                aiConfig = (entry.id == owner_id and #ai_slots > 0) and {
+                    preset = overrides.ai.preset,
+                    car = overrides.ai.car,
+                    params = overrides.ai.params,
+                } or nil,
                 mode = overrides.mode,            -- nil = auto (client derives from meta.closed); ADR-0013
                 laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
                 direction = overrides.direction,  -- nil = forward; "reverse" if reversible (ADR-0018)
@@ -1725,7 +1766,9 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
-    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [ai <n>] [all]"
+    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] "
+    .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
+    .. "[aiavoid=on|off] [aispeed=off|limit|set|legal] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -1768,6 +1811,15 @@ end
 local RACE_KEYWORDS = {"sprint", "circuit", "reverse", "recover", "repair", "force"}
 local RACE_MODES = {sprint = true, circuit = true}
 local ASSIST_KEYWORDS = {recover = true, repair = true}
+
+-- AI difficulty presets, matched as the positional token right after "ai [<n>]" by unambiguous prefix
+-- (ADR-0036 Etappe B). e/m/h are unique, so the shortest forms all resolve. The preset->parameter
+-- mapping is client-side (race/ai.lua); the server only relays the resolved name.
+local AI_PRESET_LIST = {"easy", "medium", "hard"}
+
+-- Accepted ai speedMode values for the aispeed= override, passed verbatim to the client's ai.setSpeedMode
+-- (ADR-0036 Etappe B). The client guards the call; the server just gates the value to a known mode.
+local AI_SPEED_MODES = {off = true, limit = true, set = true, legal = true}
 
 -- Resolve a keyword from a (lowercased) word by unambiguous prefix -- the same "shortest form that
 -- stays unambiguous" convenience the race shortnames use. `word` must be a non-empty prefix of
@@ -1857,23 +1909,69 @@ end
 -- assists ON at the default hold), and the first unrecognized token (or nil) so the caller can reply
 -- usage. Both assists default ON at the default hold; a recover:off / repair:off (or :-1 / :false) token
 -- turns one back off (ADR-0017 amendment).
--- Extract the optional "ai <n>" opponent request before the generic option scan (ADR-0036): its count is
--- a following bare integer that the lap-count parser would otherwise claim, so it is pulled out here and
--- both tokens removed. A missing/non-integer count defaults to one AI; the count is clamped to
--- [1, MAX_AI]. Returns {count} or nil when no ai token is present. (The Etappe-B difficulty token is not
--- consumed here yet -- it falls through to the unknown-option path for now.)
+-- Classify one "ai*=" raw-parameter override token into the BeamNG ai parameter it sets (ADR-0036
+-- Etappe B). aggression/skill/rubberband take a [0,1] number (clamped); avoid takes on/off; speed takes
+-- one of AI_SPEED_MODES. Returns (key, value) or nil for an unknown ai key or an invalid value, so the
+-- caller can reply usage. "aicar=" is NOT an ai parameter (it is a model token) and resolves here to nil.
+local function parse_ai_param_token(token)
+    local key, raw = token:match("^[Aa][Ii](%a+)=(.+)$")
+    if not key then
+        return nil
+    end
+    key = key:lower()
+    if key == "aggr" or key == "skill" or key == "rubber" then
+        local value = tonumber(raw)
+        if not value then
+            return nil
+        end
+        return key, math.max(0, math.min(1, value))
+    end
+    if key == "avoid" then
+        local lowered = raw:lower()
+        if lowered == "on" or lowered == "true" then
+            return key, true
+        end
+        if lowered == "off" or lowered == "false" then
+            return key, false
+        end
+        return nil
+    end
+    if key == "speed" and AI_SPEED_MODES[raw:lower()] then
+        return key, raw:lower()
+    end
+    return nil
+end
+
+-- Extract the optional "ai [<n>] [<preset>]" opponent request before the generic option scan (ADR-0036).
+-- The count is a following bare integer that the lap-count parser would otherwise claim, and the preset
+-- is a following easy/medium/hard token (unambiguous prefix), so both are pulled out here with "ai" and
+-- removed. `explicit` records whether a count was typed -- when false the server fills the aiRace content
+-- default count (Etappe B). A missing/non-integer count defaults to one AI; the count is clamped to
+-- [1, MAX_AI]. Returns {count, explicit, preset} or nil when no ai token is present.
 local function extract_ai_request(tokens)
     for i = 2, #tokens do
         if tokens[i]:lower() == "ai" then
-            local next_token = tokens[i + 1]
-            local has_count = next_token ~= nil and next_token:match("^%d+$") ~= nil
-            local count = has_count and math.floor(tonumber(next_token)) or DEFAULT_AI_COUNT
-            count = math.max(1, math.min(MAX_AI, count))
-            table.remove(tokens, i)       -- drop "ai"
-            if has_count then
-                table.remove(tokens, i)   -- drop the consumed count (now shifted to index i)
+            local count, explicit, preset = DEFAULT_AI_COUNT, false, nil
+            local remove = {i}  -- always drop the "ai" token itself
+            local cursor = i + 1
+            if tokens[cursor] and tokens[cursor]:match("^%d+$") then
+                count = math.max(1, math.min(MAX_AI, math.floor(tonumber(tokens[cursor]))))
+                explicit = true
+                remove[#remove + 1] = cursor
+                cursor = cursor + 1
             end
-            return {count = count}
+            local preset_word = tokens[cursor] and tokens[cursor]:lower():match("^(%a+)$")
+            local resolved = preset_word and resolve_keyword(preset_word, AI_PRESET_LIST)
+            if resolved then
+                preset = resolved
+                remove[#remove + 1] = cursor
+            end
+            -- Remove the consumed indices high-to-low so earlier removals don't shift later ones.
+            table.sort(remove, function(a, b) return a > b end)
+            for _, idx in ipairs(remove) do
+                table.remove(tokens, idx)
+            end
+            return {count = count, explicit = explicit, preset = preset}
         end
     end
     return nil
@@ -1888,6 +1986,10 @@ local function parse_race_args(argument)
     local name = tokens[1]
     local ai = extract_ai_request(tokens)
     local bad_token
+    -- AI vehicle + raw-parameter overrides (ADR-0036 Etappe B), collected in the scan below and attached
+    -- to overrides.ai afterwards. Only meaningful when an `ai` request is present; an ai*= token without
+    -- one falls to bad_token via the terminal branch.
+    local ai_car, ai_params = nil, {}
     local overrides = {
         force = false,
         all = false,
@@ -1957,10 +2059,38 @@ local function parse_race_args(argument)
             if not overrides.order and not bad_token then
                 bad_token = token
             end
-        elseif not bad_token then
-            bad_token = token
+        else
+            -- AI config tokens (ADR-0036 Etappe B), only accepted alongside an `ai` request: aicar= sets
+            -- the AI vehicle, ai*= set raw difficulty parameters. Anything else is an unknown option.
+            local handled = false
+            if ai then
+                local car = token:match("^[Aa][Ii][Cc][Aa][Rr]=(.+)$")
+                if car then
+                    ai_car = car
+                    handled = true
+                else
+                    local ai_key, ai_value = parse_ai_param_token(token)
+                    if ai_key then
+                        ai_params[ai_key] = ai_value
+                        handled = true
+                    end
+                end
+            end
+            if not handled and not bad_token then
+                bad_token = token
+            end
         end
     end
+
+    -- Attach the collected AI vehicle + parameter overrides to the request (ADR-0036 Etappe B); the
+    -- preset and content defaults fill the rest client-side.
+    if ai then
+        ai.car = ai_car
+        if next(ai_params) then
+            ai.params = ai_params
+        end
+    end
+
     return name, overrides, bad_token
 end
 
@@ -2012,7 +2142,9 @@ local function handle_race_command(player_id, player_name, argument)
         overrides.maxhp and (" maxhp=" .. overrides.maxhp) or "",
         overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or "",
         order_echo,
-        overrides.ai and (" ai=" .. overrides.ai.count) or ""))
+        overrides.ai and (" ai=" .. overrides.ai.count
+            .. (overrides.ai.explicit and "" or "(default)")
+            .. (overrides.ai.preset and (" " .. overrides.ai.preset) or "")) or ""))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
@@ -2071,7 +2203,16 @@ local function handle_race_validation(player_id, payload)
         -- grid lookup on them. Either missing just means no custom grid resolves (procedural fallback).
         local map = type(payload.map) == "string" and payload.map or nil
         local race_id = type(payload.raceId) == "string" and payload.raceId or nil
-        commit_validated_race(pending.race, pending.owner_id, pending.overrides, map, race_id)
+        -- Fill the content default AI count when the admin opted into AI without a number (ADR-0036
+        -- Etappe B): the race-blind server takes racerCount from the issuer client's reply (ADR-0019/0005).
+        local overrides = pending.overrides
+        if overrides.ai and not overrides.ai.explicit and type(payload.aiDefaults) == "table" then
+            local content_count = tonumber(payload.aiDefaults.count)
+            if content_count then
+                overrides.ai.count = math.max(1, math.min(MAX_AI, math.floor(content_count)))
+            end
+        end
+        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id)
     else
         local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
         MP.SendChatMessage(pending.owner_id, "BeamComp: " .. reason)
@@ -2106,12 +2247,23 @@ local function handle_client_info(player_id, payload)
     end
     local vehicle = type(payload.vehicle) == "table" and payload.vehicle or nil
     session.identities = session.identities or {}
+    -- A proxied AI report (ADR-0036 Etappe B): the owner reports an AI car's pwr tagged with its aiId, so
+    -- the pwr re-grid can sort the AI into the field (ADR-0033). Stored under the AI id, never the owner's,
+    -- and accepted only from the race owner for a known AI slot -- mirrors the proxied checkpoint route.
+    local target_id = player_id
+    if payload.aiId ~= nil then
+        if player_id ~= session.owner_id or not is_ai_id(payload.aiId)
+            or not (session.progress and session.progress[payload.aiId]) then
+            return
+        end
+        target_id = payload.aiId
+    end
     -- pwr (power-to-weight) feeds the start-order pwr re-grid (ADR-0033); stored verbatim, never
     -- interpreted (race-blind, ADR-0005). nil/non-number when the client could not read it.
-    session.identities[player_id] = {vehicle = vehicle, pwr = tonumber(payload.pwr)}
+    session.identities[target_id] = {vehicle = vehicle, pwr = tonumber(payload.pwr)}
     log_info("beamcomp.records", string.format(
         "clientInfo id=%s vehicle=%s/%s modified=%s",
-        tostring(player_id),
+        tostring(target_id),
         tostring(vehicle and vehicle.model),
         tostring(vehicle and vehicle.type),
         tostring(vehicle and vehicle.modified)))

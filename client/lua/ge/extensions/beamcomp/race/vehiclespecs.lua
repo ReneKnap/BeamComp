@@ -30,6 +30,12 @@ local WEIGHT_FIELDS = {"Weight", "weight", "Weight (kg)"}
 -- The walking unicycle is never a race car (mirrors race/vehicles.lua); kept out of every listing/search.
 local EXCLUDED_MODELS = {unicycle = true}
 
+-- Model Types that are not drivable race cars -- props (cones, barriers, …) and trailers are spawnable
+-- jbeam "vehicles" but must never back an AI opponent (ADR-0036 Etappe B). Used by list_car_models to keep
+-- them out of the random AI pool. The Type is read from model metadata (unverified under BeamMP like the
+-- power fields); an unreadable Type counts as a car, so the filter only ever removes a KNOWN non-car.
+local NON_CAR_TYPES = {Prop = true, Trailer = true}
+
 -- One-shot: log the keys of the first config-info table we read, so the real power/index field names are
 -- visible in-game (the single runtime-verification point for this module). Module-scope, reset on reload.
 local probed = false
@@ -115,6 +121,31 @@ function M.list_models()
     end
     table.sort(models)
     return models
+end
+
+-- The model-level Type ("Car"/"Truck"/"Prop"/"Trailer"/…) for `model`, or nil when unreadable. Read from
+-- the model metadata (data.model), the same source collect_client_info uses for the records type field.
+local function model_type(model)
+    local data = get_model(model)
+    local info = data and data.model
+    if type(info) ~= "table" then
+        return nil
+    end
+    return info.Type
+end
+
+-- Sorted array of installed DRIVABLE model keys -- list_models minus the props/trailers (NON_CAR_TYPES).
+-- The random AI vehicle pool (ADR-0036 Etappe B) draws from this so an AI never spawns as a cone/pylon. A
+-- model whose Type is unreadable is kept (treated as a car), so the filter only removes a known non-car.
+function M.list_car_models()
+    local cars = {}
+    for _, model in ipairs(M.list_models()) do
+        local model_kind = model_type(model)
+        if not (model_kind and NON_CAR_TYPES[model_kind]) then
+            cars[#cars + 1] = model
+        end
+    end
+    return cars
 end
 
 -- Sorted array of one model's configs: {config = key, name = label, power = n|nil, weight = n|nil}. Empty

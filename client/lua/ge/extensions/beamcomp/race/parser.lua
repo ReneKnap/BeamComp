@@ -163,14 +163,10 @@ local function build_prop_refs(folder)
     return {prefabFiles = prefab_files, coneFiles = {}}
 end
 
--- A mission's authoritative default lap count, from the sibling info.json's missionTypeData (ADR-0024).
--- BeamNG stores a mission's real default there; the race.race.json's own defaultLaps is an editor value
--- that disagrees for stock closed circuits (e.g. 004-mediumcourse: info 1 vs race 2). The field name is
--- mission-type-specific: timeTrial uses "defaultLaps", aiRace uses "lapCount" (ADR-0035; its goalLaps/
--- goalTime are challenge targets, not the race length). Returns the number, or nil when there is no
--- info.json or no usable value -- the caller then keeps the path object's value (mod races that ship
--- only a race.race.json).
-local function mission_default_laps(folder)
+-- A mission's missionTypeData from its sibling info.json (ADR-0024), or nil when there is no info.json
+-- or no missionTypeData. The single source for both the default lap count and the aiRace AI defaults, so
+-- the file is read once per parse.
+local function read_mission_type_data(folder)
     if not folder then
         return nil
     end
@@ -182,20 +178,58 @@ local function mission_default_laps(folder)
     if type(info) ~= "table" or type(info.missionTypeData) ~= "table" then
         return nil
     end
-    local mission_type_data = info.missionTypeData
+    return info.missionTypeData
+end
+
+-- A mission's authoritative default lap count, from its missionTypeData (ADR-0024). BeamNG stores a
+-- mission's real default there; the race.race.json's own defaultLaps is an editor value that disagrees
+-- for stock closed circuits (e.g. 004-mediumcourse: info 1 vs race 2). The field name is mission-type-
+-- specific: timeTrial uses "defaultLaps", aiRace uses "lapCount" (ADR-0035; its goalLaps/goalTime are
+-- challenge targets, not the race length). Returns the number, or nil -- the caller then keeps the path
+-- object's value (mod races that ship only a race.race.json).
+local function mission_default_laps(mission_type_data)
+    if type(mission_type_data) ~= "table" then
+        return nil
+    end
     return tonumber(mission_type_data.defaultLaps or mission_type_data.lapCount)
+end
+
+-- An aiRace's authored AI defaults from its missionTypeData (ADR-0036 Etappe B): the racer count and the
+-- defensive driving params the content ships, plus any content-specified racer vehicle(s). These fill the
+-- gaps when /race omits an explicit count/preset/aicar. Returns a table with whichever fields were found,
+-- or nil when none are -- so meta.aiDefaults stays nil for non-aiRace content.
+local function mission_ai_defaults(mission_type_data)
+    if type(mission_type_data) ~= "table" then
+        return nil
+    end
+    local defaults = {
+        count = tonumber(mission_type_data.racerCount),
+        skill = tonumber(mission_type_data.racerSkill),
+        aggression = tonumber(mission_type_data.racerAggression),
+    }
+    if type(mission_type_data.racerVehicle) == "string" then
+        defaults.vehicles = {mission_type_data.racerVehicle}
+    elseif type(mission_type_data.racerVehicles) == "table" then
+        defaults.vehicles = mission_type_data.racerVehicles
+    end
+    if defaults.count or defaults.skill or defaults.aggression or defaults.vehicles then
+        return defaults
+    end
+    return nil
 end
 
 -- defaultLaps is the override (from the mission info.json) when given, else the path object's own value;
 -- closed/branching/reversible always come from the loaded path so meta stays consistent with the
--- checkpoints/segments the path produced.
-local function build_meta(path, default_laps_override)
+-- checkpoints/segments the path produced. aiDefaults carries the aiRace content AI defaults (ADR-0036
+-- Etappe B), nil for non-aiRace content.
+local function build_meta(path, default_laps_override, ai_defaults)
     return {
         name = path.name,
         defaultLaps = default_laps_override or path.defaultLaps,
         closed = path.config.closed and true or false,
         branching = path.config.branching and true or false,
         reversible = is_reversible(path),
+        aiDefaults = ai_defaults,
     }
 end
 
@@ -214,7 +248,7 @@ function M.parse(locator)
     local race_file = locator.raceFile
     local folder = locator.folder or folder_of(race_file)
 
-    local path, default_laps
+    local path, default_laps, ai_defaults
     if locator.format == "quickrace" then
         local err
         path, err = quickrace.load_path(locator)
@@ -226,7 +260,9 @@ function M.parse(locator)
         if not path then
             return nil, "could not load race file"
         end
-        default_laps = mission_default_laps(folder)
+        local mission_type_data = read_mission_type_data(folder)
+        default_laps = mission_default_laps(mission_type_data)
+        ai_defaults = mission_ai_defaults(mission_type_data)
     end
 
     if path.config.branching then
@@ -245,7 +281,7 @@ function M.parse(locator)
     local race = {
         raceFile = race_file,
         folder = folder,
-        meta = build_meta(path, default_laps),
+        meta = build_meta(path, default_laps, ai_defaults),
         startPositions = build_start_positions(path),
         checkpoints = build_checkpoints(path),
         -- The dense authored race line for AI driving (ADR-0036); display/scoring use checkpoints.

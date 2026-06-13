@@ -224,7 +224,10 @@ function M.validate(payload)
             return {ok = false, reason = "not a loop -- add 'force' to run as circuit anyway"}
         end
     end
-    return {ok = true, raceId = locator.id}
+    -- Hand the server the aiRace content AI defaults (ADR-0036 Etappe B): the race-blind server uses
+    -- aiDefaults.count to seed the AI slots when /race opted into AI without an explicit count. nil for
+    -- non-aiRace content. The owner reads the same defaults locally via M.prepare for difficulty/vehicle.
+    return {ok = true, raceId = locator.id, aiDefaults = race.meta and race.meta.aiDefaults}
 end
 
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
@@ -316,6 +319,9 @@ function M.prepare(payload)
         plan = plan,
         -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.
         assists = resolve_assists(payload),
+        -- The aiRace authored AI defaults (ADR-0036 Etappe B): the owner fills any difficulty/vehicle
+        -- gaps from these when /race omitted an explicit preset/aicar. nil for non-aiRace content.
+        aiDefaults = race.meta and race.meta.aiDefaults,
     }
 end
 

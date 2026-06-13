@@ -113,6 +113,10 @@ local NAMETAG_RETRY_TIMEOUT = 10.0
 local RESTAGE_MAX_WAIT = 3.0
 local RESTAGE_MIN_DELTA = 0.2
 
+-- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
+-- on the host, so a larger field is heavier on the owner's machine.
+local AI_PERF_HINT_THRESHOLD = 6
+
 -- Reload-surviving state (BeamNG serializes M.state across a Lua reload).
 M.state = {
     last_event_at = 0,
@@ -143,6 +147,7 @@ M.state = {
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
+    ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
     ai_detections = nil,      -- host only: per-AI checkpoint-detection state keyed by AI id, armed on racing (ADR-0036), or nil
     ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
     ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
@@ -207,6 +212,7 @@ local function handle_race_start(payload)
         ai.stop(M.state.ai_cars or {})
         ai.clear(M.state.ai_cars or {})
         M.state.ai_cars = nil
+        M.state.ai_config = nil
         M.state.ai_detections = nil
         M.state.ai_map_pending = false
         M.state.ai_remote_ids = nil
@@ -279,6 +285,7 @@ local function handle_race_start(payload)
     ai.stop(M.state.ai_cars or {})
     ai.clear(M.state.ai_cars or {})
     M.state.ai_cars = nil
+    M.state.ai_config = nil
     M.state.ai_detections = nil
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
@@ -391,13 +398,25 @@ local function handle_race_start(payload)
     -- racing), are kept out of this client's Tab cycle, and are queued for the aiMap broadcast that lets
     -- remotes label + suppress them. The spawn-notification mute armed above also covers their burst.
     if type(payload.aiSlots) == "table" and #payload.aiSlots > 0 then
-        local cars = ai.spawn(payload.aiSlots, race.gridPoses)
+        -- The relayed AI difficulty/vehicle config (ADR-0036 Etappe B), owner-only; the driving params and
+        -- the per-car vehicle choice resolve from it plus the race's content defaults.
+        M.state.ai_config = payload.aiConfig
+        -- The AI vehicle chain reuses the relayed player policy (ADR-0032) as its second tier.
+        local cars = ai.spawn(payload.aiSlots, race.gridPoses, payload.aiConfig, race.aiDefaults, policy)
         if #cars > 0 then
             ai.set_frozen(cars, true)
             for _, car in ipairs(cars) do
                 local veh = be and be:getObjectByID(car.veh_id)
                 if veh then
                     ai.suppress(veh)
+                    -- Report this AI car's power-to-weight by proxy (ADR-0036 Etappe B) so the server can
+                    -- sort it into an order=pwr grid (ADR-0033); aiId-tagged, owner-only. Best-effort: a
+                    -- nil pwr just leaves the AI in its provisional back-of-grid slot.
+                    send_to_server("clientInfo", {
+                        race = payload.race,
+                        aiId = car.id,
+                        pwr = vehicles.collect_client_info(veh).pwr,
+                    })
                 end
             end
             M.state.ai_cars = cars
@@ -410,6 +429,15 @@ local function handle_race_start(payload)
                 M.state.current_vehicle_id = race_car:getId()
             end
             log("I", RACE_LOG_TAG, string.format("spawned %d AI opponent(s)", #cars))
+            -- Performance hint (ADR-0036 Etappe B): all AI physics run on this host, so warn once past a
+            -- handful. Owner-local + non-blocking -- it never gates the spawn.
+            if #cars >= AI_PERF_HINT_THRESHOLD then
+                guihooks.trigger("toastrMsg", {
+                    type = "warning",
+                    title = "BeamComp -- AI",
+                    msg = string.format("%d AI cars run on your machine -- expect higher load.", #cars),
+                })
+            end
         end
     end
 end
@@ -438,6 +466,7 @@ local function teardown_race_world()
     ai.stop(M.state.ai_cars or {})
     ai.clear(M.state.ai_cars or {})
     M.state.ai_cars = nil
+    M.state.ai_config = nil
     M.state.ai_detections = nil
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
@@ -535,8 +564,10 @@ local function handle_race_phase(payload)
             ai.set_frozen(M.state.ai_cars, false)
             -- Drive the dense authored race line (route points), falling back to the visible checkpoints
             -- if a race ships none, for the race's full lap count so the AI runs every lap (ADR-0036).
+            -- The resolved difficulty params (ADR-0036 Etappe B) come from the relayed config + content.
+            local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
             ai.drive(M.state.ai_cars, M.state.race.routePoints or M.state.race.checkpoints,
-                M.state.race.laps)
+                M.state.race.laps, ai_params)
             local detections = {}
             for _, car in ipairs(M.state.ai_cars) do
                 detections[car.id] = checkpoints.new(plan)
@@ -628,14 +659,49 @@ local function handle_list_vehicles(payload)
     send_to_server("vehicleList", {lines = carlist.build(model)})
 end
 
+-- Re-place the owner's host-driven AI cars onto their re-gridded poses (ADR-0036 Etappe B). `ai_slots` is
+-- the {id, slot} list the pwr re-grid sends the owner (ADR-0033); for each, update the tracked car's
+-- slot/pose and front-anchor it at the new grid pose, re-frozen until racing. No-op for a non-owner (no
+-- ai_cars) or a missing car/pose. Mirrors the player re-place below, run per AI car.
+local function replace_ai_for_regrid(ai_slots)
+    if type(ai_slots) ~= "table" or not M.state.ai_cars or not M.state.race then
+        return
+    end
+    local poses = M.state.race.gridPoses
+    if type(poses) ~= "table" then
+        return
+    end
+    local car_by_id = {}
+    for _, car in ipairs(M.state.ai_cars) do
+        car_by_id[car.id] = car
+    end
+    for _, entry in ipairs(ai_slots) do
+        local car = car_by_id[entry.id]
+        local pose = (type(entry.slot) == "number") and poses[entry.slot + 1] or nil
+        if car and pose then
+            car.slot = entry.slot
+            car.pose = pose
+            local veh = be and be:getObjectByID(car.veh_id)
+            if veh then
+                vehicles.place_at_grid(veh, pose)
+                vehicles.set_vehicle_frozen(veh, true)
+            end
+        end
+    end
+end
+
 -- The server re-gridded the start order (ADR-0033, order=pwr): adopt the new slot, re-place the race car
 -- at its new grid pose (picked from the pose set we already hold), and re-freeze. Mirrors
 -- restage_swapped_car; runs during staging, before the countdown. No-op if we are not in this race or the
--- car/pose is unavailable -- the spawn-freeze on the old pose then just holds the car where it is.
+-- car/pose is unavailable -- the spawn-freeze on the old pose then just holds the car where it is. The
+-- owner's regrid also carries its AI cars' new slots (ADR-0036 Etappe B), re-placed first.
 local function handle_regrid(payload)
     if not M.state.race or type(payload) ~= "table" then
         return
     end
+    -- Re-place the host's AI cars (owner-only; no-op otherwise) before the own-car logic, so a missing
+    -- own slot/pose below never skips the AI re-place.
+    replace_ai_for_regrid(payload.aiSlots)
     local slot = payload.slot
     local poses = M.state.race.gridPoses
     local pose = (type(slot) == "number" and poses) and poses[slot + 1] or nil
@@ -678,6 +744,9 @@ local function handle_validate_race(payload)
         -- lets a default assigned for the full id resolve whatever shorthand was typed for /race.
         map = maps.current(),
         raceId = result.raceId,
+        -- The aiRace content AI defaults (ADR-0036 Etappe B): the server uses aiDefaults.count to seed the
+        -- AI slots when /race requested AI without an explicit number. nil for non-aiRace content.
+        aiDefaults = result.aiDefaults,
     })
 end
 

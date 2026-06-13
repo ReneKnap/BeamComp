@@ -23,16 +23,68 @@ local M = {}
 
 local vehicles = require("beamcomp/race/vehicles")
 local cones = require("beamcomp/race/cones")
+local vehiclespecs = require("beamcomp/race/vehiclespecs")
 
 local LOG_TAG = "beamcomp.ai"
 
--- The car AI opponents drive in the proof. A single fixed stock model keeps the proof's variable the
--- driving quality, not the car; configurable AI vehicles are Etappe B (backlog/npc-ai-scale-and-config).
+-- The ultimate AI vehicle fallback (ADR-0036): used only when the resolution chain finds nothing and the
+-- installed-model list is unavailable. Normal AI vehicles resolve via resolve_ai_vehicle (Etappe B).
 local AI_MODEL = "etk800"
 
--- Defensive AI driving for the proof: a low aggression so the car favours staying on the line over
--- speed on tight tracks. Tunable presets are Etappe B.
-local AI_AGGRESSION = 0.6
+-- Difficulty presets (ADR-0036 Etappe B): each maps to BeamNG `ai` driving parameters. The default
+-- (medium) keeps the proof's defensive 0.6 aggression. rubberband is OFF in every preset -- a catch-up
+-- band is only enabled by an explicit airubber= override, never by a preset. aggression is the proven
+-- knob; skill/rubberband/avoidCars/speedMode are layered as guarded VE calls (spike, see drive_command).
+local PRESETS = {
+    easy = {aggression = 0.35, skill = 0.5, rubberband = 0, avoidCars = true, speedMode = "limit"},
+    medium = {aggression = 0.6, skill = 0.75, rubberband = 0, avoidCars = true, speedMode = "off"},
+    hard = {aggression = 0.95, skill = 1.0, rubberband = 0, avoidCars = true, speedMode = "off"},
+}
+local DEFAULT_PRESET = "medium"
+
+-- Resolve the effective AI driving parameters for a race (ADR-0036 Etappe B). Precedence per parameter:
+-- explicit ai*= override (config.params) -> the named preset (config.preset) -> the aiRace content
+-- defaults (content_defaults, only when no preset was given) -> the built-in default preset. Returns a
+-- params table {aggression, skill, rubberband, avoidCars, speedMode} the drive command reads.
+function M.resolve_params(config, content_defaults)
+    config = type(config) == "table" and config or {}
+    content_defaults = type(content_defaults) == "table" and content_defaults or {}
+    local preset = PRESETS[config.preset] or PRESETS[DEFAULT_PRESET]
+    local params = {
+        aggression = preset.aggression,
+        skill = preset.skill,
+        rubberband = preset.rubberband,
+        avoidCars = preset.avoidCars,
+        speedMode = preset.speedMode,
+    }
+    -- With no explicit preset, let the content's authored defaults fill the two knobs it carries.
+    if not config.preset then
+        if content_defaults.aggression then
+            params.aggression = content_defaults.aggression
+        end
+        if content_defaults.skill then
+            params.skill = content_defaults.skill
+        end
+    end
+    -- Explicit ai*= overrides win per parameter.
+    local overrides = config.params or {}
+    if overrides.aggr ~= nil then
+        params.aggression = overrides.aggr
+    end
+    if overrides.skill ~= nil then
+        params.skill = overrides.skill
+    end
+    if overrides.rubber ~= nil then
+        params.rubberband = overrides.rubber
+    end
+    if overrides.avoid ~= nil then
+        params.avoidCars = overrides.avoid
+    end
+    if overrides.speed ~= nil then
+        params.speedMode = overrides.speed
+    end
+    return params
+end
 
 -- Candidate MPVehicleGE entry fields that carry a vehicle's cross-client BeamMP id (spike #2). Tried in
 -- order until one yields a value; logged so the handover test can pin the real field.
@@ -58,21 +110,86 @@ local function spawn_oobb_forward(veh)
     return nil
 end
 
+-- Split an "model[:config]" token into (model, config); config is nil when absent. nil for an empty token.
+local function split_car_token(token)
+    if type(token) ~= "string" or token == "" then
+        return nil
+    end
+    local model, config = token:match("^([^:]+):(.+)$")
+    if model then
+        return model, config
+    end
+    return token, nil
+end
+
+-- A random installed DRIVABLE model, owner-local (only the owner spawns AI, so no cross-client determinism
+-- is needed). Draws from list_car_models so an AI never spawns as a prop/cone (ADR-0036 Etappe B). Falls
+-- back to the fixed stock model when the (filtered) list is unavailable.
+local function random_stock_model()
+    local models = vehiclespecs.list_car_models()
+    if #models == 0 then
+        return AI_MODEL
+    end
+    return models[math.random(#models)]
+end
+
+-- Resolve one AI car's {model, config} via the Etappe-B fallback chain (ADR-0036). Precedence: explicit
+-- aicar= (config.car) -> the player vehicle policy (ADR-0032: Mode 2 fixed car / Mode 3 cap-compliant car;
+-- Mode 1 = no policy falls through) -> the aiRace content default vehicle(s) -> a random stock model.
+-- `index` (1-based) cycles the content vehicle list so multiple AI vary. Returns (model, config).
+local function resolve_ai_vehicle(config, content_defaults, policy, index)
+    config = type(config) == "table" and config or {}
+    policy = type(policy) == "table" and policy or {}
+    content_defaults = type(content_defaults) == "table" and content_defaults or {}
+
+    if config.car then
+        local model, vehicle_config = split_car_token(config.car)
+        if model then
+            return model, vehicle_config
+        end
+    end
+
+    if policy.car then
+        return split_car_token(policy.car)
+    end
+    if policy.maxhp or policy.maxpwr then
+        local pick = vehiclespecs.find_compliant(nil, policy.maxhp, policy.maxpwr)
+        if pick then
+            return pick.model, pick.config
+        end
+        -- No compliant car: fall through to content/stock so the AI still races (best effort).
+    end
+
+    local vehicle_list = content_defaults.vehicles
+    if type(vehicle_list) == "table" and #vehicle_list > 0 then
+        local token = vehicle_list[((index - 1) % #vehicle_list) + 1]
+        local model, vehicle_config = split_car_token(token)
+        if model then
+            return model, vehicle_config
+        end
+    end
+
+    return random_stock_model(), nil
+end
+
 -- Spawn one host-owned AI car per slot at its grid pose (ADR-0036). `ai_slots` is the owner's relayed
--- list of {slot, id, label}; `grid_poses` is the full resolved grid (race/start). Returns a list of
--- spawned cars {id, slot, label, veh_id}; a slot whose spawn fails is logged and skipped (the proof
--- degrades to fewer AI rather than aborting). BeamMP propagates each spawn to all clients.
-function M.spawn(ai_slots, grid_poses)
+-- list of {slot, id, label}; `grid_poses` is the full resolved grid (race/start). Each car's vehicle is
+-- resolved via the Etappe-B fallback chain (resolve_ai_vehicle) from the relayed `config`/`content_defaults`
+-- (ADR-0036 Etappe B) and the player `policy` (ADR-0032). Returns a list of spawned cars
+-- {id, slot, label, veh_id}; a slot whose spawn fails is logged and skipped (the field degrades to fewer
+-- AI rather than aborting). BeamMP propagates each spawn to all clients.
+function M.spawn(ai_slots, grid_poses, config, content_defaults, policy)
     local cars = {}
     if type(ai_slots) ~= "table" or type(grid_poses) ~= "table" then
         return cars
     end
-    for _, slot_info in ipairs(ai_slots) do
+    for index, slot_info in ipairs(ai_slots) do
         local pose = grid_poses[(slot_info.slot or 0) + 1]
         if not pose then
             log("W", LOG_TAG, "no grid pose for AI slot " .. tostring(slot_info.slot))
         else
-            local veh, reason = vehicles.spawn_at(pose, AI_MODEL, nil)
+            local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index)
+            local veh, reason = vehicles.spawn_at(pose, model, vehicle_config)
             if veh then
                 cars[#cars + 1] = {
                     id = slot_info.id,
@@ -92,8 +209,10 @@ function M.spawn(ai_slots, grid_poses)
                 -- yet, unlike a player car), so a ~half-car forward offset is expected, not a bug.
                 local landed = veh:getPosition()
                 log("I", LOG_TAG, string.format(
-                    "spawned AI '%s' (%s) slot %s -> pose (%.1f, %.1f, %.1f), landed (%.1f, %.1f, %.1f)",
-                    tostring(slot_info.label), tostring(slot_info.id), tostring(slot_info.slot),
+                    "spawned AI '%s' (%s) '%s%s' slot %s -> pose (%.1f, %.1f, %.1f), "
+                    .. "landed (%.1f, %.1f, %.1f)",
+                    tostring(slot_info.label), tostring(slot_info.id), tostring(model),
+                    vehicle_config and (":" .. vehicle_config) or "", tostring(slot_info.slot),
                     pose.pos.x, pose.pos.y, pose.pos.z, landed.x, landed.y, landed.z))
             else
                 log("W", LOG_TAG, "AI spawn failed for slot " .. tostring(slot_info.slot)
@@ -177,20 +296,55 @@ local function resolve_waypoint_names(route)
     return names
 end
 
--- The VE-side Lua that drives one AI car (SPIKE #1, ADR-0036): set manual AI + aggression, then either
--- follow the resolved navgraph waypoints (ai.driveUsingPath) or, if none resolved, span the road network
--- so the car still drives (proving the host-owned car is AI-drivable + BeamMP-synced). Trivial + cannot
--- throw -- the heavy navgraph lookup happened GE-side. The multi-lap repetition is baked into
--- `names_literal` (BeamNG's noOfLaps does NOT loop a wpTargetList, verified in-game), so noOfLaps stays 1.
-local function drive_command(names_literal)
+-- The optional difficulty-parameter VE calls beyond aggression (SPIKE, ADR-0036 Etappe B). skill,
+-- rubberband, avoidCars and a non-default speedMode have no stable ai.driveUsingPath argument across
+-- engine versions, so each is emitted as its own pcall-wrapped call: pcall(ai.setX, v) is safe even when
+-- ai.setX is nil (pcall catches the nil-call), so a missing API no-ops instead of breaking the proven
+-- drive. Returns a "; "-joined call list (possibly empty). rubberband is only emitted when > 0 (off by
+-- default in every preset).
+--
+-- In-game effectiveness on BeamNG 0.38.5 (2-client handover, 2026-06-13): `aggression` and `avoidCars`
+-- have a clear visible effect; `aiskill=` has NO visible effect (kept exposed as best-effort, but the
+-- real difficulty knob is aggression); `aispeed=` (speedMode) is unverified and likely inert without a
+-- companion target speed (ai.setSpeed, not wired). See memory beamcomp-ai-driving-findings.
+local function optional_param_calls(params)
+    local calls = {}
+    if params.skill ~= nil then
+        calls[#calls + 1] = string.format("pcall(ai.setSkill, %.2f)", params.skill)
+    end
+    if params.rubberband and params.rubberband > 0 then
+        calls[#calls + 1] = string.format("pcall(ai.setRubberbandValue, %.2f)", params.rubberband)
+    end
+    if params.avoidCars ~= nil then
+        calls[#calls + 1] = string.format("pcall(ai.setAvoidCars, %q)", params.avoidCars and "on" or "off")
+    end
+    if params.speedMode and params.speedMode ~= "off" then
+        calls[#calls + 1] = string.format("pcall(ai.setSpeedMode, %q)", params.speedMode)
+    end
+    return table.concat(calls, "; ")
+end
+
+-- The VE-side Lua that drives one AI car (SPIKE #1, ADR-0036): set manual AI + the resolved aggression,
+-- then either follow the resolved navgraph waypoints (ai.driveUsingPath) or, if none resolved, span the
+-- road network so the car still drives. The proven driveUsingPath arg set (wpTargetList/noOfLaps/
+-- aggression) is kept byte-for-byte; the Etappe-B difficulty params ride as guarded trailing calls
+-- (optional_param_calls) so they never regress the proven drive. Trivial + cannot throw -- the heavy
+-- navgraph lookup happened GE-side. Multi-lap repetition is baked into `names_literal` (noOfLaps does NOT
+-- loop a wpTargetList, verified in-game), so noOfLaps stays 1.
+local function drive_command(names_literal, params)
+    local extras = optional_param_calls(params)
+    if extras ~= "" then
+        extras = "; " .. extras
+    end
     if names_literal == "" then
         return string.format(
-            "ai.setMode('manual'); ai.setAggression(%.2f); ai.setMode('span')", AI_AGGRESSION)
+            "ai.setMode('manual'); ai.setAggression(%.2f); ai.setMode('span')%s",
+            params.aggression, extras)
     end
     return string.format(
         "ai.setMode('manual'); ai.setAggression(%.2f); "
-        .. "ai.driveUsingPath({wpTargetList = {%s}, noOfLaps = 1, aggression = %.2f})",
-        AI_AGGRESSION, names_literal, AI_AGGRESSION)
+        .. "ai.driveUsingPath({wpTargetList = {%s}, noOfLaps = 1, aggression = %.2f})%s",
+        params.aggression, names_literal, params.aggression, extras)
 end
 
 -- Append `name` to `names` unless it repeats the current tail. ai.driveUsingPath dislikes
@@ -222,13 +376,15 @@ end
 
 -- Arm BeamNG's vehicle AI to drive each car along the race route (SPIKE #1, ADR-0036). Resolves
 -- the route to navgraph waypoint names GE-side, lays them out over the lap count
--- (lay_out_lap_waypoints), then queues the trivial drive command to each car's VE (queueLuaCommand,
--- the channel vehicles.set_vehicle_frozen uses). BeamNG's noOfLaps does not loop a wpTargetList
--- (verified in-game), so every lap is laid out explicitly. pcall-guarded.
-function M.drive(cars, route, laps)
+-- (lay_out_lap_waypoints), then queues the drive command -- built from the resolved difficulty `params`
+-- (ADR-0036 Etappe B) -- to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen
+-- uses). BeamNG's noOfLaps does not loop a wpTargetList (verified in-game), so every lap is laid out
+-- explicitly. pcall-guarded. A nil `params` falls back to the default preset so the call is always safe.
+function M.drive(cars, route, laps, params)
     if type(cars) ~= "table" or type(route) ~= "table" then
         return
     end
+    params = type(params) == "table" and params or M.resolve_params(nil, nil)
     local lap_count = math.max(1, math.floor(tonumber(laps) or 1))
     local lap_names = resolve_waypoint_names(route)
     local names = lay_out_lap_waypoints(lap_names, lap_count)
@@ -236,7 +392,7 @@ function M.drive(cars, route, laps)
     for _, name in ipairs(names) do
         quoted[#quoted + 1] = string.format("%q", name)
     end
-    local command = drive_command(table.concat(quoted, ", "))
+    local command = drive_command(table.concat(quoted, ", "), params)
     log("I", LOG_TAG, string.format(
         "AI route: %d waypoint(s)/lap from %d point(s), %d lap(s) -> %d total",
         #lap_names, #route, lap_count, #names))
