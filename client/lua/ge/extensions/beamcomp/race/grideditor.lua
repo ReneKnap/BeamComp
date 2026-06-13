@@ -26,8 +26,9 @@ local LOG_TAG = "beamcomp.grid"
 local PREVIEW_COUNT = grid.LAYOUT_CAPACITY
 
 -- Tunable knobs (camelCase, matching the stored/wire param keys) and their constraints. Offsets and
--- heading are unrestricted; gaps are non-negative; rows is a positive integer (the per-column stagger is
--- derived from rowGap / columns, not a knob).
+-- heading are unrestricted; gaps are non-negative; rows and columns are positive integers. rows and
+-- columns are two ways to express the same width and are mutually exclusive (see M.set): columns pins the
+-- column count (it does not grow with a large field), rows derives the columns from the fixed capacity.
 local KNOBS = {
     offsetForward = {},
     offsetLateral = {},
@@ -35,6 +36,7 @@ local KNOBS = {
     rowGap = {min = 0},
     colGap = {min = 0},
     rows = {min = 1, max = PREVIEW_COUNT, integer = true},
+    columns = {min = 1, max = PREVIEW_COUNT, integer = true},
 }
 
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
@@ -166,7 +168,13 @@ function M.set(knob, value)
         number = constraint.max
     end
 
-    M.state.blocks[M.state.direction][knob] = number
+    local block = M.state.blocks[M.state.direction]
+    block[knob] = number
+    -- rows and columns are mutually exclusive widths (last set wins): setting columns pins the width and
+    -- overrides the rows derivation; setting rows drops a pinned columns so the width derives again.
+    if knob == "rows" then
+        block.columns = nil
+    end
     recompute()
     return true, number
 end

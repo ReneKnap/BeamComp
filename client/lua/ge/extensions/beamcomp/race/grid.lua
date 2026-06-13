@@ -145,6 +145,15 @@ local function resolved_params(params)
         rows = math.ceil(GRID_CAPACITY / DEFAULT_COLUMNS)
     end
     rows = math.max(1, math.min(GRID_CAPACITY, math.floor(rows)))
+    -- An explicit column count PINS the columns (poses uses it verbatim instead of deriving from rows +
+    -- capacity), so the grid keeps that many columns even above the capacity -- the way to stop the column
+    -- count growing when the field is large (e.g. many AI). nil = derive from rows (the historical layout).
+    local columns = params.columns
+    if type(columns) == "number" and columns >= 1 then
+        columns = math.max(1, math.min(GRID_CAPACITY, math.floor(columns)))
+    else
+        columns = nil
+    end
     return {
         offset_forward = params.offsetForward or DEFAULT_OFFSET_FORWARD,
         offset_lateral = params.offsetLateral or DEFAULT_OFFSET_LATERAL,
@@ -152,6 +161,7 @@ local function resolved_params(params)
         row_gap = params.rowGap or DEFAULT_ROW_GAP,
         col_gap = params.colGap or DEFAULT_COL_GAP,
         rows = rows,
+        columns = columns,
     }
 end
 
@@ -174,8 +184,9 @@ end
 --   params      -- optional grid param set (ADR-0023): offsetForward/offsetLateral (metres, along the
 --                  travel/right axes), headingDeg (extra rotation of the whole grid about vertical),
 --                  rowGap/colGap (metres), rows (columns are derived as ceil(capacity / rows), where
---                  capacity is a fixed field size, so a slot's pose does not shift with the live count).
---                  Nil or missing fields fall back to the historical layout.
+--                  capacity is a fixed field size, so a slot's pose does not shift with the live count),
+--                  or columns (an explicit column count that pins the width and overrides the rows
+--                  derivation). Nil or missing fields fall back to the historical layout.
 --   gate_normal -- optional {x, y, z} start/finish gate normal (CP0's direction of travel). When given
 --                  the grid lays out behind it; when absent it derives forward from base_rot.
 -- Each slot is placed as right * lateral + (-forward) * setback: lateral spreads the columns about the
@@ -212,10 +223,11 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
         rot = quat_mul(z_quat(heading_rad), base_rot)
     end
 
-    -- Columns from the FIXED capacity (not the live count), so slot k sits in the same place whether 1
-    -- or capacity cars spawn -- the editor preview then matches the real grid. A field above capacity
-    -- grows the columns to fit.
-    local columns = math.ceil(math.max(count, GRID_CAPACITY) / p.rows)
+    -- Columns: an explicit count (p.columns) pins them so the grid never grows wider than asked, even
+    -- above the capacity. Otherwise derive from the FIXED capacity (not the live count), so slot k sits in
+    -- the same place whether 1 or capacity cars spawn -- the editor preview then matches the real grid; a
+    -- field above capacity grows the columns to fit.
+    local columns = p.columns or math.ceil(math.max(count, GRID_CAPACITY) / p.rows)
     local centre_column = (columns - 1) / 2
     -- Per-column stagger: spread the columns evenly across one row's depth so the grid forms a smooth
     -- diagonal (two columns -> column 2 at half the row gap), continuing into the next rows.

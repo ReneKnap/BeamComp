@@ -2687,6 +2687,8 @@ end
 --   colGap         -- spacing between positions left-to-right (m)
 --   headingDeg     -- rotate the whole grid about vertical (deg)
 --   rows           -- number of rows (columns = ceil(field / rows); columns auto-stagger by rowGap/cols)
+--   columns        -- explicit number of columns: pins the grid width so it does not grow with a large
+--                     field (e.g. many AI); overrides rows. Setting rows again switches back to deriving.
 
 -- GE console command (intentionally global): start a fresh grid from the track's generated layout.
 function beamcomp_grid_new(race_name)
