@@ -562,12 +562,14 @@ local function handle_race_phase(payload)
         -- have no ai_cars, so this is inert for them -- the AI cars just sync in and drive on the owner.
         if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
             ai.set_frozen(M.state.ai_cars, false)
-            -- Drive the dense authored race line (route points), falling back to the visible checkpoints
-            -- if a race ships none, for the race's full lap count so the AI runs every lap (ADR-0036).
-            -- The resolved difficulty params (ADR-0036 Etappe B) come from the relayed config + content.
+            -- Drive BeamNG's authored AI navgraph path when the content ships one (aiWaypoints), else fall
+            -- back to the navgraph snap of the dense route points, else the visible checkpoints, for the
+            -- race's full lap count so the AI runs every lap (ADR-0036 Step-3 three-tier source). The
+            -- resolved difficulty params (ADR-0036 Etappe B) come from the relayed config + content.
             local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
-            ai.drive(M.state.ai_cars, M.state.race.routePoints or M.state.race.checkpoints,
-                M.state.race.laps, ai_params)
+            ai.drive(M.state.ai_cars, M.state.race.aiWaypoints,
+                M.state.race.routePoints or M.state.race.checkpoints, M.state.race.laps, ai_params,
+                M.state.race.mode == "circuit")
             local detections = {}
             for _, car in ipairs(M.state.ai_cars) do
                 detections[car.id] = checkpoints.new(plan)
