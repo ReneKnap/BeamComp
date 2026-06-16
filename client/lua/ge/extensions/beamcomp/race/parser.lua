@@ -286,6 +286,11 @@ function M.parse(locator)
         checkpoints = build_checkpoints(path),
         -- The dense authored race line for AI driving (ADR-0036); display/scoring use checkpoints.
         routePoints = build_route_points(path),
+        -- The live BeamNG path object, for race/start to resolve BeamNG's own authored AI navgraph path
+        -- (path:getAiPath) at prepare time (ADR-0036 Step-3 amendment). Used transiently and never kept in
+        -- M.state.race; resolving it here would snap against the wrong map (the parser also runs for the
+        -- race browser on non-loaded maps), so it is left to prepare where the race's map is loaded.
+        path = path,
         props = props,
     }
 
