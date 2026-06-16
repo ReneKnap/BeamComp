@@ -374,28 +374,92 @@ local function lay_out_lap_waypoints(lap_names, lap_count)
     return names
 end
 
--- Arm BeamNG's vehicle AI to drive each car along the race route (SPIKE #1, ADR-0036). Resolves
--- the route to navgraph waypoint names GE-side, lays them out over the lap count
--- (lay_out_lap_waypoints), then queues the drive command -- built from the resolved difficulty `params`
--- (ADR-0036 Etappe B) -- to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen
--- uses). BeamNG's noOfLaps does not loop a wpTargetList (verified in-game), so every lap is laid out
--- explicitly. pcall-guarded. A nil `params` falls back to the default preset so the call is always safe.
-function M.drive(cars, route, laps, params)
-    if type(cars) ~= "table" or type(route) ~= "table" then
+-- BeamNG's own authored AI navgraph path for a race, as the ordered waypoint NAMES path:getAiPath produces
+-- (ADR-0036 Step-3 amendment) -- the PRIMARY AI route source for forward races. getAiPath walks the race's
+-- ordered segment graph and snaps each segment node to the navgraph (the exact list stock aiRace drives),
+-- more robust than the per-point snap of resolve_waypoint_names. The list runs CP1..CPn and, on a closed
+-- loop, ENDS on the start/finish node -- that trailing node is the finish-line crossing and must stay last
+-- (moving it to the front strands the AI on the last CP). GE-side: needs the loaded navgraph, so the caller
+-- resolves it at race-start prepare time (where the race's map is loaded), not at parse time. Returns {}
+-- when the content has no navgraph AI path (no graph, off-road, or a branch). Fully pcall-guarded; never
+-- throws into the host. Consecutive duplicates are dropped.
+function M.resolve_authored_waypoints(path)
+    if type(path) ~= "table" or type(path.getAiPath) ~= "function" then
+        return {}
+    end
+    local ok, ai_path = pcall(function() return path:getAiPath(true) end)
+    if not ok or type(ai_path) ~= "table" or #ai_path == 0 then
+        return {}
+    end
+    local names = {}
+    for _, name in ipairs(ai_path) do
+        append_waypoint(names, name)
+    end
+    return names
+end
+
+-- Lay the authored single-lap AI path (resolve_authored_waypoints) out across `lap_count` laps. Unlike the
+-- navgraph-snap layout (lay_out_lap_waypoints), the authored path keeps the start/finish node at the END of
+-- each lap, so a lap is repeated in FULL -- the seam (finish -> first corner) is the natural racing line, no
+-- node is dropped, and every checkpoint is hit on every lap. On a closed loop the first node is appended
+-- once more after the final lap so the AI drives THROUGH the finish line instead of stopping on it (mirrors
+-- BeamNG's own race.lua startAiVehicle). Consecutive duplicates are dropped. Pure; returns the name list.
+local function lay_out_authored_laps(lap_names, lap_count, closed)
+    local names = {}
+    for _ = 1, lap_count do
+        for _, name in ipairs(lap_names) do
+            append_waypoint(names, name)
+        end
+    end
+    if closed and lap_names[1] then
+        append_waypoint(names, lap_names[1])
+    end
+    return names
+end
+
+-- Arm BeamNG's vehicle AI to drive each car along the race route (ADR-0036, Step-3 three-tier source).
+-- The single-lap waypoint names resolve through: 1) the authored navgraph AI path (`ai_waypoints`, from
+-- path:getAiPath at prepare time), 2) the per-point navgraph snap of `route` (resolve_waypoint_names),
+-- 3) [reserved: Step 3b -- a direct checkpoint line], else a span drive. The chosen list is laid out over
+-- the lap count -- authored via lay_out_authored_laps (start node kept last, full-lap repeat, finish drive-
+-- through on a closed loop), the snap via lay_out_lap_waypoints (start-first, drop-leading seam) -- and the
+-- drive command (built from the resolved difficulty `params`, ADR-0036 Etappe B) is queued to each car's VE
+-- (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). BeamNG's noOfLaps does not loop a
+-- wpTargetList (verified in-game), so every lap is laid out explicitly. A nil `ai_waypoints` falls straight
+-- through to the navgraph snap (the pre-Step-3 behaviour). `closed` (race is a circuit) drives the authored
+-- finish drive-through. pcall-guarded. A nil `params` falls back to the default preset.
+function M.drive(cars, ai_waypoints, route, laps, params, closed)
+    if type(cars) ~= "table" then
         return
     end
+    route = type(route) == "table" and route or {}
     params = type(params) == "table" and params or M.resolve_params(nil, nil)
     local lap_count = math.max(1, math.floor(tonumber(laps) or 1))
-    local lap_names = resolve_waypoint_names(route)
-    local names = lay_out_lap_waypoints(lap_names, lap_count)
+
+    local authored = type(ai_waypoints) == "table" and ai_waypoints or {}
+    local lap_names, names, source
+    if #authored > 0 then
+        lap_names = authored
+        names = lay_out_authored_laps(authored, lap_count, closed)
+        source = "authored"
+    else
+        lap_names = resolve_waypoint_names(route)
+        names = lay_out_lap_waypoints(lap_names, lap_count)
+        source = "navgraph-snap"
+        -- Step 3b (backlog/npc-ai-in-time-trial) hooks in here: when lap_names is still empty, a direct
+        -- checkpoint line (no navgraph snap) would resolve before the span fallback below.
+    end
+    if #names == 0 then
+        source = "span"
+    end
     local quoted = {}
     for _, name in ipairs(names) do
         quoted[#quoted + 1] = string.format("%q", name)
     end
     local command = drive_command(table.concat(quoted, ", "), params)
     log("I", LOG_TAG, string.format(
-        "AI route: %d waypoint(s)/lap from %d point(s), %d lap(s) -> %d total",
-        #lap_names, #route, lap_count, #names))
+        "AI route source=%s: %d waypoint(s)/lap (authored=%d, route points=%d), %d lap(s) -> %d total",
+        source, #lap_names, #authored, #route, lap_count, #names))
     log("I", LOG_TAG, string.format(
         "AI lap layout: lap_count=%d, lap_names=[%s]",
         lap_count, table.concat(lap_names, ", ")))
