@@ -46,8 +46,8 @@ local DEFAULT_PRESET = "medium"
 -- parameter: explicit ai*= override (config.params) -> the named preset (config.preset) -> the aiRace
 -- content defaults (content_defaults, only when no preset was given) -> the built-in default preset.
 -- Returns {aggression, skill, rubberband, avoidCars, route} the drive command reads. `route` selects the AI
--- route variant (airoute=script|snap, default "script"): "script" drives the exact authored line via a
--- per-AI custom navgraph, "snap" snaps the route onto the road navgraph.
+-- route variant (airoute=snap|direct, default "snap"): "snap" snaps the route onto the road navgraph (the
+-- default), "direct" drives the exact authored line via a per-race custom navgraph (off-road capable).
 function M.resolve_params(config, content_defaults)
     config = type(config) == "table" and config or {}
     content_defaults = type(content_defaults) == "table" and content_defaults or {}
@@ -57,7 +57,7 @@ function M.resolve_params(config, content_defaults)
         skill = preset.skill,
         rubberband = preset.rubberband,
         avoidCars = preset.avoidCars,
-        route = "script",
+        route = "snap",
     }
     -- With no explicit preset, let the content's authored defaults fill the two knobs it carries.
     if not config.preset then
@@ -82,7 +82,7 @@ function M.resolve_params(config, content_defaults)
     if overrides.avoid ~= nil then
         params.avoidCars = overrides.avoid
     end
-    if overrides.route == "snap" or overrides.route == "script" then
+    if overrides.route == "snap" or overrides.route == "direct" then
         params.route = overrides.route
     end
     return params
@@ -305,9 +305,8 @@ end
 -- list (possibly empty). rubberband is only emitted when > 0 (off by default in every preset).
 --
 -- In-game effectiveness on BeamNG 0.38.5 (2-client, 2026-06-13): `aggression` and `avoidCars` have a clear
--- visible effect; `aiskill=` has NO visible effect (kept best-effort). The old `aispeed=` speedMode was
--- inert and is repurposed (Step-3b) into the script speed-profile toggle, so it is no longer emitted here.
--- See memory beamcomp-ai-driving-findings.
+-- visible effect; `aiskill=` has NO visible effect (kept best-effort). The old `aispeed=` speed-mode knob
+-- was inert and has been retired. See memory beamcomp-ai-driving-findings.
 local function optional_param_calls(params)
     local calls = {}
     if params.skill ~= nil then
@@ -492,10 +491,10 @@ local function drive_command_wptargets(index_sequence, params)
 end
 
 -- Arm BeamNG's vehicle AI to drive each car along the race route (ADR-0036 Step-3b). The route variant is
--- `params.route`: "script" (default) installs a custom navgraph whose only road is the race line
+-- `params.route`: "snap" (default) routes over the per-point navgraph snap (resolve_waypoint_names +
+-- wpTargetList, the on-road variant); "direct" installs a custom navgraph whose only road is the race line
 -- (install_custom_race_map -> map.reset) and drives the EXACT authored line over it via the non-teleporting
--- ai.driveUsingPath{wpTargetList} (off-road capable, no road snap); "snap" routes over the per-point
--- navgraph snap (resolve_waypoint_names + wpTargetList, the on-road variant); an empty result spans the road
+-- ai.driveUsingPath{wpTargetList} (off-road capable, no road snap); an empty result spans the road
 -- network so the car still drives. The lap sequence is laid out over the lap count (full-lap repeat +
 -- closed-loop finish drive-through), then the drive command -- built from the resolved difficulty `params`
 -- -- is queued to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). `closed` (a
@@ -512,7 +511,19 @@ function M.drive(cars, route, laps, params, closed)
 
     local source, command, per_lap, total
     local custom_map = false
-    if params.route == "snap" then
+    if params.route == "direct" then
+        local nodes = build_route_nodes(route)
+        local index_sequence = lay_out_node_indices(#nodes, lap_count, closed)
+        if install_custom_race_map(nodes, closed) then
+            command = drive_command_wptargets(index_sequence, params)
+            source = "direct"
+            custom_map = true
+        else
+            command = drive_command_wptargets({}, params)
+            source = "span"
+        end
+        per_lap, total = #nodes, #index_sequence
+    else
         local lap_names = resolve_waypoint_names(route)
         local names = lay_out_lap_waypoints(lap_names, lap_count)
         local quoted = {}
@@ -522,18 +533,6 @@ function M.drive(cars, route, laps, params, closed)
         command = drive_command(table.concat(quoted, ", "), params)
         source = #names > 0 and "navgraph-snap" or "span"
         per_lap, total = #lap_names, #names
-    else
-        local nodes = build_route_nodes(route)
-        local index_sequence = lay_out_node_indices(#nodes, lap_count, closed)
-        if install_custom_race_map(nodes, closed) then
-            command = drive_command_wptargets(index_sequence, params)
-            source = "customgraph"
-            custom_map = true
-        else
-            command = drive_command_wptargets({}, params)
-            source = "span"
-        end
-        per_lap, total = #nodes, #index_sequence
     end
 
     log("I", LOG_TAG, string.format(

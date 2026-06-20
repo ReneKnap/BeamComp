@@ -24,10 +24,9 @@
 --                 compliant car or substitute one (Mode 3); none = keep own car (Mode 1). car= wins.
 --                 AI opponents (ADR-0036): ai <n> [preset] adds n host-driven AI (no count = content
 --                 default, [1..16]); preset easy|medium|hard, aicar=/aiaggr=/aiskill=/airubber=/aiavoid=
---                 configure their vehicle + driving. airoute=script|snap picks the AI line (script =
---                 exact authored line off-road, default; snap = navgraph), aispeed=on|off toggles the
---                 script speed profile (Step-3b). AI mix into random and sort by reported pwr; else back
---                 of grid.
+--                 configure their vehicle + driving. airoute=snap|direct picks the AI line (snap =
+--                 road-navgraph snap, default; direct = exact custom-navgraph race line, off-road,
+--                 Step-3b). AI mix into random and sort by reported pwr; else back of grid.
 --                 start order (ADR-0033): order=entry (default) | random | last (prev race result) |
 --                 pwr (power-to-weight); :rev flips a directional mode (last:rev/pwr:rev = handicap).
 --                 the deprecated quickrace ("menu:") source is hidden from bare-name resolution unless
@@ -1771,7 +1770,7 @@ local RACE_USAGE =
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
     .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
-    .. "[aiavoid=on|off] [airoute=script|snap] [aispeed=on|off] [all]"
+    .. "[aiavoid=on|off] [airoute=snap|direct] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -1910,8 +1909,8 @@ end
 -- turns one back off (ADR-0017 amendment).
 -- Classify one "ai*=" raw-parameter override token into the BeamNG ai parameter it sets (ADR-0036
 -- Etappe B + Step-3b). aggression/skill/rubberband take a [0,1] number (clamped); avoid takes on/off;
--- route takes script|snap (the AI route variant, default script); speed takes on|off (the script
--- speed-profile toggle, default on). Returns (key, value) or nil for an unknown ai key or an invalid
+-- route takes snap|direct (the AI route variant, default snap: snap = road-navgraph snap, direct = exact
+-- custom-navgraph race line, off-road). Returns (key, value) or nil for an unknown ai key or an invalid
 -- value, so the caller can reply usage. "aicar=" is NOT an ai parameter (model token) and resolves to nil.
 local function parse_ai_param_token(token)
     local key, raw = token:match("^[Aa][Ii](%a+)=(.+)$")
@@ -1938,14 +1937,7 @@ local function parse_ai_param_token(token)
     end
     if key == "route" then
         local lowered = raw:lower()
-        if lowered == "script" or lowered == "snap" then
-            return key, lowered
-        end
-        return nil
-    end
-    if key == "speed" then
-        local lowered = raw:lower()
-        if lowered == "on" or lowered == "off" then
+        if lowered == "snap" or lowered == "direct" then
             return key, lowered
         end
         return nil
