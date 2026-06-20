@@ -148,6 +148,8 @@ M.state = {
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
     ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
+    ai_custom_map = nil,      -- host only: true while the script-variant custom race navgraph is live (ADR-0036 Step-3b); teardown restores the real one
+
     ai_detections = nil,      -- host only: per-AI checkpoint-detection state keyed by AI id, armed on racing (ADR-0036), or nil
     ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
     ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
@@ -211,6 +213,10 @@ local function handle_race_start(payload)
         -- been the previous owner, so its host-spawned AI must not linger into a race it is not in.
         ai.stop(M.state.ai_cars or {})
         ai.clear(M.state.ai_cars or {})
+        if M.state.ai_custom_map then
+            ai.restore_map()
+            M.state.ai_custom_map = nil
+        end
         M.state.ai_cars = nil
         M.state.ai_config = nil
         M.state.ai_detections = nil
@@ -284,6 +290,10 @@ local function handle_race_start(payload)
     -- spawned at the end, once this client's own car is placed.
     ai.stop(M.state.ai_cars or {})
     ai.clear(M.state.ai_cars or {})
+    if M.state.ai_custom_map then
+        ai.restore_map()
+        M.state.ai_custom_map = nil
+    end
     M.state.ai_cars = nil
     M.state.ai_config = nil
     M.state.ai_detections = nil
@@ -465,6 +475,10 @@ local function teardown_race_world()
     -- Idempotent + host-only (all nil on a non-owner). Remote AI id sets are just dropped below.
     ai.stop(M.state.ai_cars or {})
     ai.clear(M.state.ai_cars or {})
+    if M.state.ai_custom_map then
+        ai.restore_map()
+        M.state.ai_custom_map = nil
+    end
     M.state.ai_cars = nil
     M.state.ai_config = nil
     M.state.ai_detections = nil
@@ -562,14 +576,17 @@ local function handle_race_phase(payload)
         -- have no ai_cars, so this is inert for them -- the AI cars just sync in and drive on the owner.
         if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
             ai.set_frozen(M.state.ai_cars, false)
-            -- Drive BeamNG's authored AI navgraph path when the content ships one (aiWaypoints), else fall
-            -- back to the navgraph snap of the dense route points, else the visible checkpoints, for the
-            -- race's full lap count so the AI runs every lap (ADR-0036 Step-3 three-tier source). The
-            -- resolved difficulty params (ADR-0036 Etappe B) come from the relayed config + content.
+            -- Drive the AI along the race line: the exact authored positions (script variant, default) or
+            -- the navgraph snap (airoute=snap), for the race's full lap count so the AI runs every lap
+            -- (ADR-0036 Step-3b). The resolved difficulty + route params (ADR-0036 Etappe B) come from the
+            -- relayed config + content; circuit drives the closed-loop finish drive-through.
             local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
-            local ai_route = ai.drive(M.state.ai_cars, M.state.race.aiWaypoints,
+            local ai_route = ai.drive(M.state.ai_cars,
                 M.state.race.routePoints or M.state.race.checkpoints, M.state.race.laps, ai_params,
                 M.state.race.mode == "circuit")
+            -- The script variant swaps the client's navgraph for the race line (ADR-0036 Step-3b); remember
+            -- it so teardown restores the real navgraph (ai.restore_map).
+            M.state.ai_custom_map = ai_route and ai_route.customMap or nil
             -- Tell the server which route variant the AI got so it posts it to chat (the owner drives the
             -- AI, so only the owner reports this); lets players see authored vs navgraph-snap at a glance.
             if ai_route then

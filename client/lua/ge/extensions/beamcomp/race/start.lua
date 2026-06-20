@@ -16,7 +16,6 @@ local grid = require("beamcomp/race/grid")
 local placement = require("beamcomp/race/placement")
 local checkpoints = require("beamcomp/race/checkpoints")
 local maps = require("beamcomp/race/maps")
-local ai = require("beamcomp/race/ai")
 
 local LOG_TAG = "beamcomp.race"
 
@@ -309,16 +308,10 @@ function M.prepare(payload)
         -- Ordered, visible-only checkpoints with a stable 0-based index (ADR-0005); consumed by
         -- the racing-phase checkpoint detector (race/checkpoints.lua). Reversed for a reverse race.
         checkpoints = race_checkpoints,
-        -- Dense authored race line for the host-driven AI opponents (ADR-0036): every path node, not just
-        -- the visible checkpoints, so the AI hugs the line. Reversed in lock-step with a reverse race
-        -- (plain order reversal is enough for driving). Display/scoring keep using `checkpoints`.
+        -- The authored race line for the host-driven AI (ADR-0036 Step-3b): every path node with its
+        -- corridor radius, reversed in lock-step for a reverse race. The AI driver builds its drive script
+        -- (or navgraph snap) from these at drive time. Display/scoring keep using `checkpoints`.
         routePoints = reverse_route(race.routePoints, direction),
-        -- BeamNG's own authored AI navgraph path (ADR-0036 Step-3): the PRIMARY route for the host-driven
-        -- AI, resolved here where the race's map (and navgraph) is loaded; the path object is used
-        -- transiently and never kept in state. getAiPath keeps the start/finish node last (the finish-line
-        -- crossing) and is forward-only, so it is taken only for a forward race -- a reverse race falls back
-        -- to the routePoints navgraph snap (already reversed, proven). nil/empty -> the AI driver snaps.
-        aiWaypoints = (direction ~= "reverse") and ai.resolve_authored_waypoints(race.path) or nil,
         -- Resolved race mode + lap count, travel direction, and the detector's plan (ADR-0013/0018).
         mode = mode,
         laps = laps,

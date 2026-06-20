@@ -34,18 +34,20 @@ local AI_MODEL = "etk800"
 -- Difficulty presets (ADR-0036 Etappe B): each maps to BeamNG `ai` driving parameters. The default
 -- (medium) keeps the proof's defensive 0.6 aggression. rubberband is OFF in every preset -- a catch-up
 -- band is only enabled by an explicit airubber= override, never by a preset. aggression is the proven
--- knob; skill/rubberband/avoidCars/speedMode are layered as guarded VE calls (spike, see drive_command).
+-- knob; skill/rubberband/avoidCars are layered as guarded VE calls (spike, see optional_param_calls).
 local PRESETS = {
-    easy = {aggression = 0.35, skill = 0.5, rubberband = 0, avoidCars = true, speedMode = "limit"},
-    medium = {aggression = 0.6, skill = 0.75, rubberband = 0, avoidCars = true, speedMode = "off"},
-    hard = {aggression = 0.95, skill = 1.0, rubberband = 0, avoidCars = true, speedMode = "off"},
+    easy = {aggression = 0.35, skill = 0.5, rubberband = 0, avoidCars = true},
+    medium = {aggression = 0.6, skill = 0.75, rubberband = 0, avoidCars = true},
+    hard = {aggression = 0.95, skill = 1.0, rubberband = 0, avoidCars = true},
 }
 local DEFAULT_PRESET = "medium"
 
--- Resolve the effective AI driving parameters for a race (ADR-0036 Etappe B). Precedence per parameter:
--- explicit ai*= override (config.params) -> the named preset (config.preset) -> the aiRace content
--- defaults (content_defaults, only when no preset was given) -> the built-in default preset. Returns a
--- params table {aggression, skill, rubberband, avoidCars, speedMode} the drive command reads.
+-- Resolve the effective AI driving parameters for a race (ADR-0036 Etappe B + Step-3b). Precedence per
+-- parameter: explicit ai*= override (config.params) -> the named preset (config.preset) -> the aiRace
+-- content defaults (content_defaults, only when no preset was given) -> the built-in default preset.
+-- Returns {aggression, skill, rubberband, avoidCars, route} the drive command reads. `route` selects the AI
+-- route variant (airoute=script|snap, default "script"): "script" drives the exact authored line via a
+-- per-AI custom navgraph, "snap" snaps the route onto the road navgraph.
 function M.resolve_params(config, content_defaults)
     config = type(config) == "table" and config or {}
     content_defaults = type(content_defaults) == "table" and content_defaults or {}
@@ -55,7 +57,7 @@ function M.resolve_params(config, content_defaults)
         skill = preset.skill,
         rubberband = preset.rubberband,
         avoidCars = preset.avoidCars,
-        speedMode = preset.speedMode,
+        route = "script",
     }
     -- With no explicit preset, let the content's authored defaults fill the two knobs it carries.
     if not config.preset then
@@ -80,8 +82,8 @@ function M.resolve_params(config, content_defaults)
     if overrides.avoid ~= nil then
         params.avoidCars = overrides.avoid
     end
-    if overrides.speed ~= nil then
-        params.speedMode = overrides.speed
+    if overrides.route == "snap" or overrides.route == "script" then
+        params.route = overrides.route
     end
     return params
 end
@@ -297,16 +299,15 @@ local function resolve_waypoint_names(route)
 end
 
 -- The optional difficulty-parameter VE calls beyond aggression (SPIKE, ADR-0036 Etappe B). skill,
--- rubberband, avoidCars and a non-default speedMode have no stable ai.driveUsingPath argument across
--- engine versions, so each is emitted as its own pcall-wrapped call: pcall(ai.setX, v) is safe even when
--- ai.setX is nil (pcall catches the nil-call), so a missing API no-ops instead of breaking the proven
--- drive. Returns a "; "-joined call list (possibly empty). rubberband is only emitted when > 0 (off by
--- default in every preset).
+-- rubberband and avoidCars have no stable ai.driveUsingPath argument across engine versions, so each is
+-- emitted as its own pcall-wrapped call: pcall(ai.setX, v) is safe even when ai.setX is nil (pcall catches
+-- the nil-call), so a missing API no-ops instead of breaking the proven drive. Returns a "; "-joined call
+-- list (possibly empty). rubberband is only emitted when > 0 (off by default in every preset).
 --
--- In-game effectiveness on BeamNG 0.38.5 (2-client handover, 2026-06-13): `aggression` and `avoidCars`
--- have a clear visible effect; `aiskill=` has NO visible effect (kept exposed as best-effort, but the
--- real difficulty knob is aggression); `aispeed=` (speedMode) is unverified and likely inert without a
--- companion target speed (ai.setSpeed, not wired). See memory beamcomp-ai-driving-findings.
+-- In-game effectiveness on BeamNG 0.38.5 (2-client, 2026-06-13): `aggression` and `avoidCars` have a clear
+-- visible effect; `aiskill=` has NO visible effect (kept best-effort). The old `aispeed=` speedMode was
+-- inert and is repurposed (Step-3b) into the script speed-profile toggle, so it is no longer emitted here.
+-- See memory beamcomp-ai-driving-findings.
 local function optional_param_calls(params)
     local calls = {}
     if params.skill ~= nil then
@@ -317,9 +318,6 @@ local function optional_param_calls(params)
     end
     if params.avoidCars ~= nil then
         calls[#calls + 1] = string.format("pcall(ai.setAvoidCars, %q)", params.avoidCars and "on" or "off")
-    end
-    if params.speedMode and params.speedMode ~= "off" then
-        calls[#calls + 1] = string.format("pcall(ai.setSpeedMode, %q)", params.speedMode)
     end
     return table.concat(calls, "; ")
 end
@@ -374,70 +372,137 @@ local function lay_out_lap_waypoints(lap_names, lap_count)
     return names
 end
 
--- BeamNG's own authored AI navgraph path for a race, as the ordered waypoint NAMES path:getAiPath produces
--- (ADR-0036 Step-3 amendment) -- the PRIMARY AI route source for forward races. getAiPath walks the race's
--- ordered segment graph and snaps each segment node to the navgraph (the exact list stock aiRace drives),
--- more robust than the per-point snap of resolve_waypoint_names. The list runs CP1..CPn and, on a closed
--- loop, ENDS on the start/finish node -- that trailing node is the finish-line crossing and must stay last
--- (moving it to the front strands the AI on the last CP). GE-side: needs the loaded navgraph, so the caller
--- resolves it at race-start prepare time (where the race's map is loaded), not at parse time. Returns {}
--- when the content has no navgraph AI path (no graph, off-road, or a branch). Fully pcall-guarded; never
--- throws into the host. Consecutive duplicates are dropped.
-function M.resolve_authored_waypoints(path)
-    if type(path) ~= "table" or type(path.getAiPath) ~= "function" then
-        log("I", LOG_TAG, "authored AI path: no path object -> navgraph-snap fallback")
-        return {}
-    end
-    local ok, ai_path = pcall(function() return path:getAiPath(true) end)
-    if not ok then
-        log("W", LOG_TAG, "authored AI path: getAiPath errored -> navgraph-snap fallback: "
-            .. tostring(ai_path))
-        return {}
-    end
-    if type(ai_path) ~= "table" or #ai_path == 0 then
-        log("I", LOG_TAG, "authored AI path: empty (no navgraph AI path for this race) "
-            .. "-> navgraph-snap fallback")
-        return {}
-    end
-    local names = {}
-    for _, name in ipairs(ai_path) do
-        append_waypoint(names, name)
-    end
-    log("I", LOG_TAG, string.format("authored AI path: resolved %d waypoint(s)", #names))
-    return names
-end
-
--- Lay the authored single-lap AI path (resolve_authored_waypoints) out across `lap_count` laps. Unlike the
--- navgraph-snap layout (lay_out_lap_waypoints), the authored path keeps the start/finish node at the END of
--- each lap, so a lap is repeated in FULL -- the seam (finish -> first corner) is the natural racing line, no
--- node is dropped, and every checkpoint is hit on every lap. On a closed loop the first node is appended
--- once more after the final lap so the AI drives THROUGH the finish line instead of stopping on it (mirrors
--- BeamNG's own race.lua startAiVehicle). Consecutive duplicates are dropped. Pure; returns the name list.
-local function lay_out_authored_laps(lap_names, lap_count, closed)
-    local names = {}
-    for _ = 1, lap_count do
-        for _, name in ipairs(lap_names) do
-            append_waypoint(names, name)
+-- The race route as a list of {x, y, z, r?} nodes (ADR-0036 Step-3b): each route point's position plus its
+-- corridor radius. These become the nodes of the custom race navgraph the AI drives over
+-- (install_custom_race_map) -- the exact authored line, no road snap, off-road capable. Pure geometry,
+-- GE-side. Points with no position are skipped; a missing radius falls back to a default at drive time.
+local function build_route_nodes(route)
+    local nodes = {}
+    for _, point in ipairs(route) do
+        local p = point.pos
+        if type(p) == "table" and p.x and p.y and p.z then
+            nodes[#nodes + 1] = {x = p.x, y = p.y, z = p.z, r = point.radius}
         end
     end
-    if closed and lap_names[1] then
-        append_waypoint(names, lap_names[1])
-    end
-    return names
+    return nodes
 end
 
--- Arm BeamNG's vehicle AI to drive each car along the race route (ADR-0036, Step-3 three-tier source).
--- The single-lap waypoint names resolve through: 1) the authored navgraph AI path (`ai_waypoints`, from
--- path:getAiPath at prepare time), 2) the per-point navgraph snap of `route` (resolve_waypoint_names),
--- 3) [reserved: Step 3b -- a direct checkpoint line], else a span drive. The chosen list is laid out over
--- the lap count -- authored via lay_out_authored_laps (start node kept last, full-lap repeat, finish drive-
--- through on a closed loop), the snap via lay_out_lap_waypoints (start-first, drop-leading seam) -- and the
--- drive command (built from the resolved difficulty `params`, ADR-0036 Etappe B) is queued to each car's VE
--- (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). BeamNG's noOfLaps does not loop a
--- wpTargetList (verified in-game), so every lap is laid out explicitly. A nil `ai_waypoints` falls straight
--- through to the navgraph snap (the pre-Step-3 behaviour). `closed` (race is a circuit) drives the authored
--- finish drive-through. pcall-guarded. A nil `params` falls back to the default preset.
-function M.drive(cars, ai_waypoints, route, laps, params, closed)
+-- The wpTargetList node-index sequence across `lap_count` laps. The custom graph has one node per route
+-- point (1..node_count); a lap drives them in order, every lap repeated in full. The car spawns ON node 1
+-- (the start line), and ai.driveUsingPath's getPointNodePath(ego.pos -> node 1) then returns a 1-node path
+-- that newManualPath crashes on (it needs path[2]); so the FIRST lap starts at node 2 -- node 1 still lies
+-- on the initial car->node-2 path, so it is driven, just not listed as an explicit target. Later laps run
+-- the full node list, and on a closed loop index 1 is appended once more so the AI drives THROUGH the
+-- finish (the closing edge n->1 carries it). Returns a list of 1-based node indices.
+local function lay_out_node_indices(node_count, lap_count, closed)
+    local seq = {}
+    for lap = 1, lap_count do
+        local first = (lap == 1) and 2 or 1
+        for i = first, node_count do
+            seq[#seq + 1] = i
+        end
+    end
+    if closed and node_count > 1 then
+        seq[#seq + 1] = 1
+    end
+    return seq
+end
+
+local DEFAULT_NODE_RADIUS = 4.0  -- corridor half-width when a route point ships none
+
+-- Build a BeamNG navgraph (map.nodes format) whose ONLY road is the race line, and install it as the
+-- client's live map via map.reset (ADR-0036 Step-3b). Unlike the VE mapmgr.setCustomMap, map.reset
+-- (= map.loadMap) rebuilds ALL derived structures -- edgeKdTree, the graphpath, lane config, rules -- and
+-- pushes a COMPLETE map to every vehicle, so ai.driveUsingPath{wpTargetList} drives it with BeamNG's full
+-- planner and none of the missing-field crashes a hand-set custom map hits. GE-side, owner-only. The nodes
+-- are bc1..bcN at the route positions, linked in order (plus a closing edge on a circuit); each edge
+-- carries the in/out positions + radii loadMap's kd-tree build indexes. Returns true when installed; the
+-- real navgraph is restored by M.restore_map() after the race.
+local function install_custom_race_map(nodes, closed)
+    if type(map) ~= "table" or type(map.reset) ~= "function" or #nodes < 2 then
+        return false
+    end
+    local custom = {}
+    for i, n in ipairs(nodes) do
+        custom["bc" .. i] = {
+            pos = vec3(n.x, n.y, n.z),
+            radius = n.r or DEFAULT_NODE_RADIUS,
+            links = {},
+        }
+    end
+    local function link(i, j)
+        local a, b = "bc" .. i, "bc" .. j
+        local data = {
+            inNode = a, outNode = b, drivability = 1, speedLimit = 100, lanes = nil,
+            oneWay = false, gatedRoad = false,
+            inPos = custom[a].pos, inRadius = custom[a].radius,
+            outPos = custom[b].pos, outRadius = custom[b].radius,
+        }
+        custom[a].links[b] = data
+        custom[b].links[a] = data
+    end
+    for i = 1, #nodes - 1 do
+        link(i, i + 1)
+    end
+    if closed then
+        link(#nodes, 1)
+    end
+    local ok, err = pcall(map.reset, custom)
+    if not ok then
+        log("W", LOG_TAG, "could not install custom race map: " .. tostring(err))
+        return false
+    end
+    log("I", LOG_TAG, string.format("installed custom race map: %d node(s)", #nodes))
+    return true
+end
+
+-- Restore the real navgraph after a race that installed a custom race map (ADR-0036 Step-3b): map.reset()
+-- with no argument rebuilds the map from the scene. Guarded; no-op when map is unavailable.
+function M.restore_map()
+    if type(map) == "table" and type(map.reset) == "function" then
+        pcall(map.reset)
+        log("I", LOG_TAG, "restored real navgraph after race")
+    end
+end
+
+-- The VE-side Lua that drives one AI car along the installed custom race map (ADR-0036 Step-3b): manual AI
+-- + the resolved aggression, then the non-teleporting ai.driveUsingPath{wpTargetList} over the bc nodes.
+-- The map is complete (map.reset built it), so no field patching is needed -- BeamNG's planner handles
+-- curvature/speed/lanes. The Etappe-B difficulty params ride as guarded trailing calls. With no targets it
+-- spans the road network so the car still drives. noOfLaps is not used (the lap sequence is baked into the
+-- wpTargetList).
+local function drive_command_wptargets(index_sequence, params)
+    local extras = optional_param_calls(params)
+    if extras ~= "" then
+        extras = "; " .. extras
+    end
+    if #index_sequence == 0 then
+        return string.format(
+            "ai.setMode('manual'); ai.setAggression(%.2f); ai.setMode('span')%s",
+            params.aggression, extras)
+    end
+    local quoted = {}
+    for _, idx in ipairs(index_sequence) do
+        quoted[#quoted + 1] = string.format("'bc%d'", idx)
+    end
+    return string.format(
+        "ai.setMode('manual'); ai.setAggression(%.2f); "
+        .. "ai.driveUsingPath({wpTargetList={%s},aggression=%.2f})%s",
+        params.aggression, table.concat(quoted, ","), params.aggression, extras)
+end
+
+-- Arm BeamNG's vehicle AI to drive each car along the race route (ADR-0036 Step-3b). The route variant is
+-- `params.route`: "script" (default) installs a custom navgraph whose only road is the race line
+-- (install_custom_race_map -> map.reset) and drives the EXACT authored line over it via the non-teleporting
+-- ai.driveUsingPath{wpTargetList} (off-road capable, no road snap); "snap" routes over the per-point
+-- navgraph snap (resolve_waypoint_names + wpTargetList, the on-road variant); an empty result spans the road
+-- network so the car still drives. The lap sequence is laid out over the lap count (full-lap repeat +
+-- closed-loop finish drive-through), then the drive command -- built from the resolved difficulty `params`
+-- -- is queued to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). `closed` (a
+-- circuit) adds the closing edge + drive-through. pcall-guarded. A nil `params` uses the default preset.
+-- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph was installed (the
+-- caller restores the real one at teardown via M.restore_map).
+function M.drive(cars, route, laps, params, closed)
     if type(cars) ~= "table" then
         return
     end
@@ -445,33 +510,35 @@ function M.drive(cars, ai_waypoints, route, laps, params, closed)
     params = type(params) == "table" and params or M.resolve_params(nil, nil)
     local lap_count = math.max(1, math.floor(tonumber(laps) or 1))
 
-    local authored = type(ai_waypoints) == "table" and ai_waypoints or {}
-    local lap_names, names, source
-    if #authored > 0 then
-        lap_names = authored
-        names = lay_out_authored_laps(authored, lap_count, closed)
-        source = "authored"
+    local source, command, per_lap, total
+    local custom_map = false
+    if params.route == "snap" then
+        local lap_names = resolve_waypoint_names(route)
+        local names = lay_out_lap_waypoints(lap_names, lap_count)
+        local quoted = {}
+        for _, name in ipairs(names) do
+            quoted[#quoted + 1] = string.format("%q", name)
+        end
+        command = drive_command(table.concat(quoted, ", "), params)
+        source = #names > 0 and "navgraph-snap" or "span"
+        per_lap, total = #lap_names, #names
     else
-        lap_names = resolve_waypoint_names(route)
-        names = lay_out_lap_waypoints(lap_names, lap_count)
-        source = "navgraph-snap"
-        -- Step 3b (backlog/npc-ai-in-time-trial) hooks in here: when lap_names is still empty, a direct
-        -- checkpoint line (no navgraph snap) would resolve before the span fallback below.
+        local nodes = build_route_nodes(route)
+        local index_sequence = lay_out_node_indices(#nodes, lap_count, closed)
+        if install_custom_race_map(nodes, closed) then
+            command = drive_command_wptargets(index_sequence, params)
+            source = "customgraph"
+            custom_map = true
+        else
+            command = drive_command_wptargets({}, params)
+            source = "span"
+        end
+        per_lap, total = #nodes, #index_sequence
     end
-    if #names == 0 then
-        source = "span"
-    end
-    local quoted = {}
-    for _, name in ipairs(names) do
-        quoted[#quoted + 1] = string.format("%q", name)
-    end
-    local command = drive_command(table.concat(quoted, ", "), params)
+
     log("I", LOG_TAG, string.format(
-        "AI route source=%s: %d waypoint(s)/lap (authored=%d, route points=%d), %d lap(s) -> %d total",
-        source, #lap_names, #authored, #route, lap_count, #names))
-    log("I", LOG_TAG, string.format(
-        "AI lap layout: lap_count=%d, lap_names=[%s]",
-        lap_count, table.concat(lap_names, ", ")))
+        "AI route source=%s: %d node(s)/lap from %d route point(s), %d lap(s) -> %d total",
+        source, per_lap, #route, lap_count, total))
     for _, car in ipairs(cars) do
         local veh = be and be:getObjectByID(car.veh_id)
         if veh then
@@ -484,8 +551,9 @@ function M.drive(cars, ai_waypoints, route, laps, params, closed)
             end
         end
     end
-    -- Summary for the owner's race-start chat notice (which route variant the AI actually got).
-    return {source = source, perLap = #lap_names, total = #names, laps = lap_count}
+    -- Summary for the owner's race-start chat notice (which route variant the AI actually got); customMap
+    -- tells the caller a custom navgraph is live so it restores the real one at teardown (M.restore_map).
+    return {source = source, perLap = per_lap, total = total, laps = lap_count, customMap = custom_map}
 end
 
 -- Stop the AI before despawn so a half-driven car does not lurch on teardown (best-effort). No-op on a
