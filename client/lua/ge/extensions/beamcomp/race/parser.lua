@@ -130,12 +130,13 @@ local function build_checkpoints(path)
     return checkpoints
 end
 
--- The full ordered race line as plain {pos = {x,y,z}} points -- every path node in traversal order,
+-- The full ordered race line as {pos = {x,y,z}, radius = n} points -- every path node in traversal order,
 -- visible AND invisible, deduped against the immediately preceding node (a closed loop repeats the start
--- node). This is the authored racing line (ADR-0036): denser than the visible checkpoints, so a waypoint-
--- following AI hugs the line instead of cutting between sparse checkpoints. Display + scoring still use
--- build_checkpoints (visible only); this list is used only to drive the AI opponents. Same shape as a
--- checkpoint (`.pos`) so the AI driver consumes either.
+-- node). This is the authored racing line (ADR-0036): denser than the visible checkpoints, so the AI hugs
+-- the line instead of cutting between sparse checkpoints. The per-node radius is the corridor half-width
+-- the AI may use (the `r` of the driveUsingPath script, ADR-0036 Step-3b). Display + scoring still use
+-- build_checkpoints (visible only); this list only drives the AI opponents. Same `.pos` shape as a
+-- checkpoint so the AI driver consumes either.
 local function build_route_points(path)
     local points = {}
     local nodes = path.pathnodes.objects
@@ -143,7 +144,7 @@ local function build_route_points(path)
     for _, node_id in ipairs(path.config.linearSegments) do
         local node = nodes[node_id]
         if node and node_id ~= last_id then
-            points[#points + 1] = {pos = vec3_to_table(node.pos)}
+            points[#points + 1] = {pos = vec3_to_table(node.pos), radius = node.radius}
             last_id = node_id
         end
     end
@@ -286,11 +287,6 @@ function M.parse(locator)
         checkpoints = build_checkpoints(path),
         -- The dense authored race line for AI driving (ADR-0036); display/scoring use checkpoints.
         routePoints = build_route_points(path),
-        -- The live BeamNG path object, for race/start to resolve BeamNG's own authored AI navgraph path
-        -- (path:getAiPath) at prepare time (ADR-0036 Step-3 amendment). Used transiently and never kept in
-        -- M.state.race; resolving it here would snap against the wrong map (the parser also runs for the
-        -- race browser on non-loaded maps), so it is left to prepare where the race's map is loaded.
-        path = path,
         props = props,
     }
 
