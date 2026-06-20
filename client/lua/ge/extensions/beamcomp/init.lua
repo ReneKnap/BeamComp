@@ -567,9 +567,14 @@ local function handle_race_phase(payload)
             -- race's full lap count so the AI runs every lap (ADR-0036 Step-3 three-tier source). The
             -- resolved difficulty params (ADR-0036 Etappe B) come from the relayed config + content.
             local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
-            ai.drive(M.state.ai_cars, M.state.race.aiWaypoints,
+            local ai_route = ai.drive(M.state.ai_cars, M.state.race.aiWaypoints,
                 M.state.race.routePoints or M.state.race.checkpoints, M.state.race.laps, ai_params,
                 M.state.race.mode == "circuit")
+            -- Tell the server which route variant the AI got so it posts it to chat (the owner drives the
+            -- AI, so only the owner reports this); lets players see authored vs navgraph-snap at a glance.
+            if ai_route then
+                send_to_server("aiRouteNotice", ai_route)
+            end
             local detections = {}
             for _, car in ipairs(M.state.ai_cars) do
                 detections[car.id] = checkpoints.new(plan)

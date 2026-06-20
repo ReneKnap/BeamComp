@@ -116,6 +116,7 @@ local MSG_RACE_RECORDS = "raceRecords"  -- ship a participant's pre-run PB + the
 local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close its post-race analysis overlay (ADR-0028)
 local MSG_REGRID = "regrid"  -- tell one client its reassigned grid slot + the reordered roster for a pwr re-grid (ADR-0033)
 local MSG_AI_MAP = "aiMap"  -- owner -> all: which synced vehicles are AI cars, so remotes label/suppress them (ADR-0036)
+local MSG_AI_ROUTE_NOTICE = "aiRouteNotice"  -- owner -> server: which AI route variant was used, posted to chat (ADR-0036 Step-3)
 
 -- Cap on /races reply lines posted to chat, so a misbehaving client can't flood it.
 local RACE_LIST_MAX_LINES = 60
@@ -2620,6 +2621,22 @@ local function handle_ai_map(player_id, payload)
     broadcast_event(MSG_AI_MAP, {entries = entries})
 end
 
+-- Post which AI route variant the owner's AI actually got, to all players' chat (ADR-0036 Step-3). The
+-- owner drives the AI and resolves the route (authored navgraph path / navgraph snap / span), so only the
+-- owner reports it; the server just relays the line (race-blind, reads no geometry). Lets players see at
+-- race start whether the authored aiRace line was used or it fell back to the snap.
+local function handle_ai_route_notice(player_id, payload)
+    if session.phase == PHASE.lobby or player_id ~= session.owner_id then
+        return
+    end
+    local source = type(payload) == "table" and type(payload.source) == "string" and payload.source or nil
+    if not source then
+        return
+    end
+    local per_lap = tonumber(type(payload) == "table" and payload.perLap) or 0
+    broadcast_chat(string.format("BeamComp: AI route source=%s: %d waypoint(s)/lap", source, per_lap))
+end
+
 -- Post a client's /races reply to that player. The client (which owns race knowledge, ADR-0005) built
 -- the chat lines and sent them back (ADR-0011); the server only relays them. `player_id` is the
 -- responder -- i.e. the player who ran /races -- so no request tracking is needed. Capped to
@@ -2792,6 +2809,8 @@ local function handle_client_event(player_id, data)
         handle_checkpoint_report(player_id, decoded.payload)
     elseif decoded.type == MSG_AI_MAP then
         handle_ai_map(player_id, decoded.payload)
+    elseif decoded.type == MSG_AI_ROUTE_NOTICE then
+        handle_ai_route_notice(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_LIST then
         handle_race_list(player_id, decoded.payload)
     elseif decoded.type == MSG_VEHICLE_LIST then

@@ -385,16 +385,25 @@ end
 -- throws into the host. Consecutive duplicates are dropped.
 function M.resolve_authored_waypoints(path)
     if type(path) ~= "table" or type(path.getAiPath) ~= "function" then
+        log("I", LOG_TAG, "authored AI path: no path object -> navgraph-snap fallback")
         return {}
     end
     local ok, ai_path = pcall(function() return path:getAiPath(true) end)
-    if not ok or type(ai_path) ~= "table" or #ai_path == 0 then
+    if not ok then
+        log("W", LOG_TAG, "authored AI path: getAiPath errored -> navgraph-snap fallback: "
+            .. tostring(ai_path))
+        return {}
+    end
+    if type(ai_path) ~= "table" or #ai_path == 0 then
+        log("I", LOG_TAG, "authored AI path: empty (no navgraph AI path for this race) "
+            .. "-> navgraph-snap fallback")
         return {}
     end
     local names = {}
     for _, name in ipairs(ai_path) do
         append_waypoint(names, name)
     end
+    log("I", LOG_TAG, string.format("authored AI path: resolved %d waypoint(s)", #names))
     return names
 end
 
@@ -475,6 +484,8 @@ function M.drive(cars, ai_waypoints, route, laps, params, closed)
             end
         end
     end
+    -- Summary for the owner's race-start chat notice (which route variant the AI actually got).
+    return {source = source, perLap = #lap_names, total = #names, laps = lap_count}
 end
 
 -- Stop the AI before despawn so a half-driven car does not lurch on teardown (best-effort). No-op on a
