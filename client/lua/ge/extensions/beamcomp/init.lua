@@ -165,6 +165,7 @@ M.state = {
     hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
     hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle ensureAppVisible
     hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
+    setup_grid_pending = false,  -- a gridListReq was fired for the open settings panel (ADR-0037); routes the next gridList reply to the panel UI instead of the grid-editor toast
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -837,6 +838,42 @@ function M.note_hud_alive()
     M.state.hud_ack_gap = 0
 end
 
+-- Submit the race-setup panel's choices (UI -> GE -> server, ADR-0037). The panel serialises its form to
+-- a JSON string and calls this via bngApi.engineLua; we decode and relay it to the server as a structured
+-- startRace request that joins the same validation + start path as a typed /race. Public so the app can
+-- reach it as beamcomp_init.start_race_from_ui. Guarded: a bad encode/shape is dropped, never thrown.
+function M.start_race_from_ui(json)
+    local ok, decoded = pcall(jsonDecode, json)
+    if not ok or type(decoded) ~= "table" or type(decoded.race) ~= "string" or decoded.race == "" then
+        log("W", RACE_LOG_TAG, "start_race_from_ui: bad payload")
+        return
+    end
+    send_to_server("startRace", {race = decoded.race, overrides = decoded.overrides})
+end
+
+-- The panel's "Start Race" (ADR-0037): end the staging wait and begin the countdown (the /go equivalent).
+-- Two-stage flow -- start_race_from_ui prepares + stages, this fires the actual start. Public as
+-- beamcomp_init.go_race_from_ui.
+function M.go_race_from_ui()
+    send_to_server("raceGo", {})
+end
+
+-- Push one model's configs to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this when
+-- the car model changes; configs are probed lazily per model since an all-models probe is heavy. Public
+-- so the app can reach it as beamcomp_init.request_car_configs.
+function M.request_car_configs(model)
+    if type(model) ~= "string" then
+        return
+    end
+    guihooks.trigger("BeamCompSetupCars", {model = model, configs = carlist.options(model).configs})
+end
+
+-- Remove the race-setup panel from the live layout (UI -> GE, ADR-0037), the close counterpart to the
+-- setupOpen auto-add. Public so the panel's Close button can reach it as beamcomp_init.close_setup.
+function M.close_setup()
+    guihooks.trigger("appContainer:removeApp", "beamCompSetup")
+end
+
 -- Surface grid-editor feedback both as a toast (visible while in-game) and in the log (visible in the
 -- console where the command was typed). `kind` is a toastr type ("info"/"warning").
 local function editor_feedback(msg, kind)
@@ -866,14 +903,53 @@ local function handle_grid_data(payload)
     end
 end
 
--- Post the current map's saved grid names from a beamcomp_grid_list request (ADR-0023).
+-- Post the current map's saved grid names from a beamcomp_grid_list request (ADR-0023). When the request
+-- came from the open settings panel (ADR-0037), route the names to the panel's grid dropdown instead of
+-- the grid-editor toast -- the one-shot flag set by handle_setup_open disambiguates the two callers.
 local function handle_grid_list(payload)
     local names = type(payload) == "table" and payload.names or nil
+    if M.state.setup_grid_pending then
+        M.state.setup_grid_pending = false
+        guihooks.trigger("BeamCompSetupGrids", {names = type(names) == "table" and names or {}})
+        return
+    end
     if type(names) ~= "table" or #names == 0 then
         editor_feedback("no saved grids on this map")
         return
     end
     editor_feedback("saved grids: " .. table.concat(names, ", "))
+end
+
+-- Build the race-setup panel's option dataset and push it to the app (ADR-0037): the startable races +
+-- drivable car models (built locally since the server is race/vehicle-blind, ADR-0005), plus an async
+-- request for the map's saved grids (routed back by handle_grid_list). Static enums (modes, order,
+-- presets, airoute) live in the panel template; config lists load per model on demand. Used both when the
+-- panel opens and when it pulls/refreshes itself.
+local function push_setup_data(include_deprecated)
+    local map = maps.current()
+    guihooks.trigger("BeamCompSetupData", {
+        races = racelist.options(map, include_deprecated),
+        cars = carlist.options().models,
+    })
+    M.state.setup_grid_pending = true
+    send_to_server("gridListReq", {map = map})
+end
+
+-- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
+-- already-open panel) and make the app visible. A freshly-added app links *after* this push, so the panel
+-- also pulls the dataset itself on link via request_setup_data -- the two together cover every timing.
+local function handle_setup_open(_payload)
+    push_setup_data(false)
+    -- Ensure the panel app is on the live layout (ADR-0012 best-effort auto-add); dedups by appName.
+    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
+end
+
+-- Push the dataset on demand (UI -> GE, ADR-0037): the panel calls this on link -- so a freshly-added app
+-- that missed the open-time push still fills -- and from its Refresh / include-deprecated toggle. The arg
+-- is the toggle's string flag ("1" = include deprecated races in the list). Public as
+-- beamcomp_init.request_setup_data.
+function M.request_setup_data(include_flag)
+    push_setup_data(include_flag == "1")
 end
 
 -- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
@@ -972,6 +1048,7 @@ local HANDLERS = {
     gridList = handle_grid_list,
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,
+    setupOpen = handle_setup_open,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client

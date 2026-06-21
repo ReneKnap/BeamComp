@@ -135,4 +135,38 @@ function M.build(loaded_map, include_deprecated)
     return lines
 end
 
+-- Structured race options for the settings UI (ADR-0037): the startable on-map races as {id, label}
+-- pairs for a dropdown. `id` is the canonical locator id discovery.resolve matches and the panel submits
+-- as the race name. Mirrors build()'s on-map filter but returns data, not chat lines, and parses no
+-- geometry -- the panel needs only a pick list; the issuer client validates the choice on start. Deprecated
+-- races (ADR-0026) are excluded unless include_deprecated is set (the panel's "include deprecated" toggle),
+-- in which case they are listed with a "(deprecated)" marker.
+function M.options(loaded_map, include_deprecated)
+    if not loaded_map then
+        return {}
+    end
+    local here = {}
+    for _, locator in ipairs(discovery.list()) do
+        if locator.map and maps.matches(loaded_map, locator.map)
+            and (include_deprecated or not discovery.is_deprecated(locator)) then
+            here[#here + 1] = locator
+        end
+    end
+    local shortnames = discovery.shortnames(here)
+    local options = {}
+    for _, locator in ipairs(here) do
+        local short = shortnames[locator.id]
+        local label = locator.displayName
+        if short and short ~= locator.displayName then
+            label = label .. " [" .. short .. "]"
+        end
+        label = label .. " (" .. source_label(locator.source) .. ")"
+        if discovery.is_deprecated(locator) then
+            label = label .. " (deprecated)"
+        end
+        options[#options + 1] = {id = locator.id, label = label}
+    end
+    return options
+end
+
 return M

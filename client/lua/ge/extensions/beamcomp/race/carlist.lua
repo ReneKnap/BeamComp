@@ -76,4 +76,19 @@ function M.build(model)
     return list_all_models()
 end
 
+-- Structured vehicle options for the settings UI (ADR-0037), returned as data instead of chat lines. A
+-- model lists that model's configs ({config, name} pairs for the car= dropdown -- power/weight are dropped
+-- here, the panel only needs to pick); nil/empty lists the drivable models (props/trailers excluded, so a
+-- car= can't pick a cone). Configs are probed lazily per selected model since an all-models probe is heavy.
+function M.options(model)
+    if type(model) == "string" and model ~= "" then
+        local configs = {}
+        for _, entry in ipairs(vehiclespecs.list_configs(model)) do
+            configs[#configs + 1] = {config = entry.config, name = entry.name}
+        end
+        return {configs = configs}
+    end
+    return {models = vehiclespecs.list_car_models()}
+end
+
 return M

@@ -144,6 +144,11 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index)
     policy = type(policy) == "table" and policy or {}
     content_defaults = type(content_defaults) == "table" and content_defaults or {}
 
+    if config.car == "random" then
+        -- The panel's "random" AI car (ADR-0037): an independent random stock model per AI, so the field
+        -- varies. Distinct from no aicar (the content default below).
+        return random_stock_model(), nil
+    end
     if config.car then
         local model, vehicle_config = split_car_token(config.car)
         if model then
