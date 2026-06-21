@@ -79,6 +79,7 @@ local CHAT_COMMAND_PING = "/beamcomp"
 local CHAT_COMMAND_RESULTS = "/results"  -- toggle the asking player's finished-results card (ADR-0022)
 local CHAT_COMMAND_ANALYSIS = "/analysis"  -- toggle the asking player's post-race analysis overlay (ADR-0028)
 local CHAT_COMMAND_RACEUI = "/raceui"  -- open the asking admin's race-setup panel (ADR-0037; admin-gated)
+local CHAT_COMMAND_GRIDUI = "/gridui"  -- open the asking admin's grid-editor panel (ADR-0037 amendment / ADR-0023; admin-gated)
 -- Manual race-start aliases (ADR-0021): any of these ends the staging wait early and starts the
 -- countdown. All three route to one handler.
 local CHAT_COMMAND_GO = "/go"
@@ -102,6 +103,7 @@ local MSG_CLIENT_INFO = "clientInfo"  -- a client's vehicle metadata for best-ti
 local MSG_CLIENT_IDENTITY = "clientIdentity"  -- a client's BeamNG name, reported on connect, for identity resolution (ADR-0031)
 local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a map (ADR-0023; admin-gated)
 local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a map's default grid for a race (ADR-0023; admin-gated)
+local MSG_GRID_DELETE = "gridDelete"  -- editor deletes a saved grid for a map (ADR-0023; admin-gated)
 local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its data (ADR-0023; read-only)
 local MSG_GRID_LIST_REQ = "gridListReq"  -- editor lists a map's saved grids (ADR-0023; read-only)
 local MSG_GRID_DATA = "gridData"      -- reply to gridFetch: a saved grid's params (server -> client)
@@ -119,6 +121,7 @@ local MSG_BEST_NOTICE = "bestNotice"  -- tell a finisher they set a personal bes
 local MSG_RACE_RECORDS = "raceRecords"  -- ship a participant's pre-run PB + the race's track record at the finish seam (ADR-0028)
 local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close its post-race analysis overlay (ADR-0028)
 local MSG_SETUP_OPEN = "setupOpen"  -- tell one client to open its race-setup panel (ADR-0037)
+local MSG_GRID_SETUP_OPEN = "gridSetupOpen"  -- tell one client to open its grid-editor panel (ADR-0037 amendment)
 local MSG_REGRID = "regrid"  -- tell one client its reassigned grid slot + the reordered roster for a pwr re-grid (ADR-0033)
 local MSG_AI_MAP = "aiMap"  -- owner -> all: which synced vehicles are AI cars, so remotes label/suppress them (ADR-0036)
 local MSG_AI_ROUTE_NOTICE = "aiRouteNotice"  -- owner -> server: which AI route variant was used, posted to chat (ADR-0036 Step-3)
@@ -499,6 +502,28 @@ local function assign_default(map, race_name, name)
     end
     grid_store.defaults[map][race_name] = name
     return write_grids()
+end
+
+-- Delete a saved grid from a map and persist it (ADR-0023). Also drops any race defaults that pointed at
+-- it, so a deleted grid leaves no dangling default mapping. Returns (existed, write_grids ok): existed is
+-- false when there was no such grid (nothing written).
+local function delete_grid(map, name)
+    ensure_grids_loaded()
+    local map_grids = grid_store.grids[map]
+    if type(map_grids) ~= "table" or type(map_grids[name]) ~= "table" then
+        return false
+    end
+    map_grids[name] = nil
+    local map_defaults = grid_store.defaults[map]
+    if type(map_defaults) == "table" then
+        for race_name, default_name in pairs(map_defaults) do
+            if default_name == name then
+                map_defaults[race_name] = nil
+            end
+        end
+    end
+    local ok = write_grids()
+    return true, ok
 end
 
 -- Read and JSON-decode the records file from the first candidate path that opens (ADR-0027). Returns
@@ -2404,6 +2429,19 @@ local function handle_raceui_command(player_id, player_name)
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
+-- Admin-gated open of the asking player's grid-editor panel (ADR-0037 amendment / ADR-0023). Like
+-- /raceui, the server only relays the open signal; the client assembles the race list + opens the app.
+-- The grid edit/save/assign messages this panel drives are already admin-gated server-side (ADR-0023).
+local function handle_gridui_command(player_id, player_name)
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to edit grids")
+        log_info("beamcomp.grid", "denied " .. CHAT_COMMAND_GRIDUI .. " from " .. player_name .. " (not a race admin)")
+        return
+    end
+    send_event(player_id, MSG_GRID_SETUP_OPEN, {})
+    log_info("beamcomp.grid", CHAT_COMMAND_GRIDUI .. " open by " .. player_name)
+end
+
 -- True if no connected player other than `leaving_id` remains. onPlayerDisconnect may or may
 -- not still list the leaving player, so exclude it explicitly.
 local function is_server_empty_without(leaving_id)
@@ -2520,6 +2558,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_RACEUI then
         handle_raceui_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == CHAT_COMMAND_GRIDUI then
+        handle_gridui_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
     -- not a BeamComp command: return nothing so the message relays normally
@@ -2782,6 +2825,44 @@ local function handle_grid_assign(player_id, payload)
     end
 end
 
+-- Delete a saved grid sent by the editor (ADR-0023). Admin-gated like save/assign. Replies with the map's
+-- updated grid-name list (MSG_GRID_LIST) so the panel's dropdown refreshes without a second round-trip.
+-- Payload: {map, name}.
+local function handle_grid_delete(player_id, payload)
+    local player_name = player_name_of(player_id)
+    if not player_name or not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to delete grids")
+        return
+    end
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
+        or type(payload.name) ~= "string" or payload.name == "" then
+        MP.SendChatMessage(player_id, "BeamComp: grid delete rejected -- bad data")
+        return
+    end
+
+    local existed, ok = delete_grid(payload.map, payload.name)
+    if not existed then
+        MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.map)
+    elseif ok then
+        MP.SendChatMessage(player_id, "BeamComp: deleted grid '" .. payload.name .. "' for " .. payload.map)
+        log_info("beamcomp.grid", string.format("deleted grid '%s' for map '%s' by %s",
+            payload.name, payload.map, player_name))
+    else
+        MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
+    end
+
+    -- Always echo the current names so the editor's dropdown reflects the post-delete state.
+    local names = {}
+    local map_grids = grid_store.grids[payload.map]
+    if type(map_grids) == "table" then
+        for grid_name in pairs(map_grids) do
+            names[#names + 1] = grid_name
+        end
+        table.sort(names)
+    end
+    send_event(player_id, MSG_GRID_LIST, {names = names})
+end
+
 -- Return a saved grid's data so the editor can reopen it (ADR-0023). Read-only, so ungated like
 -- /races. A missing map/name or unknown grid replies found = false rather than an error.
 local function handle_grid_fetch(player_id, payload)
@@ -2959,6 +3040,8 @@ local function handle_client_event(player_id, data)
         handle_grid_save(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_ASSIGN then
         handle_grid_assign(player_id, decoded.payload)
+    elseif decoded.type == MSG_GRID_DELETE then
+        handle_grid_delete(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_FETCH then
         handle_grid_fetch(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_LIST_REQ then
