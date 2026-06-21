@@ -5,7 +5,7 @@
 // every racing and finished frame; we receive it with scope.$on and format it for the template.
 // No GE round-trip on load -- the per-frame push covers a mid-race add.
 angular.module('beamng.apps')
-.directive('beamCompHud', ['$timeout', function ($timeout) {
+.directive('beamCompHud', ['$timeout', '$interval', function ($timeout, $interval) {
   // Live HUD row cap: the leader plus a slice around the local player (see windowLiveEntries). The
   // finished results card is exempt -- it renders the whole field.
   var MAX_LIVE_ROWS = 7;
@@ -166,6 +166,23 @@ angular.module('beamng.apps')
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
+
+      // UI-presence heartbeat (self-healing HUD: race/hud.lua + the init.lua watchdog). Tell GE this app
+      // is alive on link and once a second after. If GE stops hearing it while a race wants the HUD up --
+      // e.g. an engine/BeamMP UI reload during the spawn churn dropped our late-mounted app (ADR-0008) --
+      // it re-shows the app and, failing that, reloads the UI. bngApi is the core UI global (not an
+      // injected service, which would not resolve for this late-loaded mod app -- ADR-0012) and
+      // typeof-guarded so a miss is inert.
+      function noteAlive() {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.note_hud_alive() end');
+        }
+      }
+      noteAlive();
+      var heartbeat = $interval(noteAlive, 1000);
+      scope.$on('$destroy', function () {
+        $interval.cancel(heartbeat);
+      });
 
       // Open/close the post-race analysis overlay via the GE flag (single source of truth, ADR-0028):
       // the results-card button and the /analysis command both route through M.toggle_analysis. bngApi is

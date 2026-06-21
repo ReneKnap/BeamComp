@@ -56,4 +56,19 @@ function M.hide()
     trigger_ui("appContainer:removeApp", APP_NAME)
 end
 
+-- Last-resort recovery for the self-healing watchdog (init.lua): force a full UI reload. During the
+-- race-start spawn churn an engine/BeamMP UI reload can knock out the whole UI, and our server-delivered
+-- app (mounted after the UI bootstrap, ADR-0008) does not come back on its own; re-showing alone may not
+-- recover it, so the watchdog escalates here. Existence-guarded + pcall-wrapped like trigger_ui so a
+-- missing engine function never breaks the caller (the onUpdate watchdog tick).
+function M.reload_ui()
+    if not reloadUI then
+        return
+    end
+    local ok, err = pcall(reloadUI)
+    if not ok then
+        log("W", LOG_TAG, "UI reload failed: " .. tostring(err))
+    end
+end
+
 return M

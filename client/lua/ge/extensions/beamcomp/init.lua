@@ -56,6 +56,14 @@ local EVENT_CHANNEL = "beamcompEvent"
 local LOG_TAG = "beamcomp.net"
 local RACE_LOG_TAG = "beamcomp.race"
 
+-- HUD self-healing watchdog thresholds (seconds). The app heartbeats ~1s (note_hud_alive); if GE hears
+-- nothing for HUD_ACK_STALE while a race wants the HUD up, it re-asserts visibility every
+-- HUD_RESHOW_EVERY, and if the surface is still silent at HUD_RELOAD_AFTER it escalates to a one-shot UI
+-- reload (recovers an engine/BeamMP UI reload that dropped our late-mounted app, ADR-0008/0012).
+local HUD_ACK_STALE = 1.5
+local HUD_RESHOW_EVERY = 1.0
+local HUD_RELOAD_AFTER = 4.0
+
 local MARKER_RADIUS = 0.6
 
 -- In-world marker styling. Checkpoints render singleplayer-style: a pale translucent column
@@ -154,6 +162,9 @@ M.state = {
     ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
     ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
     ai_server_ids = nil,      -- non-owner: set of BeamMP server ids from the latest aiMap awaiting local resolution (ADR-0036), or nil
+    hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
+    hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle ensureAppVisible
+    hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -251,6 +262,10 @@ local function handle_race_start(payload)
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
+    -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
+    M.state.hud_ack_gap = 0
+    M.state.hud_reshow_wait = 0
+    M.state.hud_reloaded = false
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
@@ -497,6 +512,10 @@ local function teardown_race_world()
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
+    -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
+    M.state.hud_ack_gap = 0
+    M.state.hud_reshow_wait = 0
+    M.state.hud_reloaded = false
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
@@ -807,6 +826,15 @@ end
 -- The /analysis relay (server -> this client) flips the same overlay flag as the results-card button.
 local function handle_analysis_toggle()
     M.toggle_analysis()
+end
+
+-- Heartbeat from the HUD app (UI -> GE, ADR-0012): the AngularJS directive calls this on link and once a
+-- second after via bngApi.engineLua. Resetting the gap tells the onUpdate watchdog the app surface is
+-- alive; if the heartbeat stops while a race wants the HUD up (an engine/BeamMP UI reload during the
+-- spawn churn can drop our late-mounted app, ADR-0008), the watchdog re-shows the app and, failing that,
+-- reloads the UI. Public so the app can reach it as beamcomp_init.note_hud_alive (mirrors toggle_analysis).
+function M.note_hud_alive()
+    M.state.hud_ack_gap = 0
 end
 
 -- Surface grid-editor feedback both as a toast (visible while in-game) and in the log (visible in the
@@ -2576,6 +2604,34 @@ local function step_start_countdown(dt_real)
     end
 end
 
+-- Self-healing HUD watchdog (ui-missing-for-some-clients-reload): keep the HUD/countdown app surface
+-- present while a race wants it on screen. The app heartbeats via M.note_hud_alive; if that goes silent --
+-- an engine/BeamMP UI reload during the spawn churn can drop our server-delivered app (ADR-0008/0012) --
+-- re-assert visibility (Stage A), and if the surface stays silent escalate once to a full UI reload
+-- (Stage B). Called from onUpdate in the visible phases only, so free-roam is never disturbed.
+local function step_hud_watchdog(dt)
+    M.state.hud_ack_gap = M.state.hud_ack_gap + (dt or 0)
+    if M.state.hud_ack_gap < HUD_ACK_STALE then
+        -- App is heartbeating -- surface healthy, reset the re-show throttle.
+        M.state.hud_reshow_wait = 0
+        return
+    end
+    -- Stage B: re-showing has not brought the app back within the grace window; reload the UI once.
+    if M.state.hud_ack_gap >= HUD_RELOAD_AFTER and not M.state.hud_reloaded then
+        M.state.hud_reloaded = true
+        M.state.hud_reshow_wait = 0
+        log("W", RACE_LOG_TAG, "HUD app silent; reloading UI to recover the race overlay")
+        hud.reload_ui()
+        return
+    end
+    -- Stage A: re-assert app visibility, throttled, until it acks (or Stage B fires).
+    M.state.hud_reshow_wait = M.state.hud_reshow_wait + (dt or 0)
+    if M.state.hud_reshow_wait >= HUD_RESHOW_EVERY then
+        M.state.hud_reshow_wait = 0
+        hud.show()
+    end
+end
+
 function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
@@ -2640,6 +2696,14 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- frozen final standings, not the last frame caught mid-racing.
     if (M.state.phase == "racing" or M.state.phase == "finished") and M.state.race then
         hud.push(build_hud_snapshot())
+    end
+    -- Keep the HUD/countdown app surface alive while a race wants it on screen
+    -- (ui-missing-for-some-clients-reload): the app heartbeats and this re-shows / reloads if it goes
+    -- silent. Covers staging (the countdown overlay arms there, ADR-0021) through finished; free-roam is
+    -- untouched.
+    if M.state.race and (M.state.phase == "staging" or M.state.phase == "countdown"
+        or M.state.phase == "racing" or M.state.phase == "finished") then
+        step_hud_watchdog(dtReal)
     end
 end
 
