@@ -1,0 +1,20 @@
+{
+  "domElement": "<beam-comp-grid-editor></beam-comp-grid-editor>",
+  "directive": "beamCompGridEditor",
+  "name": "BeamComp Grid Editor",
+  "description": "BeamComp start-grid editor -- tune, preview, save and assign parametric start grids (admin only). Opened with /gridui or from the race-setup panel.",
+  "author": "BeamComp",
+  "version": "0.0.1",
+  "category": "Gameplay",
+  "types": [
+    "ui.apps.categories.racing"
+  ],
+  "css": {
+    "top": "90px",
+    "left": "50px",
+    "width": "440px",
+    "height": "600px",
+    "min-width": "360px",
+    "min-height": "360px"
+  }
+}

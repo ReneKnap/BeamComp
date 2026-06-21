@@ -327,9 +327,13 @@ end
 
 -- Resolve just the grid anchor for a race on this map: the base start pose + the start/finish gate
 -- normal the grid lays out behind, for `direction` ("forward"/"reverse"). Used by the in-game grid
--- editor (race/grideditor) to preview poses against the same geometry a real race start uses, without
--- spawning anything. Returns {base_pose = {pos, rot}, gate_normal = {x,y,z}|nil, raceId = string} or nil
--- plus a reason. raceId is the canonical id the default-grid assignment is keyed on (ADR-0023).
+-- editor (race/grideditor) to preview poses against the same geometry a real race start uses. Also returns
+-- the reference scene the editor can spawn/draw alongside the preview (so the grid is positioned against
+-- the real start area): `prefabFiles` -- the track's static-scenery prefabs for this direction (the same
+-- set a real start loads) -- and `checkpoint` -- the first checkpoint {pos, normal, radius} for this
+-- direction. Returns {base_pose = {pos, rot}, gate_normal = {x,y,z}|nil, raceId = string, prefabFiles =
+-- {...}, checkpoint = {pos, normal, radius}|nil} or nil plus a reason. raceId is the canonical id the
+-- default-grid assignment is keyed on (ADR-0023).
 function M.anchor(race_name, direction)
     if type(race_name) ~= "string" then
         return nil, "no race name"
@@ -351,9 +355,21 @@ function M.anchor(race_name, direction)
     if direction == "reverse" then
         race_checkpoints = checkpoints.reverse(race.checkpoints, race.meta and race.meta.closed)
     end
-    local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
+    local first_checkpoint = race_checkpoints[1]
+    local gate_normal = first_checkpoint and first_checkpoint.normal
+    local checkpoint = first_checkpoint and {
+        pos = first_checkpoint.pos,
+        normal = first_checkpoint.normal,
+        radius = first_checkpoint.radius,
+    } or nil
 
-    return {base_pose = base_pose, gate_normal = gate_normal, raceId = locator.id}
+    return {
+        base_pose = base_pose,
+        gate_normal = gate_normal,
+        raceId = locator.id,
+        prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
+        checkpoint = checkpoint,
+    }
 end
 
 -- Resolve a race name/shorthand to its canonical map-scoped id without parsing it, for the grid

@@ -1,0 +1,178 @@
+<div class="bc-grid">
+  <style scoped>
+    .bc-grid { display: flex; flex-direction: column; height: 100%; box-sizing: border-box;
+      font-family: 'Roboto', sans-serif; font-size: 13px; color: #f0f0f0;
+      background: rgba(20, 22, 26, 0.92); border-radius: 4px; overflow: hidden; }
+    .bc-toolbar { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; padding: 6px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.12); }
+    .bc-toolbar .bc-title { font-weight: 700; letter-spacing: 0.04em; color: #8fd3ff; flex: 1 1 auto; }
+    .bc-scroll { flex: 1 1 auto; overflow-y: auto; padding: 8px 10px; }
+    .bc-section { margin-bottom: 10px; }
+    .bc-section-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      font-size: 11px; color: #8fd3ff; border-bottom: 1px solid rgba(255,255,255,0.12);
+      padding-bottom: 2px; margin-bottom: 6px; }
+    .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
+    .bc-row > span { flex: 0 0 44%; }
+    .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
+      color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
+    .bc-hint { font-size: 11px; color: #9aa3ad; margin: 2px 0 4px; }
+    /* Stepper: [-1] [-] number [+] [+1] (coarse +-1.0, fine +-0.05). */
+    .bc-step { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; gap: 3px; }
+    .bc-step input { flex: 1 1 auto; min-width: 0; text-align: center; }
+    .bc-step button { flex: 0 0 22px; height: 22px; background: #355; color: #cde; border: none;
+      border-radius: 3px; font-weight: 700; cursor: pointer; line-height: 1; padding: 0; }
+    .bc-step button:hover { background: #2e7d32; }
+    .bc-step button.bc-coarse { flex: 0 0 26px; font-size: 11px; background: #2b4a4a; }
+    .bc-step button.bc-coarse:hover { background: #2e7d32; }
+    .bc-row.bc-knob > span { flex: 0 0 30%; }
+    /* Custom dropdown (native <select> does not open in the BeamNG CEF overlay). */
+    .bc-dd { position: relative; flex: 1 1 auto; min-width: 0; }
+    .bc-dd-head { width: 100%; text-align: left; background: #2a2e35; color: #f0f0f0;
+      border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 22px 2px 6px;
+      cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bc-dd-head::after { content: '\25BC'; position: absolute; right: 6px; top: 50%;
+      transform: translateY(-50%); font-size: 9px; color: #9aa3ad; pointer-events: none; }
+    .bc-dd-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 50; max-height: 170px;
+      overflow-y: auto; background: #20242b; border: 1px solid rgba(255,255,255,0.22);
+      border-radius: 3px; margin-top: 2px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+    .bc-dd-opt { padding: 4px 7px; cursor: pointer; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; }
+    .bc-dd-opt:hover { background: #2e7d32; }
+    .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    .bc-seg { display: flex; gap: 6px; }
+    .bc-seg button { flex: 1 1 auto; padding: 4px 0; border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 3px; background: #2a2e35; color: #cdd; cursor: pointer; font-weight: 700; }
+    .bc-seg button.on { background: #1565c0; color: #fff; border-color: #1565c0; }
+    .bc-seg button[disabled] { color: #777; cursor: default; }
+    .bc-mini { background: #355; color: #cde; border: none; border-radius: 3px; padding: 3px 10px;
+      font-weight: 700; cursor: pointer; flex: 0 0 auto; }
+    .bc-mini[disabled] { background: #3a3a3a; color: #888; cursor: default; }
+    .bc-danger { background: #7a2e2e; color: #f0d6d6; }
+    .bc-danger[disabled] { background: #3a3a3a; color: #888; }
+    .bc-actions { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 10px;
+      border-top: 1px solid rgba(255,255,255,0.12); }
+    .bc-actions button { flex: 1 1 auto; padding: 6px 0; border: none; border-radius: 3px;
+      font-weight: 700; cursor: pointer; }
+    .bc-clear { background: #5a3a1a; color: #f0e0c0; }
+    .bc-close { background: #444; color: #ddd; }
+  </style>
+
+  <div class="bc-toolbar">
+    <span class="bc-title">Grid Editor</span>
+    <button class="bc-mini" ng-click="refresh()">Refresh</button>
+  </div>
+
+  <div class="bc-scroll">
+
+    <!-- Anchor -->
+    <div class="bc-section">
+      <div class="bc-section-title">Anchor</div>
+      <div class="bc-row">
+        <span>Race</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('race')">{{labelFor('race', 'select…')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'race'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
+              ng-click="pick('race', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row">
+        <span>New from default</span>
+        <button class="bc-mini" ng-disabled="!form.race" ng-click="newGrid()">New grid</button>
+      </div>
+      <div class="bc-row">
+        <span>Saved grid</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('loadName')">{{labelFor('loadName', 'none saved')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'loadName'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.loadName" ng-class="{sel: o.v === form.loadName}"
+              ng-click="pick('loadName', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row">
+        <span></span>
+        <button class="bc-mini" ng-disabled="!form.loadName" ng-click="loadGrid()">Load</button>
+        <button class="bc-mini bc-danger" ng-disabled="!form.loadName" ng-click="deleteGrid()">Delete</button>
+      </div>
+      <div class="bc-hint" ng-if="state.active">Editing <b>{{state.race}}</b></div>
+      <div class="bc-hint" ng-if="!state.active">Pick a race, then New grid or Load.</div>
+    </div>
+
+    <!-- Direction -->
+    <div class="bc-section" ng-if="state.active">
+      <div class="bc-section-title">Direction</div>
+      <div class="bc-seg">
+        <button ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
+        <button ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
+      </div>
+      <div class="bc-hint">Reverse is only saved if you edit it; a race with no reverse geometry is rejected.</div>
+    </div>
+
+    <!-- Knobs -->
+    <div class="bc-section" ng-if="state.active">
+      <div class="bc-section-title">Layout</div>
+      <div class="bc-row bc-knob" ng-repeat="k in knobs">
+        <span>{{k.label}}</span>
+        <div class="bc-step">
+          <button class="bc-coarse" ng-click="stepKnob(k, -1)" title="-1">&minus;1</button>
+          <button ng-if="!k.integer" ng-click="stepKnob(k, -0.05)" title="-0.05">&minus;</button>
+          <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
+            placeholder="{{k.auto ? 'auto' : '-'}}">
+          <button ng-if="!k.integer" ng-click="stepKnob(k, 0.05)" title="+0.05">+</button>
+          <button class="bc-coarse" ng-click="stepKnob(k, 1)" title="+1">+1</button>
+        </div>
+      </div>
+      <div class="bc-row">
+        <span>Preview count</span>
+        <div class="bc-step">
+          <button ng-click="stepPreview(-1)">&minus;</button>
+          <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-blur="commitPreview()">
+          <button ng-click="stepPreview(1)">+</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Save -->
+    <div class="bc-section" ng-if="state.active">
+      <div class="bc-section-title">Save</div>
+      <div class="bc-row">
+        <span>Name</span>
+        <input type="text" ng-model="form.saveName" placeholder="no spaces">
+      </div>
+      <div class="bc-row">
+        <span></span>
+        <button class="bc-mini" ng-disabled="!canSave()" ng-click="saveGrid()">Save grid</button>
+      </div>
+      <div class="bc-hint" ng-if="savedName && form.saveName === savedName">Overwrites '{{savedName}}'.</div>
+    </div>
+
+    <!-- Assign -->
+    <div class="bc-section" ng-if="state.active">
+      <div class="bc-section-title">Assign as default</div>
+      <div class="bc-row">
+        <span>For race</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('assignRace')">{{labelFor('assignRace', 'select…')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'assignRace'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.assignRace" ng-class="{sel: o.v === form.assignRace}"
+              ng-click="pick('assignRace', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row">
+        <span></span>
+        <button class="bc-mini" ng-disabled="!savedName || !form.assignRace" ng-click="assignGrid()">
+          Assign {{savedName ? "'" + savedName + "'" : ''}}</button>
+      </div>
+      <div class="bc-hint" ng-if="!savedName">Save (or load) a grid first to assign it.</div>
+    </div>
+
+  </div>
+
+  <div class="bc-actions">
+    <button class="bc-clear" ng-if="state.active" ng-click="clearEditor()">Clear</button>
+    <button class="bc-close" ng-click="close()">Close</button>
+  </div>
+</div>

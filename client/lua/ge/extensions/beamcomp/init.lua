@@ -165,7 +165,12 @@ M.state = {
     hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
     hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle ensureAppVisible
     hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
-    setup_grid_pending = false,  -- a gridListReq was fired for the open settings panel (ADR-0037); routes the next gridList reply to the panel UI instead of the grid-editor toast
+    grid_list_target = nil,   -- routes the next gridList reply by its requester: nil = grid-editor console toast (default) | "setup" = race-setup panel grid dropdown (ADR-0037) | "gridui" = grid-editor panel saved-grid dropdown
+    grid_seed_race = nil,     -- a race to pre-select when the grid-editor panel opens (carried from /raceui's "Grid bearbeiten" cross-open); consumed by push_grid_data
+    grid_active_name = nil,   -- the saved name of the grid currently being edited (set on save/load, nil for a fresh unsaved grid); reflected to the panel so a reopen restores the overwrite/assign target
+    grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
+    grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
+    grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -195,6 +200,19 @@ end
 -- Resolve + lay out the race for this client, store the state, and surface the slot. On any
 -- failure (the server cannot validate the name, ADR-0005) warn and toast the reason.
 local function handle_race_start(payload)
+    -- A starting race ends any in-progress grid edit so its preview pillars never bleed into the race
+    -- (the ADR-0023 editor is a lobby-only authoring tool); clear its reference props and drop the panel.
+    if grideditor.state.active then
+        grideditor.clear()
+        M.state.grid_active_name = nil
+        props.clear(M.state.grid_edit_prop_names or {})
+        M.state.grid_edit_prop_names = nil
+        M.state.grid_edit_checkpoint = nil
+        if guihooks then
+            guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
+        end
+    end
+
     local race, reason = race_start.prepare(payload)
     if not race then
         log("W", RACE_LOG_TAG, "raceStart ignored: " .. tostring(reason))
@@ -883,37 +901,101 @@ local function editor_feedback(msg, kind)
     log("I", RACE_LOG_TAG, "grid editor: " .. msg)
 end
 
--- Open a saved grid the server returned for a beamcomp_grid_edit fetch (ADR-0023). `found` false means
--- no such grid for this map; otherwise hand the record to the editor, which re-anchors to its race.
+-- Reflect the live grid-editor session back to the grid-editor panel (ADR-0037 amendment): the editor
+-- (race/grideditor.lua) is the source of truth, the panel only displays this state and calls the knob
+-- setters. Pushed after every mutating bridge call. knobs is the active direction's block (or nil when no
+-- session), so the panel's steppers show the authoritative, clamped values; columns is nil when derived.
+local function push_grid_state()
+    local editor = grideditor.state
+    local block = editor.active and editor.blocks and editor.blocks[editor.direction] or nil
+    guihooks.trigger("BeamCompGridState", {
+        active = editor.active,
+        race = editor.race,
+        name = M.state.grid_active_name,
+        direction = editor.direction,
+        hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
+        previewCount = grideditor.preview_count(),
+        knobs = block and {
+            offsetForward = block.offsetForward,
+            offsetLateral = block.offsetLateral,
+            headingDeg = block.headingDeg,
+            rowGap = block.rowGap,
+            colGap = block.colGap,
+            rows = block.rows,
+            columns = block.columns,
+        } or nil,
+    })
+end
+
+-- Sync the grid editor's reference scene to the active session (ADR-0037 amendment, tweak): the track's
+-- static props + first checkpoint, so the admin places the grid against the real start area. Always drops
+-- the previous editor props first. Props are spawned only in the lobby -- during a race the real race props
+-- are already in the scene (and share these object names), so we never double-spawn over them; the
+-- checkpoint is drawn immediate-mode regardless. Reload-safe: only the prop names are persistent (tracked
+-- in M.state), the checkpoint is plain data.
+local function refresh_grid_edit_scene()
+    props.clear(M.state.grid_edit_prop_names or {})
+    M.state.grid_edit_prop_names = nil
+    M.state.grid_edit_checkpoint = nil
+    if not grideditor.state.active then
+        return
+    end
+    local scene = grideditor.current_scene()
+    if not scene then
+        return
+    end
+    M.state.grid_edit_checkpoint = scene.checkpoint
+    if M.state.race == nil then
+        M.state.grid_edit_prop_names = props.load(scene.prefabFiles or {}, false)
+    end
+end
+
+-- Open a saved grid the server returned for a beamcomp_grid_edit/gridui fetch (ADR-0023). `found` false
+-- means no such grid for this map; otherwise hand the record to the editor -- re-anchored onto the panel's
+-- selected race (grid_load_anchor) so a grid authored for another race previews against the current one --
+-- then refresh the reference scene and reflect the loaded block to the panel so its knobs fill in.
 local function handle_grid_data(payload)
     if type(payload) ~= "table" or not payload.found then
         local name = type(payload) == "table" and payload.name or "?"
         editor_feedback("no saved grid '" .. tostring(name) .. "' on this map", "warning")
         return
     end
+    local anchor_race = M.state.grid_load_anchor
+    M.state.grid_load_anchor = nil
     local ok, result = grideditor.open({
         forward = payload.forward,
         reverse = payload.reverse,
         race = payload.race,
-    })
+    }, anchor_race)
     if ok then
+        -- Remember the loaded name so the panel can offer overwrite (same-name save) + assign without
+        -- retyping, and so a panel reopen restores that target.
+        M.state.grid_active_name = type(payload.name) == "string" and payload.name or nil
         editor_feedback("editing saved grid '" .. tostring(payload.name) .. "' for " .. tostring(result))
+        refresh_grid_edit_scene()
+        push_grid_state()
     else
         editor_feedback(tostring(result), "warning")
     end
 end
 
--- Post the current map's saved grid names from a beamcomp_grid_list request (ADR-0023). When the request
--- came from the open settings panel (ADR-0037), route the names to the panel's grid dropdown instead of
--- the grid-editor toast -- the one-shot flag set by handle_setup_open disambiguates the two callers.
+-- Post the current map's saved grid names from a gridListReq (ADR-0023). gridListReq has three callers, so
+-- the one-shot grid_list_target (set by the requester) routes this reply: "setup" -> the race-setup panel's
+-- grid dropdown (ADR-0037); "gridui" -> the grid-editor panel's saved-grid dropdown (ADR-0037 amendment);
+-- nil -> the grid-editor console command's toast (beamcomp_grid_list).
 local function handle_grid_list(payload)
-    local names = type(payload) == "table" and payload.names or nil
-    if M.state.setup_grid_pending then
-        M.state.setup_grid_pending = false
-        guihooks.trigger("BeamCompSetupGrids", {names = type(names) == "table" and names or {}})
+    local names = type(payload) == "table" and type(payload.names) == "table" and payload.names or {}
+    local target = M.state.grid_list_target
+    M.state.grid_list_target = nil
+    if target == "setup" then
+        guihooks.trigger("BeamCompSetupGrids", {names = names})
         return
     end
-    if type(names) ~= "table" or #names == 0 then
+    if target == "gridui" then
+        guihooks.trigger("BeamCompGridList", {names = names})
+        return
+    end
+    if #names == 0 then
         editor_feedback("no saved grids on this map")
         return
     end
@@ -931,7 +1013,7 @@ local function push_setup_data(include_deprecated)
         races = racelist.options(map, include_deprecated),
         cars = carlist.options().models,
     })
-    M.state.setup_grid_pending = true
+    M.state.grid_list_target = "setup"
     send_to_server("gridListReq", {map = map})
 end
 
@@ -950,6 +1032,201 @@ end
 -- beamcomp_init.request_setup_data.
 function M.request_setup_data(include_flag)
     push_setup_data(include_flag == "1")
+end
+
+-- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on
+-- the current map (deprecated included -- a grid can be authored for any race) and the race to pre-seed
+-- (carried from the race-setup panel's cross-open), plus an async request for the map's saved grids (routed
+-- back to the panel by handle_grid_list). Used on open and on the panel's own pull/refresh.
+local function push_grid_data()
+    local map = maps.current()
+    guihooks.trigger("BeamCompGridData", {
+        races = racelist.options(map, true),
+        seedRace = M.state.grid_seed_race,
+    })
+    M.state.grid_list_target = "gridui"
+    send_to_server("gridListReq", {map = map})
+    -- Reflect the live edit session too, so a reopened panel (its Angular scope is fresh) restores the
+    -- active grid's knobs, direction and overwrite/assign target rather than showing a blank form.
+    push_grid_state()
+end
+
+-- Open the grid-editor panel on the relayed gridSetupOpen (/gridui, ADR-0037 amendment): no carried race,
+-- so clear any stale seed, push the dataset, and make the app visible. A freshly-added app links after this
+-- push, so the panel also pulls on link via request_grid_data -- together they cover every timing.
+local function handle_grid_setup_open(_payload)
+    M.state.grid_seed_race = nil
+    push_grid_data()
+    -- Re-spawn the reference scene for a still-active (persisted) session, since close removed its props.
+    refresh_grid_edit_scene()
+    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
+end
+
+-- Pull the grid-editor dataset on demand (UI -> GE): the panel calls this on link (covers the freshly-added
+-- app that missed the open push) and from its Refresh button. Public as beamcomp_init.request_grid_data.
+function M.request_grid_data()
+    push_grid_data()
+end
+
+-- Open the grid-editor panel pre-seeded with `race` (UI -> GE): the race-setup panel's "Grid bearbeiten"
+-- button calls this so the grid editor starts on the race chosen there. Does not start an edit session --
+-- the admin still picks New / Load. The seed persists across the panel's on-link pull; the panel applies it
+-- only while its race choice is still empty, so a later Refresh never overrides a manual pick. Public as
+-- beamcomp_init.open_grid_editor_with_race.
+function M.open_grid_editor_with_race(race)
+    M.state.grid_seed_race = (type(race) == "string" and race ~= "") and race or nil
+    push_grid_data()
+    refresh_grid_edit_scene()
+    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
+end
+
+-- Start a fresh grid for `race` from the track's generated default (UI -> GE) and reflect the new session.
+function M.grid_open_new(race)
+    if type(race) ~= "string" or race == "" then
+        editor_feedback("pick a race first", "warning")
+        return
+    end
+    local ok, reason = grideditor.start_fresh(race)
+    if not ok then
+        editor_feedback(tostring(reason), "warning")
+        return
+    end
+    -- A fresh grid has no saved name yet -- it must be Saved before it can be overwritten or assigned.
+    M.state.grid_active_name = nil
+    refresh_grid_edit_scene()
+    push_grid_state()
+end
+
+-- Request a saved grid's data so the editor opens it (UI -> GE); handle_grid_data opens + reflects on reply.
+-- `anchor_race` (the panel's selected race) re-targets the grid's relative params onto that race's start
+-- line; remembered until the reply arrives.
+function M.grid_open_saved(name, anchor_race)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+    local map = maps.current()
+    if not map then
+        editor_feedback("no map loaded", "warning")
+        return
+    end
+    M.state.grid_load_anchor = (type(anchor_race) == "string" and anchor_race ~= "") and anchor_race or nil
+    send_to_server("gridFetch", {map = map, name = name})
+end
+
+-- Set one knob on the active block (UI -> GE) and reflect the clamped result back to the panel.
+function M.grid_set(knob, value)
+    local ok, applied_or_reason = grideditor.set(knob, value)
+    if not ok then
+        editor_feedback(tostring(applied_or_reason), "warning")
+        return
+    end
+    push_grid_state()
+end
+
+-- Switch the edited block to forward/reverse (UI -> GE) and reflect; a race with no reverse geometry warns.
+-- The reference scene (props + first checkpoint) is direction-specific, so refresh it too.
+function M.grid_set_direction(direction)
+    local ok, reason = grideditor.set_direction(direction)
+    if not ok then
+        editor_feedback(tostring(reason), "warning")
+        return
+    end
+    refresh_grid_edit_scene()
+    push_grid_state()
+end
+
+-- Set how many slots the preview shows (UI -> GE) and reflect.
+function M.grid_set_preview(count)
+    local ok, reason = grideditor.set_preview_count(count)
+    if not ok then
+        editor_feedback(tostring(reason), "warning")
+        return
+    end
+    push_grid_state()
+end
+
+-- Save the active grid under `name` (UI -> GE -> server, ADR-0023). Mirrors beamcomp_grid_save's guards: a
+-- name is required and may not contain whitespace (it must be selectable via /race grid=<name>).
+function M.grid_save(name)
+    if type(name) ~= "string" or name == "" then
+        editor_feedback("enter a grid name", "warning")
+        return
+    end
+    if name:find("%s") then
+        editor_feedback("grid name must not contain spaces", "warning")
+        return
+    end
+    local snapshot = grideditor.snapshot(name)
+    if not snapshot then
+        editor_feedback("not editing -- start or load a grid first", "warning")
+        return
+    end
+    send_to_server("gridSave", snapshot)
+    -- This name is now the active grid's saved target (overwrite + assign without retyping).
+    M.state.grid_active_name = name
+    push_grid_state()
+    editor_feedback("saving grid '" .. name .. "' ...")
+end
+
+-- Bind a saved grid as the default for `race` (UI -> GE -> server, ADR-0023). The race is resolved to its
+-- canonical id client-side (race_start.resolve_id), exactly like beamcomp_grid_assign.
+function M.grid_assign(race, name)
+    if type(race) ~= "string" or race == "" or type(name) ~= "string" or name == "" then
+        editor_feedback("pick a race and save a grid first", "warning")
+        return
+    end
+    local map = maps.current()
+    if not map then
+        editor_feedback("no map loaded", "warning")
+        return
+    end
+    local race_id, reason = race_start.resolve_id(race)
+    if not race_id then
+        editor_feedback(tostring(reason), "warning")
+        return
+    end
+    send_to_server("gridAssign", {map = map, race = race_id, name = name})
+    editor_feedback("assigning '" .. name .. "' as default for " .. race_id .. " ...")
+end
+
+-- Delete a saved grid (UI -> GE -> server, ADR-0023). The server replies with the updated grid list (routed
+-- to the panel via grid_list_target), so the dropdown refreshes itself.
+function M.grid_delete(name)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+    local map = maps.current()
+    if not map then
+        editor_feedback("no map loaded", "warning")
+        return
+    end
+    M.state.grid_list_target = "gridui"
+    send_to_server("gridDelete", {map = map, name = name})
+    editor_feedback("deleting grid '" .. name .. "' ...")
+end
+
+-- Close the grid-editor panel (UI -> GE): just hide the app. The edit session is deliberately KEPT alive so
+-- reopening within the session restores the in-progress grid (its knobs/name persist, reflected by
+-- push_grid_data). A starting race or the explicit Clear action ends the session; clearing pillars on a mere
+-- panel close would lose the work the user wanted to keep.
+function M.close_grid_editor()
+    M.state.grid_seed_race = nil
+    -- Remove the physical reference props (they have collision -- leaving them in free-roam would be
+    -- intrusive); the lightweight grid/checkpoint preview stays with the kept session and a reopen
+    -- re-spawns the props.
+    props.clear(M.state.grid_edit_prop_names or {})
+    M.state.grid_edit_prop_names = nil
+    guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
+end
+
+-- Clear the grid-editor session (UI -> GE): end editing, remove the preview pillars, and reflect the now-empty
+-- state so the panel returns to its "pick a race" start. The panel stays open. The explicit counterpart to
+-- close (which keeps the session).
+function M.clear_grid_editor()
+    grideditor.clear()
+    M.state.grid_active_name = nil
+    refresh_grid_edit_scene()
+    push_grid_state()
 end
 
 -- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
@@ -1049,6 +1326,7 @@ local HANDLERS = {
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,
     setupOpen = handle_setup_open,
+    gridSetupOpen = handle_grid_setup_open,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -2798,6 +3076,12 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
     -- free-roam); the next-checkpoint marker only while a race is racing.
     local ok, err = pcall(function()
         draw_editor_grid()
+        -- The grid edit's reference first checkpoint, so the admin can place the grid relative to where
+        -- cars first head. Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil ->
+        -- full area + stored-normal posts).
+        if grideditor.state.active and M.state.grid_edit_checkpoint then
+            draw_checkpoint_marker(M.state.grid_edit_checkpoint, CHECKPOINT_STYLE, nil, nil)
+        end
         local race = M.state.race
         if race then
             local detection = M.state.detection
@@ -2833,6 +3117,11 @@ function M.onExtensionUnloaded()
     end
     M.state.registered = false
     grideditor.clear()
+    -- Despawn any grid-edit reference props too (their lifecycle is separate from the race props that
+    -- teardown_race_world clears), so a reload mid-edit leaves no orphaned scenery.
+    props.clear(M.state.grid_edit_prop_names or {})
+    M.state.grid_edit_prop_names = nil
+    M.state.grid_edit_checkpoint = nil
     spawn_mute.restore()
     -- Despawn props/cones, lift the in-race lock + start freeze, and drop all race state so a reload
     -- mid-race never leaves orphaned scenery or a stuck-frozen/locked car (ADR-0017).
@@ -2958,6 +3247,9 @@ end
 -- GE console command (intentionally global): despawn the preview pillars and leave edit mode.
 function beamcomp_grid_cancel()
     grideditor.clear()
+    props.clear(M.state.grid_edit_prop_names or {})
+    M.state.grid_edit_prop_names = nil
+    M.state.grid_edit_checkpoint = nil
     editor_feedback("grid editing ended -- pillars cleared")
 end
 

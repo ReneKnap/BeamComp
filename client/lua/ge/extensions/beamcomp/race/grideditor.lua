@@ -14,16 +14,21 @@
 local M = {}
 
 local grid = require("beamcomp/race/grid")
+-- Retained but intentionally unused while the editor's ground/wall-clear safe-spawn pass is disabled
+-- (see recompute): kept so re-enabling the snap is a one-line change back to placement.resolve_all(...).
 local placement = require("beamcomp/race/placement")
 local start = require("beamcomp/race/start")
 local maps = require("beamcomp/race/maps")
 
 local LOG_TAG = "beamcomp.grid"
 
--- The editor previews the grid's full fixed-capacity field so the layout reads clearly while tuning,
--- even with fewer (or no) players present -- and so the preview matches where cars actually spawn (the
--- layout is count-independent, grid.LAYOUT_CAPACITY).
-local PREVIEW_COUNT = grid.LAYOUT_CAPACITY
+-- The editor previews the grid's full fixed-capacity field by default so the layout reads clearly while
+-- tuning, even with fewer (or no) players present -- and so the preview matches where cars actually spawn
+-- (the layout is count-independent, grid.LAYOUT_CAPACITY). The count is tunable (M.set_preview_count) so an
+-- admin can preview a larger or smaller field; grid.poses grows the layout above the capacity.
+local DEFAULT_PREVIEW_COUNT = grid.LAYOUT_CAPACITY
+local MIN_PREVIEW_COUNT = 1
+local MAX_PREVIEW_COUNT = 32
 
 -- Tunable knobs (camelCase, matching the stored/wire param keys) and their constraints. Offsets and
 -- heading are unrestricted; gaps are non-negative; rows and columns are positive integers. rows and
@@ -48,16 +53,19 @@ M.state = {
     blocks = nil,      -- {forward = <params>, reverse = <params>?} accumulated for the save
     anchors = nil,     -- cached {forward = {base_pose, gate_normal}, reverse = ...} per direction
     poses = nil,       -- current preview poses for the active direction (drawn by init.lua)
+    preview_count = DEFAULT_PREVIEW_COUNT,  -- how many grid slots the preview shows (M.set_preview_count)
 }
 
 -- Recompute the preview poses for the active direction from its block + cached anchor.
 local function recompute()
     local anchor = M.state.anchors[M.state.direction]
     local block = M.state.blocks[M.state.direction]
-    -- Ground + wall-clear the preview exactly as a real start does (ADR-0034), so the pillars sit where
-    -- cars actually spawn (the ADR-0023 preview-matches-spawn invariant).
-    M.state.poses = placement.resolve_all(grid.poses(anchor.base_pose.pos, anchor.base_pose.rot,
-        PREVIEW_COUNT, block, anchor.gate_normal))
+    -- Raw computed poses, WITHOUT the ground + wall-clear safe-spawn pass (placement.resolve_all, ADR-0034)
+    -- the real start applies: the collision-snap is disabled in the editor for now so the layout shows
+    -- exactly the parametric grid the admin is tuning, without the snap nudging pillars around. Re-enable by
+    -- wrapping this in placement.resolve_all(...) again.
+    M.state.poses = grid.poses(anchor.base_pose.pos, anchor.base_pose.rot,
+        M.state.preview_count, block, anchor.gate_normal)
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given param blocks, and
@@ -81,6 +89,7 @@ local function enter(race_name_or_id, blocks)
     M.state.direction = "forward"
     M.state.blocks = blocks
     M.state.anchors = {forward = anchor}
+    M.state.preview_count = DEFAULT_PREVIEW_COUNT
     recompute()
     return true, anchor.raceId
 end
@@ -97,10 +106,12 @@ function M.start_fresh(race_name)
     return ok, race_id
 end
 
--- Open a saved grid for further editing (beamcomp_grid_edit, once the server returns its data). The
--- record carries the race it was authored against, so we re-anchor to that race; a loaded reverse block
+-- Open a saved grid for further editing (beamcomp_grid_edit, once the server returns its data). A grid's
+-- params are RELATIVE to a start line (ADR-0023), so `anchor_race` re-targets them onto a chosen race's
+-- start line -- loading a grid authored for race A onto race B previews B's start as the new origin. Absent
+-- an override, falls back to the race the grid was authored against (record.race). A loaded reverse block
 -- is preserved (set_direction won't overwrite it). Returns true + the canonical id, or nil + a reason.
-function M.open(record)
+function M.open(record, anchor_race)
     if type(record) ~= "table" or type(record.forward) ~= "table" or type(record.race) ~= "string" then
         return nil, "saved grid is missing its race or params"
     end
@@ -108,7 +119,8 @@ function M.open(record)
     if type(record.reverse) == "table" then
         blocks.reverse = record.reverse
     end
-    local ok, race_id = enter(record.race, blocks)
+    local target = (type(anchor_race) == "string" and anchor_race ~= "") and anchor_race or record.race
+    local ok, race_id = enter(target, blocks)
     if ok then
         log("I", LOG_TAG, "editing saved grid for '" .. race_id .. "'")
     end
@@ -179,6 +191,42 @@ function M.set(knob, value)
     return true, number
 end
 
+-- Set how many grid slots the preview shows (independent of the saved params -- the layout is
+-- count-independent, ADR-0023). `count` is coerced to an integer and clamped to [MIN, MAX]. Returns true +
+-- the applied value, or nil + a reason when not editing / non-numeric.
+function M.set_preview_count(count)
+    if not M.state.active then
+        return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+    end
+    local number = tonumber(count)
+    if not number then
+        return nil, "value must be a number"
+    end
+    number = math.max(MIN_PREVIEW_COUNT, math.min(MAX_PREVIEW_COUNT, math.floor(number)))
+    M.state.preview_count = number
+    recompute()
+    return true, number
+end
+
+-- The current preview slot count.
+function M.preview_count()
+    return M.state.preview_count
+end
+
+-- The reference scene for the active direction, for the caller (init.lua) to spawn/draw alongside the
+-- preview: {prefabFiles = {...}, checkpoint = {pos, normal, radius}|nil}. The anchor for each direction
+-- already carries these (start.anchor), so switching direction switches the scene too. Nil when not editing.
+function M.current_scene()
+    if not M.state.active then
+        return nil
+    end
+    local anchor = M.state.anchors[M.state.direction]
+    if not anchor then
+        return nil
+    end
+    return {prefabFiles = anchor.prefabFiles, checkpoint = anchor.checkpoint}
+end
+
 -- The current edit as a save payload: the map and the authored blocks (reverse only if it was edited).
 -- `name` is supplied by the caller (the save command). Returns nil when not editing.
 function M.snapshot(name)
@@ -203,6 +251,7 @@ function M.clear()
     M.state.blocks = nil
     M.state.anchors = nil
     M.state.poses = nil
+    M.state.preview_count = DEFAULT_PREVIEW_COUNT
 end
 
 return M
