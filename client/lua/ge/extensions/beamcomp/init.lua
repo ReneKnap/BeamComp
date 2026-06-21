@@ -171,6 +171,7 @@ M.state = {
     grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
+    setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -1032,6 +1033,22 @@ end
 -- beamcomp_init.request_setup_data.
 function M.request_setup_data(include_flag)
     push_setup_data(include_flag == "1")
+end
+
+-- Remember the race-setup panel's form (UI -> GE, ADR-0037): a JSON string the panel sends on close, so the
+-- next open restores the last race's settings within the session. Stored opaquely (the panel owns the
+-- shape); a non-string is ignored. Public as beamcomp_init.store_setup_form.
+function M.store_setup_form(json)
+    if type(json) == "string" and json ~= "" then
+        M.state.setup_form = json
+    end
+end
+
+-- Push the remembered race-setup form to the panel (UI -> GE, ADR-0037): the panel pulls it once on link to
+-- restore the last settings; nil when nothing has been stored this session (the panel keeps its defaults).
+-- Public as beamcomp_init.request_setup_form.
+function M.request_setup_form()
+    guihooks.trigger("BeamCompSetupForm", {form = M.state.setup_form})
 end
 
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on

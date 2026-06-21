@@ -136,19 +136,42 @@ angular.module('beamng.apps')
           (scope.data.configs || []).map(function (c) { return { v: c.config, label: c.name }; }));
       }
 
-      // GE pushes the dynamic lists when the panel opens; reset the form to defaults each open.
+      // GE pushes the dynamic lists on open AND on every refresh (the include-deprecated toggle, the Refresh
+      // button). It must update only the option lists -- NOT the form: resetting the form here made the
+      // include-deprecated toggle (which triggers a refresh) snap back instantly, and wiped settings between
+      // refreshes. The form is seeded once on link and restored from GE via BeamCompSetupForm.
       scope.$on('BeamCompSetupData', function (event, payload) {
         scope.$evalAsync(function () {
           scope.data.races = (payload && payload.races) || [];
           scope.data.cars = (payload && payload.cars) || [];
-          scope.data.configs = [];
-          scope.data.grids = [];
-          scope.form = freshForm();
-          scope.open = null;
-          scope.prepared = false;
           rebuildRaceCarOpts();
+          // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
+          // harmless (labelFor falls back) and re-fetched on the next model change.
           rebuildGridOpts();
           rebuildConfigOpts();
+        });
+      });
+
+      // Restore the last race's form, remembered by GE across panel close/reopen within the session
+      // (ADR-0037). Merge over freshForm so any field absent from an older stored form keeps its default.
+      scope.$on('BeamCompSetupForm', function (event, payload) {
+        scope.$evalAsync(function () {
+          if (!payload || !payload.form) {
+            return;
+          }
+          var parsed;
+          try {
+            parsed = JSON.parse(payload.form);
+          } catch (e) {
+            return;
+          }
+          scope.form = angular.extend(freshForm(), parsed);
+          // Re-sync the race list to the restored include-deprecated flag, and fetch the restored model's
+          // configs so the config dropdown + label resolve (without clearing the stored config).
+          scope.refresh();
+          if (scope.form.carModel) {
+            geLuaArg('request_car_configs', scope.form.carModel);
+          }
         });
       });
 
@@ -209,6 +232,14 @@ angular.module('beamng.apps')
         geLuaArg('request_setup_data', scope.form.includeDeprecated ? '1' : '');
       };
 
+      // Open the grid editor for the currently selected race (ADR-0037 amendment). This panel stays open;
+      // GE opens BeamCompGridEditor client-side with the race carried over.
+      scope.editGrid = function () {
+        if (scope.form.race) {
+          geLuaArg('open_grid_editor_with_race', scope.form.race);
+        }
+      };
+
       // Prepare Race: send the structured request -- the race spawns + enters staging. Reveals Start Race.
       scope.prepareRace = function () {
         if (!scope.form.race) {
@@ -226,12 +257,16 @@ angular.module('beamng.apps')
       };
 
       scope.close = function () {
+        // Remember the current form so the next open restores it within the session (ADR-0037).
+        geLuaArg('store_setup_form', JSON.stringify(scope.form));
         geCall('close_setup');
       };
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
-      // asks GE for the lists itself (BeamCompSetupData arrives back via the $on above).
+      // asks GE for the lists itself (BeamCompSetupData arrives back via the $on above). Also pull the
+      // remembered form (BeamCompSetupForm) so a reopen restores the last race's settings.
       scope.refresh();
+      geCall('request_setup_form');
     },
   };
 }]);
