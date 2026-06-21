@@ -1,0 +1,212 @@
+<div class="bc-setup">
+  <style scoped>
+    .bc-setup { display: flex; flex-direction: column; height: 100%; box-sizing: border-box;
+      font-family: 'Roboto', sans-serif; font-size: 13px; color: #f0f0f0;
+      background: rgba(20, 22, 26, 0.92); border-radius: 4px; overflow: hidden; }
+    .bc-toolbar { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; padding: 6px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.12); }
+    .bc-toolbar .bc-tog { display: flex; align-items: center; gap: 5px; font-size: 12px; cursor: pointer; }
+    .bc-setup-scroll { flex: 1 1 auto; overflow-y: auto; padding: 8px 10px; }
+    .bc-section { margin-bottom: 10px; }
+    .bc-section-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      font-size: 11px; color: #8fd3ff; border-bottom: 1px solid rgba(255,255,255,0.12);
+      padding-bottom: 2px; margin-bottom: 6px; }
+    .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      margin: 4px 0; }
+    .bc-row > span { flex: 0 0 42%; }
+    .bc-row input[type=number] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
+      color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
+    .bc-check { justify-content: flex-start; }
+    .bc-check input { flex: 0 0 auto; margin-right: 6px; }
+    /* Custom dropdown (native <select> does not open in the BeamNG CEF overlay). */
+    .bc-dd { position: relative; flex: 1 1 auto; min-width: 0; }
+    .bc-dd-head { width: 100%; text-align: left; background: #2a2e35; color: #f0f0f0;
+      border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 22px 2px 6px;
+      cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bc-dd-head::after { content: '\25BC'; position: absolute; right: 6px; top: 50%;
+      transform: translateY(-50%); font-size: 9px; color: #9aa3ad; pointer-events: none; }
+    .bc-dd-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 50; max-height: 170px;
+      overflow-y: auto; background: #20242b; border: 1px solid rgba(255,255,255,0.22);
+      border-radius: 3px; margin-top: 2px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+    .bc-dd-opt { padding: 4px 7px; cursor: pointer; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; }
+    .bc-dd-opt:hover { background: #2e7d32; }
+    .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    .bc-actions { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 10px;
+      border-top: 1px solid rgba(255,255,255,0.12); }
+    .bc-actions button { flex: 1 1 auto; padding: 6px 0; border: none; border-radius: 3px;
+      font-weight: 700; cursor: pointer; }
+    .bc-prepare { background: #2e7d32; color: #fff; }
+    .bc-prepare[disabled] { background: #444; color: #999; cursor: default; }
+    .bc-start { background: #1565c0; color: #fff; }
+    .bc-refresh { background: #355; color: #cde; padding: 3px 10px; border: none; border-radius: 3px;
+      font-weight: 700; cursor: pointer; }
+    .bc-close { background: #444; color: #ddd; flex: 0 0 80px; }
+  </style>
+
+  <div class="bc-toolbar">
+    <button class="bc-refresh" ng-click="refresh()">Refresh</button>
+    <label class="bc-tog"><input type="checkbox" ng-model="form.includeDeprecated" ng-change="refresh()"><span>incl. deprecated</span></label>
+  </div>
+
+  <div class="bc-setup-scroll">
+
+    <!-- Basis -->
+    <div class="bc-section">
+      <div class="bc-section-title">Basis</div>
+      <div class="bc-row">
+        <span>Race</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('race')">{{labelFor('race')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'race'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
+              ng-click="pick('race', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row">
+        <span>Mode</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('mode')">{{labelFor('mode')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'mode'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.mode" ng-class="{sel: o.v === form.mode}"
+              ng-click="pick('mode', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <label class="bc-row">
+        <span>Laps</span>
+        <input type="number" min="1" ng-model="form.laps" placeholder="auto">
+      </label>
+      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
+      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.force"><span>Force (ignore mismatch)</span></label>
+    </div>
+
+    <!-- Fahrzeuge -->
+    <div class="bc-section">
+      <div class="bc-section-title">Fahrzeuge</div>
+      <div class="bc-row">
+        <span>Car (all)</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('carModel')">{{labelFor('carModel')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'carModel'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.carModel" ng-class="{sel: o.v === form.carModel}"
+              ng-click="pick('carModel', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row" ng-if="form.carModel">
+        <span>Config</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('carConfig')">{{labelFor('carConfig')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'carConfig'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.carConfig" ng-class="{sel: o.v === form.carConfig}"
+              ng-click="pick('carConfig', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <label class="bc-row" ng-if="!form.carModel">
+        <span>Max hp</span>
+        <input type="number" min="0" ng-model="form.maxhp" placeholder="off">
+      </label>
+      <label class="bc-row" ng-if="!form.carModel">
+        <span>Max hp/kg</span>
+        <input type="number" min="0" step="0.001" ng-model="form.maxpwr" placeholder="off">
+      </label>
+      <div class="bc-row">
+        <span>Start order</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('orderMode')">{{labelFor('orderMode')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'orderMode'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.orderMode" ng-class="{sel: o.v === form.orderMode}"
+              ng-click="pick('orderMode', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+      <label class="bc-row bc-check" ng-if="form.orderMode === 'last' || form.orderMode === 'pwr'">
+        <input type="checkbox" ng-model="form.orderRev"><span>Reverse order (handicap)</span>
+      </label>
+      <div class="bc-row">
+        <span>Grid</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('grid')">{{labelFor('grid')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'grid'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.grid" ng-class="{sel: o.v === form.grid}"
+              ng-click="pick('grid', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Assists -->
+    <div class="bc-section">
+      <div class="bc-section-title">Assists</div>
+      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.recover"><span>Recover</span></label>
+      <label class="bc-row" ng-if="form.recover">
+        <span>Recover hold (s)</span>
+        <input type="number" min="0" ng-model="form.recoverSecs" placeholder="default">
+      </label>
+      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.repair"><span>Repair</span></label>
+      <label class="bc-row" ng-if="form.repair">
+        <span>Repair hold (s)</span>
+        <input type="number" min="0" ng-model="form.repairSecs" placeholder="default">
+      </label>
+    </div>
+
+    <!-- KI -->
+    <div class="bc-section">
+      <div class="bc-section-title">KI</div>
+      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiEnabled"><span>AI opponents</span></label>
+      <div ng-if="form.aiEnabled">
+        <label class="bc-row">
+          <span>Count</span>
+          <input type="number" min="1" max="16" ng-model="form.aiCount">
+        </label>
+        <div class="bc-row">
+          <span>Preset</span>
+          <div class="bc-dd">
+            <button type="button" class="bc-dd-head" ng-click="toggle('aiPreset')">{{labelFor('aiPreset')}}</button>
+            <div class="bc-dd-list" ng-if="open === 'aiPreset'">
+              <div class="bc-dd-opt" ng-repeat="o in opts.aiPreset" ng-class="{sel: o.v === form.aiPreset}"
+                ng-click="pick('aiPreset', o.v)">{{o.label}}</div>
+            </div>
+          </div>
+        </div>
+        <div class="bc-row">
+          <span>AI car</span>
+          <div class="bc-dd">
+            <button type="button" class="bc-dd-head" ng-click="toggle('aiCar')">{{labelFor('aiCar')}}</button>
+            <div class="bc-dd-list" ng-if="open === 'aiCar'">
+              <div class="bc-dd-opt" ng-repeat="o in opts.aiCar" ng-class="{sel: o.v === form.aiCar}"
+                ng-click="pick('aiCar', o.v)">{{o.label}}</div>
+            </div>
+          </div>
+        </div>
+        <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAdvanced"><span>Advanced AI settings</span></label>
+        <div ng-if="form.aiAdvanced">
+          <div class="bc-row">
+            <span>Route</span>
+            <div class="bc-dd">
+              <button type="button" class="bc-dd-head" ng-click="toggle('aiRoute')">{{labelFor('aiRoute')}}</button>
+              <div class="bc-dd-list" ng-if="open === 'aiRoute'">
+                <div class="bc-dd-opt" ng-repeat="o in opts.aiRoute" ng-class="{sel: o.v === form.aiRoute}"
+                  ng-click="pick('aiRoute', o.v)">{{o.label}}</div>
+              </div>
+            </div>
+          </div>
+          <label class="bc-row"><span>Aggression</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiAggr" placeholder="-"></label>
+          <label class="bc-row"><span>Skill</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiSkill" placeholder="-"></label>
+          <label class="bc-row"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="-"></label>
+          <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="bc-actions">
+    <button class="bc-prepare" ng-disabled="!form.race" ng-click="prepareRace()">Prepare Race</button>
+    <button class="bc-start" ng-if="prepared" ng-click="startRaceGo()">Start Race</button>
+    <button class="bc-close" ng-click="close()">Close</button>
+  </div>
+</div>

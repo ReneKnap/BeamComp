@@ -1,0 +1,20 @@
+{
+  "domElement": "<beam-comp-setup></beam-comp-setup>",
+  "directive": "beamCompSetup",
+  "name": "BeamComp Setup",
+  "description": "BeamComp race-setup panel -- set all /race options via dropdowns and start the race (admin only). Opened with /raceui.",
+  "author": "BeamComp",
+  "version": "0.0.1",
+  "category": "Gameplay",
+  "types": [
+    "ui.apps.categories.racing"
+  ],
+  "css": {
+    "top": "90px",
+    "left": "50px",
+    "width": "460px",
+    "height": "560px",
+    "min-width": "360px",
+    "min-height": "320px"
+  }
+}
