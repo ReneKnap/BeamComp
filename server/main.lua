@@ -78,6 +78,7 @@ local CHAT_COMMAND_DNF = "/dnf"
 local CHAT_COMMAND_PING = "/beamcomp"
 local CHAT_COMMAND_RESULTS = "/results"  -- toggle the asking player's finished-results card (ADR-0022)
 local CHAT_COMMAND_ANALYSIS = "/analysis"  -- toggle the asking player's post-race analysis overlay (ADR-0028)
+local CHAT_COMMAND_RACEUI = "/raceui"  -- open the asking admin's race-setup panel (ADR-0037; admin-gated)
 -- Manual race-start aliases (ADR-0021): any of these ends the staging wait early and starts the
 -- countdown. All three route to one handler.
 local CHAT_COMMAND_GO = "/go"
@@ -105,6 +106,8 @@ local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its 
 local MSG_GRID_LIST_REQ = "gridListReq"  -- editor lists a map's saved grids (ADR-0023; read-only)
 local MSG_GRID_DATA = "gridData"      -- reply to gridFetch: a saved grid's params (server -> client)
 local MSG_GRID_LIST = "gridList"      -- reply to gridListReq: the map's saved grid names (server -> client)
+local MSG_START_RACE = "startRace"   -- the settings UI's structured race request: {race, overrides} (ADR-0037; admin-gated)
+local MSG_RACE_GO = "raceGo"         -- the settings UI's "start now": end staging -> countdown, the /go equivalent (ADR-0037; admin-gated)
 -- Server -> client broadcast/request types.
 local MSG_STANDINGS = "standings"     -- the live ranked standings table (broadcast)
 local MSG_LIST_RACES = "listRaces"    -- ask one client to report its installed-race list (/races)
@@ -115,6 +118,7 @@ local MSG_RESULTS_TOGGLE = "resultsToggle"  -- tell one client to hide/show its 
 local MSG_BEST_NOTICE = "bestNotice"  -- tell a finisher they set a personal best / track record (ADR-0027)
 local MSG_RACE_RECORDS = "raceRecords"  -- ship a participant's pre-run PB + the race's track record at the finish seam (ADR-0028)
 local MSG_ANALYSIS_TOGGLE = "analysisToggle"  -- tell one client to open/close its post-race analysis overlay (ADR-0028)
+local MSG_SETUP_OPEN = "setupOpen"  -- tell one client to open its race-setup panel (ADR-0037)
 local MSG_REGRID = "regrid"  -- tell one client its reassigned grid slot + the reordered roster for a pwr re-grid (ADR-0033)
 local MSG_AI_MAP = "aiMap"  -- owner -> all: which synced vehicles are AI cars, so remotes label/suppress them (ADR-0036)
 local MSG_AI_ROUTE_NOTICE = "aiRouteNotice"  -- owner -> server: which AI route variant was used, posted to chat (ADR-0036 Step-3)
@@ -2097,25 +2101,15 @@ local function parse_race_args(argument)
     return name, overrides, bad_token
 end
 
--- /race <name> [options]: from an idle/finished session start the race; from an active one queue the
--- new race and cut the current one short with a brief abort window before it restarts (ADR-0006). The
--- overrides (mode/laps/direction/force/assists) are relayed verbatim to clients (race-blind, ADR-0013/
--- 0018); the client validates them against the parsed race geometry.
-local function handle_race_command(player_id, player_name, argument)
+-- Admin-gate, apply the vehicle-policy precedence bookkeeping, log, and launch the issuer-client
+-- validation handshake for a race request. Shared by the /race chat command and the settings-UI
+-- startRace event (ADR-0037): both produce the same `overrides` shape (parse_race_args output), relayed
+-- verbatim to clients (race-blind, ADR-0005/0013/0018) for the client to validate against geometry. The
+-- caller supplies an already-resolved race_name + overrides; this owns everything from the admin check on.
+local function begin_race_request(player_id, player_name, race_name, overrides)
     if not is_race_admin(player_name) then
         MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
-        log_info("beamcomp.race", "denied /race from " .. player_name .. " (not a race admin)")
-        return
-    end
-
-    local race_name, overrides, bad_token = parse_race_args(argument)
-
-    if not race_name then
-        MP.SendChatMessage(player_id, RACE_USAGE)
-        return
-    end
-    if bad_token then
-        MP.SendChatMessage(player_id, "BeamComp: unknown option '" .. bad_token .. "' -- " .. RACE_USAGE)
+        log_info("beamcomp.race", "denied race request from " .. tostring(player_name) .. " (not a race admin)")
         return
     end
 
@@ -2133,7 +2127,7 @@ local function handle_race_command(player_id, player_name, argument)
         order_echo = " order=" .. overrides.order.mode .. (overrides.order.rev and ":rev" or "")
     end
     log_info("beamcomp.race", string.format(
-        "/race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s",
+        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
@@ -2151,7 +2145,7 @@ local function handle_race_command(player_id, player_name, argument)
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
-    -- lets a stale/duplicate reply (e.g. a re-issued /race) be ignored.
+    -- lets a stale/duplicate reply (e.g. a re-issued request) be ignored.
     session.validation_seq = session.validation_seq + 1
     local nonce = session.validation_seq
     session.pending_validation = {
@@ -2170,6 +2164,24 @@ local function handle_race_command(player_id, player_name, argument)
         all = overrides.all,  -- opt the deprecated quickrace source into resolution (ADR-0026)
         nonce = nonce,
     })
+end
+
+-- /race <name> [options]: parse the chat argument into a race name + overrides, then hand off to the
+-- shared kickoff (ADR-0037). From an idle/finished session it starts the race; from an active one it
+-- queues the new race after a brief abort window (ADR-0006), both downstream of the validation handshake.
+local function handle_race_command(player_id, player_name, argument)
+    local race_name, overrides, bad_token = parse_race_args(argument)
+
+    if not race_name then
+        MP.SendChatMessage(player_id, RACE_USAGE)
+        return
+    end
+    if bad_token then
+        MP.SendChatMessage(player_id, "BeamComp: unknown option '" .. bad_token .. "' -- " .. RACE_USAGE)
+        return
+    end
+
+    begin_race_request(player_id, player_name, race_name, overrides)
 end
 
 -- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
@@ -2379,6 +2391,19 @@ local function handle_analysis_command(player_id, player_name)
     log_info("beamcomp.race", CHAT_COMMAND_ANALYSIS .. " toggle by " .. player_name)
 end
 
+-- /raceui: open the asking admin's race-setup panel (ADR-0037). Admin-gated like /race, since the panel
+-- starts races; the client assembles the option lists + opens the app on this relay. Race-blind: the
+-- server only relays the open signal, it builds no race data.
+local function handle_raceui_command(player_id, player_name)
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
+        log_info("beamcomp.race", "denied " .. CHAT_COMMAND_RACEUI .. " from " .. player_name .. " (not a race admin)")
+        return
+    end
+    send_event(player_id, MSG_SETUP_OPEN, {})
+    log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
+end
+
 -- True if no connected player other than `leaving_id` remains. onPlayerDisconnect may or may
 -- not still list the leaving player, so exclude it explicitly.
 local function is_server_empty_without(leaving_id)
@@ -2490,6 +2515,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_ANALYSIS then
         handle_analysis_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == CHAT_COMMAND_RACEUI then
+        handle_raceui_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
     -- not a BeamComp command: return nothing so the message relays normally
@@ -2790,6 +2820,106 @@ local function handle_grid_list_request(player_id, payload)
     send_event(player_id, MSG_GRID_LIST, {names = names})
 end
 
+-- Coerce the settings UI's decoded overrides into the shape begin_race_request/start_race expect (the
+-- parse_race_args output, ADR-0037). The payload is an untrusted network boundary, so every field is
+-- type-checked and clamped; unknown fields are dropped. Most values are opaque relay (race-blind,
+-- ADR-0005) -- the issuer client validates them against geometry -- but the few the server itself reads
+-- (order.mode, ai.count, assists.*) must be well-formed so a malformed payload cannot crash it.
+local function sanitize_overrides(raw)
+    if type(raw) ~= "table" then
+        raw = {}
+    end
+    local laps = tonumber(raw.laps)
+    local overrides = {
+        force = raw.force == true,
+        all = raw.all == true,
+        mode = (raw.mode == "sprint" or raw.mode == "circuit") and raw.mode or nil,
+        direction = (raw.direction == "reverse") and "reverse" or nil,
+        laps = laps and math.max(1, math.floor(laps)) or nil,
+        car = (type(raw.car) == "string" and raw.car ~= "") and raw.car or nil,
+        maxhp = tonumber(raw.maxhp),
+        maxpwr = tonumber(raw.maxpwr),
+        grid = (type(raw.grid) == "string" and raw.grid ~= "") and raw.grid or nil,
+    }
+
+    -- Assists default both ON at the default hold (parse_race_args parity); the UI may turn either off or
+    -- set a custom hold.
+    local a = type(raw.assists) == "table" and raw.assists or {}
+    overrides.assists = {
+        recoverEnabled = a.recoverEnabled ~= false,
+        recoverHoldSeconds = tonumber(a.recoverHoldSeconds) or ASSIST_DEFAULT_HOLD_SECONDS,
+        repairEnabled = a.repairEnabled ~= false,
+        repairHoldSeconds = tonumber(a.repairHoldSeconds) or ASSIST_DEFAULT_HOLD_SECONDS,
+    }
+
+    -- Start order (ADR-0033): only a known mode survives; rev is a flag on a directional mode.
+    if type(raw.order) == "table" and ORDER_MODES[raw.order.mode] then
+        overrides.order = {mode = raw.order.mode, rev = raw.order.rev == true}
+    end
+
+    -- AI opponents (ADR-0036): present only when a count is given. Count clamped to [1, MAX_AI]; preset
+    -- resolved against the known set; vehicle + raw driving params relayed verbatim to the owner. explicit
+    -- defaults true (the UI carries a count) but may be set false to take the race's content-default count.
+    if type(raw.ai) == "table" and raw.ai.count ~= nil then
+        local count = math.max(1, math.min(MAX_AI, math.floor(tonumber(raw.ai.count) or DEFAULT_AI_COUNT)))
+        local ai = {count = count, explicit = raw.ai.explicit ~= false}
+        local preset = type(raw.ai.preset) == "string" and resolve_keyword(raw.ai.preset, AI_PRESET_LIST)
+        if preset then
+            ai.preset = preset
+        end
+        if type(raw.ai.car) == "string" and raw.ai.car ~= "" then
+            ai.car = raw.ai.car
+        end
+        if type(raw.ai.params) == "table" then
+            local params = {}
+            for _, key in ipairs({"aggr", "skill", "rubber"}) do
+                local value = tonumber(raw.ai.params[key])
+                if value then
+                    params[key] = math.max(0, math.min(1, value))
+                end
+            end
+            if type(raw.ai.params.avoid) == "boolean" then
+                params.avoid = raw.ai.params.avoid
+            end
+            if raw.ai.params.route == "snap" or raw.ai.params.route == "direct" then
+                params.route = raw.ai.params.route
+            end
+            if next(params) then
+                ai.params = params
+            end
+        end
+        overrides.ai = ai
+    end
+
+    return overrides
+end
+
+-- The settings UI's structured race request (ADR-0037): {race, overrides}. Resolve the issuer's name for
+-- the admin gate, coerce the overrides to a safe shape, and hand off to the shared kickoff -- the same
+-- validation handshake + start path the typed /race uses. Race-blind: overrides are relayed, not parsed.
+local function handle_start_race(player_id, payload)
+    if type(payload) ~= "table" or type(payload.race) ~= "string" or payload.race == "" then
+        MP.SendChatMessage(player_id, "BeamComp: race setup rejected -- no race selected")
+        return
+    end
+    local player_name = player_name_of(player_id)
+    if not player_name then
+        return
+    end
+    begin_race_request(player_id, player_name, payload.race, sanitize_overrides(payload.overrides))
+end
+
+-- The settings UI's "Start Race" (ADR-0037): end the staging wait and begin the countdown -- the /go
+-- equivalent. Resolves the issuer's name and reuses handle_start_command, which admin-gates and checks the
+-- staging phase, so a stray raceGo outside staging is a harmless no-op message.
+local function handle_race_go(player_id)
+    local player_name = player_name_of(player_id)
+    if not player_name then
+        return
+    end
+    handle_start_command(player_id, player_name)
+end
+
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
 -- hand-decodes (it does not load the shared envelope module, ADR-0004); `data` arrives as a JSON
 -- string. A non-string `data` means the handler arg order differs from the assumed (player_id, data)
@@ -2833,6 +2963,10 @@ local function handle_client_event(player_id, data)
         handle_grid_fetch(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_LIST_REQ then
         handle_grid_list_request(player_id, decoded.payload)
+    elseif decoded.type == MSG_START_RACE then
+        handle_start_race(player_id, decoded.payload)
+    elseif decoded.type == MSG_RACE_GO then
+        handle_race_go(player_id)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
