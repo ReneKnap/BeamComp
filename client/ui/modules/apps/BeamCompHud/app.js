@@ -37,6 +37,30 @@ angular.module('beamng.apps')
     return sign + m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
   }
 
+  // Live-standings interval cell: the time gap to the row's reference (the selected mode -- self,
+  // car ahead, or leader), prefixed with the checkpoint gap when the two are more than one completed
+  // checkpoint apart -> "+2 CP (+12.3)" (the frozen shared-crossing time gap, ADR-0015, is then
+  // misleadingly small, so the CP gap leads). Both are signed: a reference ahead reads negative. At
+  // <=1 CP apart it is just the time.
+  function formatInterval(e) {
+    if (typeof e.cpInterval === 'number' && Math.abs(e.cpInterval) >= 2) {
+      var cp = (e.cpInterval < 0 ? '-' : '+') + Math.abs(e.cpInterval) + ' CP';
+      return typeof e.interval === 'number' ? cp + ' (' + formatDelta(e.interval) + ')' : cp;
+    }
+    return formatDelta(e.interval);
+  }
+
+  // Short label for the live-standings interval reference mode, shown on the REL toggle.
+  function intervalLabel(mode) {
+    if (mode === 'leader') {
+      return 'LEADER';
+    }
+    if (mode === 'ahead') {
+      return 'AHEAD';
+    }
+    return 'SELF';
+  }
+
   // Unsigned race time in seconds for the analysis matrix/metrics: "S.cs" under 60 s, "M:SS.cs" from
   // 60 s (segments are usually a handful of seconds, but a long lap segment can exceed a minute).
   // Placeholder when not a number.
@@ -163,6 +187,7 @@ angular.module('beamng.apps')
       scope.countdown = {active: false};
       scope.formatTime = formatTime;
       scope.formatDelta = formatDelta;
+      scope.formatInterval = formatInterval;
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
@@ -180,8 +205,55 @@ angular.module('beamng.apps')
       }
       noteAlive();
       var heartbeat = $interval(noteAlive, 1000);
+
+      // Position-gain flash state (live HUD only): the previous rank per stable row id, the rows
+      // currently flashing, and their clear timers. Tracked across the per-frame snapshots over the
+      // full field (not the windowed rows) so a row scrolling in and out of view never false-flashes.
+      var prevPos = {};
+      var flashing = {};
+      var flashTimers = {};
+
+      function clearFlashTimers() {
+        for (var id in flashTimers) {
+          $timeout.cancel(flashTimers[id]);
+        }
+        flashTimers = {};
+      }
+
+      function resetFlashState() {
+        clearFlashTimers();
+        prevPos = {};
+        flashing = {};
+      }
+
+      // Compare each entry's rank to the last frame; a row that improved its position flashes for ~1 s.
+      // A row with no prior known rank (mid-race join, first frame) only establishes its rank.
+      function trackPositionGains(entries) {
+        for (var i = 0; i < entries.length; i++) {
+          var e = entries[i];
+          if (!e.id) {
+            continue;
+          }
+          var last = prevPos[e.id];
+          if (last != null && e.position < last) {
+            flashing[e.id] = true;
+            if (flashTimers[e.id]) {
+              $timeout.cancel(flashTimers[e.id]);
+            }
+            flashTimers[e.id] = $timeout((function (id) {
+              return function () {
+                flashing[id] = false;
+                delete flashTimers[id];
+              };
+            })(e.id), 2000);
+          }
+          prevPos[e.id] = e.position;
+        }
+      }
+
       scope.$on('$destroy', function () {
         $interval.cancel(heartbeat);
+        clearFlashTimers();
       });
 
       // Open/close the post-race analysis overlay via the GE flag (single source of truth, ADR-0028):
@@ -194,6 +266,16 @@ angular.module('beamng.apps')
           bngApi.engineLua('if beamcomp_init then beamcomp_init.toggle_analysis() end');
         }
       };
+
+      // Cycle the live-standings interval reference (self -> ahead -> leader) via the GE flag (single
+      // source of truth): the REL toggle on the standings panel routes here. bngApi is the typeof-guarded
+      // core UI global (not an injected service -- ADR-0012), so a miss is inert.
+      scope.cycleIntervalMode = function () {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.cycle_interval_mode() end');
+        }
+      };
+      scope.intervalLabel = intervalLabel;
 
       // Analysis delta cell: signed delta or a placeholder, with a faster/slower colour class (ADR-0028).
       scope.deltaCell = function (d) {
@@ -221,7 +303,15 @@ angular.module('beamng.apps')
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
           scope.hud = data || {active: false, entries: []};
+          if (scope.hud.phase === 'finished') {
+            resetFlashState();
+          } else {
+            trackPositionGains(scope.hud.entries || []);
+          }
           scope.hud.liveEntries = windowLiveEntries(scope.hud.entries);
+          for (var i = 0; i < scope.hud.liveEntries.length; i++) {
+            scope.hud.liveEntries[i].flash = !!flashing[scope.hud.liveEntries[i].id];
+          }
           scope.hud.localEntry = findLocalEntry(scope.hud.entries);
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);

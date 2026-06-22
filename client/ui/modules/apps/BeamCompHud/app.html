@@ -161,7 +161,8 @@
       text-align: right;
     }
     .beamcomp-hud .bc-int {
-      width: 5.5em;
+      /* Wide enough for the combined "+2 CP (+12.3)" interval (table-layout:fixed pins the column). */
+      width: 8.5em;
       font-variant-numeric: tabular-nums;
       text-align: right;
       opacity: 0.85;
@@ -189,6 +190,36 @@
     .beamcomp-hud tr.bc-local {
       background: rgba(63, 217, 107, 0.18);
       font-weight: bold;
+    }
+    /* Position-gain flash: a strong green pulse over ~1 s, set by the controller when a row's rank
+       improves. The animated background overrides the static bc-local tint while it plays, so the
+       flash is visible even on the local row, then fades back. */
+    @keyframes bc-flash-pulse {
+      from { background: rgba(63, 217, 107, 0.65); }
+      to { background: rgba(63, 217, 107, 0); }
+    }
+    .beamcomp-hud tr.bc-flash {
+      animation: bc-flash-pulse 2s ease-out;
+    }
+    /* Clickable interval-reference toggle on the standings panel: cycles self/ahead/leader (GE flag,
+       ADR-0012). Styled as a small button (border + background, like the analysis button) so it reads
+       as pressable; the ↻ glyph signals it cycles. pointer-events:auto via the enclosing panel. */
+    .beamcomp-hud .bc-relmode {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: bold;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      padding: 1px 8px;
+      margin: 0 0 5px 0;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      border-radius: 4px;
+      user-select: none;
+    }
+    .beamcomp-hud .bc-relmode:hover {
+      background: rgba(255, 255, 255, 0.24);
+      border-color: rgba(255, 255, 255, 0.55);
     }
     .beamcomp-hud tr.bc-finished .bc-time {
       color: #3fd96b;
@@ -379,13 +410,14 @@
       <div class="bc-pos-huge" ng-if="hud.localEntry">P{{hud.localEntry.position}}<span class="bc-pos-of">/{{hud.entries.length}}</span></div>
       <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
       <div class="bc-panel bc-standings-panel">
+        <div class="bc-relmode" ng-click="cycleIntervalMode()" title="Abstand relativ zu: umschalten (self / ahead / leader)">&#8635; REL {{intervalLabel(hud.intervalMode)}}</div>
         <div class="bc-scroll">
           <table class="bc-standings">
             <tr ng-repeat="e in hud.liveEntries"
-                ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai}">
+                ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai, 'bc-flash': e.flash}">
               <td class="bc-pos">P{{e.position}}</td>
               <td class="bc-name">{{e.name}}</td>
-              <td class="bc-int">{{formatDelta(e.interval)}}</td>
+              <td class="bc-int">{{formatInterval(e)}}</td>
             </tr>
           </table>
         </div>

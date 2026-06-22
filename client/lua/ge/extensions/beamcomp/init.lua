@@ -142,6 +142,7 @@ M.state = {
     results_hidden = false,  -- local-only toggle: hide the finished results card via /results (ADR-0022)
     race_records = nil,      -- pre-run PB + track record for the post-race analysis overlay (server raceRecords, ADR-0028), or nil
     analysis_open = false,   -- local-only toggle: show the post-race analysis overlay via /analysis or the card button (ADR-0028)
+    interval_mode = "self",  -- local-only live-standings interval reference: "self" | "ahead" | "leader"; cycled by the HUD toggle, session-persistent (not reset per race)
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
     staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
@@ -846,6 +847,15 @@ end
 -- The /analysis relay (server -> this client) flips the same overlay flag as the results-card button.
 local function handle_analysis_toggle()
     M.toggle_analysis()
+end
+
+-- Cycle the live-standings interval reference (self -> ahead -> leader -> self). Public so the HUD's
+-- REL toggle can call it via bngApi.engineLua (UI -> GE, ADR-0012). Local-only display state read by
+-- build_hud_snapshot; session-persistent (not reset per race). The next per-frame snapshot reflects it.
+function M.cycle_interval_mode()
+    local order = {self = "ahead", ahead = "leader", leader = "self"}
+    M.state.interval_mode = order[M.state.interval_mode] or "self"
+    log("I", RACE_LOG_TAG, "standings interval mode -> " .. M.state.interval_mode)
 end
 
 -- Heartbeat from the HUD app (UI -> GE, ADR-0012): the AngularJS directive calls this on link and once a
@@ -2491,6 +2501,10 @@ local function build_hud_snapshot()
                 end
             end
             entries[i] = {
+                -- Stable per-row key for the client's position-gain flash (keyed across frames,
+                -- independent of the standings windowing): the server slot when present, else the
+                -- canonical name (ADR-0031).
+                id = (e.slot ~= nil and "s" .. tostring(e.slot)) or ("n" .. tostring(e.name)),
                 position = e.position,
                 name = e.name,
                 checkpoint = checkpoint,
@@ -2531,15 +2545,39 @@ local function build_hud_snapshot()
         return a[shared] - b[shared]
     end
 
+    -- The interval column's reference is the local live-standings view mode (ADR-0012): "self" (every
+    -- row vs the local player, default), "ahead" (vs the car directly ahead), or "leader" (vs P1). The
+    -- finished results card always reads the vs-ahead interval, so the frozen card is identical for every
+    -- client regardless of each viewer's mode. `cpInterval` (signed raw crossing difference, no lap
+    -- conversion) follows the same reference; the HUD shows it alongside the time when |gap| > 1 CP.
+    local interval_mode = (phase == "racing" and M.state.interval_mode) or "ahead"
+    local local_entry = nil
+    for i = 1, #entries do
+        if entries[i].isLocal then
+            local_entry = entries[i]
+            break
+        end
+    end
+
     local leader = entries[1]
     if leader and not leader.dnf then
-        for i = 2, #entries do
+        for i = 1, #entries do
             local entry = entries[i]
-            local ahead = entries[i - 1]
             if not entry.dnf then
-                entry.gap = shared_split_gap(entry, leader)
-                if not ahead.dnf then
-                    entry.interval = shared_split_gap(entry, ahead)
+                if i > 1 then
+                    entry.gap = shared_split_gap(entry, leader)
+                end
+                local reference
+                if interval_mode == "self" then
+                    reference = local_entry
+                elseif interval_mode == "leader" then
+                    reference = leader
+                else
+                    reference = entries[i - 1]
+                end
+                if reference and reference ~= entry and not reference.dnf then
+                    entry.interval = shared_split_gap(entry, reference)
+                    entry.cpInterval = reference.checkpoint - entry.checkpoint
                 end
             end
         end
@@ -2565,6 +2603,7 @@ local function build_hud_snapshot()
         active = true,
         phase = phase,
         entries = entries,
+        intervalMode = M.state.interval_mode or "self",  -- live-standings interval reference for the REL toggle label
         grace = grace,
         graceCanFinish = grace_can_finish,
         isCircuit = is_circuit,
