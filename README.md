@@ -47,6 +47,17 @@ time** (duplicated only in the built output, never in the committed tree).
 3. (Re)start the BeamMP server. Joining BeamNG clients receive the client mod
    automatically.
 
+## Server config requirement (AI races)
+
+BeamMP's `MaxCars` (in the server's `ServerConfig.toml`) caps **all** vehicles one
+player (the race host) may have synced — and a race spawns, host-owned, the host's
+own car **plus the track's prop/cone vehicles plus the AI cars**. If
+`own + props + AI` exceeds `MaxCars`, BeamMP silently deletes the overflow (the
+last-spawned AI), so only the first few AI appear. Set `MaxCars` high enough to
+cover the worst case (e.g. **64** = 1 own + ~40 prop vehicles + 16 AI). The AI
+count itself is capped at 16 in the plugin; `MaxCars` must simply stay well above
+`own + props + 16`.
+
 ## Status
 
 Phase 1 (Recon & Skeleton). This scaffold establishes the repository layout;
