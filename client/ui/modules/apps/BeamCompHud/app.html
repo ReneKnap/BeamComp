@@ -205,13 +205,16 @@
        ADR-0012). Styled as a small button (border + background, like the analysis button) so it reads
        as pressable; the ↻ glyph signals it cycles. pointer-events:auto via the enclosing panel. */
     .beamcomp-hud .bc-relmode {
-      display: inline-block;
+      /* Right-aligned over the interval column it switches (margin-left:auto pushes the fit-width button
+         to the panel's right edge). */
+      display: block;
+      width: fit-content;
+      margin: 0 0 5px auto;
       font-size: 11px;
       font-weight: bold;
       letter-spacing: 0.06em;
       cursor: pointer;
       padding: 1px 8px;
-      margin: 0 0 5px 0;
       background: rgba(255, 255, 255, 0.12);
       border: 1px solid rgba(255, 255, 255, 0.35);
       border-radius: 4px;
@@ -279,6 +282,21 @@
       padding: 2px 0 6px 0;
       border-bottom: 1px solid rgba(255, 255, 255, 0.25);
       margin-bottom: 4px;
+    }
+    /* Green "finished" check before a driver's name on the provisional card -- marks who is already home
+       while others still race. */
+    .beamcomp-hud .bc-fin-mark {
+      color: #3fd96b;
+      font-weight: bold;
+    }
+    /* "still running" sub-label under the provisional-standings title. */
+    .beamcomp-hud .bc-provisional-badge {
+      text-align: center;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: #ffcc33;
+      opacity: 0.85;
+      padding: 0 0 5px 0;
     }
     /* Per-player best lap column on the results card (circuit only), gold like the live Best row. */
     .beamcomp-hud .bc-bestlap {
@@ -404,8 +422,8 @@
   </style>
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
-  <!-- Live: two screen-anchored regions -->
-  <div ng-if="hud.phase !== 'finished'">
+  <!-- Live: two screen-anchored regions (hidden while the provisional results card overlays them) -->
+  <div ng-if="hud.phase !== 'finished' && !hud.provisionalShown">
     <div class="bc-tl">
       <div class="bc-pos-huge" ng-if="hud.localEntry">P{{hud.localEntry.position}}<span class="bc-pos-of">/{{hud.entries.length}}</span></div>
       <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
@@ -422,6 +440,7 @@
           </table>
         </div>
       </div>
+      <button type="button" class="bc-analysis-btn" ng-if="hud.provisionalAvailable && !hud.provisionalOpen" ng-click="toggleProvisional()">&#9656; Ergebnisse</button>
     </div>
     <div class="bc-tr" ng-if="hud.localEntry">
       <div class="bc-lapcp-huge">
@@ -445,6 +464,33 @@
         </table>
       </div>
     </div>
+  </div>
+  <!-- Provisional standings (ADR-0022): a finished/DNF'd player views the live classification while the
+       race still runs. Same layout as the final card, but gap-vs-leader and no podium tints so it reads
+       as not-yet-final; the live corner regions are hidden while it is up. -->
+  <div class="bc-results-card" ng-if="hud.provisionalShown">
+    <div class="bc-results-title">Vorläufige Wertung</div>
+    <div class="bc-provisional-badge">{{hud.grace != null ? 'Rennen endet in ' + formatTime(hud.grace) : 'Rennen läuft noch'}}</div>
+    <div class="bc-scroll">
+      <table class="bc-standings bc-results">
+        <tr class="bc-results-head">
+          <td class="bc-pos"></td>
+          <td class="bc-name">Driver</td>
+          <td class="bc-time">Time</td>
+          <td class="bc-bestlap" ng-if="hud.isCircuit">Best Lap</td>
+          <td class="bc-int">Gap</td>
+        </tr>
+        <tr ng-repeat="e in hud.entries"
+            ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai}">
+          <td class="bc-pos">P{{e.position}}</td>
+          <td class="bc-name"><span class="bc-fin-mark" ng-if="e.finished">&#10003; </span>{{e.name}}</td>
+          <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : (e.finished ? formatTime(e.time) : '')}}</td>
+          <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
+          <td class="bc-int">{{formatLeaderGap(e)}}</td>
+        </tr>
+      </table>
+    </div>
+    <button type="button" class="bc-analysis-btn" ng-click="toggleProvisional()">Schließen</button>
   </div>
   <!-- Finished: centered results card (hidden by /results, ADR-0022; replaced by the analysis overlay
        while that is open, ADR-0028) -->

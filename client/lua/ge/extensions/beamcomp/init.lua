@@ -142,6 +142,7 @@ M.state = {
     results_hidden = false,  -- local-only toggle: hide the finished results card via /results (ADR-0022)
     race_records = nil,      -- pre-run PB + track record for the post-race analysis overlay (server raceRecords, ADR-0028), or nil
     analysis_open = false,   -- local-only toggle: show the post-race analysis overlay via /analysis or the card button (ADR-0028)
+    provisional_open = true,  -- local-only per-player: auto-show the provisional results card once the local player is finished/DNF while the race still runs; toggled by the HUD buttons / racing-phase /results, reset per race
     interval_mode = "self",  -- local-only live-standings interval reference: "self" | "ahead" | "leader"; cycled by the HUD toggle, session-persistent (not reset per race)
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
@@ -235,6 +236,7 @@ local function handle_race_start(payload)
         M.state.standings = nil
         M.state.race_records = nil
         M.state.analysis_open = false
+        M.state.provisional_open = true
         M.state.grace = nil
         M.state.assist_armed = false
         M.state.assist_held = nil
@@ -280,6 +282,7 @@ local function handle_race_start(payload)
     M.state.standings = nil
     M.state.race_records = nil
     M.state.analysis_open = false
+    M.state.provisional_open = true
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
@@ -530,6 +533,7 @@ local function teardown_race_world()
     M.state.standings = nil
     M.state.race_records = nil
     M.state.analysis_open = false
+    M.state.provisional_open = true
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
@@ -647,10 +651,12 @@ local function handle_race_phase(payload)
         else
             M.state.laptimer = nil
         end
-        -- Each race starts with its results card shown and its analysis overlay closed; the /results and
-        -- /analysis toggles only last that race (ADR-0022/0028).
+        -- Each race starts with its results card shown, its analysis overlay closed, and the provisional
+        -- results card armed to auto-show on finish; the /results and /analysis toggles only last that race
+        -- (ADR-0022/0028).
         M.state.results_hidden = false
         M.state.analysis_open = false
+        M.state.provisional_open = true
         -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
         -- dedups, so a manually-added copy is not duplicated.
         hud.show()
@@ -827,10 +833,35 @@ local function handle_finish_grace(payload)
     log("I", RACE_LOG_TAG, string.format("finish grace: %.0fs to finish or DNF", duration))
 end
 
--- Toggle the local finished-results card on/off (the server relays a /results from this player; ADR-0022).
+-- True when the local player is out of the running race -- finished (detection done) or DNF'd (their
+-- standings row is flagged, ADR-0014). Gates the provisional results view during the racing phase.
+local function local_is_out()
+    local detection = M.state.detection
+    if detection and detection.done then
+        return true
+    end
+    local race = M.state.race
+    local my_slot = race and race.mySlot
+    local standings = M.state.standings
+    if my_slot ~= nil and standings then
+        for _, e in ipairs(standings) do
+            if e.slot == my_slot then
+                return e.dnf and true or false
+            end
+        end
+    end
+    return false
+end
+
+-- Toggle the local results card on/off (the server relays a /results from this player; ADR-0022).
 -- Local-only and per-player: it just flips a flag the HUD snapshot carries, so a player can look around
--- after finishing without affecting anyone else.
+-- without affecting anyone else. Phase-aware: while the race still runs, a finished/DNF'd player toggles
+-- the provisional card; once finished it toggles the final results card.
 local function handle_results_toggle()
+    if M.state.phase == "racing" and local_is_out() then
+        M.toggle_provisional_results()
+        return
+    end
     M.state.results_hidden = not M.state.results_hidden
     log("I", RACE_LOG_TAG, "results card " .. (M.state.results_hidden and "hidden" or "shown"))
 end
@@ -842,6 +873,15 @@ end
 function M.toggle_analysis()
     M.state.analysis_open = not M.state.analysis_open
     log("I", RACE_LOG_TAG, "analysis overlay " .. (M.state.analysis_open and "shown" or "hidden"))
+end
+
+-- Toggle the local provisional results card (ADR-0022 pattern). Public so the HUD's "Ergebnisse"/Schließen
+-- buttons reach it via bngApi.engineLua as beamcomp_init.toggle_provisional_results (UI -> GE, ADR-0012);
+-- the racing-phase /results also routes here. Only renders while the local player is finished/DNF and the
+-- race still runs (the snapshot gates it), so a flip otherwise is inert; reset to shown on each racing start.
+function M.toggle_provisional_results()
+    M.state.provisional_open = not M.state.provisional_open
+    log("I", RACE_LOG_TAG, "provisional results " .. (M.state.provisional_open and "shown" or "hidden"))
 end
 
 -- The /analysis relay (server -> this client) flips the same overlay flag as the results-card button.
@@ -2566,6 +2606,9 @@ local function build_hud_snapshot()
             if not entry.dnf then
                 if i > 1 then
                     entry.gap = shared_split_gap(entry, leader)
+                    -- Completed-crossing gap to the leader (mode-independent); the provisional card shows
+                    -- it alongside the leader time when more than one checkpoint apart.
+                    entry.cpGap = leader.checkpoint - entry.checkpoint
                 end
                 local reference
                 if interval_mode == "self" then
@@ -2611,6 +2654,9 @@ local function build_hud_snapshot()
         analysisAvailable = analysis_available,
         analysisOpen = M.state.analysis_open or false,
         analysis = analysis,
+        -- Provisional results card: shown to a finished/DNF'd player while the race still runs (ADR-0022).
+        provisionalAvailable = ((phase == "racing") and (local_finished or local_dnf)) and true or false,
+        provisionalOpen = M.state.provisional_open,
     }
 end
 

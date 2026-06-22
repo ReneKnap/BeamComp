@@ -50,6 +50,17 @@ angular.module('beamng.apps')
     return formatDelta(e.interval);
   }
 
+  // Provisional-card gap cell: the time gap to the leader, prefixed with the checkpoint gap when the row
+  // is more than one completed checkpoint behind the leader -> "+2 CP (+12.3)". P1 (no leader gap) and
+  // <=1 CP behind fall back to the plain leader time.
+  function formatLeaderGap(e) {
+    if (typeof e.cpGap === 'number' && Math.abs(e.cpGap) >= 2) {
+      var cp = (e.cpGap < 0 ? '-' : '+') + Math.abs(e.cpGap) + ' CP';
+      return typeof e.gap === 'number' ? cp + ' (' + formatDelta(e.gap) + ')' : cp;
+    }
+    return formatDelta(e.gap);
+  }
+
   // Short label for the live-standings interval reference mode, shown on the REL toggle.
   function intervalLabel(mode) {
     if (mode === 'leader') {
@@ -276,6 +287,16 @@ angular.module('beamng.apps')
         }
       };
       scope.intervalLabel = intervalLabel;
+      scope.formatLeaderGap = formatLeaderGap;
+
+      // Show/hide the provisional results card (GE flag, single source of truth): the card's Schließen
+      // button and the live HUD's Ergebnisse button both route here, as does the racing-phase /results.
+      // bngApi is the typeof-guarded core UI global (ADR-0012), so a miss is inert.
+      scope.toggleProvisional = function () {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.toggle_provisional_results() end');
+        }
+      };
 
       // Analysis delta cell: signed delta or a placeholder, with a faster/slower colour class (ADR-0028).
       scope.deltaCell = function (d) {
@@ -313,6 +334,10 @@ angular.module('beamng.apps')
             scope.hud.liveEntries[i].flash = !!flashing[scope.hud.liveEntries[i].id];
           }
           scope.hud.localEntry = findLocalEntry(scope.hud.entries);
+          // Provisional results card: a finished/DNF'd player viewing standings while the race runs. While
+          // it is up the live corner regions hide (template), so this one flag drives both ng-ifs.
+          scope.hud.provisionalShown = !!(scope.hud.provisionalAvailable && scope.hud.provisionalOpen &&
+            !scope.hud.analysisOpen);
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
         });
