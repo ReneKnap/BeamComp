@@ -2452,12 +2452,16 @@ local function build_hud_snapshot()
             local checkpoint = e.completed
             local time = e.total_time
             local lap = e.lap or 1
+            -- The HUD lap counter shows *completed* laps (0-based), reaching lapCount at the finish;
+            -- `lap` itself stays the server current-lap value (ADR-0013) the other rows carry.
+            local laps_done = nil
             -- Only substitute live detector values for the local row during racing -- once the race
             -- is finished, every client must show the same server-authoritative totals.
             if is_local and detection and phase == "racing" then
                 checkpoint = detection.seq
                 time = detection.elapsed
                 lap = detection_lap(detection)
+                laps_done = (detection.done and lap_count) or math.max(0, lap - 1)
             end
             -- Lap clock (ADR-0022): best lap is the server-relayed per-player value (so every results
             -- row has one); the local row prefers its own laptimer for an instant best + the live lap
@@ -2478,7 +2482,9 @@ local function build_hud_snapshot()
                 if detection and phase == "racing" then
                     cp_per_lap = (race and race.checkpoints) and #race.checkpoints or checkpoint_count
                     if (race and race.mode == "circuit") and cp_per_lap > 0 then
-                        cp_in_lap = detection.seq % cp_per_lap
+                        -- Per-lap reset, but the final lap counts through to N/N at the finish line
+                        -- (done) instead of wrapping back to 0 -- flips together with laps_done.
+                        cp_in_lap = (detection.done and cp_per_lap) or (detection.seq % cp_per_lap)
                     else
                         cp_in_lap = detection.seq
                     end
@@ -2494,6 +2500,7 @@ local function build_hud_snapshot()
                 dnf = e.dnf,
                 isLocal = is_local,
                 lap = lap,
+                lapsDone = laps_done,
                 lapCount = lap_count,
                 lapTime = lap_time,
                 bestLap = best_lap,
