@@ -8,7 +8,7 @@
 -- Owns a server-authoritative race state machine (ADR-0006, staging phase ADR-0021):
 --   lobby -> spawning -> staging -> countdown -> racing -> finished -> lobby
 -- finished is a long results + free-roam window (ADR-0006 amendment, B3): results and props stay
--- up for PHASE_DURATIONS.finished_hold (or until /raceend) with a heads-up before cleanup.
+-- up for PHASE_DURATIONS.finished_hold (or until /raceclear) with a heads-up before cleanup.
 -- An always-on 250 ms tick (MP.CreateEventTimer) drives the timed transitions; a
 -- monotonic MP.CreateTimer() stopwatch measures elapsed time per phase. Every
 -- transition is broadcast to all clients as a "racePhase" envelope on the
@@ -47,7 +47,9 @@
 --                 restarting. Bare /race replies with usage.
 --   /go /start /racestart  start the race now: end the staging wait early and begin the countdown
 --                 (ADR-0021). Admin-gated like /race; only acts while a race is staging.
---   /raceend      force the state machine back to lobby (safety hatch).
+--   /raceend      force the race straight to the finished/results screen, no despawn -- runs the same
+--                 finalize as a grace expiry from any active pre-finished phase (ADR-0038). Admin-gated.
+--   /raceclear    force the state machine back to lobby + cleanup/despawn (safety hatch; old /raceend).
 --   /races [all]  list the time-trial races on the asking player's current map. The server is
 --                 race-blind (ADR-0005), so it asks that client (a "listRaces" event); the client
 --                 builds the list and sends it back ("raceList"), and the server posts it to the
@@ -71,7 +73,8 @@ local M = {}
 
 local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
-local CHAT_COMMAND_RACEEND = "/raceend"
+local CHAT_COMMAND_RACEEND = "/raceend"  -- force-finish the race straight to the results screen, no despawn (ADR-0038)
+local CHAT_COMMAND_RACECLEAR = "/raceclear"  -- force the machine back to lobby + cleanup/despawn (old /raceend; ADR-0038)
 local CHAT_COMMAND_RACES = "/races"
 local CHAT_COMMAND_CARS = "/cars"  -- list installed vehicle models, or one model's configs (ADR-0032)
 local CHAT_COMMAND_DNF = "/dnf"
@@ -197,8 +200,8 @@ local session = {
     owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
 }
 
--- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race and
--- /raceend; it is loaded on init from the plugin config file. Candidate paths tolerate the unverified
+-- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race, /raceend and
+-- /raceclear; it is loaded on init from the plugin config file. Candidate paths tolerate the unverified
 -- runtime working directory (recon TODO #4) -- server root first, then the plugin folder. An empty,
 -- missing, or unparseable config leaves the gate inactive (opt-in: everyone may start/end races).
 local CONFIG_CANDIDATE_PATHS = {
@@ -1010,7 +1013,7 @@ local function enter_countdown_from_staging()
 end
 
 -- Clear the session and announce the lobby phase. If a race was active, tell players the world is
--- back to free-roam (B3) -- so a /raceend or the finished-window expiry has a visible close-out.
+-- back to free-roam (B3) -- so a /raceclear or the finished-window expiry has a visible close-out.
 local function reset_to_lobby()
     local had_race = session.race ~= nil
     session.race = nil
@@ -1244,13 +1247,13 @@ local function maybe_warn_cleanup()
         return
     end
     session.cleanup_warned = true
-    broadcast_chat("BeamComp: race props and results clear in 1 minute -- /raceend to clear now")
+    broadcast_chat("BeamComp: race props and results clear in 1 minute -- /raceclear to clear now")
 end
 
 -- Leave the spawning phase once every rostered player is accounted for -- acked via spawnReady or
 -- gone (pruned on disconnect) -- or the spawning timeout caps the wait (ADR-0006 amendment). If not a
 -- single client acked by then, the roster never spawned (all left or none ran the mod), so abort to
--- lobby instead of running an empty race until /raceend; otherwise proceed to staging. A no-op until
+-- lobby instead of running an empty race until /raceclear; otherwise proceed to staging. A no-op until
 -- the wait resolves, so it is safe to call every tick.
 local function advance_spawning()
     if not session.spawn_pending then
@@ -1743,6 +1746,22 @@ local function capture_records()
     end
 end
 
+-- Settle the race into the finished results window (ADR-0006): classify everyone still out as DNF, fold this
+-- run into the records, remember the order, and switch phase. No despawn -- finished keeps cars/props up (B3).
+-- Shared by the finish-grace expiry (tick) and the /raceend force-finish (ADR-0038).
+local function finalize_race(reason)
+    dnf_active_players(reason)
+    -- Snapshot pre-run per-car section bests BEFORE capture folds this run in, so the Race section can show
+    -- "vs your/anyone's previous best lap with the car"; then capture (this run now counts) and send the
+    -- current-inclusive records (ADR-0030).
+    local prerun = snapshot_prerun_section_bests()
+    capture_records()
+    send_race_records(prerun)
+    -- Remember the finishing order so the next race's order=last can grid by it (ADR-0033).
+    capture_finishing_order()
+    enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
+end
+
 local function tick()
     expire_stale_validation()
     maybe_warn_cleanup()
@@ -1756,16 +1775,7 @@ local function tick()
     -- on track at that point is marked DNF before the race settles (ADR-0014).
     if phase == PHASE.racing then
         if session.grace_deadline and now() >= session.grace_deadline then
-            dnf_active_players("grace expired")
-            -- Snapshot pre-run per-car section bests BEFORE capture folds this run in, so the Race
-            -- section can show "vs your/anyone's previous best lap with the car"; then capture (this run
-            -- now counts) and send the current-inclusive records (ADR-0030).
-            local prerun = snapshot_prerun_section_bests()
-            capture_records()
-            send_race_records(prerun)
-            -- Remember the finishing order so the next race's order=last can grid by it (ADR-0033).
-            capture_finishing_order()
-            enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
+            finalize_race("grace expired")
         end
         return
     end
@@ -2328,7 +2338,27 @@ local function handle_client_identity(player_id, payload)
     end
 end
 
--- /raceend: force the machine back to lobby from any active phase (safety hatch).
+-- /raceclear: force the machine back to lobby + cleanup/despawn from any active phase (safety hatch). This
+-- is the former /raceend behavior; /raceend now force-finishes into the results screen instead (ADR-0038).
+local function handle_raceclear_command(player_id, player_name)
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to end races")
+        log_info("beamcomp.race", "denied /raceclear from " .. player_name .. " (not a race admin)")
+        return
+    end
+
+    if session.phase == PHASE.lobby then
+        MP.SendChatMessage(player_id, "BeamComp: no race in progress")
+        return
+    end
+    log_info("beamcomp.race", "/raceclear by " .. player_name)
+    reset_to_lobby()
+    MP.SendChatMessage(player_id, "BeamComp: race cleared")
+end
+
+-- /raceend: force the race straight into the finished/results screen without despawn (ADR-0038). Runs the
+-- same finalize as a grace expiry (classify everyone, capture records) from any active pre-finished phase;
+-- the cars/props stay up until /raceclear or the finished window expires.
 local function handle_raceend_command(player_id, player_name)
     if not is_race_admin(player_name) then
         MP.SendChatMessage(player_id, "BeamComp: you are not allowed to end races")
@@ -2340,9 +2370,13 @@ local function handle_raceend_command(player_id, player_name)
         MP.SendChatMessage(player_id, "BeamComp: no race in progress")
         return
     end
-    log_info("beamcomp.race", "/raceend by " .. player_name)
-    reset_to_lobby()
-    MP.SendChatMessage(player_id, "BeamComp: race ended")
+    if session.phase == PHASE.finished then
+        MP.SendChatMessage(player_id, "BeamComp: race already finished")
+        return
+    end
+    log_info("beamcomp.race", "/raceend (force finish) by " .. player_name)
+    finalize_race("force finish")
+    MP.SendChatMessage(player_id, "BeamComp: race finished -- results up (cars stay; /raceclear to clear)")
 end
 
 -- /go, /start, /racestart: end the staging wait early and start the countdown (ADR-0021). Admin-gated
@@ -2510,6 +2544,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_RACEEND then
         handle_raceend_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == CHAT_COMMAND_RACECLEAR then
+        handle_raceclear_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
 
