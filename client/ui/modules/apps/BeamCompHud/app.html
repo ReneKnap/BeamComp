@@ -44,6 +44,37 @@
     .beamcomp-root .bc-cd-staging .bc-cd-staging-time {
       font-size: 105px;
     }
+    /* Personal finish banner (own race finish): same centered fixed overlay treatment as the countdown,
+       green like GO!; the GE snapshot is unchanged -- this is a pure client transition cue (app.js fires it
+       on the local player's own finish during racing, then the provisional card follows). */
+    .beamcomp-root .bc-finish-banner {
+      position: fixed;
+      top: 25%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 1000;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-weight: bold;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+      font-variant-numeric: tabular-nums;
+      animation: bc-fb-in 0.25s ease-out;
+    }
+    .beamcomp-root .bc-finish-banner .bc-fb-title {
+      font-size: 140px;
+      line-height: 1;
+      color: #3fd96b;
+    }
+    .beamcomp-root .bc-finish-banner .bc-fb-pos {
+      font-size: 90px;
+      line-height: 1;
+      color: #fff;
+    }
+    @keyframes bc-fb-in {
+      from { opacity: 0; transform: translate(-50%, -50%) scale(0.8); }
+      to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    }
     /* The app frame is now just a logical container: the live regions and the results card are
        position:fixed children, so the frame itself carries no background or size. */
     .beamcomp-hud {
@@ -428,7 +459,7 @@
       <div class="bc-pos-huge" ng-if="hud.localEntry">P{{hud.localEntry.position}}<span class="bc-pos-of">/{{hud.entries.length}}</span></div>
       <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
       <div class="bc-panel bc-standings-panel">
-        <div class="bc-relmode" ng-click="cycleIntervalMode()" title="Abstand relativ zu: umschalten (self / ahead / leader)">&#8635; REL {{intervalLabel(hud.intervalMode)}}</div>
+        <div class="bc-relmode" ng-click="cycleIntervalMode()" title="Gap relative to: toggle (self / ahead / leader)">&#8635; REL {{intervalLabel(hud.intervalMode)}}</div>
         <div class="bc-scroll">
           <table class="bc-standings">
             <tr ng-repeat="e in hud.liveEntries"
@@ -440,7 +471,7 @@
           </table>
         </div>
       </div>
-      <button type="button" class="bc-analysis-btn" ng-if="hud.provisionalAvailable && !hud.provisionalOpen" ng-click="toggleProvisional()">&#9656; Ergebnisse</button>
+      <button type="button" class="bc-analysis-btn" ng-if="hud.provisionalAvailable && !hud.provisionalOpen" ng-click="toggleProvisional()">&#9656; Results</button>
     </div>
     <div class="bc-tr" ng-if="hud.localEntry">
       <div class="bc-lapcp-huge">
@@ -469,8 +500,8 @@
        race still runs. Same layout as the final card, but gap-vs-leader and no podium tints so it reads
        as not-yet-final; the live corner regions are hidden while it is up. -->
   <div class="bc-results-card" ng-if="hud.provisionalShown">
-    <div class="bc-results-title">Vorläufige Wertung</div>
-    <div class="bc-provisional-badge">{{hud.grace != null ? 'Rennen endet in ' + formatTime(hud.grace) : 'Rennen läuft noch'}}</div>
+    <div class="bc-results-title">Provisional Standings</div>
+    <div class="bc-provisional-badge">{{hud.grace != null ? 'Race ends in ' + formatTime(hud.grace) : 'Race in progress'}}</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
         <tr class="bc-results-head">
@@ -490,7 +521,7 @@
         </tr>
       </table>
     </div>
-    <button type="button" class="bc-analysis-btn" ng-click="toggleProvisional()">Schließen</button>
+    <button type="button" class="bc-analysis-btn" ng-click="toggleProvisional()">Close</button>
   </div>
   <!-- Finished: centered results card (hidden by /results, ADR-0022; replaced by the analysis overlay
        while that is open, ADR-0028) -->
@@ -562,9 +593,9 @@
         <tr><td>Runs / time (all players)</td><td>{{hud.analysis.track.trackRuns}} · {{formatDuration(hud.analysis.track.trackTime)}}</td></tr>
         <tr><td>Runs (this car, all)</td><td>{{hud.analysis.track.carRuns}}</td></tr>
         <tr><td>Record (any car)<span ng-if="hud.analysis.track.recordAnyCarLabel"> {{hud.analysis.track.recordAnyCarLabel}}</span></td><td>{{hud.analysis.track.recordAnyCar != null ? formatTime(hud.analysis.track.recordAnyCar) : '--'}}<span ng-if="hud.analysis.track.recordAnyCar != null && hud.analysis.track.recordAnyCarHolder"> ({{hud.analysis.track.recordAnyCarHolder}})</span></td></tr>
-        <tr ng-if="hud.analysis.track.recordAnyCarOld != null"><td>Alter Record (any car)</td><td>{{formatTime(hud.analysis.track.recordAnyCarOld)}}<span ng-if="hud.analysis.track.recordAnyCarOldHolder"> ({{hud.analysis.track.recordAnyCarOldHolder}})</span></td></tr>
+        <tr ng-if="hud.analysis.track.recordAnyCarOld != null"><td>Previous Record (any car)</td><td>{{formatTime(hud.analysis.track.recordAnyCarOld)}}<span ng-if="hud.analysis.track.recordAnyCarOldHolder"> ({{hud.analysis.track.recordAnyCarOldHolder}})</span></td></tr>
         <tr><td>Record (this car)<span ng-if="hud.analysis.track.carLabel"> {{hud.analysis.track.carLabel}}</span></td><td>{{hud.analysis.track.recordThisCar != null ? formatTime(hud.analysis.track.recordThisCar) : '--'}}<span ng-if="hud.analysis.track.recordThisCar != null && hud.analysis.track.recordThisCarHolder"> ({{hud.analysis.track.recordThisCarHolder}})</span></td></tr>
-        <tr ng-if="hud.analysis.track.recordThisCarOld != null"><td>Alter Record (this car)</td><td>{{formatTime(hud.analysis.track.recordThisCarOld)}}<span ng-if="hud.analysis.track.recordThisCarOldHolder"> ({{hud.analysis.track.recordThisCarOldHolder}})</span></td></tr>
+        <tr ng-if="hud.analysis.track.recordThisCarOld != null"><td>Previous Record (this car)</td><td>{{formatTime(hud.analysis.track.recordThisCarOld)}}<span ng-if="hud.analysis.track.recordThisCarOldHolder"> ({{hud.analysis.track.recordThisCarOldHolder}})</span></td></tr>
       </table>
     </div>
 
@@ -605,5 +636,11 @@
       <div class="bc-cd-staging-title">Race starting…</div>
       <div class="bc-cd-staging-time">{{formatStaging(countdown.remaining)}}</div>
     </div>
+  </div>
+  <!-- Personal finish banner: fires on the local player's own finish during racing (app.js), holds ~3s,
+       then the provisional card shows. -->
+  <div class="bc-finish-banner" ng-show="finishBanner.active">
+    <div class="bc-fb-title">FINISHED</div>
+    <div class="bc-fb-pos">P{{finishBanner.position}}</div>
   </div>
 </div>

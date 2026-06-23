@@ -196,6 +196,7 @@ angular.module('beamng.apps')
     link: function (scope, element, attrs) {
       scope.hud = {active: false, entries: []};
       scope.countdown = {active: false};
+      scope.finishBanner = {active: false, position: null};
       scope.formatTime = formatTime;
       scope.formatDelta = formatDelta;
       scope.formatInterval = formatInterval;
@@ -224,6 +225,12 @@ angular.module('beamng.apps')
       var flashing = {};
       var flashTimers = {};
 
+      // Personal finish-banner state (local player only, so a single boolean, not a map). null means the
+      // local finished status has not been seen yet -> the first racing frame only establishes it, so an
+      // app/UI reload while already finished does not re-fire the banner (mirrors trackPositionGains).
+      var prevLocalFinished = null;
+      var finishBannerTimer = null;
+
       function clearFlashTimers() {
         for (var id in flashTimers) {
           $timeout.cancel(flashTimers[id]);
@@ -235,6 +242,16 @@ angular.module('beamng.apps')
         clearFlashTimers();
         prevPos = {};
         flashing = {};
+      }
+
+      // Hide the finish banner and cancel its self-hide timer. Phase handling owns prevLocalFinished, so
+      // this only clears the visible banner (used on teardown and on every non-racing phase).
+      function resetFinishBanner() {
+        if (finishBannerTimer) {
+          $timeout.cancel(finishBannerTimer);
+          finishBannerTimer = null;
+        }
+        scope.finishBanner.active = false;
       }
 
       // Compare each entry's rank to the last frame; a row that improved its position flashes for ~1 s.
@@ -265,7 +282,39 @@ angular.module('beamng.apps')
       scope.$on('$destroy', function () {
         $interval.cancel(heartbeat);
         clearFlashTimers();
+        resetFinishBanner();
       });
+
+      // Announce the local player's own race finish: a one-shot "FINISHED" + reached position banner the
+      // moment our row crosses the line during racing (while others may still be driving), held ~3 s. Only
+      // a genuine not-finished -> finished transition fires; the null sentinel means the first racing frame
+      // we see merely establishes the status (reload-safe). A non-racing phase re-arms (lobby/staging set
+      // false so a fresh race fires again) or clears (finished). DNF never fires (localFinished excludes it).
+      function trackLocalFinish() {
+        var phase = scope.hud.phase;
+        if (phase !== 'racing') {
+          prevLocalFinished = false;
+          resetFinishBanner();
+          return;
+        }
+        var localEntry = scope.hud.localEntry;
+        var localFinished = !!localEntry && !!localEntry.finished && !localEntry.dnf;
+        if (prevLocalFinished === null) {
+          prevLocalFinished = localFinished;
+          return;
+        }
+        if (localFinished && !prevLocalFinished) {
+          scope.finishBanner = {active: true, position: localEntry.position};
+          if (finishBannerTimer) {
+            $timeout.cancel(finishBannerTimer);
+          }
+          finishBannerTimer = $timeout(function () {
+            scope.finishBanner.active = false;
+            finishBannerTimer = null;
+          }, 3000);
+        }
+        prevLocalFinished = localFinished;
+      }
 
       // Open/close the post-race analysis overlay via the GE flag (single source of truth, ADR-0028):
       // the results-card button and the /analysis command both route through M.toggle_analysis. bngApi is
@@ -289,8 +338,8 @@ angular.module('beamng.apps')
       scope.intervalLabel = intervalLabel;
       scope.formatLeaderGap = formatLeaderGap;
 
-      // Show/hide the provisional results card (GE flag, single source of truth): the card's Schließen
-      // button and the live HUD's Ergebnisse button both route here, as does the racing-phase /results.
+      // Show/hide the provisional results card (GE flag, single source of truth): the card's Close
+      // button and the live HUD's Results button both route here, as does the racing-phase /results.
       // bngApi is the typeof-guarded core UI global (ADR-0012), so a miss is inert.
       scope.toggleProvisional = function () {
         if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
@@ -334,10 +383,12 @@ angular.module('beamng.apps')
             scope.hud.liveEntries[i].flash = !!flashing[scope.hud.liveEntries[i].id];
           }
           scope.hud.localEntry = findLocalEntry(scope.hud.entries);
+          trackLocalFinish();
           // Provisional results card: a finished/DNF'd player viewing standings while the race runs. While
-          // it is up the live corner regions hide (template), so this one flag drives both ng-ifs.
+          // it is up the live corner regions hide (template), so this one flag drives both ng-ifs. The
+          // finish banner holds it back until it fades, so a finisher first sees "FINISHED", then the card.
           scope.hud.provisionalShown = !!(scope.hud.provisionalAvailable && scope.hud.provisionalOpen &&
-            !scope.hud.analysisOpen);
+            !scope.hud.analysisOpen && !scope.finishBanner.active);
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
         });
