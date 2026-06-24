@@ -16,7 +16,11 @@ angular.module('beamng.apps')
   var STATIC_OPTS = {
     mode: [{ v: '', label: 'auto' }, { v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }],
     orderMode: [{ v: 'entry', label: 'entry' }, { v: 'random', label: 'random' },
-      { v: 'last', label: 'last result' }, { v: 'pwr', label: 'power/weight' }],
+      { v: 'last', label: 'last result' }, { v: 'pwr', label: 'power/weight' },
+      { v: 'championship', label: 'championship' }],
+    champPreset: [{ v: 'f1', label: 'F1 (25-18-15…)' }, { v: 'linear', label: 'linear (per starter)' },
+      { v: 'quadratic', label: 'quadratic (64-32-16…)' }],
+    champOrder: [{ v: 'reversed', label: 'reversed (handicap)' }, { v: 'normal', label: 'normal' }],
     aiPreset: [{ v: '', label: 'default' }, { v: 'easy', label: 'easy' }, { v: 'medium', label: 'medium' },
       { v: 'hard', label: 'hard' }],
     aiRoute: [{ v: '', label: 'default' }, { v: 'snap', label: 'snap (road)' },
@@ -32,6 +36,7 @@ angular.module('beamng.apps')
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 1, aiPreset: '', aiCar: '', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: false,
+      champPreset: 'f1', champOrder: 'reversed',
     };
   }
 
@@ -119,6 +124,7 @@ angular.module('beamng.apps')
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [] }, STATIC_OPTS);
+      scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -241,11 +247,17 @@ angular.module('beamng.apps')
       };
 
       // Prepare Race: send the structured request -- the race spawns + enters staging. Reveals Start Race.
+      // While a championship is active, omit order= so the server applies the championship's grid order
+      // (ADR-0040) instead of this panel's default; an explicit per-race order would otherwise win.
       scope.prepareRace = function () {
         if (!scope.form.race) {
           return;
         }
-        var request = { race: scope.form.race, overrides: buildOverrides(scope.form) };
+        var overrides = buildOverrides(scope.form);
+        if (scope.championship.active) {
+          delete overrides.order;
+        }
+        var request = { race: scope.form.race, overrides: overrides };
         geLuaArg('start_race_from_ui', JSON.stringify(request));
         scope.prepared = true;
       };
@@ -262,11 +274,38 @@ angular.module('beamng.apps')
         geCall('close_setup');
       };
 
+      // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
+      // Sync the section's dropdowns to the active settings so the controls reflect reality, not stale form.
+      scope.$on('BeamCompChampionship', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.championship = payload || { active: false };
+          if (scope.championship.active) {
+            scope.form.champPreset = scope.championship.preset || scope.form.champPreset;
+            scope.form.champOrder = scope.championship.order || scope.form.champOrder;
+          }
+        });
+      });
+
+      // Championship controls (ADR-0040): relay a structured command through GE -> server, which routes it
+      // through the same admin-gated handler as /championship. start begins one; set changes settings live
+      // on an active championship; reset ends it + announces the winner.
+      function championshipCmd(action) {
+        geLuaArg('championship_cmd', JSON.stringify({
+          action: action, preset: scope.form.champPreset, order: scope.form.champOrder,
+        }));
+      }
+      scope.championshipStart = function () { championshipCmd('start'); };
+      scope.championshipApply = function () { championshipCmd('set'); };
+      scope.championshipReset = function () {
+        geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
+      };
+
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
       // asks GE for the lists itself (BeamCompSetupData arrives back via the $on above). Also pull the
       // remembered form (BeamCompSetupForm) so a reopen restores the last race's settings.
       scope.refresh();
       geCall('request_setup_form');
+      geCall('request_championship');
     },
   };
 }]);

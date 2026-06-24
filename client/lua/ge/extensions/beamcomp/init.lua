@@ -174,6 +174,7 @@ M.state = {
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
+    championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -712,6 +713,17 @@ local function handle_standings(payload)
         tonumber(leader.total_time) or 0))
 end
 
+-- Store the latest server-broadcast championship table (ADR-0040) and reflect it to the setup panel. The
+-- HUD finished card reads it from the per-frame snapshot (build_hud_snapshot); the panel is not on the
+-- per-frame path, so it gets an immediate push here. payload.active=false (a reset) clears the table, so
+-- both the card and the panel hide it.
+local function handle_championship(payload)
+    M.state.championship = type(payload) == "table" and payload or nil
+    if guihooks then
+        guihooks.trigger("BeamCompChampionship", M.state.championship or {active = false})
+    end
+end
+
 -- Answer the server's listRaces request: build this client's installed-race list for the loaded map
 -- and ship it back for the server to post to the asking player (ADR-0005: the server is race-blind,
 -- so the client owns the list; ADR-0011: client->server reply). The relayed `all` flag (ADR-0026)
@@ -930,6 +942,31 @@ end
 -- beamcomp_init.go_race_from_ui.
 function M.go_race_from_ui()
     send_to_server("raceGo", {})
+end
+
+-- The setup panel's championship control (ADR-0037/0040): the panel serialises {action, preset, order} and
+-- calls this; we decode and relay it as a championshipCmd, which routes through the same admin-gated handler
+-- as the /championship chat command. Public as beamcomp_init.championship_cmd. A bad payload is dropped.
+function M.championship_cmd(json)
+    local ok, decoded = pcall(jsonDecode, json)
+    if not ok or type(decoded) ~= "table" or type(decoded.action) ~= "string" then
+        log("W", RACE_LOG_TAG, "championship_cmd: bad payload")
+        return
+    end
+    send_to_server("championshipCmd", {
+        action = decoded.action,
+        preset = decoded.preset,
+        order = decoded.order,
+    })
+end
+
+-- Re-push the last-known championship state to the panel (UI -> GE, ADR-0040): the panel calls this on link
+-- so a freshly-added app that missed the open-time broadcast still fills. Public as
+-- beamcomp_init.request_championship.
+function M.request_championship()
+    if guihooks then
+        guihooks.trigger("BeamCompChampionship", M.state.championship or {active = false})
+    end
 end
 
 -- Push one model's configs to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this when
@@ -1385,6 +1422,7 @@ local HANDLERS = {
     raceStart = handle_race_start,
     racePhase = handle_race_phase,
     standings = handle_standings,
+    championship = handle_championship,
     listRaces = handle_list_races,
     listVehicles = handle_list_vehicles,
     regrid = handle_regrid,
@@ -2662,6 +2700,9 @@ local function build_hud_snapshot()
         -- Provisional results card: shown to a finished/DNF'd player while the race still runs (ADR-0022).
         provisionalAvailable = ((phase == "racing") and (local_finished or local_dnf)) and true or false,
         provisionalOpen = M.state.provisional_open,
+        -- The multi-race championship table (ADR-0040), shown on the finished results card when active; nil
+        -- or active=false hides it. Rides opaquely through to the app.
+        championship = M.state.championship,
     }
 end
 

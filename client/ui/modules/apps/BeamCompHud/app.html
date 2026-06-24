@@ -344,6 +344,43 @@
     .beamcomp-hud .bc-results-head .bc-bestlap {
       color: inherit;
     }
+    /* Championship table on the finished card (ADR-0040): a compact second table under the final
+       standings; the podium tints + AI italics reuse the standings row classes. */
+    .beamcomp-hud .bc-champ-section {
+      margin-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.25);
+      padding-top: 6px;
+    }
+    .beamcomp-hud .bc-champ-title {
+      text-align: center;
+      font-weight: bold;
+      font-size: 15px;
+      letter-spacing: 0.04em;
+      padding-bottom: 4px;
+    }
+    .beamcomp-hud .bc-champ-title .bc-champ-meta {
+      font-weight: normal;
+      font-size: 12px;
+      opacity: 0.7;
+    }
+    .beamcomp-hud .bc-champ-wins {
+      width: 4em;
+      text-align: right;
+      opacity: 0.85;
+    }
+    /* "Last" column on the championship table: points gained in the most recent race (ADR-0040). */
+    .beamcomp-hud .bc-champ-last {
+      width: 4em;
+      text-align: right;
+      opacity: 0.7;
+      font-variant-numeric: tabular-nums;
+    }
+    .beamcomp-hud .bc-champ-pts {
+      width: 5em;
+      text-align: right;
+      font-weight: bold;
+      font-variant-numeric: tabular-nums;
+    }
     /* Post-race analysis overlay (ADR-0028): a wider centered fixed panel layered above the results
        card, toggled by /analysis or the card's Analysis button. Scrolls for wide segment matrices. */
     .beamcomp-hud .bc-analysis-card {
@@ -544,6 +581,30 @@
           <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
           <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
           <td class="bc-int">{{formatDelta(e.interval)}}</td>
+        </tr>
+      </table>
+    </div>
+    <!-- Multi-race championship table (ADR-0040): shown under the final standings while a championship is
+         active. Points accrue across the session; the leader starts the next race reversed by default. -->
+    <div ng-if="hud.championship && hud.championship.active" class="bc-champ-section">
+      <div class="bc-champ-title">Championship
+        <span class="bc-champ-meta">({{hud.championship.preset}}, grid {{hud.championship.order}}, race {{hud.championship.raceCount}})</span>
+      </div>
+      <table class="bc-standings bc-champ">
+        <tr class="bc-results-head">
+          <td class="bc-pos"></td>
+          <td class="bc-name">Driver</td>
+          <td class="bc-champ-wins">Wins</td>
+          <td class="bc-champ-last">Last</td>
+          <td class="bc-champ-pts">Points</td>
+        </tr>
+        <tr ng-repeat="c in hud.championship.rows"
+            ng-class="{'bc-ai': c.ai, 'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
+          <td class="bc-pos">{{c.position}}</td>
+          <td class="bc-name">{{c.name}}</td>
+          <td class="bc-champ-wins">{{c.wins}}</td>
+          <td class="bc-champ-last">+{{c.lastGain}}</td>
+          <td class="bc-champ-pts">{{c.points}}</td>
         </tr>
       </table>
     </div>

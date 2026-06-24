@@ -17,7 +17,7 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship[:rev]] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) = per-player caps that keep a
@@ -199,6 +199,7 @@ local session = {
     identities = nil,         -- per-player {vehicle, pwr} reported via clientInfo, for records (ADR-0027) + start-order (ADR-0033); name moved to client_names (ADR-0031)
     order = nil,              -- this race's start-order {mode, rev} (ADR-0033), or nil = entry order
     last_order = nil,         -- previous race's finishing order as a list of identities (ADR-0033); session-scoped, survives reset_to_lobby so order=last has a source
+    championship = nil,       -- active multi-race championship {points_preset, order, standings, race_count} or nil (ADR-0040); session-scoped, survives reset_to_lobby like last_order
     owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
 }
 
@@ -671,11 +672,52 @@ local function shuffle(items)
     return items
 end
 
+-- Order ids by an identity ranking list (ADR-0033/0040): ids whose identity (ADR-0031) appears in
+-- `ranking` come first in ranking order (optionally reversed), the rest keep their incoming entry order at
+-- the back. Shared by order=last (previous finish) and order=championship (points table). An empty ranking
+-- leaves every id in the back group, i.e. plain entry order.
+local function place_by_identity(ids, ranking, rev)
+    -- An id's ranking identity: AI ids are strings "ai:<k>" that carry the display name "AI <k>" in the
+    -- standings (mirrors AI_ID_PREFIX / make_slot_entry), so the championship can rank AI alongside players;
+    -- real player ids are numbers resolved via resolve_identity (ADR-0031).
+    local function identity_of(id)
+        if type(id) == "string" then
+            return "AI " .. id:sub(4)
+        end
+        return resolve_identity(id)
+    end
+    local rank = {}
+    for pos, identity in ipairs(ranking) do
+        rank[identity] = pos
+    end
+    local placed, rest = {}, {}
+    for _, id in ipairs(ids) do  -- ids are in entry order, so rest stays entry-ordered
+        if rank[identity_of(id)] then
+            placed[#placed + 1] = id
+        else
+            rest[#rest + 1] = id
+        end
+    end
+    table.sort(placed, function(a, b)
+        return rank[identity_of(a)] < rank[identity_of(b)]
+    end)
+    if rev then
+        for i = 1, math.floor(#placed / 2) do
+            placed[i], placed[#placed - i + 1] = placed[#placed - i + 1], placed[i]
+        end
+    end
+    for _, id in ipairs(rest) do
+        placed[#placed + 1] = id
+    end
+    return placed
+end
+
 -- Order the player ids for slot assignment per the start-order mode (ADR-0033). `entry` (default) is id
 -- ascending -- the historical order and the stable base the other modes build on; `random` shuffles;
--- `last` follows the previous race's finishing order (by identity, ADR-0031), with players absent from it
--- appended at the back in entry order, and `:rev` reversing just the placed group. `pwr` orders as entry
--- here -- it is resolved after staging by the re-grid -- and `last` with no source falls back to random.
+-- `last` follows the previous race's finishing order (by identity, ADR-0031), with absent ids appended at
+-- the back in entry order and `:rev` reversing just the placed group. `pwr` orders as entry here -- it is
+-- resolved after staging by the re-grid -- and `last` with no source falls back to random. `championship`
+-- is handled in build_slots, since it ranks the AI into the field too (ADR-0040), not here.
 local function order_ids(players, order, last_order)
     local ids = {}
     for id in pairs(players) do
@@ -693,30 +735,7 @@ local function order_ids(players, order, last_order)
         if type(last_order) ~= "table" or #last_order == 0 then
             return shuffle(ids)  -- no finishing-order source yet -> random fallback
         end
-        local rank = {}
-        for pos, identity in ipairs(last_order) do
-            rank[identity] = pos
-        end
-        local placed, rest = {}, {}
-        for _, id in ipairs(ids) do  -- ids are in entry order, so rest stays entry-ordered
-            if rank[resolve_identity(id)] then
-                placed[#placed + 1] = id
-            else
-                rest[#rest + 1] = id
-            end
-        end
-        table.sort(placed, function(a, b)
-            return rank[resolve_identity(a)] < rank[resolve_identity(b)]
-        end)
-        if order.rev then
-            for i = 1, math.floor(#placed / 2) do
-                placed[i], placed[#placed - i + 1] = placed[#placed - i + 1], placed[i]
-            end
-        end
-        for _, id in ipairs(rest) do
-            placed[#placed + 1] = id
-        end
-        return placed
+        return place_by_identity(ids, last_order, order.rev)
     end
 
     -- entry, or pwr (provisional entry order until the post-staging re-grid resolves it).
@@ -757,13 +776,15 @@ end
 
 -- Assign every participant (connected players + the requested AI, ADR-0036 Etappe B) a 0-based slot in
 -- the resolved start order (ADR-0033). For `random` the AI shuffle into the field with the players; for
+-- `championship` the AI are ranked into the field by their own points (ADR-0040), since they score too; for
 -- entry/last/pwr the players are ordered first and the AI appended at the back -- their natural position
 -- (no entry/finish history) and it avoids the mixed numeric/string id sort. pwr re-sorts the AI into the
 -- field after staging (regrid_by_pwr). Deterministic for a given mode + roster so every client computes
 -- the same grid.
-local function build_slots(players, order, last_order, ai_count)
+local function build_slots(players, order, last_order, champ_order, ai_count)
+    local mode = order and order.mode
     local ids
-    if order and order.mode == "random" then
+    if mode == "random" then
         ids = {}
         for id in pairs(players) do
             ids[#ids + 1] = id
@@ -772,6 +793,23 @@ local function build_slots(players, order, last_order, ai_count)
             ids[#ids + 1] = ai_id
         end
         ids = shuffle(ids)
+    elseif mode == "championship" then
+        -- AI score in the championship too (ADR-0040), so rank them into the grid with the players (by the
+        -- points table) instead of pinning them to the back. The combined field starts in entry order
+        -- (players by id, then AI), then place_by_identity ranks + optionally reverses it.
+        local field = {}
+        for id in pairs(players) do
+            field[#field + 1] = id
+        end
+        table.sort(field)
+        for _, ai_id in ipairs(ai_id_list(ai_count)) do
+            field[#field + 1] = ai_id
+        end
+        if type(champ_order) ~= "table" or #champ_order == 0 then
+            ids = shuffle(field)  -- first race, everyone on 0 points -> random grid (ADR-0040)
+        else
+            ids = place_by_identity(field, champ_order, order and order.rev)
+        end
     else
         ids = order_ids(players, order, last_order)
         for _, ai_id in ipairs(ai_id_list(ai_count)) do
@@ -934,6 +972,254 @@ local function capture_finishing_order()
     session.last_order = order
 end
 
+
+-- Multi-race points championship (ADR-0040). All championship logic hangs off this one `champ` namespace
+-- table -- a single top-level local, because main.lua's main chunk is near Lua's 200-local limit and a flat
+-- set of ~20 locals would overflow it (the plugin then fails to load entirely). The state itself lives in
+-- session.championship and -- like session.last_order -- survives reset_to_lobby, so points accumulate
+-- across the races of a play-session; it is in-memory only (a plugin restart ends a championship). nil = no
+-- championship active.
+local champ = {}
+
+-- Cross-side message + command names (ADR-0040), kept on the table to spare top-level local slots.
+champ.CHAT_COMMAND = "/championship"  -- manage the championship (mutations admin-gated)
+champ.MSG = "championship"            -- table + settings, broadcast on change + after each award
+champ.MSG_CMD = "championshipCmd"     -- the setup panel's control: {action, preset, order} (ADR-0037)
+
+-- Points schemes (ADR-0040). Only finishers score (DNF = 0, enforced by the caller). F1 is a fixed table by
+-- finishing position. linear gives the winner one point per starter (everyone who lined up, finished or
+-- not) and one less per place below -- so a full grid is worth more even if some crash out. quadratic is a
+-- fixed halving from 64 (64, 32, 16, ... ) that stops once a place would score below one point.
+champ.F1_POINTS = {25, 18, 15, 12, 10, 8, 6, 4, 2, 1}
+champ.QUADRATIC_TOP = 64  -- P1 in the quadratic scheme; each place below scores half, floored, until < 1
+champ.PRESETS = {"f1", "linear", "quadratic"}
+champ.DEFAULT_PRESET = "f1"
+
+-- The points a classified finisher at `position` (1-based among finishers) scores under `preset`, given
+-- `starters` = the total field that lined up (finishers + DNFs). Out-of-range positions / unknown presets
+-- score 0; the caller already gives DNFs nothing.
+function champ.points(preset, position, starters)
+    if type(position) ~= "number" or position < 1 then
+        return 0
+    end
+    if preset == "linear" then
+        return math.max(0, starters - position + 1)  -- P1 = one point per starter, -1 per place
+    end
+    if preset == "quadratic" then
+        local pts = champ.QUADRATIC_TOP / (2 ^ (position - 1))
+        return pts >= 1 and math.floor(pts) or 0  -- 64, 32, 16, ...; below 1 point scores nothing
+    end
+    return champ.F1_POINTS[position] or 0  -- f1 (default): fixed table, 0 beyond P10
+end
+
+-- Whether a championship is currently accumulating points.
+function champ.is_active()
+    return session.championship ~= nil
+end
+
+-- The grid order a championship imposes: {mode = "championship", rev}. Default reversed = current leader
+-- starts at the back (handicap, ADR-0040). `normal` puts the leader on pole.
+function champ.order(rev)
+    return {mode = "championship", rev = rev}
+end
+
+-- Begin a fresh championship with empty standings (ADR-0040). preset defaults to F1; rev defaults to
+-- reversed (the handicap default) -- the caller passes (order ~= "normal") so an explicit normal sets rev false.
+function champ.start(preset, rev)
+    session.championship = {
+        points_preset = preset or champ.DEFAULT_PRESET,
+        order = champ.order(rev ~= false),
+        standings = {},   -- keyed by identity (players) / display name (AI): {points, races, wins, best_finish, ai}
+        race_count = 0,
+    }
+end
+
+-- End the championship and clear its table.
+function champ.reset()
+    session.championship = nil
+end
+
+-- Live preset / grid-order changes on an active championship (ADR-0040). No-ops when none is active.
+function champ.set_preset(preset)
+    if champ.is_active() and preset then
+        session.championship.points_preset = preset
+    end
+end
+
+function champ.set_order(rev)
+    if champ.is_active() then
+        session.championship.order = champ.order(rev)
+    end
+end
+
+-- Wins (P1 finishes) recorded for a championship entry -- finishes[1], or 0 (ADR-0040).
+function champ.wins_of(entry)
+    return (entry.finishes and entry.finishes[1]) or 0
+end
+
+-- The standings as a ranked list (ADR-0040): {identity, entry} ordered by points desc, then a
+-- finishing-position countback (most 1st places, then most 2nds, then 3rds, ... -- motorsport style), then
+-- identity as a stable final tiebreak. Drives both order=championship and the table.
+function champ.rank_list()
+    if not champ.is_active() then
+        return {}
+    end
+    local ranked = {}
+    for identity, entry in pairs(session.championship.standings) do
+        ranked[#ranked + 1] = {identity = identity, entry = entry}
+    end
+    -- Compare two entries by countback: whoever has more finishes at the best still-differing position wins.
+    -- Returns 1/-1 when one is ahead, 0 when fully tied (then the caller falls back to identity).
+    local function countback(a, b)
+        local maxp = 0
+        for p in pairs(a.finishes) do if p > maxp then maxp = p end end
+        for p in pairs(b.finishes) do if p > maxp then maxp = p end end
+        for p = 1, maxp do
+            local ca, cb = a.finishes[p] or 0, b.finishes[p] or 0
+            if ca ~= cb then
+                return ca > cb and 1 or -1
+            end
+        end
+        return 0
+    end
+    table.sort(ranked, function(x, y)
+        local a, b = x.entry, y.entry
+        if a.points ~= b.points then
+            return a.points > b.points
+        end
+        local cb = countback(a, b)
+        if cb ~= 0 then
+            return cb > 0
+        end
+        return x.identity < y.identity
+    end)
+    return ranked
+end
+
+-- The ranked identities alone, for the order=championship placement (ADR-0040).
+function champ.order_identities()
+    local ids = {}
+    for _, item in ipairs(champ.rank_list()) do
+        ids[#ids + 1] = item.identity
+    end
+    return ids
+end
+
+-- The grid order a live championship imposes on the next race, or nil when none is active (ADR-0040).
+-- Applied in start_race unless the race carries an explicit order=.
+function champ.active_order()
+    if not champ.is_active() then
+        return nil
+    end
+    return session.championship.order
+end
+
+-- Fold the just-finished race into the championship standings (ADR-0040). Called at the racing->finished
+-- seam after every still-out player is DNF'd, so each standings entry is terminal (finished or DNF). DNF
+-- scores 0 but still counts as a participation; classified finishers score by the active preset. Keyed by
+-- canonical identity (players) or the AI slot's display name (ADR-0036). A no-op with no active championship.
+function champ.award()
+    if not champ.is_active() then
+        return
+    end
+    local state = session.championship
+    local standings = build_standings()
+    local starters = #standings  -- the whole field that lined up (finishers + DNFs); linear scores off this
+    -- Everyone starts this race's gain at 0; a non-participant (in the table but not this race) keeps 0, so
+    -- the "last race" column reads true for the whole table.
+    for _, record in pairs(state.standings) do
+        record.last_gain = 0
+    end
+    for _, entry in ipairs(standings) do
+        local identity = entry.name
+        if identity then
+            local record = state.standings[identity]
+            if not record then
+                record = {points = 0, races = 0, finishes = {}, last_gain = 0, ai = entry.ai or nil}
+                state.standings[identity] = record
+            end
+            record.races = record.races + 1
+            if not entry.dnf then
+                local gain = champ.points(state.points_preset, entry.position, starters)
+                record.points = record.points + gain
+                record.last_gain = gain
+                record.finishes[entry.position] = (record.finishes[entry.position] or 0) + 1
+            end
+        end
+    end
+    state.race_count = state.race_count + 1
+end
+
+-- A client-facing snapshot of the championship table (ADR-0040): active flag, settings, ranked rows.
+-- Shipped in the championship broadcast for the HUD finished card + the setup panel; active=false (no
+-- rows) tells a client to hide the table after a reset. wins is derived from the finishes histogram;
+-- lastGain is the points added in the most recent race (0 for a non-participant).
+function champ.snapshot()
+    if not champ.is_active() then
+        return {active = false}
+    end
+    local state = session.championship
+    local rows = {}
+    for position, item in ipairs(champ.rank_list()) do
+        local entry = item.entry
+        rows[#rows + 1] = {
+            position = position,
+            name = item.identity,
+            points = entry.points,
+            wins = champ.wins_of(entry),
+            races = entry.races,
+            lastGain = entry.last_gain or 0,
+            ai = entry.ai or nil,
+        }
+    end
+    return {
+        active = true,
+        preset = state.points_preset,
+        order = state.order.rev and "reversed" or "normal",
+        raceCount = state.race_count,
+        rows = rows,
+    }
+end
+
+-- Broadcast the current championship table to every client (ADR-0040).
+function champ.broadcast()
+    broadcast_event(champ.MSG, champ.snapshot())
+end
+
+-- The overall winner line for the reset announcement (ADR-0040): the top of the ranked table (tie already
+-- broken by points, best finish, wins), or nil when nobody scored.
+function champ.winner_text()
+    local top = champ.rank_list()[1]
+    if not top then
+        return nil
+    end
+    return string.format("%s (%d pts)", top.identity, top.entry.points)
+end
+
+-- Post the current championship table to one player as chat lines (ADR-0040), like /races. Open to all.
+function champ.post_table(player_id)
+    if not champ.is_active() then
+        MP.SendChatMessage(player_id, "BeamComp: no championship active")
+        return
+    end
+    local state = session.championship
+    MP.SendChatMessage(player_id, string.format(
+        "BeamComp championship (points=%s, grid=%s, races=%d):",
+        state.points_preset, state.order.rev and "reversed" or "normal", state.race_count))
+    local ranked = champ.rank_list()
+    if #ranked == 0 then
+        MP.SendChatMessage(player_id, "  (no points yet)")
+        return
+    end
+    for position, item in ipairs(ranked) do
+        local entry = item.entry
+        local wins = champ.wins_of(entry)
+        MP.SendChatMessage(player_id, string.format("  %d. %s -- %d pts (last +%d, %d win%s)",
+            position, item.identity, entry.points, entry.last_gain or 0, wins, wins == 1 and "" or "s"))
+    end
+end
+
+
 -- Resolve the pwr start order at the staging->countdown seam (ADR-0033): sort the rostered players by
 -- their reported power-to-weight (desc by default = strongest on pole, asc for :rev = weakest on pole),
 -- with players who reported none to the back in current slot order. Reassign slots, rebuild the roster,
@@ -1034,6 +1320,8 @@ local function reset_to_lobby()
     session.spawn_ready_count = 0
     session.identities = nil
     session.owner_id = nil
+    -- session.last_order (ADR-0033) and session.championship (ADR-0040) deliberately persist across the
+    -- lobby -- they are the cross-race order sources and must outlive a single race.
     enter_phase(PHASE.lobby, nil)
     if had_race then
         broadcast_chat("BeamComp: race cleared -- back in free roam")
@@ -1077,14 +1365,16 @@ end
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
 local function start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
-    -- Resolve the grid start order (ADR-0033): entry/random/last are applied to the slot assignment now;
-    -- pwr is provisional here and re-gridded after staging. last reads the previous race's finishing order.
-    session.order = overrides.order
+    -- Resolve the grid start order (ADR-0033/0040): entry/random/last/championship are applied to the slot
+    -- assignment now; pwr is provisional here and re-gridded after staging. While a championship is active
+    -- its stored order (reversed by default) grids the race unless the admin gave an explicit order=.
+    local effective_order = overrides.order or champ.active_order()
+    session.order = effective_order
     -- The requested AI opponents become synthetic participant slots (ADR-0036), so the roster, grid
     -- layout, and standings include them like any participant; the owner spawns + drives them. They mix
     -- into a random order and sort by reported pwr; otherwise they take the back of the grid.
-    local slots = build_slots(MP.GetPlayers(), overrides.order, session.last_order,
-        overrides.ai and overrides.ai.count)
+    local slots = build_slots(MP.GetPlayers(), effective_order, session.last_order,
+        champ.order_identities(), overrides.ai and overrides.ai.count)
     local roster = build_roster(slots)
     local assists = overrides.assists
     -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). The default is
@@ -1775,6 +2065,12 @@ local function finalize_race(reason)
     send_race_records(prerun)
     -- Remember the finishing order so the next race's order=last can grid by it (ADR-0033).
     capture_finishing_order()
+    -- Fold this race into the championship table and push the updated standings (ADR-0040); both no-ops
+    -- when no championship is active.
+    champ.award()
+    if champ.is_active() then
+        champ.broadcast()
+    end
     enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
 end
 
@@ -1823,7 +2119,7 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
-    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr[:rev]] "
+    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship[:rev]] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
     .. "[aiavoid=on|off] [airoute=snap|direct] [all]"
 
@@ -1931,8 +2227,9 @@ local function parse_option_token(token)
     return "assist", {keyword = keyword, enabled = assist.enabled, hold = assist.hold}
 end
 
--- Start-order modes for /race order= (ADR-0033). entry/random are non-directional; last/pwr accept :rev.
-local ORDER_MODES = {entry = true, random = true, last = true, pwr = true}
+-- Start-order modes for /race order= (ADR-0033/0040). entry/random are non-directional; last/pwr/
+-- championship accept :rev. championship orders by the live points table (ADR-0040).
+local ORDER_MODES = {entry = true, random = true, last = true, pwr = true, championship = true}
 
 -- Parse an order= value "<mode>[:rev]" into {mode, rev}, or nil when the mode is unknown or a suffix
 -- other than "rev" is given. :rev flips a directional mode (last/pwr); entry/random ignore it (ADR-0033).
@@ -2403,6 +2700,95 @@ local function handle_raceend_command(player_id, player_name)
     MP.SendChatMessage(player_id, "BeamComp: race finished -- results up (cars stay; /raceclear to clear)")
 end
 
+-- Parse a /championship argument into an action plus optional settings (ADR-0040). Recognizes a bare
+-- action token (start | reset/end/stop | show/status) and points=<preset> / order=normal|reversed tokens.
+-- An unknown preset prefix or order word is dropped (left nil); the caller normalizes a bare points=/order=
+-- into a live "set". Order is forgiving so both the chat command and the panel's reconstructed string parse.
+function champ.parse_args(argument)
+    local action, preset, order
+    for token in argument:gmatch("%S+") do
+        local lowered = token:lower()
+        local key, value = lowered:match("^(%a+)=(%w+)$")  -- %w: the f1 preset carries a digit
+        if key == "points" then
+            preset = resolve_keyword(value, champ.PRESETS)
+        elseif key == "order" then
+            if value == "normal" or value == "reversed" then
+                order = value
+            end
+        elseif lowered == "start" or lowered == "reset" or lowered == "end" or lowered == "stop"
+            or lowered == "show" or lowered == "status" then
+            action = lowered
+        end
+    end
+    return action, preset, order
+end
+
+-- /championship: manage the multi-race points championship (ADR-0040). `start [points=<preset>]
+-- [order=normal|reversed]` begins one; `reset`/`end`/`stop` ends it and announces the overall winner; a
+-- bare points=/order= changes settings live; a bare command (or show/status) posts the current table.
+-- Mutations are admin-gated (ADR-0016); the query is open to everyone like /races. Shared by the chat
+-- command and the setup panel (champ.handle_cmd), so both reuse one validated mutation path.
+function champ.handle_command(player_id, player_name, argument)
+    local action, preset, order = champ.parse_args(argument)
+
+    if action == "end" or action == "stop" then
+        action = "reset"
+    elseif action == "status" then
+        action = "show"
+    elseif not action and (preset or order) then
+        action = "set"  -- a bare points=/order= is a live change
+    elseif not action then
+        action = "show"
+    end
+
+    if action == "show" then
+        champ.post_table(player_id)
+        return
+    end
+
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to manage the championship")
+        log_info("beamcomp.champ", "denied /championship from " .. player_name .. " (not a race admin)")
+        return
+    end
+
+    if action == "start" then
+        champ.start(preset, order ~= "normal")  -- default + explicit "reversed" -> reversed grid
+        champ.broadcast()
+        broadcast_chat(string.format("BeamComp: championship started -- points=%s, grid=%s",
+            session.championship.points_preset, session.championship.order.rev and "reversed" or "normal"))
+        log_info("beamcomp.champ", "championship started by " .. player_name)
+        return
+    end
+
+    if action == "reset" then
+        if not champ.is_active() then
+            MP.SendChatMessage(player_id, "BeamComp: no championship active")
+            return
+        end
+        local winner = champ.winner_text()
+        champ.reset()
+        champ.broadcast()
+        broadcast_chat(winner and ("BeamComp: championship over -- winner: " .. winner)
+            or "BeamComp: championship reset")
+        log_info("beamcomp.champ", "championship reset by " .. player_name)
+        return
+    end
+
+    -- action == "set": a live preset / grid-order change on an active championship.
+    if not champ.is_active() then
+        MP.SendChatMessage(player_id, "BeamComp: no championship active -- /championship start first")
+        return
+    end
+    champ.set_preset(preset)
+    if order then
+        champ.set_order(order == "reversed")
+    end
+    champ.broadcast()
+    MP.SendChatMessage(player_id, string.format("BeamComp: championship updated -- points=%s, grid=%s",
+        session.championship.points_preset, session.championship.order.rev and "reversed" or "normal"))
+end
+
 -- /go, /start, /racestart: end the staging wait early and start the countdown (ADR-0021). Admin-gated
 -- like /race; a no-op (with a notice) from any phase other than staging.
 local function handle_start_command(player_id, player_name)
@@ -2484,6 +2870,9 @@ local function handle_raceui_command(player_id, player_name)
         return
     end
     send_event(player_id, MSG_SETUP_OPEN, {})
+    -- Seed the panel with the current championship state (ADR-0040) so its section reflects reality on
+    -- open; subsequent changes arrive via the broadcast.
+    send_event(player_id, champ.MSG, champ.snapshot())
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
@@ -2626,6 +3015,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_GRIDUI then
         handle_gridui_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == champ.CHAT_COMMAND then
+        champ.handle_command(player_id, player_name, argument)
         return 1  -- suppress the command's own chat echo
     end
     -- not a BeamComp command: return nothing so the message relays normally
@@ -3064,6 +3458,27 @@ local function handle_race_go(player_id)
     handle_start_command(player_id, player_name)
 end
 
+-- The setup panel's championship control (ADR-0037/0040): {action, preset, order}. Resolve the issuer's
+-- name and route through the same handler the chat command uses by reconstructing an equivalent
+-- /championship argument -- so the panel reuses one admin-gated mutation path (no duplicated logic).
+function champ.handle_cmd(player_id, payload)
+    if type(payload) ~= "table" or type(payload.action) ~= "string" then
+        return
+    end
+    local player_name = player_name_of(player_id)
+    if not player_name then
+        return
+    end
+    local parts = {payload.action}
+    if type(payload.preset) == "string" then
+        parts[#parts + 1] = "points=" .. payload.preset
+    end
+    if type(payload.order) == "string" then
+        parts[#parts + 1] = "order=" .. payload.order
+    end
+    champ.handle_command(player_id, player_name, table.concat(parts, " "))
+end
+
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
 -- hand-decodes (it does not load the shared envelope module, ADR-0004); `data` arrives as a JSON
 -- string. A non-string `data` means the handler arg order differs from the assumed (player_id, data)
@@ -3113,6 +3528,8 @@ local function handle_client_event(player_id, data)
         handle_start_race(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_GO then
         handle_race_go(player_id)
+    elseif decoded.type == champ.MSG_CMD then
+        champ.handle_cmd(player_id, decoded.payload)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
