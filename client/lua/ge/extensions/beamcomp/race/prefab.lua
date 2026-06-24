@@ -55,6 +55,27 @@ local function char_count(line, ch)
     return count
 end
 
+-- Split a JSONL prefab's lines into a statics-only list (the cone prop-vehicle lines dropped) plus the
+-- dropped-cone count. Keeps anything not positively identified as a cone -- safer to keep an unexpected
+-- line than to drop scenery; a bad line decodes to nil (pcall is the boundary) and is kept. Shared by
+-- write_statics_only (writes to disk) and statics_content (ships the string, ADR-0039).
+local function filter_statics(raw)
+    local kept = {}
+    local dropped = 0
+    for line in (raw .. "\n"):gmatch("(.-)\n") do
+        local trimmed = line:gsub("\r$", "")
+        if trimmed ~= "" then
+            local ok, obj = pcall(jsonDecode, trimmed)
+            if ok and is_cone_object(obj) then
+                dropped = dropped + 1
+            else
+                kept[#kept + 1] = trimmed
+            end
+        end
+    end
+    return kept, dropped
+end
+
 -- Write a statics-only copy of `prefab_file` to `dest_file`: every line except the cone prop-vehicle
 -- lines, kept verbatim. Returns true on success, false (logged) if the file cannot be read/written or
 -- has no static objects to keep. The caller spawns `dest_file` on non-hosts so cones never instantiate.
@@ -70,22 +91,7 @@ function M.write_statics_only(prefab_file, dest_file)
         return false
     end
 
-    local kept = {}
-    local dropped = 0
-    for line in (raw .. "\n"):gmatch("(.-)\n") do
-        local trimmed = line:gsub("\r$", "")
-        if trimmed ~= "" then
-            -- Keep anything we cannot positively identify as a cone -- safer to keep an unexpected
-            -- line than to drop scenery. jsonDecode returns nil on a bad line (pcall is the boundary).
-            local ok, obj = pcall(jsonDecode, trimmed)
-            if ok and is_cone_object(obj) then
-                dropped = dropped + 1
-            else
-                kept[#kept + 1] = trimmed
-            end
-        end
-    end
-
+    local kept, dropped = filter_statics(raw)
     if #kept == 0 then
         log("W", LOG_TAG, "prefab '" .. tostring(prefab_file) .. "' had no static objects to keep")
         return false
@@ -99,6 +105,36 @@ function M.write_statics_only(prefab_file, dest_file)
     log("I", LOG_TAG, string.format(
         "statics-only prefab: kept %d line(s), dropped %d cone(s) -> %s", #kept, dropped, dest_file))
     return true
+end
+
+-- The static-scenery content to ship to a file-less client so it can spawn this race's barriers/signs
+-- without the local file (ADR-0039). For a JSONL mission prefab the statics-only string (cone vehicles
+-- dropped, like write_statics_only -- a file-less client must never instantiate a cone, ADR-0020); for
+-- a legacy quickrace prefab the raw text (already cone-free; its cones live in the host-only cone source,
+-- ADR-0024/0025). Returns {format = "json"|"legacy", content = string} or nil (logged) on a read failure
+-- or a JSONL prefab with no statics to keep. The host calls this; the consumer materializes it back.
+function M.statics_content(prefab_file)
+    if type(readFile) ~= "function" then
+        log("W", LOG_TAG, "readFile unavailable -- cannot read prefab for distribution")
+        return nil
+    end
+
+    local raw = readFile(prefab_file)
+    if not raw then
+        log("W", LOG_TAG, "could not read prefab '" .. tostring(prefab_file) .. "'")
+        return nil
+    end
+
+    if prefab_file:find("%.prefab%.json$") then
+        local kept = filter_statics(raw)
+        if #kept == 0 then
+            log("W", LOG_TAG, "prefab '" .. tostring(prefab_file) .. "' had no statics to distribute")
+            return nil
+        end
+        return {format = "json", content = table.concat(kept, "\n")}
+    end
+
+    return {format = "legacy", content = raw}
 end
 
 -- Keep only the SimGroup container line and the cone-vehicle lines of a JSONL prefab; drop the
@@ -179,6 +215,47 @@ local function filter_legacy_cones(raw)
     end
 
     return kept, cones
+end
+
+-- Where shipped statics content is written on a file-less client before spawning (ADR-0039). BeamNG temp
+-- vpaths, overwritten each load -- no cleanup needed (mirrors the STATICS/CONES temp prefixes in props.lua).
+local DIST_TMP_PREFIX = "/temp/beamcomp_dist_"
+
+-- Materialize the host's shipped statics content to temp vpaths so a file-less client can spawn the
+-- race's barriers/signs without the local files (ADR-0039). `content_list` is the relayed prefabContent:
+-- {name, format, content} per prefab. Writes each under the source basename (so the caller's direction
+-- filter still selects the forward/reverse copy) and returns the written vpaths. Best-effort: an entry
+-- that cannot be written is skipped and logged -- geometry is independent, so a missing barrier never
+-- blocks the race. The caller spawns these via props.load exactly like local prefab paths.
+--
+-- Trust model: the content is written verbatim and then spawned, so the host could ship arbitrary prefab
+-- objects. This is within BeamComp's threat model -- the issuer is an admin-gated /race owner on a private
+-- friend server who can already spawn arbitrary synced vehicles (cones). `name` is the source basename
+-- with no path separators (build_prefab_content uses `[^/]+$`), so the temp path cannot be traversed out.
+function M.materialize(content_list)
+    if type(writeFile) ~= "function" then
+        log("W", LOG_TAG, "writeFile unavailable -- cannot materialize distributed prefabs")
+        return {}
+    end
+    if type(content_list) ~= "table" then
+        return {}
+    end
+
+    local paths = {}
+    for _, entry in ipairs(content_list) do
+        if type(entry) == "table" and type(entry.name) == "string"
+            and type(entry.content) == "string" then
+            local dest = DIST_TMP_PREFIX .. entry.name
+            if writeFile(dest, entry.content) then
+                paths[#paths + 1] = dest
+            else
+                log("W", LOG_TAG, "could not write distributed prefab '" .. dest .. "'")
+            end
+        end
+    end
+
+    log("I", LOG_TAG, string.format("materialized %d distributed prefab(s)", #paths))
+    return paths
 end
 
 -- Write a cones-only copy of `prefab_file` to `dest_file`: only the cone prop-vehicle objects (plus

@@ -817,6 +817,11 @@ local function handle_validate_race(payload)
         -- The aiRace content AI defaults (ADR-0036 Etappe B): the server uses aiDefaults.count to seed the
         -- AI slots when /race requested AI without an explicit number. nil for non-aiRace content.
         aiDefaults = result.aiDefaults,
+        -- The serialized race definition + statics content (ADR-0039): the race-blind server relays these
+        -- verbatim in raceStart so a client without the local race file can build + spawn it. nil on a
+        -- refusal (no parse happened).
+        raceData = result.raceData,
+        prefabContent = result.prefabContent,
     })
 end
 

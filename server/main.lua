@@ -189,6 +189,8 @@ local session = {
     pending_overrides = nil, -- queued race's relayed {mode, laps, direction, force, assists} (ADR-0018)
     pending_map = nil,       -- queued race's issuer-reported map, for grid resolution (ADR-0023)
     pending_race_id = nil,   -- queued race's canonical id, the default-grid lookup key (ADR-0023)
+    pending_race_data = nil, -- queued race's serialized definition, relayed verbatim in raceStart (ADR-0039)
+    pending_prefab_content = nil, -- queued race's serialized statics content, relayed verbatim (ADR-0039)
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
@@ -1025,6 +1027,8 @@ local function reset_to_lobby()
     session.pending_overrides = nil
     session.pending_map = nil
     session.pending_race_id = nil
+    session.pending_race_data = nil
+    session.pending_prefab_content = nil
     session.cleanup_warned = false
     session.spawn_pending = nil
     session.spawn_ready_count = 0
@@ -1072,7 +1076,7 @@ end
 -- race file, ADR-0013/0018). `owner_id` is the player that issued /race; exactly that player's
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
-local function start_race(race_name, owner_id, overrides, map, race_id)
+local function start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
     -- Resolve the grid start order (ADR-0033): entry/random/last are applied to the slot assignment now;
     -- pwr is provisional here and re-gridded after staging. last reads the previous race's finishing order.
     session.order = overrides.order
@@ -1099,6 +1103,8 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
     session.pending_overrides = nil
     session.pending_map = nil
     session.pending_race_id = nil
+    session.pending_race_data = nil
+    session.pending_prefab_content = nil
     session.cleanup_warned = false
 
     -- Seed the spawn-ready gate: await one spawnReady ack per rostered player before leaving the
@@ -1165,6 +1171,12 @@ local function start_race(race_name, owner_id, overrides, map, race_id)
                 car = overrides.car,
                 maxhp = overrides.maxhp,
                 maxpwr = overrides.maxpwr,
+                -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
+                -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
+                -- race from these. Same for every slot; the host (which has the file) ignores them and
+                -- parses locally. nil when the issuer's client did not ship them (older client).
+                raceData = race_data,
+                prefabContent = prefab_content,
             })
         end
     end
@@ -1194,12 +1206,16 @@ local function advance_from_finished()
         local overrides = session.pending_overrides
         local map = session.pending_map
         local race_id = session.pending_race_id
+        local race_data = session.pending_race_data
+        local prefab_content = session.pending_prefab_content
         session.pending_race = nil
         session.pending_owner = nil
         session.pending_overrides = nil
         session.pending_map = nil
         session.pending_race_id = nil
-        start_race(pending, owner, overrides, map, race_id)
+        session.pending_race_data = nil
+        session.pending_prefab_content = nil
+        start_race(pending, owner, overrides, map, race_id, race_data, prefab_content)
         return
     end
     reset_to_lobby()
@@ -2222,9 +2238,9 @@ end
 -- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
 -- phase is re-checked here, not at request time, since the race may have ended while the check was in
 -- flight: from lobby/finished start now; from an active phase queue + run the brief abort window.
-local function commit_validated_race(race_name, owner_id, overrides, map, race_id)
+local function commit_validated_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name, owner_id, overrides, map, race_id)
+        start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
         MP.SendChatMessage(owner_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
@@ -2234,6 +2250,8 @@ local function commit_validated_race(race_name, owner_id, overrides, map, race_i
     session.pending_overrides = overrides
     session.pending_map = map
     session.pending_race_id = race_id
+    session.pending_race_data = race_data
+    session.pending_prefab_content = prefab_content
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
     MP.SendChatMessage(owner_id, "BeamComp: restarting with race '" .. race_name .. "'")
 end
@@ -2262,7 +2280,13 @@ local function handle_race_validation(player_id, payload)
                 overrides.ai.count = math.max(1, math.min(MAX_AI, math.floor(content_count)))
             end
         end
-        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id)
+        -- The issuer's serialized race definition + statics content (ADR-0039): captured here as an opaque
+        -- blob and relayed verbatim into raceStart so a file-less client can build the race. The server
+        -- never parses or inspects it -- race-blindness holds (ADR-0005). nil from an older client.
+        local race_data = type(payload.raceData) == "table" and payload.raceData or nil
+        local prefab_content = type(payload.prefabContent) == "table" and payload.prefabContent or nil
+        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id,
+            race_data, prefab_content)
     else
         local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
         MP.SendChatMessage(pending.owner_id, "BeamComp: " .. reason)

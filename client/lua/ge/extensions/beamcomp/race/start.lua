@@ -16,6 +16,7 @@ local grid = require("beamcomp/race/grid")
 local placement = require("beamcomp/race/placement")
 local checkpoints = require("beamcomp/race/checkpoints")
 local maps = require("beamcomp/race/maps")
+local prefab = require("beamcomp/race/prefab")
 
 local LOG_TAG = "beamcomp.race"
 
@@ -201,6 +202,47 @@ local function resolve_race(payload)
     return race, locator, nil
 end
 
+-- The host's serialized race definition for a file-less client (ADR-0039): only the normalized model a
+-- relayed M.prepare needs -- start positions, checkpoints, meta. routePoints and the local prop paths are
+-- omitted (the AI owner is always the host and parses locally; the prop content ships separately and the
+-- consumer rebuilds race.props). Paired with the canonical locator the consumer keys its map guard +
+-- display on. Plain serializable tables (ADR-0005); the race-blind server relays this verbatim.
+local function build_race_data(race, locator)
+    return {
+        race = {
+            startPositions = race.startPositions,
+            checkpoints = race.checkpoints,
+            meta = race.meta,
+        },
+        locator = {
+            id = locator.id,
+            displayName = locator.displayName,
+            map = locator.map,
+        },
+    }
+end
+
+-- The static-scenery content for each of this race's prefab files (ADR-0039), so a file-less client can
+-- spawn the barriers/signs without the local files. Cones are not shipped -- the host spawns them and
+-- BeamMP syncs them to everyone (ADR-0020/0025). Each entry keeps the file's basename so the consumer's
+-- direction filter still selects the forward/reverse copy. A prefab that cannot be read/filtered is
+-- skipped (best-effort: geometry is independent, so a missing barrier never blocks the race).
+local function build_prefab_content(race)
+    local files = (race.props and race.props.prefabFiles) or {}
+    local content = {}
+    for _, file in ipairs(files) do
+        local shipped = prefab.statics_content(file)
+        if shipped then
+            content[#content + 1] = {
+                name = file:match("[^/]+$") or file,
+                format = shipped.format,
+                content = shipped.content,
+            }
+        end
+    end
+    return content
+end
+
 -- The issuing client's pre-flight verdict on a /race's options (ADR-0019). The race-blind server relays
 -- the options here; we resolve + parse the race locally and report whether it can run as asked. A bad
 -- name / wrong map / ambiguous name, or a geometry mismatch the admin did not `force` (circuit on an
@@ -227,7 +269,78 @@ function M.validate(payload)
     -- Hand the server the aiRace content AI defaults (ADR-0036 Etappe B): the race-blind server uses
     -- aiDefaults.count to seed the AI slots when /race opted into AI without an explicit count. nil for
     -- non-aiRace content. The owner reads the same defaults locally via M.prepare for difficulty/vehicle.
-    return {ok = true, raceId = locator.id, aiDefaults = race.meta and race.meta.aiDefaults}
+    --
+    -- raceData + prefabContent serialize the race for distribution (ADR-0039): the server relays them
+    -- verbatim in raceStart so a client without the local race file can still build + spawn it.
+    return {
+        ok = true,
+        raceId = locator.id,
+        aiDefaults = race.meta and race.meta.aiDefaults,
+        raceData = build_race_data(race, locator),
+        prefabContent = build_prefab_content(race),
+    }
+end
+
+-- ADR-0039 decision 6: with the file installed a client parses locally (no behavior change); a file-less
+-- client builds from the host's relayed definition. Flip this to true to make the relayed model the
+-- PRIMARY source (local parse becomes the fallback), once the 2-client perf/size check clears it.
+local PREFER_RELAYED_RACE_DATA = false
+
+-- Reconstruct the parsed race model + locator from the host's relayed definition (ADR-0039). The host
+-- ships only the geometry, so the prop side the consumer owns is rebuilt here: the shipped statics are
+-- materialized to temp vpaths (best-effort), and cones stay host-only (BeamMP-synced, never spawned
+-- here). Guards the map -- the relayed coordinates are world-absolute and valid only on the race's own
+-- map, so a client elsewhere refuses rather than spawn at alien coordinates. Returns race, locator on
+-- success, or nil plus a reason.
+local function race_from_distribution(race_data, prefab_content)
+    if type(race_data) ~= "table" or type(race_data.race) ~= "table"
+        or type(race_data.locator) ~= "table" then
+        return nil, "no relayed race definition"
+    end
+
+    local locator = race_data.locator
+    local loaded = maps.current()
+    if loaded and locator.map and not maps.matches(loaded, locator.map) then
+        return nil, "race is on map '" .. tostring(locator.map) .. "' -- you are on '"
+            .. tostring(loaded) .. "'"
+    end
+
+    local race = race_data.race
+    race.props = {
+        prefabFiles = prefab.materialize(prefab_content),
+        coneFiles = {},
+    }
+    return race, locator
+end
+
+-- Resolve a raceStart payload to its parsed race model + locator (ADR-0039): a client with the file
+-- parses locally (unchanged), a file-less client falls back to the host's relayed definition. The flag
+-- above flips the order so the relayed model can become primary. Returns race, locator or nil + reason.
+local function resolve_race_for_prepare(payload)
+    local has_relayed = type(payload.raceData) == "table"
+
+    if PREFER_RELAYED_RACE_DATA and has_relayed then
+        local race, locator = race_from_distribution(payload.raceData, payload.prefabContent)
+        if race then
+            return race, locator
+        end
+    end
+
+    local race, locator, err = resolve_race(payload)
+    if race then
+        return race, locator
+    end
+
+    if has_relayed then
+        local relayed_race, relayed_locator_or_err = race_from_distribution(payload.raceData,
+            payload.prefabContent)
+        if relayed_race then
+            return relayed_race, relayed_locator_or_err
+        end
+        return nil, nil, relayed_locator_or_err
+    end
+
+    return nil, nil, err
 end
 
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
@@ -236,7 +349,7 @@ function M.prepare(payload)
         return nil, "malformed raceStart payload"
     end
 
-    local race, locator, err = resolve_race(payload)
+    local race, locator, err = resolve_race_for_prepare(payload)
     if not race then
         return nil, err
     end
