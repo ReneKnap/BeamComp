@@ -162,6 +162,7 @@ M.state = {
     ai_custom_map = nil,      -- host only: true while the script-variant custom race navgraph is live (ADR-0036 Step-3b); teardown restores the real one
 
     ai_detections = nil,      -- host only: per-AI checkpoint-detection state keyed by AI id, armed on racing (ADR-0036), or nil
+    ai_laptimers = nil,       -- host only: per-AI circuit lap clock keyed by AI id, armed alongside ai_detections; feeds the proxy best-lap + run-up report (ADR-0036/0022/0041), or nil
     ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
     ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
     ai_server_ids = nil,      -- non-owner: set of BeamMP server ids from the latest aiMap awaiting local resolution (ADR-0036), or nil
@@ -259,6 +260,7 @@ local function handle_race_start(payload)
         M.state.ai_cars = nil
         M.state.ai_config = nil
         M.state.ai_detections = nil
+        M.state.ai_laptimers = nil
         M.state.ai_map_pending = false
         M.state.ai_remote_ids = nil
         M.state.ai_server_ids = nil
@@ -345,6 +347,7 @@ local function handle_race_start(payload)
     M.state.ai_cars = nil
     M.state.ai_config = nil
     M.state.ai_detections = nil
+    M.state.ai_laptimers = nil
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
     M.state.ai_server_ids = nil
@@ -532,6 +535,7 @@ local function teardown_race_world()
     M.state.ai_cars = nil
     M.state.ai_config = nil
     M.state.ai_detections = nil
+    M.state.ai_laptimers = nil
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
     M.state.ai_server_ids = nil
@@ -591,8 +595,9 @@ local function begin_driving(plan, ai_laps)
         log("W", RACE_LOG_TAG, "driving: no traversal plan; checkpoint detection disabled")
     end
     -- Host only: release the AI cars, hand them to BeamNG's AI to drive the route, and arm one detector per
-    -- AI so the host scores them by proxy (ADR-0036). In qualifying the AI lap the quali plan too so the
-    -- field is populated; they grid at the back (no AI proxy lap timing in v1, ADR-0041).
+    -- AI so the host scores them by proxy (ADR-0036). On a circuit each AI also gets a lap clock, so the host
+    -- reports their best lap + run-up by proxy (ADR-0022); the AI lap-time the quali plan too and qualify on
+    -- pace via the server's quali.ranking (ADR-0041) rather than always gridding at the back.
     if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
         ai.set_frozen(M.state.ai_cars, false)
         local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
@@ -604,10 +609,22 @@ local function begin_driving(plan, ai_laps)
             send_to_server("aiRouteNotice", ai_route)
         end
         local detections = {}
+        -- Circuit only: a per-AI lap clock mirroring the player's, armed at the start/finish line (the same
+        -- checkpoints[1] the player's laptimer watches), so the host reports each AI's best lap + run-up (S0)
+        -- by proxy. nil on a sprint -- no best-lap column, no S0 column (ADR-0022/0036/0041).
+        local ai_laptimers = nil
+        if M.state.race.mode == "circuit" and M.state.race.checkpoints
+            and M.state.race.checkpoints[1] then
+            ai_laptimers = {}
+        end
         for _, car in ipairs(M.state.ai_cars) do
             detections[car.id] = checkpoints.new(plan)
+            if ai_laptimers then
+                ai_laptimers[car.id] = laptimer.new(M.state.race.checkpoints[1])
+            end
         end
         M.state.ai_detections = detections
+        M.state.ai_laptimers = ai_laptimers
     end
     -- Circuit only: arm the client-side lap clock on the start/finish line (ADR-0022); display-only, so it
     -- never touches the scored plan. In qualifying its best-lap drives the grid (server-reported, ADR-0041).
@@ -724,6 +741,7 @@ local function handle_race_phase(payload)
         end
         M.state.ai_cars = nil
         M.state.ai_detections = nil
+        M.state.ai_laptimers = nil
     elseif phase == "finished" then
         -- Race over, but the results + props stay up for the long free-roam window (ADR-0006/0017
         -- amendments, B3). Release the in-race lock and hand the recover/repair keys back to vanilla
@@ -2154,6 +2172,7 @@ local function step_ai_detections(dt_sim)
     local detections = M.state.ai_detections
     local cars = M.state.ai_cars
     local race = M.state.race
+    local laptimers = M.state.ai_laptimers
     if not detections or not cars or not race or not race.checkpoints then
         return
     end
@@ -2169,7 +2188,15 @@ local function step_ai_detections(dt_sim)
                 end
             end
             local event = checkpoints.step(detection, race.checkpoints, veh_pos, dt_sim)
+            -- Circuit only (nil otherwise): the AI's lap clock mirrors the player's path (step_detection +
+            -- on_checkpoint_reached). A scored start/finish crossing closes a lap, folding in the best before
+            -- the report; the report then carries this AI's best lap + run-up so the server stores them by
+            -- proxy exactly like a player (ADR-0036/0022). Both stay nil on a sprint -> harmless.
+            local ai_lt = laptimers and laptimers[car.id]
             if event then
+                if ai_lt and ai_lt.start_cp and event.index == ai_lt.start_cp.index then
+                    laptimer.complete_lap(ai_lt, event.time)
+                end
                 send_to_server("checkpoint", {
                     -- Proxy tag (ADR-0036): the server records this crossing into the AI slot's progress,
                     -- not the owner's. Accepted only from the race owner for a known AI id (server-side).
@@ -2180,9 +2207,16 @@ local function step_ai_detections(dt_sim)
                     lap = event.lap,
                     time = event.time,
                     count = detection.plan.count,
+                    bestLap = ai_lt and ai_lt.best or nil,
+                    runUp = ai_lt and ai_lt.run_up or nil,
                 })
                 log("I", RACE_LOG_TAG, string.format("AI '%s' checkpoint seq %d @ %.2fs",
                     tostring(car.label), event.seq, event.time))
+            end
+            -- Swept run-up test after the detector, mirroring step_detection's trailing laptimer.step: the
+            -- first start/finish crossing arms run_up (gun -> line); a no-op once armed.
+            if ai_lt then
+                laptimer.step(ai_lt, veh_pos, detection.elapsed)
             end
         end
     end
