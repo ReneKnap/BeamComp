@@ -667,7 +667,15 @@ local function handle_race_phase(payload)
         -- each whole second and plays the final beeps on the centered overlay (ADR-0021).
         lock.install()
         M.state.staging = nil
-        M.state.countdown = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
+        -- Anchor the count to a wall clock (os.clockhp) rather than accumulating the clamped per-frame dt,
+        -- so a spawn/despawn hitch at the quali seam can't make it finish behind the server's wall-time
+        -- phase (ADR-0041); the quali re-grid now re-spawns the AI a lead time earlier, so this count is
+        -- normally hitch-free anyway. Display only -- the server owns the countdown -> racing transition.
+        M.state.countdown = {
+            total = tonumber(payload.duration) or 0,
+            anchor = os.clockhp(),
+            last_shown = nil,
+        }
     elseif phase == "qualifying" then
         -- Qualifying session (ADR-0041): release the lock and lap the unbounded quali plan to set lap
         -- times; the grid is set afterwards from quali pace. The AI drive too (so the session is populated),
@@ -692,15 +700,22 @@ local function handle_race_phase(payload)
         M.state.grace = nil
         M.state.detection = nil
         M.state.laptimer = nil
-        -- Count the pause down so the card shows when the race starts (the phase carries its duration).
-        -- NOTE: this local countdown can drift a few seconds behind the server's wall-time pause across the
-        -- AI-despawn frame hitch (tracked as a bug); the card still hides server-authoritatively on the phase
-        -- change.
-        M.state.qualiResults = {remaining = tonumber(payload.duration) or 0}
-        -- Despawn the host's quali AI NOW, at the start of the pause -- the ~20 s gap lets BeamMP fully
-        -- remove them before the regrid re-spawns fresh cars on the earned grid, so a delete+spawn overlap
-        -- never pushes the car count past MaxCars (which silently drops the new AI). Restore the navgraph
-        -- the quali drive may have swapped. Owner-only (ai_cars nil elsewhere).
+        -- Count the pause down for the card's "race starts in" line, anchored to a wall clock (os.clockhp)
+        -- rather than accumulating the clamped per-frame dt, so the AI-despawn frame hitch below cannot make
+        -- it drift behind the server's wall-time pause (ADR-0041). Display only -- the card hides
+        -- server-authoritatively on the phase change regardless. remaining is kept fresh by the tick for the
+        -- HUD snapshot to read.
+        local quali_results_seconds = tonumber(payload.duration) or 0
+        M.state.qualiResults = {
+            total = quali_results_seconds,
+            anchor = os.clockhp(),
+            remaining = quali_results_seconds,
+        }
+        -- Despawn the host's quali AI NOW, at the start of the pause -- the gap until the re-grid (which now
+        -- runs a lead time before the countdown, ADR-0041) lets BeamMP fully remove them before fresh cars
+        -- re-spawn on the earned grid, so a delete+spawn overlap never pushes the car count past MaxCars
+        -- (which silently drops the new AI). Restore the navgraph the quali drive may have swapped.
+        -- Owner-only (ai_cars nil elsewhere).
         ai.stop(M.state.ai_cars or {})
         ai.clear(M.state.ai_cars or {})
         if M.state.ai_custom_map then
@@ -836,18 +851,22 @@ local function respawn_ai_for_quali(ai_slots)
     if type(ai_slots) ~= "table" or #ai_slots == 0 or not M.state.race then
         return
     end
-    -- The quali AI were despawned at the start of the quali-results pause, so BeamMP has had ~20 s to
-    -- remove them; spawn fresh + frozen at the new poses now, with the same spawn-notification mute as
-    -- race start.
-    -- Lift the in-race action lock first: this re-grid arrives during the race countdown, where the lock
-    -- is installed, and it guards core_vehicles.spawnNewVehicle -- which silently refuses the AI spawn
-    -- (ai.spawn returned 0). The countdown phase handler re-installs the lock right after this regrid.
+    -- The quali AI were despawned at quali-results entry, so BeamMP has had the lead gap (the pause minus
+    -- quali_regrid_lead) to remove them; spawn fresh + frozen at the new poses now, with the same
+    -- spawn-notification mute as race start.
+    -- Lift the in-race action lock first: the full fixed-car lock persists from the first countdown through
+    -- qualifying and this pause, and it gates core_vehicles.spawnNewVehicle -- which would silently refuse
+    -- the AI spawn (ai.spawn returns 0). It is re-installed at the end of this function: the re-grid now runs
+    -- during the quali-results pause (a lead before the countdown), so waiting for the countdown handler to
+    -- restore it would leave the car swappable for the rest of the pause -- the race must keep the same car
+    -- from quali start to finish.
     lock.remove()
     spawn_mute.mute_for(SPAWN_NOTIFICATION_MUTE_SECONDS)
     local cars = ai.spawn(ai_slots, M.state.race.gridPoses, M.state.ai_config, M.state.race.aiDefaults,
         M.state.ai_policy)
     if type(cars) ~= "table" or #cars == 0 then
         log("W", RACE_LOG_TAG, "quali AI re-spawn: ai.spawn returned no cars")
+        lock.install()  -- restore the lock removed above, even on the spawn-failure path
         return
     end
     ai.set_frozen(cars, true)
@@ -865,6 +884,10 @@ local function respawn_ai_for_quali(ai_slots)
         pcall(function() be:enterVehicle(0, race_car) end)
         M.state.current_vehicle_id = race_car:getId()
     end
+    -- Re-install the fixed-car lock now that the spawn + re-seat are done (see the lock.remove note above
+    -- for why this can't wait for the countdown). The own-car re-place that follows in handle_regrid is a
+    -- programmatic keep_own teleport, not a player action, so the restored lock does not block it.
+    lock.install()
     log("I", RACE_LOG_TAG, string.format("re-spawned %d AI on the quali grid", #cars))
 end
 
@@ -3222,13 +3245,13 @@ end
 -- Tick the start countdown in wall time off the server-issued duration (ADR-0021): render each whole
 -- second on the centered overlay and play the final 3-2-1 beeps as the shown number changes. GO! and
 -- the actual release are driven by the server `racing` phase, not this tick.
-local function step_start_countdown(dt_real)
+local function step_start_countdown()
     local count = M.state.countdown
     if not count then
         return
     end
-    count.remaining = math.max(0, count.remaining - (dt_real or 0))
-    local shown = math.max(1, math.ceil(count.remaining))
+    local remaining = math.max(0, count.total - (os.clockhp() - count.anchor))
+    local shown = math.max(1, math.ceil(remaining))
     if shown ~= count.last_shown then
         count.last_shown = shown
         countdown.show_start(shown)
@@ -3278,7 +3301,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         restage_swapped_car(dtReal)
     elseif M.state.phase == "countdown" and M.state.race then
         -- Tick the start countdown on the centered overlay (ADR-0021).
-        step_start_countdown(dtReal)
+        step_start_countdown()
     elseif M.state.phase == "qualifying" and M.state.race then
         -- Qualifying (ADR-0041): the same detection + lap-clock path as racing, plus the host's AI
         -- detectors (the AI lap the quali plan too) and the local quali-clock countdown for the HUD. The
@@ -3298,10 +3321,12 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
             M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
         end
     elseif M.state.phase == "qualiResults" and M.state.race then
-        -- Tick the pause countdown for the quali-results card (ADR-0041). Can drift behind the server pause
-        -- across the AI-despawn hitch (tracked bug); the card hides server-authoritatively regardless.
-        if M.state.qualiResults then
-            M.state.qualiResults.remaining = math.max(0, M.state.qualiResults.remaining - (dtReal or 0))
+        -- Update the quali-results card's "race starts in" remaining from the wall-clock anchor (os.clockhp),
+        -- so the AI-despawn frame hitch can't drift it behind the server pause (ADR-0041). Display only.
+        local quali_results = M.state.qualiResults
+        if quali_results then
+            quali_results.remaining =
+                math.max(0, quali_results.total - (os.clockhp() - quali_results.anchor))
         end
     elseif M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
@@ -3330,8 +3355,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- Non-owner: keep resolving the relayed aiMap to local handles until every synced AI car is found.
     resolve_remote_ai()
     -- Host only: deferred front-anchor restage of the AI cars onto the grid over the frozen phases, once
-    -- each car's jbeam has loaded (ADR-0036) -- the per-car mirror of the player restage above.
-    if (M.state.phase == "staging" or M.state.phase == "countdown") and M.state.ai_cars then
+    -- each car's jbeam has loaded (ADR-0036) -- the per-car mirror of the player restage above. Includes
+    -- qualiResults so the quali re-spawned AI (which now spawn a lead time before the countdown, ADR-0041)
+    -- are straightened onto the grid during the pause, not mid-countdown.
+    if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "qualiResults")
+        and M.state.ai_cars then
         ai.restage(M.state.ai_cars, dtReal)
     end
     -- Arm the seated car's VE key forwarders across the locked sequence (staging + countdown + racing).

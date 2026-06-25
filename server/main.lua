@@ -166,6 +166,9 @@ local PHASE_DURATIONS = {
     quali_default = 480.0, -- default qualifying session length, 8 min (ADR-0041); per-event override in session.quali.duration
     quali_lap_grace = 45.0, -- finish-your-lap cap after the quali clock expires before quali-results (ADR-0041)
     quali_results = 20.0,  -- classification pause between qualifying and the race countdown (ADR-0041)
+    quali_regrid_lead = 8.0, -- lead before the countdown to run the AI re-grid inside quali-results, so the
+                             -- AI re-spawn frame hitch lands on the static results card, not the race
+                             -- countdown (which ticks locally and would lose those seconds) (ADR-0041)
 }
 
 -- Seconds before the finished results window expires to warn players that the props and results
@@ -1296,6 +1299,7 @@ function quali.begin(duration)
         duration = tonumber(duration) or PHASE_DURATIONS.quali_default,
         lap_grace_deadline = nil,  -- set when the quali clock expires, to let an in-progress lap finish
         done = false,              -- flips true at the quali-results -> countdown hand-off (race grid set)
+        regridded = false,         -- flips true when the AI re-grid fires inside quali-results (ADR-0041)
     }
 end
 
@@ -1432,10 +1436,31 @@ function quali.advance_qualifying()
     end
 end
 
--- Leave the quali-results pause for the race (ADR-0041): grid the field by quali pace, mark the event done
--- (so the next countdown gates the race, not another quali), and enter the race countdown.
-function quali.advance_results()
+-- Run the quali re-grid once, a lead time before the results pause ends (ADR-0041 amendment). The owner
+-- re-spawns fresh AI here, on the static results card, so the AI-spawn frame hitch never lands on the race
+-- countdown -- which ticks locally and would otherwise lose those seconds and finish behind the server (the
+-- race starting before the count reaches GO). The client despawned the quali AI at quali-results entry, so
+-- this lead also preserves the despawn -> respawn gap that keeps the car count under MaxCars. A no-op until
+-- the lead point, and after it has run once.
+function quali.maybe_regrid()
+    local q = session.quali
+    if not q or q.regridded then
+        return
+    end
+    local pause = session.phase_duration or PHASE_DURATIONS.quali_results
+    if phase_elapsed() < pause - PHASE_DURATIONS.quali_regrid_lead then
+        return
+    end
+    q.regridded = true
     quali.regrid()
+end
+
+-- Leave the quali-results pause for the race (ADR-0041): ensure the field is gridded by quali pace (the
+-- re-grid normally ran a lead time earlier via quali.maybe_regrid; this is the fallback if that window was
+-- skipped), mark the event done (so the next countdown gates the race, not another quali), and enter the
+-- race countdown.
+function quali.advance_results()
+    quali.maybe_regrid()
     if session.quali then
         session.quali.done = true
     end
@@ -2347,6 +2372,13 @@ local function tick()
     if phase == PHASE.spawning then
         advance_spawning()
         return
+    end
+
+    -- quali-results runs the AI re-grid a lead time before the pause ends (ADR-0041 amendment), so the AI
+    -- re-spawn hitch lands on the static results card rather than the race countdown. No return: the pause's
+    -- own timed end (-> countdown) still fires via the generic advance below.
+    if phase == PHASE.quali_results then
+        quali.maybe_regrid()
     end
 
     -- Every other active phase is timed: advance once its configured duration elapses.
