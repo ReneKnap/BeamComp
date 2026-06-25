@@ -142,6 +142,25 @@ angular.module('beamng.apps')
     return 'dense';
   }
 
+  // Qualifying board (ADR-0041): the live classification during the qualifying session, ranked by best
+  // lap (fastest on pole); drivers with no valid time fall to the back in their current order. Display
+  // only -- the server sets the actual grid from the same metric when qualifying ends.
+  function qualiBoard(entries) {
+    var list = (entries || []).slice();
+    list.sort(function (a, b) {
+      var at = typeof a.bestLap === 'number';
+      var bt = typeof b.bestLap === 'number';
+      if (at && bt) {
+        return a.bestLap - b.bestLap;
+      }
+      if (at !== bt) {
+        return at ? -1 : 1;
+      }
+      return (a.position || 0) - (b.position || 0);
+    });
+    return list;
+  }
+
   // The local player's full entry (the one flagged isLocal), or null. Resolved from the full field
   // -- not the windowed live rows -- so the header, time block, and results best-lap bind to it even
   // when the local player is scrolled out of the live row window.
@@ -347,6 +366,16 @@ angular.module('beamng.apps')
         }
       };
 
+      // Minimize/maximize the quali-results card (ADR-0041): client-local, no GE round-trip. Methods (not
+      // inline ng-click assignments) so they set the flag on this scope, not an ng-if child scope. Minimize
+      // collapses to a small bar rather than hiding the results outright.
+      scope.minimizeQualiResults = function () {
+        scope.qualiResultsMin = true;
+      };
+      scope.maximizeQualiResults = function () {
+        scope.qualiResultsMin = false;
+      };
+
       // Analysis delta cell: signed delta or a placeholder, with a faster/slower colour class (ADR-0028).
       scope.deltaCell = function (d) {
         return typeof d === 'number' ? formatDelta(d) : '--';
@@ -383,6 +412,15 @@ angular.module('beamng.apps')
             scope.hud.liveEntries[i].flash = !!flashing[scope.hud.liveEntries[i].id];
           }
           scope.hud.localEntry = findLocalEntry(scope.hud.entries);
+          // Qualifying live board (ADR-0041): rank the field by best lap for the quali session view.
+          if (scope.hud.phase === 'qualifying') {
+            scope.hud.qualiBoard = qualiBoard(scope.hud.entries);
+          }
+          // The quali-results minimize is per-event: clear it outside the results pause so the next
+          // qualifying shows the card again (ADR-0041).
+          if (scope.hud.phase !== 'qualiResults') {
+            scope.qualiResultsMin = false;
+          }
           trackLocalFinish();
           // Provisional results card: a finished/DNF'd player viewing standings while the race runs. While
           // it is up the live corner regions hide (template), so this one flag drives both ng-ifs. The

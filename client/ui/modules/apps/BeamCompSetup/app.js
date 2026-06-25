@@ -17,10 +17,12 @@ angular.module('beamng.apps')
     mode: [{ v: '', label: 'auto' }, { v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }],
     orderMode: [{ v: 'entry', label: 'entry' }, { v: 'random', label: 'random' },
       { v: 'last', label: 'last result' }, { v: 'pwr', label: 'power/weight' },
-      { v: 'championship', label: 'championship' }],
+      { v: 'quali', label: 'qualifying' }],
+    qualiPresets: [5, 8, 12, 15],
     champPreset: [{ v: 'f1', label: 'F1 (25-18-15…)' }, { v: 'linear', label: 'linear (per starter)' },
       { v: 'quadratic', label: 'quadratic (64-32-16…)' }],
-    champOrder: [{ v: 'reversed', label: 'reversed (handicap)' }, { v: 'normal', label: 'normal' }],
+    champOrder: [{ v: 'reversed', label: 'reversed (handicap)' }, { v: 'normal', label: 'normal' },
+      { v: 'quali', label: 'qualifying' }],
     aiPreset: [{ v: '', label: 'default' }, { v: 'easy', label: 'easy' }, { v: 'medium', label: 'medium' },
       { v: 'hard', label: 'hard' }],
     aiRoute: [{ v: '', label: 'default' }, { v: 'snap', label: 'snap (road)' },
@@ -32,11 +34,11 @@ angular.module('beamng.apps')
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
       carModel: '', carConfig: '', maxhp: '', maxpwr: '',
-      orderMode: 'entry', orderRev: false, grid: '',
+      orderMode: 'entry', orderRev: false, qualiMinutes: 5, grid: '',
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 1, aiPreset: '', aiCar: '', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: false,
-      champPreset: 'f1', champOrder: 'reversed',
+      champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
     };
   }
 
@@ -80,6 +82,10 @@ angular.module('beamng.apps')
       },
       order: { mode: form.orderMode, rev: !!form.orderRev },
     };
+    // Qualifying length (ADR-0041): only meaningful for order=quali; sent as minutes, the server clamps.
+    if (form.orderMode === 'quali' && num(form.qualiMinutes) !== undefined) {
+      o.qualiMinutes = num(form.qualiMinutes);
+    }
     if (form.mode) { o.mode = form.mode; }
     if (num(form.laps) !== undefined) { o.laps = num(form.laps); }
     if (form.reverse) { o.direction = 'reverse'; }
@@ -282,6 +288,9 @@ angular.module('beamng.apps')
           if (scope.championship.active) {
             scope.form.champPreset = scope.championship.preset || scope.form.champPreset;
             scope.form.champOrder = scope.championship.order || scope.form.champOrder;
+            // champQualiMinutes is UI-owned and kept session-long -- do NOT overwrite it from the snapshot
+            // (which would reset the admin's chosen length to the server default each broadcast). The value
+            // is sent on Start/Apply; the field persists for the directive's life.
           }
         });
       });
@@ -292,6 +301,8 @@ angular.module('beamng.apps')
       function championshipCmd(action) {
         geLuaArg('championship_cmd', JSON.stringify({
           action: action, preset: scope.form.champPreset, order: scope.form.champOrder,
+          // Qualifying length (minutes) used when the championship grid is "quali" (ADR-0041).
+          qualiMinutes: num(scope.form.champQualiMinutes),
         }));
       }
       scope.championshipStart = function () { championshipCmd('start'); };

@@ -47,6 +47,12 @@
       font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .bc-order-locked { font-style: italic; opacity: 0.7; }
     .bc-champ-actions { justify-content: flex-start; gap: 8px; }
+    /* Qualifying length control (ADR-0041): a free minute input plus preset quick-buttons. */
+    .bc-quali-len { flex: 1 1 auto; display: flex; align-items: center; gap: 4px; justify-content: flex-end; }
+    .bc-quali-len input[type=number] { flex: 0 0 48px; }
+    .bc-preset { background: #2a2e35; color: #cde; border: 1px solid #3a3f47; border-radius: 3px;
+      padding: 2px 7px; cursor: pointer; font-size: 12px; }
+    .bc-preset.sel { background: #355; border-color: #4a6; }
     .bc-champ-actions button { flex: 1 1 auto; }
     .bc-champ-reset { background: #5a2d2d; color: #f0d0d0; }
   </style>
@@ -132,6 +138,16 @@
           </div>
         </div>
         <span class="bc-champ-status bc-order-locked" ng-if="championship.active">by championship ({{championship.order}})</span>
+      </div>
+      <!-- Qualifying length (ADR-0041): only for order=quali; a short session sets the grid by best lap.
+           A free minute value plus preset quick-buttons. -->
+      <div class="bc-row" ng-if="!championship.active && form.orderMode === 'quali'">
+        <span>Qualifying length</span>
+        <span class="bc-quali-len">
+          <input type="number" min="1" max="30" ng-model="form.qualiMinutes"> min
+          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
+            ng-class="{sel: form.qualiMinutes === m}" ng-click="form.qualiMinutes = m">{{m}}</button>
+        </span>
       </div>
       <label class="bc-row bc-check"
              ng-if="!championship.active && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
@@ -245,6 +261,16 @@
               ng-click="pick('champOrder', o.v)">{{o.label}}</div>
           </div>
         </div>
+      </div>
+      <!-- Qualifying length for a championship whose grid is "quali" (ADR-0041): each race runs a quali of
+           this length. Free minutes + preset quick-buttons, mirroring the per-race control. -->
+      <div class="bc-row" ng-if="form.champOrder === 'quali'">
+        <span>Qualifying length</span>
+        <span class="bc-quali-len">
+          <input type="number" min="1" max="30" ng-model="form.champQualiMinutes"> min
+          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
+            ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m">{{m}}</button>
+        </span>
       </div>
       <div class="bc-row bc-champ-actions">
         <button class="bc-refresh" ng-if="!championship.active" ng-click="championshipStart()">Start</button>

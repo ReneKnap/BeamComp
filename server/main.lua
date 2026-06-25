@@ -17,7 +17,7 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship[:rev]] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) = per-player caps that keep a
@@ -27,8 +27,10 @@
 --                 configure their vehicle + driving. airoute=snap|direct picks the AI line (snap =
 --                 road-navgraph snap, default; direct = exact custom-navgraph race line, off-road,
 --                 Step-3b). AI mix into random and sort by reported pwr; else back of grid.
---                 start order (ADR-0033): order=entry (default) | random | last (prev race result) |
---                 pwr (power-to-weight); :rev flips a directional mode (last:rev/pwr:rev = handicap).
+--                 start order (ADR-0033/0040/0041): order=entry (default) | random | last (prev race
+--                 result) | pwr (power-to-weight) | championship (points table) | quali (qualifying pace);
+--                 :rev flips a directional mode (last:rev/pwr:rev = handicap). quali=<min> sets the
+--                 qualifying length (default 8) for order=quali.
 --                 the deprecated quickrace ("menu:") source is hidden from bare-name resolution unless
 --                 "all" is given or the name carries an explicit "menu:" prefix (ADR-0026).
 --                 <name> may carry a "map:"/"menu:" source prefix (freeroam-mission vs Time-Trial-menu
@@ -146,6 +148,8 @@ local PHASE = {
     spawning = "spawning",
     staging = "staging",
     countdown = "countdown",
+    qualifying = "qualifying",      -- time-boxed qualifying session before the race (ADR-0041); reuses racing machinery
+    quali_results = "qualiResults", -- short classification pause after qualifying, before the race countdown (ADR-0041)
     racing = "racing",
     finished = "finished",
 }
@@ -159,6 +163,9 @@ local PHASE_DURATIONS = {
     all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
     finished_hold = 900.0, -- long results + free-roam window before returning to lobby (ADR-0006 amendment)
+    quali_default = 480.0, -- default qualifying session length, 8 min (ADR-0041); per-event override in session.quali.duration
+    quali_lap_grace = 45.0, -- finish-your-lap cap after the quali clock expires before quali-results (ADR-0041)
+    quali_results = 20.0,  -- classification pause between qualifying and the race countdown (ADR-0041)
 }
 
 -- Seconds before the finished results window expires to warn players that the props and results
@@ -200,6 +207,7 @@ local session = {
     order = nil,              -- this race's start-order {mode, rev} (ADR-0033), or nil = entry order
     last_order = nil,         -- previous race's finishing order as a list of identities (ADR-0033); session-scoped, survives reset_to_lobby so order=last has a source
     championship = nil,       -- active multi-race championship {points_preset, order, standings, race_count} or nil (ADR-0040); session-scoped, survives reset_to_lobby like last_order
+    quali = nil,              -- active quali-then-race event {duration, lap_grace_deadline, done} or nil (ADR-0041); per-event, cleared by reset_to_lobby (unlike last_order/championship)
     owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
 }
 
@@ -738,7 +746,8 @@ local function order_ids(players, order, last_order)
         return place_by_identity(ids, last_order, order.rev)
     end
 
-    -- entry, or pwr (provisional entry order until the post-staging re-grid resolves it).
+    -- entry, or pwr/quali (provisional entry order until their re-grid resolves it -- pwr after staging,
+    -- quali after the qualifying session; ADR-0033/0041).
     return ids
 end
 
@@ -777,10 +786,11 @@ end
 -- Assign every participant (connected players + the requested AI, ADR-0036 Etappe B) a 0-based slot in
 -- the resolved start order (ADR-0033). For `random` the AI shuffle into the field with the players; for
 -- `championship` the AI are ranked into the field by their own points (ADR-0040), since they score too; for
--- entry/last/pwr the players are ordered first and the AI appended at the back -- their natural position
--- (no entry/finish history) and it avoids the mixed numeric/string id sort. pwr re-sorts the AI into the
--- field after staging (regrid_by_pwr). Deterministic for a given mode + roster so every client computes
--- the same grid.
+-- entry/last/pwr/quali the players are ordered first and the AI appended at the back -- their natural
+-- position (no entry/finish history) and it avoids the mixed numeric/string id sort. pwr re-sorts the AI
+-- into the field after staging (regrid_by_pwr); quali re-grids the whole field by pace after the qualifying
+-- session (quali.regrid, ADR-0041). Deterministic for a given mode + roster so every client computes the
+-- same grid.
 local function build_slots(players, order, last_order, champ_order, ai_count)
     local mode = order and order.mode
     local ids
@@ -1017,18 +1027,32 @@ function champ.is_active()
     return session.championship ~= nil
 end
 
--- The grid order a championship imposes: {mode = "championship", rev}. Default reversed = current leader
--- starts at the back (handicap, ADR-0040). `normal` puts the leader on pole.
-function champ.order(rev)
-    return {mode = "championship", rev = rev}
+-- The grid order a championship imposes, from a grid choice string (ADR-0040/0041). "reversed" (default)
+-- = current leader starts at the back (handicap); "normal" = leader on pole; "quali" = each race runs a
+-- qualifying session and grids by pace (ADR-0041), the championship still scoring from the race result.
+function champ.order(grid)
+    if grid == "quali" then
+        return {mode = "quali"}
+    end
+    return {mode = "championship", rev = grid ~= "normal"}
 end
 
--- Begin a fresh championship with empty standings (ADR-0040). preset defaults to F1; rev defaults to
--- reversed (the handicap default) -- the caller passes (order ~= "normal") so an explicit normal sets rev false.
-function champ.start(preset, rev)
+-- A grid-choice label ("reversed"/"normal"/"quali") for an order table, for the snapshot + chat lines.
+function champ.order_label(order)
+    if order.mode == "quali" then
+        return "quali"
+    end
+    return order.rev and "reversed" or "normal"
+end
+
+-- Begin a fresh championship with empty standings (ADR-0040). preset defaults to F1; grid defaults to
+-- reversed (the handicap default) -- the caller passes the parsed grid string ("normal"/"quali") or nil.
+-- quali_seconds is the qualifying length used when grid="quali" (ADR-0041), defaulting to quali's default.
+function champ.start(preset, grid, quali_seconds)
     session.championship = {
         points_preset = preset or champ.DEFAULT_PRESET,
-        order = champ.order(rev ~= false),
+        order = champ.order(grid or "reversed"),
+        quali_seconds = quali_seconds or PHASE_DURATIONS.quali_default,
         standings = {},   -- keyed by identity (players) / display name (AI): {points, races, wins, best_finish, ai}
         race_count = 0,
     }
@@ -1046,9 +1070,17 @@ function champ.set_preset(preset)
     end
 end
 
-function champ.set_order(rev)
+function champ.set_order(grid)
     if champ.is_active() then
-        session.championship.order = champ.order(rev)
+        session.championship.order = champ.order(grid)
+    end
+end
+
+-- Live qualifying-length change for a championship whose grid is quali (ADR-0041). seconds is already
+-- clamped by the caller (the `quali` table is defined later in the file, so champ cannot call quali.clamp).
+function champ.set_quali(seconds)
+    if champ.is_active() and seconds then
+        session.championship.quali_seconds = seconds
     end
 end
 
@@ -1175,7 +1207,9 @@ function champ.snapshot()
     return {
         active = true,
         preset = state.points_preset,
-        order = state.order.rev and "reversed" or "normal",
+        order = champ.order_label(state.order),
+        -- Qualifying length in minutes for the panel control when grid=quali (ADR-0041).
+        qualiMinutes = math.floor((state.quali_seconds or PHASE_DURATIONS.quali_default) / 60),
         raceCount = state.race_count,
         rows = rows,
     }
@@ -1205,7 +1239,7 @@ function champ.post_table(player_id)
     local state = session.championship
     MP.SendChatMessage(player_id, string.format(
         "BeamComp championship (points=%s, grid=%s, races=%d):",
-        state.points_preset, state.order.rev and "reversed" or "normal", state.race_count))
+        state.points_preset, champ.order_label(state.order), state.race_count))
     local ranked = champ.rank_list()
     if #ranked == 0 then
         MP.SendChatMessage(player_id, "  (no points yet)")
@@ -1217,6 +1251,195 @@ function champ.post_table(player_id)
         MP.SendChatMessage(player_id, string.format("  %d. %s -- %d pts (last +%d, %d win%s)",
             position, item.identity, entry.points, entry.last_gain or 0, wins, wins == 1 and "" or "s"))
     end
+end
+
+
+-- Qualifying-then-race format (ADR-0041). Like `champ`, all logic hangs off this one `quali` namespace
+-- table to spare top-level local slots -- main.lua's main chunk sits near Lua's 200-local limit, and a flat
+-- set of locals would overflow it and fail the whole plugin load. The event state lives in session.quali
+-- and -- unlike last_order/championship -- is per-event: reset_to_lobby clears it. nil = not a quali event.
+--
+-- Qualifying is a DEFERRED start-order source modeled on order=pwr (ADR-0033): order=quali assigns a
+-- provisional random grid at race start, runs a time-boxed session in which drivers set lap times, then
+-- re-grids by quali pace (quali.regrid) before the race countdown. The server ranks the client-reported
+-- best_lap/total_time only -- it never reads geometry (race-blind, ADR-0005).
+local quali = {}
+
+quali.MSG = "quali"  -- classification snapshot for the quali HUD + results card, broadcast on quali-results
+
+-- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
+-- a free quali=<n>. A free value is clamped to [MIN, MAX] seconds.
+quali.PRESETS = {5, 8, 12, 15}
+quali.MIN_SECONDS = 60.0
+quali.MAX_SECONDS = 1800.0
+
+-- Whether this race is a quali event at all (qualifying pending or already handed off to the race).
+function quali.is_active()
+    return session.quali ~= nil
+end
+
+-- Whether the qualifying session still owns the event -- it has not yet handed the grid to the race. The
+-- tick uses this to route the first countdown into qualifying (vs. the race) for a quali event.
+function quali.is_pending()
+    return session.quali ~= nil and not session.quali.done
+end
+
+-- Clamp a requested quali length (seconds) into the sane bounds (ADR-0041).
+function quali.clamp(seconds)
+    return math.max(quali.MIN_SECONDS, math.min(quali.MAX_SECONDS, seconds))
+end
+
+-- Begin a quali event with a session length in seconds (already resolved/clamped by the caller, else the
+-- default). Cleared by reset_to_lobby, so it never outlives the event (contrast last_order/championship).
+function quali.begin(duration)
+    session.quali = {
+        duration = tonumber(duration) or PHASE_DURATIONS.quali_default,
+        lap_grace_deadline = nil,  -- set when the quali clock expires, to let an in-progress lap finish
+        done = false,              -- flips true at the quali-results -> countdown hand-off (race grid set)
+    }
+end
+
+function quali.clear()
+    session.quali = nil
+end
+
+-- The qualifying classification as a ranked list of {identity, pace, ai} (ADR-0041). Pace = the
+-- client-reported best_lap (circuit); a sprint reports none, so a finisher's total run time stands in
+-- (single-run degradation until the rally-staged sprint quali ships). Faster pace ranks ahead; a driver
+-- with no valid time keeps entry (slot) order at the back. Pure over build_standings -- race-blind.
+function quali.ranking()
+    local timed, untimed = {}, {}
+    for _, entry in ipairs(build_standings()) do
+        if entry.name then
+            local pace = tonumber(entry.best_lap)
+            if not pace and entry.finished then
+                pace = tonumber(entry.total_time)
+            end
+            if pace then
+                timed[#timed + 1] = {identity = entry.name, pace = pace, slot = entry.slot or 0, ai = entry.ai}
+            else
+                untimed[#untimed + 1] = {identity = entry.name, slot = entry.slot or 0, ai = entry.ai}
+            end
+        end
+    end
+    table.sort(timed, function(a, b)
+        if a.pace ~= b.pace then
+            return a.pace < b.pace  -- fastest lap/run on pole
+        end
+        return a.slot < b.slot       -- stable tiebreak on the provisional slot
+    end)
+    table.sort(untimed, function(a, b) return a.slot < b.slot end)
+    local ranked = {}
+    for _, item in ipairs(timed) do ranked[#ranked + 1] = item end
+    for _, item in ipairs(untimed) do ranked[#ranked + 1] = item end
+    return ranked
+end
+
+-- The ranked identities alone (fastest first), for the quali.regrid placement (ADR-0041).
+function quali.order_identities()
+    local ids = {}
+    for _, item in ipairs(quali.ranking()) do
+        ids[#ids + 1] = item.identity
+    end
+    return ids
+end
+
+-- A client-facing snapshot of the qualifying classification (ADR-0041), shipped on entering quali-results
+-- for the HUD results card. Rows carry the pace as seconds (nil for an unclassified driver).
+function quali.snapshot()
+    local rows = {}
+    for position, item in ipairs(quali.ranking()) do
+        rows[#rows + 1] = {
+            position = position,
+            name = item.identity,
+            time = item.pace,
+            ai = item.ai or nil,
+        }
+    end
+    return {rows = rows}
+end
+
+-- Re-grid the field by the qualifying classification at the quali-results -> countdown seam (ADR-0041),
+-- mirroring regrid_by_pwr: reassign every participant a slot in quali-pace order (pole = fastest), rebuild
+-- the roster, and send each client its new slot + the reordered roster so it re-places (regrid) before the
+-- race countdown. AI slots ride the owner's regrid (ADR-0036). A no-op when this is not a quali event or no
+-- one set a time (the provisional random grid then stands).
+function quali.regrid()
+    if not session.progress or not quali.is_active() then
+        return
+    end
+    local players = MP.GetPlayers()
+    local ids = {}
+    for id in pairs(session.progress) do
+        ids[#ids + 1] = id
+    end
+    table.sort(ids, function(a, b) return session.progress[a].slot < session.progress[b].slot end)
+    -- place_by_identity maps each id's identity (player license or "AI <k>") onto the quali ranking, fastest
+    -- first; unranked ids (no time) keep slot order at the back. Never reversed -- quali is pole-to-the-fast.
+    local ordered = place_by_identity(ids, quali.order_identities(), false)
+
+    local slots = {}
+    for index, id in ipairs(ordered) do
+        slots[#slots + 1] = make_slot_entry(id, index - 1, players)
+    end
+    session.roster = build_roster(slots)
+    -- Re-seed progress fresh on the quali-earned grid so the race starts from a clean baseline (completed 0,
+    -- no splits/best_lap); the quali session's progress was only ever a means to the classification.
+    session.progress = build_progress(slots)
+
+    -- AI slots carry the label too (ADR-0041): the owner re-spawns fresh AI on the quali grid for the race
+    -- (a quali drive leaves them in a state a teleport does not reliably recover), so it needs the display
+    -- name like the original raceStart aiSlots.
+    local ai_regrid = {}
+    for _, entry in ipairs(slots) do
+        if is_ai_id(entry.id) then
+            ai_regrid[#ai_regrid + 1] = {id = entry.id, slot = entry.slot, label = entry.name}
+        end
+    end
+    for _, entry in ipairs(slots) do
+        if not is_ai_id(entry.id) then
+            local payload = {slot = entry.slot, grid = session.roster}
+            if entry.id == session.owner_id and #ai_regrid > 0 then
+                payload.aiSlots = ai_regrid
+                payload.qualiRespawnAi = true  -- tell the owner to re-spawn (not teleport) the AI (ADR-0041)
+            end
+            send_event(entry.id, MSG_REGRID, payload)
+        end
+    end
+    log_info("beamcomp.race", string.format("quali re-grid: %d participant(s) by best time", #ordered))
+end
+
+-- Advance the qualifying phase from the tick (ADR-0041): run for session.quali.duration, then arm a
+-- bounded finish-your-lap grace (so an in-progress lap still counts), then broadcast the classification and
+-- enter the results pause. Mirrors the racing finish-grace handling -- handled explicitly (not by the
+-- generic timed advance) so the grace can sit between the clock and the pause.
+function quali.advance_qualifying()
+    local q = session.quali
+    if not q or phase_elapsed() < q.duration then
+        return  -- still within the quali clock
+    end
+    if not q.lap_grace_deadline then
+        q.lap_grace_deadline = now() + PHASE_DURATIONS.quali_lap_grace
+        -- Tell clients the finish-your-lap window length so each still-circulating driver sees the timeout
+        -- to be at the finish (reuses the racing finish-grace display, ADR-0014/0041).
+        broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.quali_lap_grace})
+        log_info("beamcomp.race", "quali clock expired; finish-your-lap grace armed")
+        return
+    end
+    if now() >= q.lap_grace_deadline then
+        broadcast_event(quali.MSG, quali.snapshot())
+        enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results)
+    end
+end
+
+-- Leave the quali-results pause for the race (ADR-0041): grid the field by quali pace, mark the event done
+-- (so the next countdown gates the race, not another quali), and enter the race countdown.
+function quali.advance_results()
+    quali.regrid()
+    if session.quali then
+        session.quali.done = true
+    end
+    enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
 end
 
 
@@ -1320,6 +1543,9 @@ local function reset_to_lobby()
     session.spawn_ready_count = 0
     session.identities = nil
     session.owner_id = nil
+    -- session.quali (ADR-0041) is per-event, so unlike last_order/championship it is cleared here -- a
+    -- qualifying belongs to one race event and must not bleed into the next.
+    session.quali = nil
     -- session.last_order (ADR-0033) and session.championship (ADR-0040) deliberately persist across the
     -- lobby -- they are the cross-race order sources and must outlive a single race.
     enter_phase(PHASE.lobby, nil)
@@ -1365,11 +1591,25 @@ end
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
 local function start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
-    -- Resolve the grid start order (ADR-0033/0040): entry/random/last/championship are applied to the slot
-    -- assignment now; pwr is provisional here and re-gridded after staging. While a championship is active
-    -- its stored order (reversed by default) grids the race unless the admin gave an explicit order=.
+    -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
+    -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
+    -- after the qualifying session). While a championship is active its stored order grids the race unless
+    -- the admin gave an explicit order=.
     local effective_order = overrides.order or champ.active_order()
     session.order = effective_order
+    -- order=quali makes this a two-phase event (ADR-0041): begin the qualifying session state now; the
+    -- provisional grid below is random, and quali.regrid sets the real race grid by pace after qualifying.
+    -- Length precedence: an explicit per-race quali= wins; else a championship driving the quali grid
+    -- supplies its configured length; else the default.
+    if effective_order and effective_order.mode == "quali" then
+        local quali_seconds = overrides.quali_duration
+        if not quali_seconds and champ.is_active() then
+            quali_seconds = session.championship.quali_seconds
+        end
+        quali.begin(quali_seconds)
+    else
+        quali.clear()
+    end
     -- The requested AI opponents become synthetic participant slots (ADR-0036), so the roster, grid
     -- layout, and standings include them like any participant; the owner spawns + drives them. They mix
     -- into a random order and sort by reported pwr; otherwise they take the back of the grid.
@@ -1467,6 +1707,9 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- parses locally. nil when the issuer's client did not ship them (older client).
                 raceData = race_data,
                 prefabContent = prefab_content,
+                -- Qualifying event (ADR-0041): present only for order=quali, carrying the session length so
+                -- the client builds an unbounded-lap quali plan + shows the quali clock. nil = normal race.
+                quali = session.quali and {duration = session.quali.duration} or nil,
             })
         end
     end
@@ -2092,6 +2335,13 @@ local function tick()
         return
     end
 
+    -- qualifying is time-boxed (ADR-0041): handled ahead of the generic timed advance so the finish-your-lap
+    -- grace can sit between the quali clock and the classification pause (mirrors the racing grace).
+    if phase == PHASE.qualifying then
+        quali.advance_qualifying()
+        return
+    end
+
     -- spawning ends on spawn-ready acks (or a timeout), not a fixed delay -- handled ahead of the
     -- generic timed advance so a full ack set can leave early (ADR-0006 amendment).
     if phase == PHASE.spawning then
@@ -2107,10 +2357,17 @@ local function tick()
     if phase == PHASE.staging then
         enter_countdown_from_staging()
     elseif phase == PHASE.countdown then
-        -- The release signal itself is a later Phase-3 item; here we enter racing and send the
-        -- baseline standings (every player at zero) so clients have a table to show from the start.
-        enter_phase(PHASE.racing, nil)
+        -- For a quali event the first countdown gates the qualifying session, not the race (ADR-0041): the
+        -- second countdown (after quali-results sets the grid) gates the race. Either way send the baseline
+        -- standings (every participant at zero) so clients have a table to show from the start.
+        if quali.is_pending() then
+            enter_phase(PHASE.qualifying, session.quali.duration)
+        else
+            enter_phase(PHASE.racing, nil)
+        end
         broadcast_standings()
+    elseif phase == PHASE.quali_results then
+        quali.advance_results()
     elseif phase == PHASE.finished then
         advance_from_finished()
     end
@@ -2119,7 +2376,7 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
-    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship[:rev]] "
+    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
     .. "[aiavoid=on|off] [airoute=snap|direct] [all]"
 
@@ -2227,9 +2484,10 @@ local function parse_option_token(token)
     return "assist", {keyword = keyword, enabled = assist.enabled, hold = assist.hold}
 end
 
--- Start-order modes for /race order= (ADR-0033/0040). entry/random are non-directional; last/pwr/
--- championship accept :rev. championship orders by the live points table (ADR-0040).
-local ORDER_MODES = {entry = true, random = true, last = true, pwr = true, championship = true}
+-- Start-order modes for /race order= (ADR-0033/0040/0041). entry/random are non-directional; last/pwr/
+-- championship accept :rev. championship orders by the live points table (ADR-0040); quali runs a
+-- qualifying session first and grids by pace (ADR-0041, pole = fastest, no :rev).
+local ORDER_MODES = {entry = true, random = true, last = true, pwr = true, championship = true, quali = true}
 
 -- Parse an order= value "<mode>[:rev]" into {mode, rev}, or nil when the mode is unknown or a suffix
 -- other than "rev" is given. :rev flips a directional mode (last/pwr); entry/random ignore it (ADR-0033).
@@ -2412,6 +2670,15 @@ local function parse_race_args(argument)
             -- unknown mode or a bad suffix falls to bad_token.
             overrides.order = parse_order_value(token:match("^[Oo][Rr][Dd][Ee][Rr]=(.+)$"))
             if not overrides.order and not bad_token then
+                bad_token = token
+            end
+        elseif token:match("^[Qq][Uu][Aa][Ll][Ii]=.+$") then
+            -- quali=<minutes> sets the qualifying session length for order=quali (ADR-0041); stored in
+            -- seconds, clamped to the sane bounds. A non-numeric value falls to bad_token.
+            local minutes = tonumber(token:match("^[Qq][Uu][Aa][Ll][Ii]=(.+)$"))
+            if minutes then
+                overrides.quali_duration = quali.clamp(minutes * 60)
+            elseif not bad_token then
                 bad_token = token
             end
         else
@@ -2705,22 +2972,27 @@ end
 -- An unknown preset prefix or order word is dropped (left nil); the caller normalizes a bare points=/order=
 -- into a live "set". Order is forgiving so both the chat command and the panel's reconstructed string parse.
 function champ.parse_args(argument)
-    local action, preset, order
+    local action, preset, order, quali_seconds
     for token in argument:gmatch("%S+") do
         local lowered = token:lower()
         local key, value = lowered:match("^(%a+)=(%w+)$")  -- %w: the f1 preset carries a digit
         if key == "points" then
             preset = resolve_keyword(value, champ.PRESETS)
         elseif key == "order" then
-            if value == "normal" or value == "reversed" then
+            if value == "normal" or value == "reversed" or value == "quali" then
                 order = value
+            end
+        elseif key == "quali" then  -- quali=<min>: the qualifying length for grid=quali (ADR-0041)
+            local minutes = tonumber(value)
+            if minutes then
+                quali_seconds = quali.clamp(minutes * 60)
             end
         elseif lowered == "start" or lowered == "reset" or lowered == "end" or lowered == "stop"
             or lowered == "show" or lowered == "status" then
             action = lowered
         end
     end
-    return action, preset, order
+    return action, preset, order, quali_seconds
 end
 
 -- /championship: manage the multi-race points championship (ADR-0040). `start [points=<preset>]
@@ -2729,14 +3001,14 @@ end
 -- Mutations are admin-gated (ADR-0016); the query is open to everyone like /races. Shared by the chat
 -- command and the setup panel (champ.handle_cmd), so both reuse one validated mutation path.
 function champ.handle_command(player_id, player_name, argument)
-    local action, preset, order = champ.parse_args(argument)
+    local action, preset, order, quali_seconds = champ.parse_args(argument)
 
     if action == "end" or action == "stop" then
         action = "reset"
     elseif action == "status" then
         action = "show"
-    elseif not action and (preset or order) then
-        action = "set"  -- a bare points=/order= is a live change
+    elseif not action and (preset or order or quali_seconds) then
+        action = "set"  -- a bare points=/order=/quali= is a live change
     elseif not action then
         action = "show"
     end
@@ -2753,10 +3025,10 @@ function champ.handle_command(player_id, player_name, argument)
     end
 
     if action == "start" then
-        champ.start(preset, order ~= "normal")  -- default + explicit "reversed" -> reversed grid
+        champ.start(preset, order, quali_seconds)  -- nil/reversed -> reversed grid; "normal"/"quali" as given
         champ.broadcast()
         broadcast_chat(string.format("BeamComp: championship started -- points=%s, grid=%s",
-            session.championship.points_preset, session.championship.order.rev and "reversed" or "normal"))
+            session.championship.points_preset, champ.order_label(session.championship.order)))
         log_info("beamcomp.champ", "championship started by " .. player_name)
         return
     end
@@ -2782,11 +3054,12 @@ function champ.handle_command(player_id, player_name, argument)
     end
     champ.set_preset(preset)
     if order then
-        champ.set_order(order == "reversed")
+        champ.set_order(order)
     end
+    champ.set_quali(quali_seconds)
     champ.broadcast()
     MP.SendChatMessage(player_id, string.format("BeamComp: championship updated -- points=%s, grid=%s",
-        session.championship.points_preset, session.championship.order.rev and "reversed" or "normal"))
+        session.championship.points_preset, champ.order_label(session.championship.order)))
 end
 
 -- /go, /start, /racestart: end the staging wait early and start the countdown (ADR-0021). Admin-gated
@@ -3040,7 +3313,10 @@ local function handle_checkpoint_report(player_id, payload)
         return
     end
 
-    if session.phase ~= PHASE.racing then
+    -- Accept reports while racing and while qualifying (ADR-0041): the quali session uses the same
+    -- checkpoint/best-lap path to set lap times, which feed the quali grid. The finish-grace + end-race
+    -- hooks below self-guard on the racing phase, so a quali crossing never finishes the race.
+    if session.phase ~= PHASE.racing and session.phase ~= PHASE.qualifying then
         log_info("beamcomp.race", "checkpoint report from id " .. tostring(player_id)
             .. " ignored: not racing (phase " .. session.phase .. ")")
         return
@@ -3395,6 +3671,12 @@ local function sanitize_overrides(raw)
         overrides.order = {mode = raw.order.mode, rev = raw.order.rev == true}
     end
 
+    -- Qualifying length (ADR-0041): a UI-supplied minutes value for order=quali, clamped to bounds.
+    local quali_minutes = tonumber(raw.qualiMinutes)
+    if quali_minutes then
+        overrides.quali_duration = quali.clamp(quali_minutes * 60)
+    end
+
     -- AI opponents (ADR-0036): present only when a count is given. Count clamped to [1, MAX_AI]; preset
     -- resolved against the known set; vehicle + raw driving params relayed verbatim to the owner. explicit
     -- defaults true (the UI carries a count) but may be set false to take the race's content-default count.
@@ -3475,6 +3757,9 @@ function champ.handle_cmd(player_id, payload)
     end
     if type(payload.order) == "string" then
         parts[#parts + 1] = "order=" .. payload.order
+    end
+    if tonumber(payload.qualiMinutes) then
+        parts[#parts + 1] = "quali=" .. math.floor(tonumber(payload.qualiMinutes))
     end
     champ.handle_command(player_id, player_name, table.concat(parts, " "))
 end

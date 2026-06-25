@@ -344,6 +344,36 @@
     .beamcomp-hud .bc-results-head .bc-bestlap {
       color: inherit;
     }
+    /* Qualifying session board (ADR-0041): a title + big clock above the best-lap classification, in the
+       same top-left panel the live standings use. */
+    .beamcomp-hud .bc-quali-head {
+      font-weight: bold;
+      font-size: 15px;
+      letter-spacing: 0.08em;
+      opacity: 0.85;
+    }
+    .beamcomp-hud .bc-quali-clock {
+      font-size: 34px;
+      font-weight: bold;
+      line-height: 1.1;
+      padding-bottom: 4px;
+    }
+    /* Finish-your-lap timeout once the quali clock expires (ADR-0041): amber to read as "hurry". */
+    .beamcomp-hud .bc-quali-grace {
+      font-size: 20px;
+      font-weight: bold;
+      color: #ffcc33;
+      padding-bottom: 4px;
+    }
+    .beamcomp-hud .bc-quali-grace .bc-quali-grace-t {
+      font-size: 26px;
+    }
+    /* Minimized quali-results bar (ADR-0041): a small centered pill that restores the card. */
+    .beamcomp-hud .bc-quali-restore {
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+      background: rgba(20, 22, 26, 0.85); color: #cde; border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 4px; padding: 4px 12px; cursor: pointer; font-weight: bold; font-size: 13px;
+    }
     /* Championship table on the finished card (ADR-0040): a compact second table under the final
        standings; the podium tints + AI italics reuse the standings row classes. */
     .beamcomp-hud .bc-champ-section {
@@ -491,7 +521,7 @@
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
   <!-- Live: two screen-anchored regions (hidden while the provisional results card overlays them) -->
-  <div ng-if="hud.phase !== 'finished' && !hud.provisionalShown">
+  <div ng-if="hud.phase === 'racing' && !hud.provisionalShown">
     <div class="bc-tl">
       <div class="bc-pos-huge" ng-if="hud.localEntry">P{{hud.localEntry.position}}<span class="bc-pos-of">/{{hud.entries.length}}</span></div>
       <div class="bc-grace" ng-show="hud.grace != null">{{hud.graceCanFinish ? 'Finish in' : 'Race ends in'}} {{formatTime(hud.grace)}}</div>
@@ -532,6 +562,69 @@
         </table>
       </div>
     </div>
+  </div>
+  <!-- Qualifying (ADR-0041): the time-boxed session board -- a clock counting the window down and the live
+       classification ranked by best lap, fastest on pole. The right-side time block shows the local
+       driver's live lap + best. -->
+  <div ng-if="hud.phase === 'qualifying'">
+    <div class="bc-tl">
+      <div class="bc-quali-head">QUALIFYING</div>
+      <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
+      <!-- Clock expired: show the finish-your-lap timeout (time left to be at the finish), or -- once this
+           driver has completed their lap -- that they are waiting for the others to finish (ADR-0041). -->
+      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null && !hud.qualiDone">FINISH LAP <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiDone">Waiting <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-panel bc-standings-panel">
+        <div class="bc-scroll">
+          <table class="bc-standings">
+            <tr ng-repeat="e in hud.qualiBoard"
+                ng-class="{'bc-local': e.isLocal, 'bc-ai': e.ai}">
+              <td class="bc-pos">P{{$index + 1}}</td>
+              <td class="bc-name">{{e.name}}</td>
+              <td class="bc-int">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="bc-tr" ng-if="hud.localEntry">
+      <div class="bc-panel bc-timepanel">
+        <table class="bc-timeblock">
+          <tr>
+            <td class="bc-tb-label">Lap</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.lapTime)}}</td>
+          </tr>
+          <tr class="bc-tb-best">
+            <td class="bc-tb-label">Best</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.bestLap)}}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+  </div>
+  <!-- Qualifying results (ADR-0041): the classification that sets the race grid, shown during the pause
+       before the race countdown. Pole = fastest; an unclassified driver shows no time. -->
+  <!-- Minimized: a small bar that restores the card, so the results are never fully lost (ADR-0041). -->
+  <button type="button" class="bc-quali-restore" ng-if="hud.phase === 'qualiResults' && hud.quali && qualiResultsMin"
+    ng-click="maximizeQualiResults()">Qualifying Results &#9650;</button>
+  <div class="bc-results-card" ng-if="hud.phase === 'qualiResults' && hud.quali && !qualiResultsMin">
+    <div class="bc-results-title">Qualifying Results</div>
+    <div class="bc-provisional-badge" ng-if="hud.qualiResultsRemaining != null">Race starts in {{formatStaging(hud.qualiResultsRemaining)}}</div>
+    <div class="bc-scroll">
+      <table class="bc-standings bc-results">
+        <tr class="bc-results-head">
+          <td class="bc-pos"></td>
+          <td class="bc-name">Driver</td>
+          <td class="bc-time">Best</td>
+        </tr>
+        <tr ng-repeat="r in hud.quali.rows" ng-class="{'bc-ai': r.ai}">
+          <td class="bc-pos">P{{r.position}}</td>
+          <td class="bc-name">{{r.name}}</td>
+          <td class="bc-time">{{r.time != null ? formatTime(r.time) : '--'}}</td>
+        </tr>
+      </table>
+    </div>
+    <button type="button" class="bc-analysis-btn" ng-click="minimizeQualiResults()">Minimize</button>
   </div>
   <!-- Provisional standings (ADR-0022): a finished/DNF'd player views the live classification while the
        race still runs. Same layout as the final card, but gap-vs-leader and no podium tints so it reads

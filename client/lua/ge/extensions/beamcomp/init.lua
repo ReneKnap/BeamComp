@@ -158,6 +158,7 @@ M.state = {
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
     ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
+    ai_policy = nil,          -- host only: the vehicle policy used for the AI car chain (ADR-0032), kept so a quali re-grid can re-spawn fresh AI (ADR-0041), or nil
     ai_custom_map = nil,      -- host only: true while the script-variant custom race navgraph is live (ADR-0036 Step-3b); teardown restores the real one
 
     ai_detections = nil,      -- host only: per-AI checkpoint-detection state keyed by AI id, armed on racing (ADR-0036), or nil
@@ -175,6 +176,9 @@ M.state = {
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
+    qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
+    qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
+    quali = nil,              -- latest server-broadcast quali classification snapshot {rows} (ADR-0041), or nil; rendered on the quali-results card
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -287,6 +291,10 @@ local function handle_race_start(payload)
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
+    -- Drop any quali state from a prior event (ADR-0041) so a stale clock/results card never carries over.
+    M.state.qualifying = nil
+    M.state.qualiResults = nil
+    M.state.quali = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
@@ -451,6 +459,8 @@ local function handle_race_start(payload)
         -- The relayed AI difficulty/vehicle config (ADR-0036 Etappe B), owner-only; the driving params and
         -- the per-car vehicle choice resolve from it plus the race's content defaults.
         M.state.ai_config = payload.aiConfig
+        -- Keep the policy so a quali re-grid (ADR-0041) can re-spawn fresh AI on the earned grid.
+        M.state.ai_policy = policy
         -- The AI vehicle chain reuses the relayed player policy (ADR-0032) as its second tier.
         local cars = ai.spawn(payload.aiSlots, race.gridPoses, payload.aiConfig, race.aiDefaults, policy)
         if #cars > 0 then
@@ -538,6 +548,10 @@ local function teardown_race_world()
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
+    -- Drop any quali state from a prior event (ADR-0041) so a stale clock/results card never carries over.
+    M.state.qualifying = nil
+    M.state.qualiResults = nil
+    M.state.quali = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
@@ -552,9 +566,70 @@ local function teardown_race_world()
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
 end
 
+-- Release the start lock and arm detection + the lap clock for a driving phase -- the racing phase, and
+-- the qualifying session that reuses the same machinery on its unbounded plan (ADR-0041). `plan` is the
+-- traversal plan to score against (the real race plan, or the quali plan); the host's AI drive the route
+-- for `ai_laps` laps (the race lap count, or the quali plan's lap count so they keep lapping the session).
+-- The caller has already confirmed we are in this race.
+local function begin_driving(plan, ai_laps)
+    -- Countdown over: show GO! on the server-authoritative release, play the cue, stop the local count, and
+    -- release the start lock so the car can drive.
+    M.state.countdown = nil
+    countdown.show_go()
+    countdown.play_go()
+    local released, release_err = vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
+    if not released then
+        log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
+    end
+    disarm_freeze_hold_ve()
+    M.state.freeze_hold_armed = false
+    -- Arm checkpoint detection on the plan: it walks the traversal plan (sprint/circuit, ADR-0013), testing
+    -- the local car against the planned-next checkpoint each frame while driving (ADR-0010).
+    if plan then
+        M.state.detection = checkpoints.new(plan)
+    else
+        log("W", RACE_LOG_TAG, "driving: no traversal plan; checkpoint detection disabled")
+    end
+    -- Host only: release the AI cars, hand them to BeamNG's AI to drive the route, and arm one detector per
+    -- AI so the host scores them by proxy (ADR-0036). In qualifying the AI lap the quali plan too so the
+    -- field is populated; they grid at the back (no AI proxy lap timing in v1, ADR-0041).
+    if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
+        ai.set_frozen(M.state.ai_cars, false)
+        local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
+        local ai_route = ai.drive(M.state.ai_cars,
+            M.state.race.routePoints or M.state.race.checkpoints, ai_laps or M.state.race.laps, ai_params,
+            M.state.race.mode == "circuit")
+        M.state.ai_custom_map = ai_route and ai_route.customMap or nil
+        if ai_route then
+            send_to_server("aiRouteNotice", ai_route)
+        end
+        local detections = {}
+        for _, car in ipairs(M.state.ai_cars) do
+            detections[car.id] = checkpoints.new(plan)
+        end
+        M.state.ai_detections = detections
+    end
+    -- Circuit only: arm the client-side lap clock on the start/finish line (ADR-0022); display-only, so it
+    -- never touches the scored plan. In qualifying its best-lap drives the grid (server-reported, ADR-0041).
+    local race_state = M.state.race
+    if race_state and race_state.mode == "circuit" and race_state.checkpoints
+        and race_state.checkpoints[1] then
+        M.state.laptimer = laptimer.new(race_state.checkpoints[1])
+    else
+        M.state.laptimer = nil
+    end
+    -- Each driving phase starts with its results card shown, analysis overlay closed, and the provisional
+    -- results card armed to auto-show on finish (ADR-0022/0028).
+    M.state.results_hidden = false
+    M.state.analysis_open = false
+    M.state.provisional_open = true
+    -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. ensureAppVisible dedups.
+    hud.show()
+end
+
 -- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
--- server broadcasts a racePhase on every transition (ADR-0006). The car is spawned frozen in
--- handle_race_start and held through the countdown; here we release it on racing, and release
+-- server broadcasts a racePhase on every transition (ADR-0006/0041). The car is spawned frozen in
+-- handle_race_start and held through the countdown; here we release it on racing/qualifying, and release
 -- defensively on lobby (the car is preserved in place, only unlocked). The countdown UI is driven
 -- off the same phases via race/countdown (ADR-0008): countdown starts the count, racing shows GO!.
 local function handle_race_phase(payload)
@@ -593,74 +668,47 @@ local function handle_race_phase(payload)
         lock.install()
         M.state.staging = nil
         M.state.countdown = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
+    elseif phase == "qualifying" then
+        -- Qualifying session (ADR-0041): release the lock and lap the unbounded quali plan to set lap
+        -- times; the grid is set afterwards from quali pace. The AI drive too (so the session is populated),
+        -- but only for the real race lap count -- ai.drive bakes every lap into the waypoint list (noOfLaps
+        -- does not loop, ADR-0036), so the unbounded quali lap count would build a runaway path; they run the
+        -- race distance, set a time, then idle, and grid at the back. Seed the quali clock from the phase
+        -- duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs server-side.
+        local quali_state = M.state.race and M.state.race.quali
+        begin_driving(quali_state and quali_state.plan, M.state.race and M.state.race.laps)
+        M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
     elseif phase == "racing" then
-        -- Countdown over: show GO! (server-authoritative, so it lands exactly on the release), play
-        -- the GO cue, stop the local count, and release the start lock so the car can drive.
-        M.state.countdown = nil
-        countdown.show_go()
-        countdown.play_go()
-        local released, release_err = vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
-        if not released then
-            log("W", RACE_LOG_TAG, "could not release start lock: " .. tostring(release_err))
+        -- Countdown over: release the lock, arm detection on the real race plan, drive the host's AI, and
+        -- arm the lap clock (ADR-0006/0036/0022). After a quali event this is the second countdown -> race,
+        -- on the quali-earned grid set by the preceding regrid.
+        M.state.qualifying = nil
+        M.state.qualiResults = nil
+        begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
+    elseif phase == "qualiResults" then
+        -- Qualifying over (ADR-0041): stop scoring -- the classification card renders from the quali
+        -- snapshot.
+        M.state.qualifying = nil
+        M.state.grace = nil
+        M.state.detection = nil
+        M.state.laptimer = nil
+        -- Count the pause down so the card shows when the race starts (the phase carries its duration).
+        -- NOTE: this local countdown can drift a few seconds behind the server's wall-time pause across the
+        -- AI-despawn frame hitch (tracked as a bug); the card still hides server-authoritatively on the phase
+        -- change.
+        M.state.qualiResults = {remaining = tonumber(payload.duration) or 0}
+        -- Despawn the host's quali AI NOW, at the start of the pause -- the ~20 s gap lets BeamMP fully
+        -- remove them before the regrid re-spawns fresh cars on the earned grid, so a delete+spawn overlap
+        -- never pushes the car count past MaxCars (which silently drops the new AI). Restore the navgraph
+        -- the quali drive may have swapped. Owner-only (ai_cars nil elsewhere).
+        ai.stop(M.state.ai_cars or {})
+        ai.clear(M.state.ai_cars or {})
+        if M.state.ai_custom_map then
+            ai.restore_map()
+            M.state.ai_custom_map = nil
         end
-        -- Release the EV throttle clamp now the freeze is lifting, so the car can pull away (ADR-0017
-        -- amendment). Idempotent + a no-op on combustion cars / when never armed.
-        disarm_freeze_hold_ve()
-        M.state.freeze_hold_armed = false
-        -- Arm checkpoint detection now the lock is released: it walks the race's traversal plan
-        -- (sprint/circuit, ADR-0013), testing the local car against the planned-next checkpoint each
-        -- frame (onUpdate) while racing (ADR-0010).
-        local plan = M.state.race and M.state.race.plan
-        if plan then
-            M.state.detection = checkpoints.new(plan)
-        else
-            log("W", RACE_LOG_TAG, "racing: no traversal plan; checkpoint detection disabled")
-        end
-        -- Host only: release the AI cars, hand them to BeamNG's AI to drive the route, and arm one
-        -- checkpoint detector per AI so the host scores them by proxy each frame (ADR-0036). Non-owners
-        -- have no ai_cars, so this is inert for them -- the AI cars just sync in and drive on the owner.
-        if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
-            ai.set_frozen(M.state.ai_cars, false)
-            -- Drive the AI along the race line: the exact authored positions (script variant, default) or
-            -- the navgraph snap (airoute=snap), for the race's full lap count so the AI runs every lap
-            -- (ADR-0036 Step-3b). The resolved difficulty + route params (ADR-0036 Etappe B) come from the
-            -- relayed config + content; circuit drives the closed-loop finish drive-through.
-            local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
-            local ai_route = ai.drive(M.state.ai_cars,
-                M.state.race.routePoints or M.state.race.checkpoints, M.state.race.laps, ai_params,
-                M.state.race.mode == "circuit")
-            -- The script variant swaps the client's navgraph for the race line (ADR-0036 Step-3b); remember
-            -- it so teardown restores the real navgraph (ai.restore_map).
-            M.state.ai_custom_map = ai_route and ai_route.customMap or nil
-            -- Tell the server which route variant the AI got so it posts it to chat (the owner drives the
-            -- AI, so only the owner reports this); lets players see authored vs navgraph-snap at a glance.
-            if ai_route then
-                send_to_server("aiRouteNotice", ai_route)
-            end
-            local detections = {}
-            for _, car in ipairs(M.state.ai_cars) do
-                detections[car.id] = checkpoints.new(plan)
-            end
-            M.state.ai_detections = detections
-        end
-        -- Circuit only: arm the client-side lap clock on the start/finish line (ADR-0022). It is a
-        -- display-only derivation -- no server report -- so it never touches the scored plan above.
-        local race_state = M.state.race
-        if race_state and race_state.mode == "circuit" and race_state.checkpoints
-            and race_state.checkpoints[1] then
-            M.state.laptimer = laptimer.new(race_state.checkpoints[1])
-        else
-            M.state.laptimer = nil
-        end
-        -- Each race starts with its results card shown, its analysis overlay closed, and the provisional
-        -- results card armed to auto-show on finish; the /results and /analysis toggles only last that race
-        -- (ADR-0022/0028).
-        M.state.results_hidden = false
-        M.state.analysis_open = false
-        M.state.provisional_open = true
-        -- Auto-show the HUD app for the race (ADR-0012); removed again on lobby. ensureAppVisible
-        -- dedups, so a manually-added copy is not duplicated.
-        hud.show()
+        M.state.ai_cars = nil
+        M.state.ai_detections = nil
     elseif phase == "finished" then
         -- Race over, but the results + props stay up for the long free-roam window (ADR-0006/0017
         -- amendments, B3). Release the in-race lock and hand the recover/repair keys back to vanilla
@@ -676,9 +724,9 @@ local function handle_race_phase(payload)
         teardown_race_world()
     end
 
-    -- Surface the phase as a toast, except staging/countdown/racing -- the centered overlay covers
-    -- those (the staging indicator, the count, and GO!).
-    if phase ~= "staging" and phase ~= "countdown" and phase ~= "racing" then
+    -- Surface the phase as a toast, except staging/countdown/racing/qualifying -- the centered overlay
+    -- covers those (the staging indicator, the count, GO!, and the quali drive).
+    if phase ~= "staging" and phase ~= "countdown" and phase ~= "racing" and phase ~= "qualifying" then
         guihooks.trigger("toastrMsg", {
             type = "info",
             title = "BeamComp",
@@ -722,6 +770,13 @@ local function handle_championship(payload)
     if guihooks then
         guihooks.trigger("BeamCompChampionship", M.state.championship or {active = false})
     end
+end
+
+-- Store the latest qualifying classification (ADR-0041), broadcast by the server when qualifying ends.
+-- The HUD reads it from the per-frame snapshot to render the quali-results card during the pause; cleared
+-- on the next race start so a stale card never lingers.
+local function handle_quali(payload)
+    M.state.quali = (type(payload) == "table" and type(payload.rows) == "table") and payload or nil
 end
 
 -- Answer the server's listRaces request: build this client's installed-race list for the loaded map
@@ -772,18 +827,63 @@ local function replace_ai_for_regrid(ai_slots)
     end
 end
 
--- The server re-gridded the start order (ADR-0033, order=pwr): adopt the new slot, re-place the race car
--- at its new grid pose (picked from the pose set we already hold), and re-freeze. Mirrors
--- restage_swapped_car; runs during staging, before the countdown. No-op if we are not in this race or the
--- car/pose is unavailable -- the spawn-freeze on the old pose then just holds the car where it is. The
--- owner's regrid also carries its AI cars' new slots (ADR-0036 Etappe B), re-placed first.
+-- Re-spawn the host's AI fresh on the quali-earned grid for the race (ADR-0041). A quali drive leaves the
+-- AI in a state a teleport does not reliably recover (custom navgraph + driveUsingPath), so the owner
+-- despawns the quali AI and spawns clean cars at the new slots via the proven race-start spawn path. The
+-- regrid carries each AI's {id, slot, label}; the config + policy were kept from the spawn. No-op for a
+-- non-owner or when the inputs are missing.
+local function respawn_ai_for_quali(ai_slots)
+    if type(ai_slots) ~= "table" or #ai_slots == 0 or not M.state.race then
+        return
+    end
+    -- The quali AI were despawned at the start of the quali-results pause, so BeamMP has had ~20 s to
+    -- remove them; spawn fresh + frozen at the new poses now, with the same spawn-notification mute as
+    -- race start.
+    -- Lift the in-race action lock first: this re-grid arrives during the race countdown, where the lock
+    -- is installed, and it guards core_vehicles.spawnNewVehicle -- which silently refuses the AI spawn
+    -- (ai.spawn returned 0). The countdown phase handler re-installs the lock right after this regrid.
+    lock.remove()
+    spawn_mute.mute_for(SPAWN_NOTIFICATION_MUTE_SECONDS)
+    local cars = ai.spawn(ai_slots, M.state.race.gridPoses, M.state.ai_config, M.state.race.aiDefaults,
+        M.state.ai_policy)
+    if type(cars) ~= "table" or #cars == 0 then
+        log("W", RACE_LOG_TAG, "quali AI re-spawn: ai.spawn returned no cars")
+        return
+    end
+    ai.set_frozen(cars, true)
+    for _, car in ipairs(cars) do
+        local veh = be and be:getObjectByID(car.veh_id)
+        if veh then
+            ai.suppress(veh)
+        end
+    end
+    M.state.ai_cars = cars
+    M.state.ai_map_pending = true  -- re-broadcast the server-id map so remotes label + suppress the new cars
+    -- Spawning auto-enters the player into the last AI car: re-seat them in their own race car.
+    local race_car = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+    if race_car and be then
+        pcall(function() be:enterVehicle(0, race_car) end)
+        M.state.current_vehicle_id = race_car:getId()
+    end
+    log("I", RACE_LOG_TAG, string.format("re-spawned %d AI on the quali grid", #cars))
+end
+
+-- The server re-gridded the start order (ADR-0033, order=pwr; ADR-0041, order=quali): adopt the new slot,
+-- re-place the race car at its new grid pose (picked from the pose set we already hold), and re-freeze.
+-- Mirrors restage_swapped_car. No-op if we are not in this race or the car/pose is unavailable. The owner's
+-- regrid also carries its AI cars' new slots: pwr re-places them in situ, while a quali re-grid re-spawns
+-- them fresh (qualiRespawnAi), since a quali drive leaves them unteleportable.
 local function handle_regrid(payload)
     if not M.state.race or type(payload) ~= "table" then
         return
     end
-    -- Re-place the host's AI cars (owner-only; no-op otherwise) before the own-car logic, so a missing
-    -- own slot/pose below never skips the AI re-place.
-    replace_ai_for_regrid(payload.aiSlots)
+    -- Re-place / re-spawn the host's AI cars (owner-only; no-op otherwise) before the own-car logic, so a
+    -- missing own slot/pose below never skips it.
+    if payload.qualiRespawnAi then
+        respawn_ai_for_quali(payload.aiSlots)
+    else
+        replace_ai_for_regrid(payload.aiSlots)
+    end
     local slot = payload.slot
     local poses = M.state.race.gridPoses
     local pose = (type(slot) == "number" and poses) and poses[slot + 1] or nil
@@ -1423,6 +1523,7 @@ local HANDLERS = {
     racePhase = handle_race_phase,
     standings = handle_standings,
     championship = handle_championship,
+    quali = handle_quali,
     listRaces = handle_list_races,
     listVehicles = handle_list_vehicles,
     regrid = handle_regrid,
@@ -1835,7 +1936,7 @@ end
 
 function M.onVehicleSwitched(_oldId, newId)
     local phase = M.state.phase
-    if (phase == "countdown" or phase == "racing") and M.state.race_car_id ~= nil
+    if (phase == "countdown" or phase == "racing" or phase == "qualifying") and M.state.race_car_id ~= nil
             and tostring(newId) ~= tostring(M.state.race_car_id) then
         if bounce_to_race_car() then
             return
@@ -1960,6 +2061,12 @@ local function on_checkpoint_reached(event, count)
     local lt = M.state.laptimer
     if lt and lt.start_cp and event.index == lt.start_cp.index then
         laptimer.complete_lap(lt, event.time)
+        -- During the qualifying finish-your-lap window (ADR-0041), completing a lap ends this driver's
+        -- quali: stop the detector after this crossing is reported, so no further checkpoints are scored or
+        -- shown for them. The report below still carries this lap's best time.
+        if M.state.phase == "qualifying" and M.state.grace then
+            M.state.detection = nil
+        end
     end
     -- `bestLap` rides the existing report as an additive field: the server stores the latest per
     -- player and relays it in the standings (ADR-0022) so the results card can show every player's
@@ -2537,6 +2644,9 @@ local function build_hud_snapshot()
     local lap_count = (race and race.laps) or 1
     local local_finished = detection and detection.done
     local local_dnf = false
+    -- Both racing and qualifying drive the local detector + lap clock (ADR-0041), so the live local-row
+    -- substitutions (checkpoint, time, lap clock) apply to both.
+    local driving = phase == "racing" or phase == "qualifying"
 
     local entries = {}
     if standings then
@@ -2548,9 +2658,9 @@ local function build_hud_snapshot()
             -- The HUD lap counter shows *completed* laps (0-based), reaching lapCount at the finish;
             -- `lap` itself stays the server current-lap value (ADR-0013) the other rows carry.
             local laps_done = nil
-            -- Only substitute live detector values for the local row during racing -- once the race
-            -- is finished, every client must show the same server-authoritative totals.
-            if is_local and detection and phase == "racing" then
+            -- Only substitute live detector values for the local row while driving (racing/qualifying) --
+            -- once finished, every client must show the same server-authoritative totals.
+            if is_local and detection and driving then
                 checkpoint = detection.seq
                 time = detection.elapsed
                 lap = detection_lap(detection)
@@ -2568,11 +2678,11 @@ local function build_hud_snapshot()
                 local lt = M.state.laptimer
                 if lt then
                     best_lap = lt.best or best_lap
-                    if detection and phase == "racing" then
+                    if detection and driving then
                         lap_time = laptimer.current(lt, detection.elapsed)
                     end
                 end
-                if detection and phase == "racing" then
+                if detection and driving then
                     cp_per_lap = (race and race.checkpoints) and #race.checkpoints or checkpoint_count
                     if (race and race.mode == "circuit") and cp_per_lap > 0 then
                         -- Per-lap reset, but the final lap counts through to N/N at the finish line
@@ -2703,6 +2813,16 @@ local function build_hud_snapshot()
         -- The multi-race championship table (ADR-0040), shown on the finished results card when active; nil
         -- or active=false hides it. Rides opaquely through to the app.
         championship = M.state.championship,
+        -- Qualifying (ADR-0041): the live time-remaining clock (qualifying phase), the finish-your-lap
+        -- timeout once the clock expires, the pause countdown to the race, and the classification snapshot
+        -- for the quali-results card. nil outside a quali event; the app reads phase to pick the view.
+        qualiRemaining = M.state.qualifying and M.state.qualifying.remaining or nil,
+        qualiGrace = (phase == "qualifying" and M.state.grace) and M.state.grace.remaining or nil,
+        -- The local driver has completed their finish-your-lap lap (detector stopped during the grace), so
+        -- the HUD shows "waiting for others" instead of the timeout (ADR-0041).
+        qualiDone = (phase == "qualifying" and M.state.grace ~= nil and M.state.detection == nil) and true or false,
+        qualiResultsRemaining = M.state.qualiResults and M.state.qualiResults.remaining or nil,
+        quali = M.state.quali,
     }
 end
 
@@ -2920,10 +3040,10 @@ local function notify_assist_blocked(msg)
 end
 
 -- A recover/repair key went down (forwarded from the VE, ADR-0017): record which assist is held so
--- the per-frame stepper can run the hold. Racing only, enabled assists only -- a disabled assist's
--- key is inert (blocked). The actual countdown starts in step_assist once the car is stationary.
+-- the per-frame stepper can run the hold. Racing + qualifying (ADR-0041), enabled assists only -- a
+-- disabled assist's key is inert (blocked). The actual countdown starts in step_assist once stationary.
 function M.on_assist_key_down(kind)
-    if not M.state.race or M.state.phase ~= "racing" then
+    if not M.state.race or (M.state.phase ~= "racing" and M.state.phase ~= "qualifying") then
         return
     end
     local enabled = assist_setting(kind)
@@ -3157,6 +3277,30 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     elseif M.state.phase == "countdown" and M.state.race then
         -- Tick the start countdown on the centered overlay (ADR-0021).
         step_start_countdown(dtReal)
+    elseif M.state.phase == "qualifying" and M.state.race then
+        -- Qualifying (ADR-0041): the same detection + lap-clock path as racing, plus the host's AI
+        -- detectors (the AI lap the quali plan too) and the local quali-clock countdown for the HUD. The
+        -- server stays authoritative on the actual qualifying->results transition; this clock is display
+        -- only and floors at 0 ("finish your lap" while the server runs the finish-your-lap grace).
+        step_detection(dtSim)
+        step_ai_detections(dtSim)
+        -- Recover/repair work in qualifying exactly as in the race (ADR-0017): drive the held assist
+        -- countdown so a player can reset a spun/stuck car and keep setting lap times.
+        step_assist(dtReal)
+        if M.state.qualifying then
+            M.state.qualifying.remaining = math.max(0, M.state.qualifying.remaining - (dtReal or 0))
+        end
+        -- Once the quali clock expires the server arms a finish-your-lap window (ADR-0041): tick its local
+        -- copy so the HUD shows the timeout to be at the finish (the server stays authoritative on the cut).
+        if M.state.grace then
+            M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
+        end
+    elseif M.state.phase == "qualiResults" and M.state.race then
+        -- Tick the pause countdown for the quali-results card (ADR-0041). Can drift behind the server pause
+        -- across the AI-despawn hitch (tracked bug); the card hides server-authoritatively regardless.
+        if M.state.qualiResults then
+            M.state.qualiResults.remaining = math.max(0, M.state.qualiResults.remaining - (dtReal or 0))
+        end
     elseif M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
         -- Host only: step the AI detectors + proxy-report their crossings (ADR-0036). Inert otherwise.
@@ -3193,8 +3337,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- available mid-race even with both assists off (ADR-0017). It must cover staging too: the lock
     -- arms there (ADR-0021), but the recover keys are owned by this VE override (not action-filtered),
     -- so without it Insert/Ctrl+Insert would still trigger vanilla recover and break the grid freeze.
-    if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing")
-        and M.state.race then
+    if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing"
+        or M.state.phase == "qualifying" or M.state.phase == "qualiResults") and M.state.race then
         push_assist_arm()
     end
     -- Arm the EV start-freeze throttle clamp over the frozen phases only (staging + countdown), so it
@@ -3203,8 +3347,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         push_freeze_hold()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
-    -- frozen final standings, not the last frame caught mid-racing.
-    if (M.state.phase == "racing" or M.state.phase == "finished") and M.state.race then
+    -- frozen final standings, not the last frame caught mid-racing. Qualifying + quali-results push too,
+    -- so the HUD renders the quali clock/classification and the results card (ADR-0041). Countdown pushes
+    -- as well so the quali-results card clears when the pause ends -> race countdown (else the frozen
+    -- qualiResults snapshot would linger until racing); all HUD cards are gated off countdown, so it stays
+    -- blank behind the centered count.
+    if (M.state.phase == "racing" or M.state.phase == "finished" or M.state.phase == "qualifying"
+        or M.state.phase == "qualiResults" or M.state.phase == "countdown") and M.state.race then
         hud.push(build_hud_snapshot())
     end
     -- Keep the HUD/countdown app surface alive while a race wants it on screen
@@ -3212,7 +3361,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- silent. Covers staging (the countdown overlay arms there, ADR-0021) through finished; free-roam is
     -- untouched.
     if M.state.race and (M.state.phase == "staging" or M.state.phase == "countdown"
-        or M.state.phase == "racing" or M.state.phase == "finished") then
+        or M.state.phase == "racing" or M.state.phase == "finished"
+        or M.state.phase == "qualifying" or M.state.phase == "qualiResults") then
         step_hud_watchdog(dtReal)
     end
 end
@@ -3240,7 +3390,8 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         local race = M.state.race
         if race then
             local detection = M.state.detection
-            if M.state.phase == "racing" and detection and not detection.done then
+            if (M.state.phase == "racing" or M.state.phase == "qualifying")
+                and detection and not detection.done then
                 -- Use the same owned car the detector crosses checkpoints with (step_detection), so the
                 -- posts face the point that actually triggers the gate, not a different camera vehicle.
                 local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)

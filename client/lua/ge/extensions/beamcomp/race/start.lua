@@ -344,6 +344,27 @@ local function resolve_race_for_prepare(payload)
 end
 
 -- Build the race-start state for a raceStart payload, or return nil plus a reason.
+-- Build the qualifying descriptor for a quali event (ADR-0041), or nil for a normal race. The quali plan
+-- is an unbounded-lap circuit plan (sized to the window so a driver can't run it out) so they keep lapping
+-- and setting lap times for the whole session; the real race plan drives the actual race after qualifying.
+-- A sprint reuses the single-run race plan -- a degraded single timed run until the rally-staged sprint
+-- quali ships as its own item. `duration` feeds the HUD quali clock.
+local function quali_for(payload, race_checkpoints, mode, race_plan)
+    if type(payload.quali) ~= "table" then
+        return nil
+    end
+    local duration = tonumber(payload.quali.duration) or 480
+    local plan = race_plan
+    local laps = 1
+    if mode == "circuit" then
+        -- Size the lap count to the window so neither a player nor the AI can run the plan out before the
+        -- clock ends (~8 s/lap floor is far quicker than any real lap).
+        laps = math.max(10, math.min(MAX_LAPS, math.ceil(duration / 8)))
+        plan = checkpoints.plan(race_checkpoints, mode, laps)
+    end
+    return {duration = duration, plan = plan, laps = laps, mode = mode}
+end
+
 function M.prepare(payload)
     if type(payload) ~= "table" or type(payload.race) ~= "string" then
         return nil, "malformed raceStart payload"
@@ -435,6 +456,9 @@ function M.prepare(payload)
         -- The aiRace authored AI defaults (ADR-0036 Etappe B): the owner fills any difficulty/vehicle
         -- gaps from these when /race omitted an explicit preset/aicar. nil for non-aiRace content.
         aiDefaults = race.meta and race.meta.aiDefaults,
+        -- Qualifying event descriptor (ADR-0041): {duration, plan, mode} for order=quali, else nil. The
+        -- quali plan loops the circuit for the window; the real `plan` above drives the race afterwards.
+        quali = quali_for(payload, race_checkpoints, mode, plan),
     }
 end
 
