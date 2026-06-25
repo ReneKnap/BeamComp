@@ -1044,9 +1044,10 @@ function M.go_race_from_ui()
     send_to_server("raceGo", {})
 end
 
--- The setup panel's championship control (ADR-0037/0040): the panel serialises {action, preset, order} and
--- calls this; we decode and relay it as a championshipCmd, which routes through the same admin-gated handler
--- as the /championship chat command. Public as beamcomp_init.championship_cmd. A bad payload is dropped.
+-- The setup panel's championship control (ADR-0037/0040/0041): the panel serialises
+-- {action, preset, order, qualiMinutes} and calls this; we decode and relay it as a championshipCmd
+-- that routes through the same admin-gated handler as the /championship chat command. Public as
+-- beamcomp_init.championship_cmd. A bad payload is dropped.
 function M.championship_cmd(json)
     local ok, decoded = pcall(jsonDecode, json)
     if not ok or type(decoded) ~= "table" or type(decoded.action) ~= "string" then
@@ -1057,6 +1058,7 @@ function M.championship_cmd(json)
         action = decoded.action,
         preset = decoded.preset,
         order = decoded.order,
+        qualiMinutes = decoded.qualiMinutes,  -- length for a grid=quali championship (ADR-0041)
     })
 end
 
