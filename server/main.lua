@@ -165,10 +165,16 @@ local PHASE_DURATIONS = {
     finished_hold = 900.0, -- long results + free-roam window before returning to lobby (ADR-0006 amendment)
     quali_default = 480.0, -- default qualifying session length, 8 min (ADR-0041); per-event override in session.quali.duration
     quali_lap_grace = 45.0, -- finish-your-lap cap after the quali clock expires before quali-results (ADR-0041)
-    quali_results = 20.0,  -- classification pause between qualifying and the race countdown (ADR-0041)
-    quali_regrid_lead = 8.0, -- lead before the countdown to run the AI re-grid inside quali-results, so the
-                             -- AI re-spawn frame hitch lands on the static results card, not the race
-                             -- countdown (which ticks locally and would lose those seconds) (ADR-0041)
+    quali_results = 30.0,  -- classification pause between qualifying and the race countdown (ADR-0041):
+                           -- ~10 s results display + a ~20 s settle window after the re-grid (see lead)
+    quali_regrid_lead = 20.0, -- lead before the countdown at which the AI re-grid + respawn run inside
+                              -- quali-results, so (a) the multi-second re-spawn freeze lands on the static
+                              -- results card, not the race countdown, and (b) a settle window of this length
+                              -- follows the respawn. The freeze eats the first seconds of that window, so the
+                              -- visible settle (the client's small "race starts in" timer, counting the
+                              -- remaining pause to 0) is ~lead minus the freeze -- generous so it always runs
+                              -- fully to the countdown rather than being cut short (ADR-0041). The
+                              -- despawn->respawn gap that keeps cars under MaxCars stays quali_results - lead.
 }
 
 -- Seconds before the finished results window expires to warn players that the props and results
@@ -665,12 +671,18 @@ end
 -- Move the session into `phase`, stamp the entry time, and announce it to all clients as a
 -- racePhase envelope. `duration` (seconds) is carried for timed phases so a client can render a
 -- synced countdown; pass nil for open-ended phases (lobby, racing).
-local function enter_phase(phase, duration)
+local function enter_phase(phase, duration, extra)
     session.phase = phase
     session.phase_duration = duration
     session.phase_started_at = now()
     log_info("beamcomp.race", "phase -> " .. phase)
-    broadcast_event(MSG_RACE_PHASE, {phase = phase, duration = duration})
+    local payload = {phase = phase, duration = duration}
+    if type(extra) == "table" then
+        for key, value in pairs(extra) do
+            payload[key] = value
+        end
+    end
+    broadcast_event(MSG_RACE_PHASE, payload)
 end
 
 -- Shuffle an array in place (Fisher-Yates) using math.random (seeded in on_init). Used by the random
@@ -1432,7 +1444,10 @@ function quali.advance_qualifying()
     end
     if now() >= q.lap_grace_deadline then
         broadcast_event(quali.MSG, quali.snapshot())
-        enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results)
+        -- Carry the re-grid lead so the client can split the pause display: a clean "results" countdown
+        -- (pause - lead) before the respawn, then the settle timer (the remaining pause) after it (ADR-0041).
+        enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
+            {regridLead = PHASE_DURATIONS.quali_regrid_lead})
     end
 end
 

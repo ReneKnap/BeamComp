@@ -44,6 +44,30 @@
     .beamcomp-root .bc-cd-staging .bc-cd-staging-time {
       font-size: 105px;
     }
+    /* Quali->race settle timer (ADR-0041): a small centered cue shown after the grid re-spawn and before the
+       start countdown, so the count does not begin unexpectedly. Smaller than the start countdown. */
+    .beamcomp-root .bc-quali-settle {
+      position: fixed;
+      top: 22%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 1000;
+      color: #fff;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-weight: bold;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+      font-variant-numeric: tabular-nums;
+    }
+    .beamcomp-root .bc-quali-settle .bc-qs-title {
+      font-size: 30px;
+      opacity: 0.85;
+    }
+    .beamcomp-root .bc-quali-settle .bc-qs-time {
+      font-size: 56px;
+      line-height: 1.15;
+    }
     /* Personal finish banner (own race finish): same centered fixed overlay treatment as the countdown,
        green like GO!; the GE snapshot is unchanged -- this is a pure client transition cue (app.js fires it
        on the local player's own finish during racing, then the provisional card follows). */
@@ -605,11 +629,11 @@
   <!-- Qualifying results (ADR-0041): the classification that sets the race grid, shown during the pause
        before the race countdown. Pole = fastest; an unclassified driver shows no time. -->
   <!-- Minimized: a small bar that restores the card, so the results are never fully lost (ADR-0041). -->
-  <button type="button" class="bc-quali-restore" ng-if="hud.phase === 'qualiResults' && hud.quali && qualiResultsMin"
+  <button type="button" class="bc-quali-restore" ng-if="hud.phase === 'qualiResults' && hud.quali && qualiResultsMin && !hud.qualiSettleActive"
     ng-click="maximizeQualiResults()">Qualifying Results &#9650;</button>
-  <div class="bc-results-card" ng-if="hud.phase === 'qualiResults' && hud.quali && !qualiResultsMin">
+  <div class="bc-results-card" ng-if="hud.phase === 'qualiResults' && hud.quali && !qualiResultsMin && !hud.qualiSettleActive">
     <div class="bc-results-title">Qualifying Results</div>
-    <div class="bc-provisional-badge" ng-if="hud.qualiResultsRemaining != null">Race starts in {{formatStaging(hud.qualiResultsRemaining)}}</div>
+    <div class="bc-provisional-badge" ng-if="hud.qualiResultsPreRemaining != null">Race starts in {{formatStaging(hud.qualiResultsPreRemaining)}}</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
         <tr class="bc-results-head">
@@ -790,6 +814,13 @@
       <div class="bc-cd-staging-title">Race starting…</div>
       <div class="bc-cd-staging-time">{{formatStaging(countdown.remaining)}}</div>
     </div>
+  </div>
+  <!-- Quali->race settle window (ADR-0041): after the cars re-spawn on the earned grid, the big results card
+       steps back for this small timer so the start countdown does not begin abruptly. Reuses the
+       quali-results remaining seconds, which read ~the settle lead at the re-grid and count down to 0. -->
+  <div class="bc-quali-settle" ng-if="hud.phase === 'qualiResults' && hud.qualiSettleActive">
+    <div class="bc-qs-title">Get ready</div>
+    <div class="bc-qs-time">Countdown starts in {{formatStaging(hud.qualiResultsRemaining)}}</div>
   </div>
   <!-- Personal finish banner: fires on the local player's own finish during racing (app.js), holds ~3s,
        then the provisional card shows. -->

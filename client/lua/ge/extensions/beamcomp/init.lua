@@ -179,6 +179,7 @@ M.state = {
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
     qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
+    quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
     quali = nil,              -- latest server-broadcast quali classification snapshot {rows} (ADR-0041), or nil; rendered on the quali-results card
 }
 
@@ -297,6 +298,7 @@ local function handle_race_start(payload)
     M.state.qualifying = nil
     M.state.qualiResults = nil
     M.state.quali = nil
+    M.state.quali_settle = false
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
@@ -556,6 +558,7 @@ local function teardown_race_world()
     M.state.qualifying = nil
     M.state.qualiResults = nil
     M.state.quali = nil
+    M.state.quali_settle = false
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
@@ -698,7 +701,7 @@ local function handle_race_phase(payload)
         -- times; the grid is set afterwards from quali pace. The AI drive too (so the session is populated),
         -- but only for the real race lap count -- ai.drive bakes every lap into the waypoint list (noOfLaps
         -- does not loop, ADR-0036), so the unbounded quali lap count would build a runaway path; they run the
-        -- race distance, set a time, then idle, and grid at the back. Seed the quali clock from the phase
+        -- race distance, set a time, then idle; the grid is then set from quali pace. Seed the quali clock from the phase
         -- duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs server-side.
         local quali_state = M.state.race and M.state.race.quali
         begin_driving(quali_state and quali_state.plan, M.state.race and M.state.race.laps)
@@ -709,14 +712,16 @@ local function handle_race_phase(payload)
         -- on the quali-earned grid set by the preceding regrid.
         M.state.qualifying = nil
         M.state.qualiResults = nil
+        M.state.quali_settle = false
         begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
     elseif phase == "qualiResults" then
         -- Qualifying over (ADR-0041): stop scoring -- the classification card renders from the quali
-        -- snapshot.
+        -- snapshot. The settle window stays closed until the re-grid places the cars on the race grid.
         M.state.qualifying = nil
         M.state.grace = nil
         M.state.detection = nil
         M.state.laptimer = nil
+        M.state.quali_settle = false
         -- Count the pause down for the card's "race starts in" line, anchored to a wall clock (os.clockhp)
         -- rather than accumulating the clamped per-frame dt, so the AI-despawn frame hitch below cannot make
         -- it drift behind the server's wall-time pause (ADR-0041). Display only -- the card hides
@@ -727,6 +732,10 @@ local function handle_race_phase(payload)
             total = quali_results_seconds,
             anchor = os.clockhp(),
             remaining = quali_results_seconds,
+            -- The re-grid/respawn fires `lead` before the pause ends, splitting the pause into a results
+            -- display (pause - lead) and the post-respawn settle window (lead). The card shows the results
+            -- count before the respawn; the settle timer shows the remaining pause after it (ADR-0041).
+            lead = tonumber(payload.regridLead) or 0,
         }
         -- Despawn the host's quali AI NOW, at the start of the pause -- the gap until the re-grid (which now
         -- runs a lead time before the countdown, ADR-0041) lets BeamMP fully remove them before fresh cars
@@ -917,6 +926,14 @@ end
 local function handle_regrid(payload)
     if not M.state.race or type(payload) ~= "table" then
         return
+    end
+    -- A quali re-grid (fired during the quali-results pause) is the cars landing on the earned race grid:
+    -- open the settle window so the HUD steps the big results card back for a small "race starts in" timer
+    -- before the start countdown (ADR-0041). A pwr re-grid runs in staging and never enters this phase, so
+    -- it leaves the flag untouched. Set before the own-car re-place below so an edge-case early return there
+    -- cannot skip it -- the server still advances to the countdown regardless.
+    if M.state.phase == "qualiResults" then
+        M.state.quali_settle = true
     end
     -- Re-place / re-spawn the host's AI cars (owner-only; no-op otherwise) before the own-car logic, so a
     -- missing own slot/pose below never skips it.
@@ -2881,6 +2898,14 @@ local function build_hud_snapshot()
         -- the HUD shows "waiting for others" instead of the timeout (ADR-0041).
         qualiDone = (phase == "qualifying" and M.state.grace ~= nil and M.state.detection == nil) and true or false,
         qualiResultsRemaining = M.state.qualiResults and M.state.qualiResults.remaining or nil,
+        -- The results-display portion of the pause (before the respawn): the full remaining minus the settle
+        -- lead, so the card's "race starts in" reads a clean count to the respawn rather than the whole pause.
+        qualiResultsPreRemaining = M.state.qualiResults
+            and math.max(0, M.state.qualiResults.remaining - (M.state.qualiResults.lead or 0)) or nil,
+        -- Settle window (ADR-0041): true from the quali re-grid (cars on the grid) until the start countdown,
+        -- so the app swaps the big results card for a small "race starts in" timer. The remaining seconds reuse
+        -- qualiResultsRemaining (the freeze eats the lead's first seconds; the rest is the visible settle).
+        qualiSettleActive = (phase == "qualiResults" and M.state.quali_settle) and true or false,
         quali = M.state.quali,
     }
 end
