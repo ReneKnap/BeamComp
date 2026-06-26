@@ -32,8 +32,8 @@ local MAX_PREVIEW_COUNT = 32
 
 -- Tunable knobs (camelCase, matching the stored/wire param keys) and their constraints. Offsets and
 -- heading are unrestricted; gaps are non-negative; rows and columns are positive integers. rows and
--- columns are two ways to express the same width and are mutually exclusive (see M.set): columns pins the
--- column count (it does not grow with a large field), rows derives the columns from the fixed capacity.
+-- columns are two ways to express the same width and are mutually exclusive (see M.set): pinning one axis
+-- drops the other, which then becomes the dynamic axis derived from the field at spawn (grid.poses).
 local KNOBS = {
     offsetForward = {},
     offsetLateral = {},
@@ -182,10 +182,12 @@ function M.set(knob, value)
 
     local block = M.state.blocks[M.state.direction]
     block[knob] = number
-    -- rows and columns are mutually exclusive widths (last set wins): setting columns pins the width and
-    -- overrides the rows derivation; setting rows drops a pinned columns so the width derives again.
+    -- rows and columns are mutually exclusive width pins (last set wins): pinning one axis drops the other
+    -- so it becomes the dynamic axis (grid.poses derives it from the field). Symmetric in both directions.
     if knob == "rows" then
         block.columns = nil
+    elseif knob == "columns" then
+        block.rows = nil
     end
     recompute()
     return true, number

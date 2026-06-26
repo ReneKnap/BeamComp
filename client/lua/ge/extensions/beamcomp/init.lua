@@ -1157,7 +1157,8 @@ end
 -- Reflect the live grid-editor session back to the grid-editor panel (ADR-0037 amendment): the editor
 -- (race/grideditor.lua) is the source of truth, the panel only displays this state and calls the knob
 -- setters. Pushed after every mutating bridge call. knobs is the active direction's block (or nil when no
--- session), so the panel's steppers show the authoritative, clamped values; columns is nil when derived.
+-- session), so the panel's steppers show the authoritative, clamped values; the non-pinned width axis
+-- (rows or columns) is nil/derived and reads blank ("auto") in the panel.
 local function push_grid_state()
     local editor = grideditor.state
     local block = editor.active and editor.blocks and editor.blocks[editor.direction] or nil

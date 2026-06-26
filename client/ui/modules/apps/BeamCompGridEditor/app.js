@@ -11,15 +11,16 @@
 angular.module('beamng.apps')
 .directive('beamCompGridEditor', [function () {
   // The seven tunable knobs (ADR-0023) in display order. Each continuous knob has a fine (0.05) and a
-  // coarse (1.0) stepper pair; integer knobs (rows/columns) step by 1 only. `columns` is "auto" (derived
-  // from rows) until pinned to an explicit value; setting `rows` returns it to auto (GE clears it).
+  // coarse (1.0) stepper pair; integer knobs (rows/columns) step by 1 only. rows and columns are mutually
+  // exclusive width pins: pinning one drops the other (GE clears it), which then shows blank ("auto") and
+  // is derived from the field at spawn. Both carry `auto: true` so whichever is unpinned reads "auto".
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)' },
     { key: 'offsetLateral', label: 'Offset lateral (m)' },
     { key: 'headingDeg', label: 'Heading (deg)' },
     { key: 'rowGap', label: 'Row gap (m)' },
     { key: 'colGap', label: 'Col gap (m)' },
-    { key: 'rows', label: 'Rows', integer: true },
+    { key: 'rows', label: 'Rows', integer: true, auto: true },
     { key: 'columns', label: 'Columns', integer: true, auto: true },
   ];
 

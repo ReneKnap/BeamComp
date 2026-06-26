@@ -22,23 +22,22 @@
 
 local M = {}
 
--- Layout defaults. Reproduce the historical staggered two-column grid when a param is absent:
--- two columns 4 m apart (2 * the old HALF_WIDTH), rows 6 m apart, and the whole field 15 m behind the
--- line (the old GRID_START_SETBACK, ADR-0022). The per-column stagger is no longer a fixed value: each
--- column is set back by row_gap / columns, so the columns spread evenly across one row's depth (with two
--- columns, column 2 sits at half the row gap). For the default (6 m rows, 2 columns) that is 3 m -- the
--- same as the old fixed STAGGER, so the default grid is unchanged.
+-- Layout defaults. The default grid pins two columns and lets the rows grow with the field: a 2-wide grid
+-- 4 m across (DEFAULT_COL_GAP), each row 8 m further back (DEFAULT_ROW_GAP), the whole field 15 m behind the
+-- line (the old GRID_START_SETBACK, ADR-0022). The per-column stagger is not a fixed value: each column is
+-- set back by row_gap / columns, so the columns spread evenly across one row's depth (with two columns,
+-- column 2 sits at half the row gap -- 4 m for the 8 m default).
 local DEFAULT_COLUMNS = 2
 local DEFAULT_OFFSET_FORWARD = 15.0  -- metres the whole grid trails behind the line (ADR-0022)
 local DEFAULT_OFFSET_LATERAL = 0.0   -- metres the whole grid shifts along the right axis
 local DEFAULT_HEADING_DEG = 0.0      -- extra rotation about vertical applied to layout + headings
-local DEFAULT_ROW_GAP = 6.0          -- longitudinal gap between rows (metres)
+local DEFAULT_ROW_GAP = 8.0          -- longitudinal gap between rows (metres)
 local DEFAULT_COL_GAP = 4.0          -- lateral gap between adjacent columns (metres)
 
--- Fixed field size the grid is laid out (and centred) for, so a given slot's pose is INDEPENDENT of how
--- many players are actually present: P0..P7 sit in the same places whether 1 or 8 cars spawn, and the
--- editor's 8-car preview matches the real spawn. Only the first `count` slots get a pose. A field larger
--- than this still works (the layout grows), it just is not the centred-for-8 arrangement.
+-- The editor's default preview field size and the rows clamp/fallback. With the columns-pinned default a
+-- slot's pose is count-independent (slot k -> a fixed row/column from k alone), so the editor's 8-car
+-- preview matches the real spawn. NOTE: this is no longer a layout floor -- when rows are pinned instead,
+-- the columns derive from the ACTUAL field size (grid.poses), so that layout grows/shrinks with the count.
 local GRID_CAPACITY = 8
 M.LAYOUT_CAPACITY = GRID_CAPACITY
 
@@ -135,25 +134,32 @@ end
 
 -- Fill a (possibly partial, possibly nil) grid param set with defaults. Param keys are camelCase to
 -- match the wire format (ADR-0023); 0 is a valid value for the numeric offsets/gaps, so `or` defaulting
--- is safe (0 is truthy in Lua). Rows default to GRID_CAPACITY / DEFAULT_COLUMNS (the historical two
--- columns) and are clamped to [1, GRID_CAPACITY] -- independent of the live player count, so a slot's
--- pose is stable across field sizes.
+-- is safe (0 is truthy in Lua). rows and columns are two ways to express the same width and are mutually
+-- exclusive: an explicit `columns` PINS the column count (poses uses it verbatim, the rows grow with the
+-- field); an explicit `rows` pins the row count (poses derives the columns from the live field size). When
+-- NEITHER is given -- the bare fallback / no-custom-grid case -- the default pins DEFAULT_COLUMNS columns.
+-- Both pins clamp to [1, GRID_CAPACITY]; rows always gets a value (used only when columns is nil/derived).
 local function resolved_params(params)
     params = params or {}
+
+    local has_columns = type(params.columns) == "number" and params.columns >= 1
+    local has_rows = type(params.rows) == "number" and params.rows >= 1
+
+    local columns
+    if has_columns then
+        columns = math.max(1, math.min(GRID_CAPACITY, math.floor(params.columns)))
+    elseif not has_rows then
+        columns = DEFAULT_COLUMNS
+    else
+        columns = nil
+    end
+
     local rows = params.rows
     if type(rows) ~= "number" or rows < 1 then
         rows = math.ceil(GRID_CAPACITY / DEFAULT_COLUMNS)
     end
     rows = math.max(1, math.min(GRID_CAPACITY, math.floor(rows)))
-    -- An explicit column count PINS the columns (poses uses it verbatim instead of deriving from rows +
-    -- capacity), so the grid keeps that many columns even above the capacity -- the way to stop the column
-    -- count growing when the field is large (e.g. many AI). nil = derive from rows (the historical layout).
-    local columns = params.columns
-    if type(columns) == "number" and columns >= 1 then
-        columns = math.max(1, math.min(GRID_CAPACITY, math.floor(columns)))
-    else
-        columns = nil
-    end
+
     return {
         offset_forward = params.offsetForward or DEFAULT_OFFSET_FORWARD,
         offset_lateral = params.offsetLateral or DEFAULT_OFFSET_LATERAL,
@@ -167,7 +173,8 @@ end
 
 -- A fresh default param set (camelCase, as stored and edited). The grid editor (race/grideditor) seeds
 -- its starting values from this so it shows real numbers to tune; a race start that relays no custom
--- grid gets the same values implicitly via resolved_params.
+-- grid gets the same defaults implicitly via resolved_params. Pins DEFAULT_COLUMNS columns; rows is the
+-- dynamic axis, left unset so the editor shows it as derived ("auto") and it grows with the field.
 function M.default_params()
     return {
         offsetForward = DEFAULT_OFFSET_FORWARD,
@@ -175,7 +182,7 @@ function M.default_params()
         headingDeg = DEFAULT_HEADING_DEG,
         rowGap = DEFAULT_ROW_GAP,
         colGap = DEFAULT_COL_GAP,
-        rows = math.ceil(GRID_CAPACITY / DEFAULT_COLUMNS),
+        columns = DEFAULT_COLUMNS,
     }
 end
 
@@ -183,10 +190,10 @@ end
 -- { pos = {x, y, z}, rot = {x, y, z, w} } in slot order.
 --   params      -- optional grid param set (ADR-0023): offsetForward/offsetLateral (metres, along the
 --                  travel/right axes), headingDeg (extra rotation of the whole grid about vertical),
---                  rowGap/colGap (metres), rows (columns are derived as ceil(capacity / rows), where
---                  capacity is a fixed field size, so a slot's pose does not shift with the live count),
---                  or columns (an explicit column count that pins the width and overrides the rows
---                  derivation). Nil or missing fields fall back to the historical layout.
+--                  rowGap/colGap (metres), and a width pin -- either rows (columns are derived as
+--                  ceil(count / rows) from the live field, so the columns grow/shrink with the driver
+--                  count) or columns (an explicit column count that pins the width and lets the rows grow).
+--                  Nil or missing fields fall back to the default layout (pinned DEFAULT_COLUMNS columns).
 --   gate_normal -- optional {x, y, z} start/finish gate normal (CP0's direction of travel). When given
 --                  the grid lays out behind it; when absent it derives forward from base_rot.
 -- Each slot is placed as right * lateral + (-forward) * setback: lateral spreads the columns about the
@@ -223,11 +230,11 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
         rot = quat_mul(z_quat(heading_rad), base_rot)
     end
 
-    -- Columns: an explicit count (p.columns) pins them so the grid never grows wider than asked, even
-    -- above the capacity. Otherwise derive from the FIXED capacity (not the live count), so slot k sits in
-    -- the same place whether 1 or capacity cars spawn -- the editor preview then matches the real grid; a
-    -- field above capacity grows the columns to fit.
-    local columns = p.columns or math.ceil(math.max(count, GRID_CAPACITY) / p.rows)
+    -- Columns: an explicit count (p.columns) pins them so the grid never grows wider than asked, and the
+    -- rows grow with the field. Otherwise (rows pinned) derive the columns from the ACTUAL field size, so a
+    -- pinned 2-row grid is 2 cars wide for 4 cars and grows wider as the field grows. max(count, 1) only
+    -- guards the column_setback division below for an empty field (the slot loop then runs zero times).
+    local columns = p.columns or math.ceil(math.max(count, 1) / p.rows)
     local centre_column = (columns - 1) / 2
     -- Per-column stagger: spread the columns evenly across one row's depth so the grid forms a smooth
     -- diagonal (two columns -> column 2 at half the row gap), continuing into the next rows.
