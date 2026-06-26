@@ -139,7 +139,7 @@ M.state = {
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
     laptimer = nil,      -- circuit lap-clock state (race/laptimer), armed on racing; display only (ADR-0022)
-    results_hidden = false,  -- local-only toggle: hide the finished results card via /results (ADR-0022)
+    results_min = false,     -- local-only: finished results card minimized to a small restore bar; toggled by /results + the on-card Minimize/restore buttons (ADR-0012/0041 minimize pattern)
     race_records = nil,      -- pre-run PB + track record for the post-race analysis overlay (server raceRecords, ADR-0028), or nil
     analysis_open = false,   -- local-only toggle: show the post-race analysis overlay via /analysis or the card button (ADR-0028)
     provisional_open = true,  -- local-only per-player: auto-show the provisional results card once the local player is finished/DNF while the race still runs; toggled by the HUD buttons / racing-phase /results, reset per race
@@ -640,9 +640,9 @@ local function begin_driving(plan, ai_laps)
     else
         M.state.laptimer = nil
     end
-    -- Each driving phase starts with its results card shown, analysis overlay closed, and the provisional
-    -- results card armed to auto-show on finish (ADR-0022/0028).
-    M.state.results_hidden = false
+    -- Each driving phase starts with its results card shown (not minimized), analysis overlay closed, and the
+    -- provisional results card armed to auto-show on finish (ADR-0022/0028).
+    M.state.results_min = false
     M.state.analysis_open = false
     M.state.provisional_open = true
     -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. ensureAppVisible dedups.
@@ -1050,8 +1050,7 @@ local function handle_results_toggle()
         M.toggle_provisional_results()
         return
     end
-    M.state.results_hidden = not M.state.results_hidden
-    log("I", RACE_LOG_TAG, "results card " .. (M.state.results_hidden and "hidden" or "shown"))
+    M.toggle_results_min()
 end
 
 -- Toggle the local post-race analysis overlay (ADR-0028). Public so the results-card button can call it
@@ -1070,6 +1069,15 @@ end
 function M.toggle_provisional_results()
     M.state.provisional_open = not M.state.provisional_open
     log("I", RACE_LOG_TAG, "provisional results " .. (M.state.provisional_open and "shown" or "hidden"))
+end
+
+-- Minimize/restore the finished results card (ADR-0012/0041 minimize pattern). Public so the HUD's Minimize +
+-- restore buttons reach it via bngApi (UI -> GE), and so the /results command (handle_results_toggle) routes
+-- here in the finished phase. Local-only: it flips a flag the HUD snapshot carries, collapsing the card to a
+-- small restore bar rather than fully hiding it. Reset to restored on each driving-phase start.
+function M.toggle_results_min()
+    M.state.results_min = not M.state.results_min
+    log("I", RACE_LOG_TAG, "results card " .. (M.state.results_min and "minimized" or "restored"))
 end
 
 -- The /analysis relay (server -> this client) flips the same overlay flag as the results-card button.
@@ -2920,7 +2928,7 @@ local function build_hud_snapshot()
         grace = grace,
         graceCanFinish = grace_can_finish,
         isCircuit = is_circuit,
-        resultsHidden = M.state.results_hidden or false,
+        resultsMin = M.state.results_min or false,
         analysisAvailable = analysis_available,
         analysisOpen = M.state.analysis_open or false,
         analysis = analysis,

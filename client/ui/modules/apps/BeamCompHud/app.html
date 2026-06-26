@@ -721,7 +721,7 @@
   </div>
   <!-- Finished: centered results card (hidden by /results, ADR-0022; replaced by the analysis overlay
        while that is open, ADR-0028) -->
-  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsHidden && !hud.analysisOpen">
+  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsMin && !hud.analysisOpen">
     <div class="bc-results-title">Final Standings</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
@@ -789,8 +789,13 @@
         </tr>
       </table>
     </div>
+    <button type="button" class="bc-analysis-btn" ng-click="toggleResultsMin()">Minimize</button>
     <button type="button" class="bc-analysis-btn" ng-if="hud.analysisAvailable" ng-click="toggleAnalysis()">&#9656; Analysis</button>
   </div>
+  <!-- Minimized: a small bar that restores the final standings card, so the results are never fully lost
+       (reuses the quali-results minimize pattern, ADR-0041). -->
+  <button type="button" class="bc-quali-restore" ng-if="hud.phase === 'finished' && hud.resultsMin && !hud.analysisOpen"
+    ng-click="toggleResultsMin()">Final Standings &#9650;</button>
   <!-- Finished: full analysis overlay (opened by the card button or /analysis, ADR-0028) -->
   <div class="bc-analysis-card" ng-if="hud.phase === 'finished' && hud.analysisOpen && hud.analysis">
     <div class="bc-analysis-title">Race Analysis</div>

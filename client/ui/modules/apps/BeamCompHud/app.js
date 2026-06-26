@@ -366,6 +366,14 @@ angular.module('beamng.apps')
         }
       };
 
+      // Minimize/restore the finished final-standings card (ADR-0012/0041 pattern): routes to the GE flag, so
+      // these buttons and the /results command share one state. Inert if bngApi is unavailable (ADR-0012).
+      scope.toggleResultsMin = function () {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.toggle_results_min() end');
+        }
+      };
+
       // Minimize/maximize the quali-results card (ADR-0041): client-local, no GE round-trip. Methods (not
       // inline ng-click assignments) so they set the flag on this scope, not an ng-if child scope. Minimize
       // collapses to a small bar rather than hiding the results outright.
