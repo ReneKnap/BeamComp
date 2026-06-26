@@ -216,6 +216,7 @@ local session = {
     order = nil,              -- this race's start-order {mode, rev} (ADR-0033), or nil = entry order
     last_order = nil,         -- previous race's finishing order as a list of identities (ADR-0033); session-scoped, survives reset_to_lobby so order=last has a source
     championship = nil,       -- active multi-race championship {points_preset, order, standings, race_count} or nil (ADR-0040); session-scoped, survives reset_to_lobby like last_order
+    tournament = nil,         -- active class-drop tournament {classes, order, standings, race_count, winner, ended} or nil (ADR-0042); session-scoped, survives reset_to_lobby like championship
     quali = nil,              -- active quali-then-race event {duration, lap_grace_deadline, done} or nil (ADR-0041); per-event, cleared by reset_to_lobby (unlike last_order/championship)
     owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
 }
@@ -1483,6 +1484,351 @@ function quali.advance_results()
 end
 
 
+-- Class-drop elimination tournament (ADR-0042). A multi-race handicap series: every driver starts in the
+-- fastest of an ordered list of car classes, the winner of each race drops one class for the next, and the
+-- tournament ends when someone wins in the slowest class. Like `champ`/`quali`, every piece of logic hangs
+-- off this one `tour` namespace table -- a single top-level local, because main.lua sits at Lua's 200-local
+-- ceiling and a flat set of functions would overflow it (the plugin then fails to load entirely). The
+-- cross-race state lives in session.tournament; like the championship it survives reset_to_lobby (one
+-- tournament = one play-session) and is in-memory only.
+local tour = {}
+
+-- Cross-side message + command names (ADR-0042), kept on the table to spare top-level local slots.
+tour.MSG = "tournament"          -- table + per-driver class, broadcast on change + after each award
+tour.MSG_CMD = "tournamentCmd"   -- the setup panel's control: {action, classes, order} (ADR-0037)
+
+tour.DEFAULT_CLASS_COUNT = 4
+tour.MIN_CLASSES = 2
+tour.MAX_CLASSES = 6
+
+-- Whether a class-drop tournament is currently running.
+function tour.is_active()
+    return session.tournament ~= nil
+end
+
+-- The standings identity for a participant id: AI ids "ai:<k>" carry the display name "AI <k>" (ADR-0036),
+-- real player ids resolve to the canonical client name (ADR-0031). Matches build_standings/make_slot_entry,
+-- so a driver's class keys consistently across the spawn relay and the award fold.
+function tour.identity_of(id)
+    if is_ai_id(id) then
+        return "AI " .. id:sub(#AI_ID_PREFIX + 1)
+    end
+    return resolve_identity(id)
+end
+
+-- The car/cap descriptor of one class spec, or nil for keep-own (an empty spec). For chat + UI labels.
+function tour.spec_label(spec)
+    if type(spec) ~= "table" then
+        return nil
+    end
+    if spec.car then
+        return spec.car
+    end
+    if spec.maxhp then
+        return "<=" .. tostring(spec.maxhp) .. " hp"
+    end
+    if spec.maxpwr then
+        return "<=" .. tostring(spec.maxpwr) .. " hp/kg"
+    end
+    return nil
+end
+
+-- A short human label for a class index (ADR-0042): "class N" plus the car or cap it enforces. Class 1 is
+-- the fastest. Used in the drop/win chat announcements.
+function tour.class_label(index)
+    local state = session.tournament
+    local detail = state and tour.spec_label(state.classes[index])
+    if detail then
+        return string.format("class %d (%s)", index, detail)
+    end
+    return string.format("class %d", index)
+end
+
+-- Normalize the admin-authored class list into ordered opaque specs (ADR-0042/0032). Each class buckets into
+-- exactly one shape: a fixed car {car="model[:config]"} or a power cap {maxhp=N} / {maxpwr=N} (car wins if both
+-- are somehow present). Empty/unconfigured rows are dropped, not kept as a no-op class -- so an admin who left
+-- the rows blank gets the "too few classes" feedback instead of a degenerate keep-own tournament. The server
+-- never interprets the tokens (race-blind, ADR-0005); it only buckets each entry so policy_for + the labels
+-- are predictable. Returns nil when fewer than MIN_CLASSES valid entries remain; excess past MAX is dropped.
+function tour.sanitize_classes(raw)
+    if type(raw) ~= "table" then
+        return nil
+    end
+    local classes = {}
+    for _, spec in ipairs(raw) do
+        if #classes >= tour.MAX_CLASSES then
+            break
+        end
+        if type(spec) == "table" then
+            local clean
+            if type(spec.car) == "string" and spec.car ~= "" then
+                clean = {car = spec.car}
+            elseif tonumber(spec.maxhp) then
+                clean = {maxhp = tonumber(spec.maxhp)}
+            elseif tonumber(spec.maxpwr) then
+                clean = {maxpwr = tonumber(spec.maxpwr)}
+            end
+            if clean then
+                classes[#classes + 1] = clean
+            end
+        end
+    end
+    if #classes < tour.MIN_CLASSES then
+        return nil
+    end
+    return classes
+end
+
+-- The grid order for the tournament from a panel choice (ADR-0042). Defaults to random -- the car class is
+-- the handicap, so the grid is not also handicapped by default. Accepts the per-race order modes that resolve
+-- at start (ADR-0033: entry/random/last/pwr); an unknown/empty choice falls back to random. quali is not
+-- offered here (a tournament does not compose a qualifying session in v1).
+function tour.order(choice)
+    local mode = type(choice) == "table" and choice.mode or choice
+    if mode == "entry" or mode == "random" or mode == "last" or mode == "pwr" then
+        return {mode = mode, rev = (type(choice) == "table" and choice.rev) or nil}
+    end
+    return {mode = "random"}
+end
+
+-- The grid order a live tournament imposes on the next race, or nil when none is active (ADR-0042). Feeds the
+-- effective_order chain in start_race unless the race carries an explicit order=.
+function tour.active_order()
+    if not tour.is_active() then
+        return nil
+    end
+    return session.tournament.order
+end
+
+-- Begin a fresh class-drop tournament with the given ordered class specs (ADR-0042). order defaults to random.
+-- Returns the class count on success, or nil when too few valid classes were given. Mutual exclusion with the
+-- points-championship (ADR-0040) is enforced by the command handler (champ is defined earlier in the file), so
+-- start itself does not reference champ.
+function tour.start(classes, order)
+    local clean = tour.sanitize_classes(classes)
+    if not clean then
+        return nil
+    end
+    session.tournament = {
+        -- keyed by identity (players) / display name (AI): {class_index, reached_at{class->race}, races, finishes, ai}
+        classes = clean,
+        order = tour.order(order),
+        standings = {},
+        race_count = 0,
+        winner = nil,
+        ended = false,
+    }
+    return #clean
+end
+
+-- End the tournament and clear its state.
+function tour.reset()
+    session.tournament = nil
+end
+
+-- Live changes to a running tournament (ADR-0042). New class specs apply to subsequent spawns only -- a driver
+-- keeps their class_index, only the car for that index changes (non-retroactive, like a championship preset
+-- change). A nil argument leaves that setting unchanged; invalid classes are ignored. No-op when none active.
+function tour.set(classes, order)
+    if not tour.is_active() then
+        return
+    end
+    if classes ~= nil then
+        local clean = tour.sanitize_classes(classes)
+        if clean then
+            session.tournament.classes = clean
+        end
+    end
+    if order ~= nil then
+        session.tournament.order = tour.order(order)
+    end
+end
+
+-- The class a driver currently races in (1 = fastest). Drivers absent from the standings -- including late
+-- joiners (ADR-0042) -- default to class 1, clamped to the configured class count. nil identity -> class 1.
+function tour.class_index_of(identity)
+    local state = session.tournament
+    if not identity or not state then
+        return 1
+    end
+    local record = state.standings[identity]
+    local index = (record and record.class_index) or 1
+    if index > #state.classes then
+        index = #state.classes
+    end
+    return index
+end
+
+-- The vehicle policy a participant spawns under this race (ADR-0042 / ADR-0032 amendment): the car or cap of
+-- their current class, relayed verbatim per-recipient. A missing/empty class spec degrades to keep-own (Mode 1)
+-- so a misconfigured class never crashes or strands a driver. Returns a {car?, maxhp?, maxpwr?} subset.
+function tour.policy_for(id)
+    if not tour.is_active() then
+        return {}
+    end
+    local spec = session.tournament.classes[tour.class_index_of(tour.identity_of(id))]
+    if type(spec) ~= "table" then
+        return {}
+    end
+    return {car = spec.car, maxhp = spec.maxhp, maxpwr = spec.maxpwr}
+end
+
+-- The race winner's identity for the class-drop fold: the top classified finisher (P1, not DNF), or nil when
+-- nobody finished (an all-DNF race drops no one). Race-blind -- reads build_standings rank order (ADR-0015).
+function tour.race_winner(standings)
+    local top = standings[1]
+    if top and not top.dnf and top.name then
+        return top.name
+    end
+    return nil
+end
+
+-- Fold the just-finished race into the tournament (ADR-0042). Called at the racing->finished seam after
+-- champ.award (a no-op unless a tournament is active and unfinished). Every classified/DNF participant gets a
+-- class-1 record on first sighting and a bumped race + finishes count (the never-winner countback tiebreak).
+-- The race winner then drops one class (stamping the race number at which they reached it), or -- if already
+-- in the slowest class -- ends the tournament as overall winner. Keyed by identity / AI display name.
+function tour.award()
+    if not tour.is_active() or session.tournament.ended then
+        return
+    end
+    local state = session.tournament
+    local standings = build_standings()
+    for _, entry in ipairs(standings) do
+        local identity = entry.name
+        if identity then
+            local record = state.standings[identity]
+            if not record then
+                record = {class_index = 1, reached_at = {[1] = 0}, races = 0, finishes = {}, ai = entry.ai or nil}
+                state.standings[identity] = record
+            end
+            record.races = record.races + 1
+            if not entry.dnf then
+                record.finishes[entry.position] = (record.finishes[entry.position] or 0) + 1
+            end
+        end
+    end
+    state.race_count = state.race_count + 1
+
+    local winner = tour.race_winner(standings)
+    if not winner then
+        return  -- all-DNF race: no class change, the tournament continues
+    end
+    local record = state.standings[winner]
+    if record.class_index < #state.classes then
+        record.class_index = record.class_index + 1
+        record.reached_at[record.class_index] = state.race_count
+        broadcast_chat(string.format("BeamComp: %s wins -- drops to %s",
+            winner, tour.class_label(record.class_index)))
+    else
+        state.winner = winner
+        state.ended = true
+        broadcast_chat(string.format("BeamComp: %s wins the class-drop tournament!", winner))
+    end
+end
+
+-- Countback of two finish histograms (ADR-0040 style): whoever has more finishes at the best still-differing
+-- position is ahead. Returns 1 (a ahead), -1 (b ahead), or 0 (tied) -- the final tiebreak among drivers who
+-- never dropped a class (all still in class 1, reached at race 0).
+function tour.countback(a, b)
+    local maxp = 0
+    for p in pairs(a) do if p > maxp then maxp = p end end
+    for p in pairs(b) do if p > maxp then maxp = p end end
+    for p = 1, maxp do
+        local ca, cb = a[p] or 0, b[p] or 0
+        if ca ~= cb then
+            return ca > cb and 1 or -1
+        end
+    end
+    return 0
+end
+
+-- The tournament standings as a ranked list (ADR-0042): {identity, entry}. The overall winner (set when a
+-- driver wins in the slowest class) is pinned to 1st -- another driver may have reached the slowest class
+-- earlier without winning there, so descent depth alone would mis-rank the actual winner. Everyone else is
+-- ordered by deepest class reached (slower = better), then the earliest race that reached it, then a finish
+-- countback, then identity. Drives the HUD/panel table.
+function tour.rank_list()
+    if not tour.is_active() then
+        return {}
+    end
+    local state = session.tournament
+    local winner = state.winner
+    local ranked = {}
+    for identity, entry in pairs(state.standings) do
+        ranked[#ranked + 1] = {identity = identity, entry = entry}
+    end
+    table.sort(ranked, function(x, y)
+        if winner then
+            if x.identity == winner then return true end
+            if y.identity == winner then return false end
+        end
+        local a, b = x.entry, y.entry
+        if a.class_index ~= b.class_index then
+            return a.class_index > b.class_index  -- deeper (slower) class first
+        end
+        local ra = a.reached_at[a.class_index] or 0
+        local rb = b.reached_at[b.class_index] or 0
+        if ra ~= rb then
+            return ra < rb  -- reached this class in an earlier race = better
+        end
+        local cb = tour.countback(a.finishes, b.finishes)
+        if cb ~= 0 then
+            return cb > 0
+        end
+        return x.identity < y.identity
+    end)
+    return ranked
+end
+
+-- A client-facing snapshot of the tournament (ADR-0042) for the HUD results card + the setup panel: active
+-- flag, the configured classes, the ranked rows with each driver's current class, and the overall winner once
+-- the tournament has ended. active=false (no rows) tells a client to hide the table.
+function tour.snapshot()
+    if not tour.is_active() then
+        return {active = false}
+    end
+    local state = session.tournament
+    local classes = {}
+    for index, spec in ipairs(state.classes) do
+        classes[index] = {
+            index = index,
+            car = spec.car,
+            maxhp = spec.maxhp,
+            maxpwr = spec.maxpwr,
+            label = tour.spec_label(spec),
+        }
+    end
+    local rows = {}
+    for position, item in ipairs(tour.rank_list()) do
+        local entry = item.entry
+        local class_index = math.min(entry.class_index, #state.classes)
+        rows[#rows + 1] = {
+            position = position,
+            name = item.identity,
+            class = class_index,
+            classLabel = tour.spec_label(state.classes[class_index]),
+            races = entry.races,
+            ai = entry.ai or nil,
+        }
+    end
+    return {
+        active = true,
+        ended = state.ended or nil,
+        winner = state.winner,
+        classCount = #state.classes,
+        raceCount = state.race_count,
+        classes = classes,
+        rows = rows,
+    }
+end
+
+-- Broadcast the current tournament table to every client (ADR-0042).
+function tour.broadcast()
+    broadcast_event(tour.MSG, tour.snapshot())
+end
+
+
 -- Resolve the pwr start order at the staging->countdown seam (ADR-0033): sort the rostered players by
 -- their reported power-to-weight (desc by default = strongest on pole, asc for :rev = weakest on pole),
 -- with players who reported none to the back in current slot order. Reassign slots, rebuild the roster,
@@ -1586,8 +1932,9 @@ local function reset_to_lobby()
     -- session.quali (ADR-0041) is per-event, so unlike last_order/championship it is cleared here -- a
     -- qualifying belongs to one race event and must not bleed into the next.
     session.quali = nil
-    -- session.last_order (ADR-0033) and session.championship (ADR-0040) deliberately persist across the
-    -- lobby -- they are the cross-race order sources and must outlive a single race.
+    -- session.last_order (ADR-0033), session.championship (ADR-0040) and session.tournament (ADR-0042)
+    -- deliberately persist across the lobby -- they are the cross-race order sources / series state and must
+    -- outlive a single race.
     enter_phase(PHASE.lobby, nil)
     if had_race then
         broadcast_chat("BeamComp: race cleared -- back in free roam")
@@ -1635,7 +1982,9 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
     -- the admin gave an explicit order=.
-    local effective_order = overrides.order or champ.active_order()
+    -- While a class-drop tournament is active its stored order grids the race too (ADR-0042); it defaults to
+    -- random since the car class is the handicap. champ/tour are mutually exclusive, so at most one applies.
+    local effective_order = overrides.order or champ.active_order() or tour.active_order()
     session.order = effective_order
     -- order=quali makes this a two-phase event (ADR-0041): begin the qualifying session state now; the
     -- provisional grid below is random, and quali.regrid sets the real race grid by pace after qualifying.
@@ -1693,7 +2042,17 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     local ai_slots = {}
     for _, entry in ipairs(slots) do
         if is_ai_id(entry.id) then
-            ai_slots[#ai_slots + 1] = {slot = entry.slot, id = entry.id, label = entry.name}
+            local ai_entry = {slot = entry.slot, id = entry.id, label = entry.name}
+            -- In a class-drop tournament each AI drives the car/cap of its current class (ADR-0042); the
+            -- owner resolves a cap to a compliant car exactly as it does for the player policy (ADR-0036).
+            -- Absent (no tournament) the AI vehicle falls back to the uniform aiConfig chain unchanged.
+            if tour.is_active() then
+                local vp = tour.policy_for(entry.id)
+                ai_entry.car = vp.car
+                ai_entry.maxhp = vp.maxhp
+                ai_entry.maxpwr = vp.maxpwr
+            end
+            ai_slots[#ai_slots + 1] = ai_entry
         end
     end
     -- Drop any identity/vehicle reports from a prior race so a re-issue (abort path, no reset_to_lobby)
@@ -1707,6 +2066,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
         -- AI slots have no client (ADR-0036): skip them. The owner alone receives aiSlots, so it spawns
         -- and drives the AI cars; everyone else just sees them in the roster + standings.
         if not is_ai_id(entry.id) then
+            -- Per-recipient vehicle policy (ADR-0032 amendment): a class-drop tournament gives each driver the
+            -- car/cap of their current class (ADR-0042); otherwise every client gets the uniform admin policy,
+            -- byte-for-byte as before. policy_for degrades to keep-own (Mode 1) for a missing/empty class spec.
+            local policy = (tour.is_active() and tour.policy_for(entry.id))
+                or {car = overrides.car, maxhp = overrides.maxhp, maxpwr = overrides.maxpwr}
             send_event(entry.id, MSG_RACE_START, {
                 race = race_name,
                 slot = entry.slot,
@@ -1735,12 +2099,13 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- Resolved custom-grid params (ADR-0023); nil = procedural grid. Same for every slot --
                 -- clients pick their own pose from the shared layout by slot.
                 gridParams = grid_params,
-                -- Vehicle policy (ADR-0032), relayed verbatim and never interpreted (ADR-0005): car =
-                -- fixed "model[:config]" for everyone (Mode 2); maxhp (hp) / maxpwr (power-to-weight, hp
-                -- per kg) = per-player caps (Mode 3). All nil = keep own car (Mode 1). car wins client-side.
-                car = overrides.car,
-                maxhp = overrides.maxhp,
-                maxpwr = overrides.maxpwr,
+                -- Vehicle policy (ADR-0032, per-recipient since the ADR-0042 amendment), relayed verbatim and
+                -- never interpreted (ADR-0005): car = fixed "model[:config]" (Mode 2); maxhp (hp) / maxpwr
+                -- (power-to-weight, hp per kg) = caps (Mode 3); all nil = keep own car (Mode 1). car wins
+                -- client-side. `policy` is this driver's class car in a tournament, else the uniform admin policy.
+                car = policy.car,
+                maxhp = policy.maxhp,
+                maxpwr = policy.maxpwr,
                 -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
                 -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
                 -- race from these. Same for every slot; the host (which has the file) ignores them and
@@ -2353,6 +2718,12 @@ local function finalize_race(reason)
     champ.award()
     if champ.is_active() then
         champ.broadcast()
+    end
+    -- Fold this race into the class-drop tournament and push its table (ADR-0042); both no-ops when no
+    -- tournament is active. Mutually exclusive with the championship -- only one format runs at a time.
+    tour.award()
+    if tour.is_active() then
+        tour.broadcast()
     end
     enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
 end
@@ -3072,8 +3443,10 @@ function champ.handle_command(player_id, player_name, argument)
     end
 
     if action == "start" then
+        tour.reset()  -- mutual exclusion: starting a championship ends any class-drop tournament (ADR-0042)
         champ.start(preset, order, quali_seconds)  -- nil/reversed -> reversed grid; "normal"/"quali" as given
         champ.broadcast()
+        tour.broadcast()  -- tell clients the tournament (if it was on) is now off
         broadcast_chat(string.format("BeamComp: championship started -- points=%s, grid=%s",
             session.championship.points_preset, champ.order_label(session.championship.order)))
         log_info("beamcomp.champ", "championship started by " .. player_name)
@@ -3190,9 +3563,10 @@ local function handle_raceui_command(player_id, player_name)
         return
     end
     send_event(player_id, MSG_SETUP_OPEN, {})
-    -- Seed the panel with the current championship state (ADR-0040) so its section reflects reality on
-    -- open; subsequent changes arrive via the broadcast.
+    -- Seed the panel with the current championship + tournament state (ADR-0040/0042) so its tournament
+    -- section reflects reality on open; subsequent changes arrive via the broadcasts.
     send_event(player_id, champ.MSG, champ.snapshot())
+    send_event(player_id, tour.MSG, tour.snapshot())
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
@@ -3811,6 +4185,65 @@ function champ.handle_cmd(player_id, payload)
     champ.handle_command(player_id, player_name, table.concat(parts, " "))
 end
 
+-- Handle the setup panel's tournamentCmd (ADR-0042) -- the only entry point, since class-drop is panel-only
+-- (no chat command). action start/set/reset; classes is the ordered fast->slow spec list (each {car} or a
+-- {maxhp}/{maxpwr} cap), order the grid choice. Mutations are admin-gated (ADR-0016). Starting a tournament
+-- ends any active points-championship -- the two formats are mutually exclusive (champ is in scope here, so
+-- the cross-reset lives at the call site, not inside tour.start).
+function tour.handle_cmd(player_id, payload)
+    if type(payload) ~= "table" or type(payload.action) ~= "string" then
+        return
+    end
+    local player_name = player_name_of(player_id)
+    if not player_name then
+        return
+    end
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to manage tournaments")
+        log_info("beamcomp.tour", "denied tournamentCmd from " .. player_name .. " (not a race admin)")
+        return
+    end
+
+    local action = payload.action
+    if action == "start" then
+        champ.reset()  -- mutual exclusion: only one tournament format runs at a time (ADR-0042)
+        local count = tour.start(payload.classes, payload.order)
+        if not count then
+            MP.SendChatMessage(player_id, string.format(
+                "BeamComp: need at least %d valid classes to start a tournament", tour.MIN_CLASSES))
+            return
+        end
+        champ.broadcast()  -- tell clients the championship (if it was on) is now off
+        tour.broadcast()
+        broadcast_chat(string.format("BeamComp: class-drop tournament started -- %d classes", count))
+        log_info("beamcomp.tour", string.format("tournament started by %s (%d classes)", player_name, count))
+        return
+    end
+
+    if action == "reset" then
+        if not tour.is_active() then
+            MP.SendChatMessage(player_id, "BeamComp: no tournament active")
+            return
+        end
+        local winner = tour.winner_text()
+        tour.reset()
+        tour.broadcast()
+        broadcast_chat(winner and ("BeamComp: tournament over -- winner: " .. winner)
+            or "BeamComp: tournament reset")
+        log_info("beamcomp.tour", "tournament reset by " .. player_name)
+        return
+    end
+
+    -- action == "set": a live class/order change on a running tournament (non-retroactive on class_index).
+    if not tour.is_active() then
+        MP.SendChatMessage(player_id, "BeamComp: no tournament active -- start one first")
+        return
+    end
+    tour.set(payload.classes, payload.order)
+    tour.broadcast()
+    MP.SendChatMessage(player_id, "BeamComp: tournament updated")
+end
+
 -- Receive a client -> server { type, payload } envelope on EVENT_CHANNEL (ADR-0011). The server
 -- hand-decodes (it does not load the shared envelope module, ADR-0004); `data` arrives as a JSON
 -- string. A non-string `data` means the handler arg order differs from the assumed (player_id, data)
@@ -3862,6 +4295,8 @@ local function handle_client_event(player_id, data)
         handle_race_go(player_id)
     elseif decoded.type == champ.MSG_CMD then
         champ.handle_cmd(player_id, decoded.payload)
+    elseif decoded.type == tour.MSG_CMD then
+        tour.handle_cmd(player_id, decoded.payload)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
