@@ -1324,6 +1324,10 @@ local function handle_setup_open(_payload)
     push_setup_data(false)
     -- Ensure the panel app is on the live layout (ADR-0012 best-effort auto-add); dedups by appName.
     guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
+    -- Auto-minimize the final standings card so the opening panel has a clear view. Only visible in the
+    -- finished phase (the snapshot gates it), so this is inert otherwise; manual restore via
+    -- M.toggle_results_min and the per-race reset (driving-phase start) stay the counter-force.
+    M.state.results_min = true
 end
 
 -- Push the dataset on demand (UI -> GE, ADR-0037): the panel calls this on link -- so a freshly-added app
