@@ -29,15 +29,18 @@ angular.module('beamng.apps')
       { v: 'direct', label: 'direct (exact)' }],
   };
 
-  // Defaults mirror /race with no arguments (ADR-0037 v1: always opens at defaults, no persistence).
+  // Curated panel defaults (ADR-0037): a fresh form opens at opinionated race settings -- random start
+  // order, plus (once AI is toggled on) 4 hard AI on random stock cars that avoid each other. These differ
+  // from bare /race (entry order, no AI car); the session form-restore (BeamCompSetupForm) overrides them
+  // after a race has been set up.
   function freshForm() {
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
       carModel: '', carConfig: '', maxhp: '', maxpwr: '',
-      orderMode: 'entry', orderRev: false, qualiMinutes: 5, grid: '',
+      orderMode: 'random', orderRev: false, qualiMinutes: 5, grid: '',
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
-      aiEnabled: false, aiCount: 1, aiPreset: '', aiCar: '', aiRoute: '', aiAdvanced: false,
-      aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: false,
+      aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
+      aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
     };
   }
