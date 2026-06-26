@@ -345,8 +345,23 @@ angular.module('beamng.apps')
           qualiMinutes: num(scope.form.champQualiMinutes),
         }));
       }
-      scope.championshipStart = function () { championshipCmd('start'); };
-      scope.championshipApply = function () { championshipCmd('set'); };
+      // Live-apply: every championship option change applies at once. Sends 'start' if not yet active (which
+      // also captures a change made in the brief window before the activate broadcast returns -- harmless
+      // pre-race, it overwrites empty standings), else 'set'. The Mode selector + live-apply replace the old
+      // Start/Apply buttons.
+      scope.championshipLive = function () {
+        championshipCmd(scope.championship.active ? 'set' : 'start');
+      };
+      // Preset/grid dropdown pick: set the field, close the dropdown, live-apply.
+      scope.pickChamp = function (field, value) {
+        scope.form[field] = value;
+        scope.open = null;
+        scope.championshipLive();
+      };
+      // "Reset points": clear the standings but keep the championship active -- re-sending 'start' overwrites
+      // with a fresh empty table while it stays on. Distinct from Mode=off, which fully stops it.
+      scope.championshipRestart = function () { championshipCmd('start'); };
+      // Full stop -- used by Mode=off (pickTourMode).
       scope.championshipReset = function () {
         geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
       };
@@ -371,14 +386,17 @@ angular.module('beamng.apps')
         if (scope.form.tourClasses.length < 6) {
           scope.form.tourClasses.push(defaultClass());
         }
+        scope.tournamentLive();
       };
       scope.removeClass = function (i) {
         if (scope.form.tourClasses.length > 2) {
           scope.form.tourClasses.splice(i, 1);
         }
+        scope.tournamentLive();
       };
       scope.setClassKind = function (i, kind) {
         scope.form.tourClasses[i].kind = kind;
+        scope.tournamentLive();
       };
       // Takes the class object (not an index): the car/config options are NESTED ng-repeats, so $index there
       // is the option index, not the class row -- passing `cls` directly avoids the shadowing bug.
@@ -389,10 +407,12 @@ angular.module('beamng.apps')
         if (model) {
           geLuaArg('request_car_configs', model);
         }
+        scope.tournamentLive();
       };
       scope.pickClassConfig = function (cls, config) {
         cls.config = config;
         scope.open = null;
+        scope.tournamentLive();
       };
       // Config dropdown options for one class's selected car model, from the per-model cache (ADR-0042).
       scope.classConfigOpts = function (cls) {
@@ -409,6 +429,12 @@ angular.module('beamng.apps')
         if (mode === 'off') {
           if (scope.tournament.active) { scope.tournamentReset(); }
           if (scope.championship.active) { scope.championshipReset(); }
+        } else if (mode === 'championship') {
+          if (!scope.championship.active) { championshipCmd('start'); }
+        } else if (mode === 'classdrop') {
+          // Class-drop needs >=2 valid classes to start; start now if the config already qualifies, else the
+          // editor is armed and the first valid live-apply (a class edit) starts it.
+          if (!scope.tournament.active && tourConfigValid()) { tournamentCmd('start'); }
         }
       };
       scope.classCarLabel = function (cls) {
@@ -446,8 +472,38 @@ angular.module('beamng.apps')
           order: scope.form.tourOrder,
         }));
       }
-      scope.tournamentStart = function () { tournamentCmd('start'); };
-      scope.tournamentApply = function () { tournamentCmd('set'); };
+      // True when the class list has >=2 configured classes (mirrors the server's sanitize threshold), so a
+      // class-drop tournament can actually start.
+      function tourConfigValid() {
+        var n = 0;
+        (scope.form.tourClasses || []).forEach(function (c) {
+          if (c.kind === 'cap') {
+            if (num(c.maxhp) !== undefined || num(c.maxpwr) !== undefined) { n++; }
+          } else if (c.car) {
+            n++;
+          }
+        });
+        return n >= 2;
+      }
+      // Live-apply: a class/order change applies at once -- 'set' on an active tournament, else 'start' once
+      // the config is valid, so class-drop activates as soon as >=2 classes are configured.
+      scope.tournamentLive = function () {
+        if (scope.tournament.active) {
+          tournamentCmd('set');
+        } else if (tourConfigValid()) {
+          tournamentCmd('start');
+        }
+      };
+      // Order dropdown pick: set the field, close the dropdown, live-apply.
+      scope.pickTour = function (field, value) {
+        scope.form[field] = value;
+        scope.open = null;
+        scope.tournamentLive();
+      };
+      // "Reset progress": everyone back to class 1 but the tournament stays on -- re-send 'start' with the
+      // current classes (fresh progression, still active). Distinct from Mode=off, which fully stops it.
+      scope.tournamentRestart = function () { tournamentCmd('start'); };
+      // Full stop -- used by Mode=off (pickTourMode).
       scope.tournamentReset = function () {
         geLuaArg('tournament_cmd', JSON.stringify({ action: 'reset' }));
       };

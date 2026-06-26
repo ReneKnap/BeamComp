@@ -261,7 +261,7 @@
             <button type="button" class="bc-dd-head" ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
             <div class="bc-dd-list" ng-if="open === 'champPreset'">
               <div class="bc-dd-opt" ng-repeat="o in opts.champPreset" ng-class="{sel: o.v === form.champPreset}"
-                ng-click="pick('champPreset', o.v)">{{o.label}}</div>
+                ng-click="pickChamp('champPreset', o.v)">{{o.label}}</div>
             </div>
           </div>
         </div>
@@ -271,7 +271,7 @@
             <button type="button" class="bc-dd-head" ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
             <div class="bc-dd-list" ng-if="open === 'champOrder'">
               <div class="bc-dd-opt" ng-repeat="o in opts.champOrder" ng-class="{sel: o.v === form.champOrder}"
-                ng-click="pick('champOrder', o.v)">{{o.label}}</div>
+                ng-click="pickChamp('champOrder', o.v)">{{o.label}}</div>
             </div>
           </div>
         </div>
@@ -279,15 +279,16 @@
         <div class="bc-row" ng-if="form.champOrder === 'quali'">
           <span>Qualifying length</span>
           <span class="bc-quali-len">
-            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes"> min
+            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes"
+              ng-blur="championshipLive()" ng-keydown="$event.keyCode === 13 && championshipLive()"> min
             <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
-              ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m">{{m}}</button>
+              ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m; championshipLive()">{{m}}</button>
           </span>
         </div>
-        <div class="bc-row bc-champ-actions">
-          <button class="bc-refresh" ng-if="!championship.active" ng-click="championshipStart()">Start</button>
-          <button class="bc-refresh" ng-if="championship.active" ng-click="championshipApply()">Apply</button>
-          <button class="bc-refresh bc-champ-reset" ng-if="championship.active" ng-click="championshipReset()">Reset</button>
+        <!-- No Start/Apply: the Mode selector activates the championship and every option live-applies. The one
+             button restarts the standings while it stays active; Mode=off fully stops it. -->
+        <div class="bc-row bc-champ-actions" ng-if="championship.active">
+          <button class="bc-refresh bc-champ-reset" ng-click="championshipRestart()">Reset points</button>
         </div>
       </div>
 
@@ -331,11 +332,13 @@
           </div>
           <label class="bc-row" ng-if="cls.kind === 'cap'">
             <span>Max hp</span>
-            <input type="number" min="0" ng-model="cls.maxhp" placeholder="off">
+            <input type="number" min="0" ng-model="cls.maxhp" placeholder="off"
+              ng-blur="tournamentLive()" ng-keydown="$event.keyCode === 13 && tournamentLive()">
           </label>
           <label class="bc-row" ng-if="cls.kind === 'cap'">
             <span>Max hp/kg</span>
-            <input type="number" min="0" step="0.001" ng-model="cls.maxpwr" placeholder="off">
+            <input type="number" min="0" step="0.001" ng-model="cls.maxpwr" placeholder="off"
+              ng-blur="tournamentLive()" ng-keydown="$event.keyCode === 13 && tournamentLive()">
           </label>
         </div>
         <div class="bc-row">
@@ -347,14 +350,14 @@
             <button type="button" class="bc-dd-head" ng-click="toggle('tourOrder')">{{labelFor('tourOrder')}}</button>
             <div class="bc-dd-list" ng-if="open === 'tourOrder'">
               <div class="bc-dd-opt" ng-repeat="o in opts.tourOrder" ng-class="{sel: o.v === form.tourOrder}"
-                ng-click="pick('tourOrder', o.v)">{{o.label}}</div>
+                ng-click="pickTour('tourOrder', o.v)">{{o.label}}</div>
             </div>
           </div>
         </div>
-        <div class="bc-row bc-champ-actions">
-          <button class="bc-refresh" ng-if="!tournament.active" ng-click="tournamentStart()">Start</button>
-          <button class="bc-refresh" ng-if="tournament.active" ng-click="tournamentApply()">Apply</button>
-          <button class="bc-refresh bc-champ-reset" ng-if="tournament.active" ng-click="tournamentReset()">Reset</button>
+        <!-- No Start/Apply: selecting the mode + a valid class list activates it, and every edit live-applies.
+             The one button restarts progression while it stays active; Mode=off fully stops it. -->
+        <div class="bc-row bc-champ-actions" ng-if="tournament.active">
+          <button class="bc-refresh bc-champ-reset" ng-click="tournamentRestart()">Reset progress</button>
         </div>
       </div>
     </div>
