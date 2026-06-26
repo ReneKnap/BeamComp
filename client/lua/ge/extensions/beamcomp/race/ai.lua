@@ -139,10 +139,26 @@ end
 -- aicar= (config.car) -> the player vehicle policy (ADR-0032: Mode 2 fixed car / Mode 3 cap-compliant car;
 -- Mode 1 = no policy falls through) -> the aiRace content default vehicle(s) -> a random stock model.
 -- `index` (1-based) cycles the content vehicle list so multiple AI vary. Returns (model, config).
-local function resolve_ai_vehicle(config, content_defaults, policy, index)
+local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_policy)
     config = type(config) == "table" and config or {}
     policy = type(policy) == "table" and policy or {}
     content_defaults = type(content_defaults) == "table" and content_defaults or {}
+    slot_policy = type(slot_policy) == "table" and slot_policy or {}
+
+    -- A per-AI class policy (ADR-0042) wins over everything else: in a class-drop tournament each AI must
+    -- drive the car/cap of its OWN class, not the shared aicar=. A fixed car spawns it; a cap finds a
+    -- compliant car; an empty or unsatisfiable spec falls through to the normal chain so the AI still races.
+    if slot_policy.car then
+        local model, vehicle_config = split_car_token(slot_policy.car)
+        if model then
+            return model, vehicle_config
+        end
+    elseif slot_policy.maxhp or slot_policy.maxpwr then
+        local pick = vehiclespecs.find_compliant(nil, slot_policy.maxhp, slot_policy.maxpwr)
+        if pick then
+            return pick.model, pick.config
+        end
+    end
 
     if config.car == "random" then
         -- The panel's "random" AI car (ADR-0037): an independent random stock model per AI, so the field
@@ -195,7 +211,9 @@ function M.spawn(ai_slots, grid_poses, config, content_defaults, policy)
         if not pose then
             log("W", LOG_TAG, "no grid pose for AI slot " .. tostring(slot_info.slot))
         else
-            local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index)
+            -- slot_info carries this AI's per-class policy (car/maxhp/maxpwr) in a class-drop tournament
+            -- (ADR-0042); it takes precedence inside resolve_ai_vehicle. nil fields = the normal chain.
+            local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index, slot_info)
             local veh, reason = vehicles.spawn_at(pose, model, vehicle_config)
             if veh then
                 cars[#cars + 1] = {

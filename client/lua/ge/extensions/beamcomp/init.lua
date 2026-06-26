@@ -169,6 +169,7 @@ M.state = {
     hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
     hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle ensureAppVisible
     hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
+    idle_info_shown = false,  -- whether the between-races series info box (ADR-0042) currently holds the HUD app up (lobby/free-roam, no race), so it is shown once and taken down when the series ends
     grid_list_target = nil,   -- routes the next gridList reply by its requester: nil = grid-editor console toast (default) | "setup" = race-setup panel grid dropdown (ADR-0037) | "gridui" = grid-editor panel saved-grid dropdown
     grid_seed_race = nil,     -- a race to pre-select when the grid-editor panel opens (carried from /raceui's "Grid bearbeiten" cross-open); consumed by push_grid_data
     grid_active_name = nil,   -- the saved name of the grid currently being edited (set on save/load, nil for a fresh unsaved grid); reflected to the panel so a reopen restores the overwrite/assign target
@@ -177,6 +178,7 @@ M.state = {
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
+    tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
     qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
     quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
@@ -814,6 +816,17 @@ local function handle_championship(payload)
     end
 end
 
+-- Store the latest server-broadcast class-drop tournament table (ADR-0042) and reflect it to the setup panel,
+-- exactly like handle_championship: the HUD finished card reads it from the per-frame snapshot; the panel is
+-- not on the per-frame path, so it gets an immediate push here. payload.active=false (no tournament / reset)
+-- clears the table, so both the card and the panel hide it.
+local function handle_tournament(payload)
+    M.state.tournament = type(payload) == "table" and payload or nil
+    if guihooks then
+        guihooks.trigger("BeamCompTournament", M.state.tournament or {active = false})
+    end
+end
+
 -- Store the latest qualifying classification (ADR-0041), broadcast by the server when qualifying ends.
 -- The HUD reads it from the per-frame snapshot to render the quali-results card during the pause; cleared
 -- on the next race start so a stale card never lingers.
@@ -1126,6 +1139,31 @@ end
 function M.request_championship()
     if guihooks then
         guihooks.trigger("BeamCompChampionship", M.state.championship or {active = false})
+    end
+end
+
+-- The setup panel's class-drop tournament control (ADR-0037/0042): the panel serialises {action, classes,
+-- order} and calls this; we decode and relay it as a tournamentCmd routed through the same admin-gated server
+-- handler the panel uses. Public as beamcomp_init.tournament_cmd. A bad payload is dropped.
+function M.tournament_cmd(json)
+    local ok, decoded = pcall(jsonDecode, json)
+    if not ok or type(decoded) ~= "table" or type(decoded.action) ~= "string" then
+        log("W", RACE_LOG_TAG, "tournament_cmd: bad payload")
+        return
+    end
+    send_to_server("tournamentCmd", {
+        action = decoded.action,
+        classes = decoded.classes,  -- ordered fast->slow specs: each {car="model[:config]"} or {maxhp=N}/{maxpwr=N}
+        order = decoded.order,
+    })
+end
+
+-- Re-push the last-known tournament state to the panel (UI -> GE, ADR-0042), mirroring request_championship
+-- so a freshly-added app that missed the open-time broadcast still fills. Public as
+-- beamcomp_init.request_tournament.
+function M.request_tournament()
+    if guihooks then
+        guihooks.trigger("BeamCompTournament", M.state.tournament or {active = false})
     end
 end
 
@@ -1584,6 +1622,7 @@ local HANDLERS = {
     racePhase = handle_race_phase,
     standings = handle_standings,
     championship = handle_championship,
+    tournament = handle_tournament,
     quali = handle_quali,
     listRaces = handle_list_races,
     listVehicles = handle_list_vehicles,
@@ -2891,6 +2930,9 @@ local function build_hud_snapshot()
         -- The multi-race championship table (ADR-0040), shown on the finished results card when active; nil
         -- or active=false hides it. Rides opaquely through to the app.
         championship = M.state.championship,
+        -- The class-drop tournament table (ADR-0042), shown on the finished results card when active; nil or
+        -- active=false hides it. Rides opaquely through to the app, like the championship.
+        tournament = M.state.tournament,
         -- Qualifying (ADR-0041): the live time-remaining clock (qualifying phase), the finish-your-lap
         -- timeout once the clock expires, the pause countdown to the race, and the classification snapshot
         -- for the quali-results card. nil outside a quali event; the app reads phase to pick the view.
@@ -2909,6 +2951,21 @@ local function build_hud_snapshot()
         -- qualiResultsRemaining (the freeze eats the lead's first seconds; the rest is the visible settle).
         qualiSettleActive = (phase == "qualiResults" and M.state.quali_settle) and true or false,
         quali = M.state.quali,
+    }
+end
+
+-- A minimal HUD snapshot for the between-races idle window (ADR-0042): just enough for the compact series
+-- info box to show which multi-race format is active and how far along, without running the full per-frame
+-- standings build. `idleInfo` gates the box so it never shows during the countdown/race/results (which push
+-- the full snapshot, where idleInfo is absent). The championship/tournament tables ride through as on the
+-- full snapshot; both persist across the lobby, so they are current here.
+local function build_idle_info_snapshot()
+    return {
+        active = true,
+        phase = M.state.phase or "lobby",
+        idleInfo = true,
+        championship = M.state.championship,
+        tournament = M.state.tournament,
     }
 end
 
@@ -3443,9 +3500,28 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- as well so the quali-results card clears when the pause ends -> race countdown (else the frozen
     -- qualiResults snapshot would linger until racing); all HUD cards are gated off countdown, so it stays
     -- blank behind the centered count.
-    if (M.state.phase == "racing" or M.state.phase == "finished" or M.state.phase == "qualifying"
-        or M.state.phase == "qualiResults" or M.state.phase == "countdown") and M.state.race then
+    local full_hud = (M.state.phase == "racing" or M.state.phase == "finished" or M.state.phase == "qualifying"
+        or M.state.phase == "qualiResults" or M.state.phase == "countdown") and M.state.race
+    local series_active = (M.state.tournament and M.state.tournament.active)
+        or (M.state.championship and M.state.championship.active)
+    if full_hud then
         hud.push(build_hud_snapshot())
+        M.state.idle_info_shown = false
+    elseif series_active and not M.state.race and (M.state.phase == nil or M.state.phase == "lobby") then
+        -- Between races with a championship/tournament active (ADR-0042): keep the HUD app up and push a light
+        -- snapshot so the compact series info box shows the running format + progress where the in-race time
+        -- block sits. The full HUD above takes over once a race is on; here free-roam stays otherwise untouched
+        -- (the push only fires while a series is active).
+        if not M.state.idle_info_shown then
+            hud.show()
+            M.state.idle_info_shown = true
+        end
+        hud.push(build_idle_info_snapshot())
+    elseif M.state.idle_info_shown then
+        -- The series ended/reset while idle: take the info box down and revert to the normal HUD.
+        hud.clear()
+        hud.hide()
+        M.state.idle_info_shown = false
     end
     -- Keep the HUD/countdown app surface alive while a race wants it on screen
     -- (ui-missing-for-some-clients-reload): the app heartbeats and this re-shows / reloads if it goes
