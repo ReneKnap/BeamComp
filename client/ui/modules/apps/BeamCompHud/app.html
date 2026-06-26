@@ -555,6 +555,19 @@
     .beamcomp-hud .bc-analysis-btn:hover {
       background: rgba(255, 255, 255, 0.22);
     }
+    /* Final standings actions: lay the card's two buttons (Analysis, Minimize) out in one centered row.
+       Scoped to this wrapper so the shared .bc-analysis-btn (used by single-button cards) keeps its
+       block/auto-margin layout everywhere else; here the row supplies the 8px top gap and the buttons'
+       own auto side-margins are zeroed so gap + justify-content control the horizontal spacing. */
+    .beamcomp-hud .bc-results-actions {
+      display: flex;
+      justify-content: center;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .beamcomp-hud .bc-results-actions .bc-analysis-btn {
+      margin: 0;
+    }
     /* Idle series info box (ADR-0042): the compact between-races readout in the top-right time-block slot. */
     .beamcomp-hud .bc-series-box {
       padding: 6px 10px;
@@ -789,8 +802,10 @@
         </tr>
       </table>
     </div>
-    <button type="button" class="bc-analysis-btn" ng-click="toggleResultsMin()">Minimize</button>
-    <button type="button" class="bc-analysis-btn" ng-if="hud.analysisAvailable" ng-click="toggleAnalysis()">&#9656; Analysis</button>
+    <div class="bc-results-actions">
+      <button type="button" class="bc-analysis-btn" ng-if="hud.analysisAvailable" ng-click="toggleAnalysis()">&#9656; Analysis</button>
+      <button type="button" class="bc-analysis-btn" ng-click="toggleResultsMin()">Minimize</button>
+    </div>
   </div>
   <!-- Minimized: a small bar that restores the final standings card, so the results are never fully lost
        (reuses the quali-results minimize pattern, ADR-0041). -->
