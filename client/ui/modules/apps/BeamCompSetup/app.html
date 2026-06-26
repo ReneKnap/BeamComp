@@ -128,9 +128,10 @@
       </label>
       <div class="bc-row">
         <span>Start order</span>
-        <!-- While a championship is active it sets the grid (ADR-0040), so the per-race picker is disabled
-             and the race request omits order= (see prepareRace) -- the server then applies the champ order. -->
-        <div class="bc-dd" ng-if="!championship.active">
+        <!-- While a championship (ADR-0040) or class-drop tournament (ADR-0042) is active it sets the grid,
+             so the per-race picker is disabled and the race request omits order= (see prepareRace) -- the
+             server then applies the active format's order. -->
+        <div class="bc-dd" ng-if="!championship.active && !tournament.active">
           <button type="button" class="bc-dd-head" ng-click="toggle('orderMode')">{{labelFor('orderMode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'orderMode'">
             <div class="bc-dd-opt" ng-repeat="o in opts.orderMode" ng-class="{sel: o.v === form.orderMode}"
@@ -138,10 +139,11 @@
           </div>
         </div>
         <span class="bc-champ-status bc-order-locked" ng-if="championship.active">by championship ({{championship.order}})</span>
+        <span class="bc-champ-status bc-order-locked" ng-if="!championship.active && tournament.active">by tournament (class handicap)</span>
       </div>
       <!-- Qualifying length (ADR-0041): only for order=quali; a short session sets the grid by best lap.
            A free minute value plus preset quick-buttons. -->
-      <div class="bc-row" ng-if="!championship.active && form.orderMode === 'quali'">
+      <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">
         <span>Qualifying length</span>
         <span class="bc-quali-len">
           <input type="number" min="1" max="30" ng-model="form.qualiMinutes"> min
@@ -150,7 +152,7 @@
         </span>
       </div>
       <label class="bc-row bc-check"
-             ng-if="!championship.active && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
+             ng-if="!championship.active && !tournament.active && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
         <input type="checkbox" ng-model="form.orderRev"><span>Reverse order (handicap)</span>
       </label>
       <div class="bc-row">
@@ -230,52 +232,130 @@
       </div>
     </div>
 
-    <!-- Championship (ADR-0040): a multi-race points series. Points accrue across races; the standings
-         drive the next race's grid (reversed by default = handicap). Mutations are admin-gated server-side. -->
+    <!-- Tournament (ADR-0042): one of two mutually-exclusive multi-race formats -- the points championship
+         (ADR-0040) or the class-drop handicap. The mode selector reflects the active format; mutations are
+         admin-gated server-side. -->
     <div class="bc-section">
-      <div class="bc-section-title">Championship</div>
-      <div class="bc-row" ng-if="championship.active">
-        <span>Status</span>
-        <span class="bc-champ-status">{{championship.preset}} · {{championship.order}} · {{championship.raceCount}} races</span>
-      </div>
-      <div class="bc-row" ng-if="!championship.active">
-        <span>Status</span>
-        <span class="bc-champ-status">none active</span>
-      </div>
+      <div class="bc-section-title">Tournament</div>
       <div class="bc-row">
-        <span>Points</span>
+        <span>Mode</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
-          <div class="bc-dd-list" ng-if="open === 'champPreset'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.champPreset" ng-class="{sel: o.v === form.champPreset}"
-              ng-click="pick('champPreset', o.v)">{{o.label}}</div>
+          <button type="button" class="bc-dd-head" ng-click="toggle('tourMode')">{{labelFor('tourMode')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'tourMode'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.tourMode" ng-class="{sel: o.v === form.tourMode}"
+              ng-click="pickTourMode(o.v)">{{o.label}}</div>
           </div>
         </div>
       </div>
-      <div class="bc-row">
-        <span>Grid order</span>
-        <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
-          <div class="bc-dd-list" ng-if="open === 'champOrder'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.champOrder" ng-class="{sel: o.v === form.champOrder}"
-              ng-click="pick('champOrder', o.v)">{{o.label}}</div>
+
+      <!-- Points championship (ADR-0040): points accrue across races; the standings drive the next grid. -->
+      <div ng-if="form.tourMode === 'championship'">
+        <div class="bc-row">
+          <span>Status</span>
+          <span class="bc-champ-status" ng-if="championship.active">{{championship.preset}} · {{championship.order}} · {{championship.raceCount}} races</span>
+          <span class="bc-champ-status" ng-if="!championship.active">none active</span>
+        </div>
+        <div class="bc-row">
+          <span>Points</span>
+          <div class="bc-dd">
+            <button type="button" class="bc-dd-head" ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
+            <div class="bc-dd-list" ng-if="open === 'champPreset'">
+              <div class="bc-dd-opt" ng-repeat="o in opts.champPreset" ng-class="{sel: o.v === form.champPreset}"
+                ng-click="pick('champPreset', o.v)">{{o.label}}</div>
+            </div>
           </div>
         </div>
+        <div class="bc-row">
+          <span>Grid order</span>
+          <div class="bc-dd">
+            <button type="button" class="bc-dd-head" ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
+            <div class="bc-dd-list" ng-if="open === 'champOrder'">
+              <div class="bc-dd-opt" ng-repeat="o in opts.champOrder" ng-class="{sel: o.v === form.champOrder}"
+                ng-click="pick('champOrder', o.v)">{{o.label}}</div>
+            </div>
+          </div>
+        </div>
+        <!-- Qualifying length for a championship whose grid is "quali" (ADR-0041). -->
+        <div class="bc-row" ng-if="form.champOrder === 'quali'">
+          <span>Qualifying length</span>
+          <span class="bc-quali-len">
+            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes"> min
+            <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
+              ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m">{{m}}</button>
+          </span>
+        </div>
+        <div class="bc-row bc-champ-actions">
+          <button class="bc-refresh" ng-if="!championship.active" ng-click="championshipStart()">Start</button>
+          <button class="bc-refresh" ng-if="championship.active" ng-click="championshipApply()">Apply</button>
+          <button class="bc-refresh bc-champ-reset" ng-if="championship.active" ng-click="championshipReset()">Reset</button>
+        </div>
       </div>
-      <!-- Qualifying length for a championship whose grid is "quali" (ADR-0041): each race runs a quali of
-           this length. Free minutes + preset quick-buttons, mirroring the per-race control. -->
-      <div class="bc-row" ng-if="form.champOrder === 'quali'">
-        <span>Qualifying length</span>
-        <span class="bc-quali-len">
-          <input type="number" min="1" max="30" ng-model="form.champQualiMinutes"> min
-          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
-            ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m">{{m}}</button>
-        </span>
-      </div>
-      <div class="bc-row bc-champ-actions">
-        <button class="bc-refresh" ng-if="!championship.active" ng-click="championshipStart()">Start</button>
-        <button class="bc-refresh" ng-if="championship.active" ng-click="championshipApply()">Apply</button>
-        <button class="bc-refresh bc-champ-reset" ng-if="championship.active" ng-click="championshipReset()">Reset</button>
+
+      <!-- Class-drop tournament (ADR-0042): an ordered fast->slow list of classes, each a fixed car or a power
+           cap. The winner of each race drops one class; the tournament ends when someone wins the slowest. -->
+      <div ng-if="form.tourMode === 'classdrop'">
+        <div class="bc-row">
+          <span>Status</span>
+          <span class="bc-champ-status" ng-if="tournament.active && !tournament.ended">{{tournament.classCount}} classes · race {{tournament.raceCount}}</span>
+          <span class="bc-champ-status" ng-if="tournament.active && tournament.ended">won by {{tournament.winner}}</span>
+          <span class="bc-champ-status" ng-if="!tournament.active">none active</span>
+        </div>
+        <div class="bc-tour-class" ng-repeat="cls in form.tourClasses">
+          <div class="bc-row bc-tour-class-head">
+            <span>Class {{$index + 1}}<span class="bc-champ-meta" ng-if="$index === 0"> (fastest)</span><span class="bc-champ-meta" ng-if="$index === form.tourClasses.length - 1 && form.tourClasses.length > 1"> (slowest)</span></span>
+            <span>
+              <button type="button" class="bc-preset" ng-class="{sel: cls.kind === 'car'}" ng-click="setClassKind($index, 'car')">Car</button>
+              <button type="button" class="bc-preset" ng-class="{sel: cls.kind === 'cap'}" ng-click="setClassKind($index, 'cap')">Cap</button>
+              <button type="button" class="bc-preset bc-champ-reset" ng-if="form.tourClasses.length > 2" ng-click="removeClass($index)" title="Remove this class">×</button>
+            </span>
+          </div>
+          <div class="bc-row" ng-if="cls.kind === 'car'">
+            <span>Car</span>
+            <div class="bc-dd">
+              <button type="button" class="bc-dd-head" ng-click="toggle('tourCar' + $index)">{{classCarLabel(cls)}}</button>
+              <div class="bc-dd-list" ng-if="open === 'tourCar' + $index">
+                <div class="bc-dd-opt" ng-repeat="o in opts.carModel" ng-class="{sel: o.v === cls.car}"
+                  ng-click="pickClassCar(cls, o.v)">{{o.label}}</div>
+              </div>
+            </div>
+          </div>
+          <div class="bc-row" ng-if="cls.kind === 'car'">
+            <span>Config</span>
+            <div class="bc-dd">
+              <button type="button" class="bc-dd-head" ng-click="toggle('tourCfg' + $index)">{{cls.config || 'stock'}}</button>
+              <div class="bc-dd-list" ng-if="open === 'tourCfg' + $index">
+                <div class="bc-dd-opt" ng-repeat="o in classConfigOpts(cls)" ng-class="{sel: o.v === cls.config}"
+                  ng-click="pickClassConfig(cls, o.v)">{{o.label}}</div>
+              </div>
+            </div>
+          </div>
+          <label class="bc-row" ng-if="cls.kind === 'cap'">
+            <span>Max hp</span>
+            <input type="number" min="0" ng-model="cls.maxhp" placeholder="off">
+          </label>
+          <label class="bc-row" ng-if="cls.kind === 'cap'">
+            <span>Max hp/kg</span>
+            <input type="number" min="0" step="0.001" ng-model="cls.maxpwr" placeholder="off">
+          </label>
+        </div>
+        <div class="bc-row">
+          <button class="bc-refresh" ng-if="form.tourClasses.length < 6" ng-click="addClass()">Add class</button>
+        </div>
+        <div class="bc-row">
+          <span>Grid order</span>
+          <div class="bc-dd">
+            <button type="button" class="bc-dd-head" ng-click="toggle('tourOrder')">{{labelFor('tourOrder')}}</button>
+            <div class="bc-dd-list" ng-if="open === 'tourOrder'">
+              <div class="bc-dd-opt" ng-repeat="o in opts.tourOrder" ng-class="{sel: o.v === form.tourOrder}"
+                ng-click="pick('tourOrder', o.v)">{{o.label}}</div>
+            </div>
+          </div>
+        </div>
+        <div class="bc-row bc-champ-actions">
+          <button class="bc-refresh" ng-if="!tournament.active" ng-click="tournamentStart()">Start</button>
+          <button class="bc-refresh" ng-if="tournament.active" ng-click="tournamentApply()">Apply</button>
+          <button class="bc-refresh bc-champ-reset" ng-if="tournament.active" ng-click="tournamentReset()">Reset</button>
+        </div>
       </div>
     </div>
 

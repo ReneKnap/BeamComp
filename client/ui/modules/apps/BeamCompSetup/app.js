@@ -23,11 +23,31 @@ angular.module('beamng.apps')
       { v: 'quadratic', label: 'quadratic (64-32-16…)' }],
     champOrder: [{ v: 'reversed', label: 'reversed (handicap)' }, { v: 'normal', label: 'normal' },
       { v: 'quali', label: 'qualifying' }],
+    // Tournament mode (ADR-0042): the two multi-race formats are mutually exclusive, picked here.
+    tourMode: [{ v: 'off', label: 'off' }, { v: 'championship', label: 'Points Championship' },
+      { v: 'classdrop', label: 'Class-Drop' }],
+    // Class-drop per-round grid order: the car class is the handicap, so it defaults to random (no quali).
+    tourOrder: [{ v: 'entry', label: 'entry' }, { v: 'random', label: 'random' },
+      { v: 'last', label: 'last result' }, { v: 'pwr', label: 'power/weight' }],
     aiPreset: [{ v: '', label: 'default' }, { v: 'easy', label: 'easy' }, { v: 'medium', label: 'medium' },
       { v: 'hard', label: 'hard' }],
     aiRoute: [{ v: '', label: 'default' }, { v: 'snap', label: 'snap (road)' },
       { v: 'direct', label: 'direct (exact)' }],
   };
+
+  // One class-drop class row in the panel (ADR-0042): either a fixed car (kind 'car' + model[:config]) or a
+  // power cap (kind 'cap' + maxhp/maxpwr). Defaults to a cap row -- a handicap tournament is most naturally
+  // built from descending power limits, and a cap needs no car lookup.
+  function defaultClass() {
+    return { kind: 'cap', car: '', config: '', maxhp: '', maxpwr: '' };
+  }
+  function defaultClasses(n) {
+    var list = [];
+    for (var i = 0; i < n; i++) {
+      list.push(defaultClass());
+    }
+    return list;
+  }
 
   // Curated panel defaults (ADR-0037): a fresh form opens at opinionated race settings -- random start
   // order, plus (once AI is toggled on) 4 hard AI on random stock cars that avoid each other. These differ
@@ -42,6 +62,7 @@ angular.module('beamng.apps')
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
+      tourMode: 'off', tourClasses: defaultClasses(4), tourOrder: 'random',
     };
   }
 
@@ -134,6 +155,8 @@ angular.module('beamng.apps')
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [] }, STATIC_OPTS);
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
+      scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
+      scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -187,6 +210,12 @@ angular.module('beamng.apps')
           if (scope.form.carModel) {
             geLuaArg('request_car_configs', scope.form.carModel);
           }
+          // Re-fetch configs for each restored class car so the per-class config dropdowns repopulate (ADR-0042).
+          (scope.form.tourClasses || []).forEach(function (c) {
+            if (c.car) {
+              geLuaArg('request_car_configs', c.car);
+            }
+          });
         });
       });
 
@@ -199,8 +228,13 @@ angular.module('beamng.apps')
 
       scope.$on('BeamCompSetupCars', function (event, payload) {
         scope.$evalAsync(function () {
-          // Only the configs for the currently selected model are relevant.
-          if (payload && payload.model === scope.form.carModel) {
+          if (!payload || !payload.model) {
+            return;
+          }
+          // Cache by model so each class row's config dropdown can resolve its own model (ADR-0042).
+          scope.configsByModel[payload.model] = payload.configs || [];
+          // The per-race vehicle-policy picker tracks the single selected model.
+          if (payload.model === scope.form.carModel) {
             scope.data.configs = payload.configs || [];
             rebuildConfigOpts();
           }
@@ -263,7 +297,9 @@ angular.module('beamng.apps')
           return;
         }
         var overrides = buildOverrides(scope.form);
-        if (scope.championship.active) {
+        // A championship (ADR-0040) or a class-drop tournament (ADR-0042) drives the grid order server-side,
+        // so omit the per-race order= and let the active format apply its own.
+        if (scope.championship.active || scope.tournament.active) {
           delete overrides.order;
         }
         var request = { race: scope.form.race, overrides: overrides };
@@ -289,6 +325,7 @@ angular.module('beamng.apps')
         scope.$evalAsync(function () {
           scope.championship = payload || { active: false };
           if (scope.championship.active) {
+            scope.form.tourMode = 'championship';  // reflect the active format in the mode selector (ADR-0042)
             scope.form.champPreset = scope.championship.preset || scope.form.champPreset;
             scope.form.champOrder = scope.championship.order || scope.form.champOrder;
             // champQualiMinutes is UI-owned and kept session-long -- do NOT overwrite it from the snapshot
@@ -314,12 +351,114 @@ angular.module('beamng.apps')
         geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
       };
 
+      // Class-drop tournament state (ADR-0042): GE pushes the table + classes on open and on every change.
+      // When a tournament is active, reflect it in the mode selector so the panel opens on the right section.
+      scope.$on('BeamCompTournament', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.tournament = payload || { active: false };
+          if (scope.tournament.active) {
+            scope.form.tourMode = 'classdrop';
+          }
+        });
+      });
+
+      // Class-list editing (ADR-0042): the admin builds an ordered fast->slow list, each row a fixed car or a
+      // power cap. Bounds mirror the server (2..6 classes; the server re-validates and ignores the rest).
+      scope.addClass = function () {
+        if (!scope.form.tourClasses) {
+          scope.form.tourClasses = [];
+        }
+        if (scope.form.tourClasses.length < 6) {
+          scope.form.tourClasses.push(defaultClass());
+        }
+      };
+      scope.removeClass = function (i) {
+        if (scope.form.tourClasses.length > 2) {
+          scope.form.tourClasses.splice(i, 1);
+        }
+      };
+      scope.setClassKind = function (i, kind) {
+        scope.form.tourClasses[i].kind = kind;
+      };
+      // Takes the class object (not an index): the car/config options are NESTED ng-repeats, so $index there
+      // is the option index, not the class row -- passing `cls` directly avoids the shadowing bug.
+      scope.pickClassCar = function (cls, model) {
+        cls.car = model;
+        cls.config = '';  // a new model invalidates the old config; fetch the new model's configs lazily
+        scope.open = null;
+        if (model) {
+          geLuaArg('request_car_configs', model);
+        }
+      };
+      scope.pickClassConfig = function (cls, config) {
+        cls.config = config;
+        scope.open = null;
+      };
+      // Config dropdown options for one class's selected car model, from the per-model cache (ADR-0042).
+      scope.classConfigOpts = function (cls) {
+        var list = (cls.car && scope.configsByModel[cls.car]) || [];
+        return [{ v: '', label: 'stock' }].concat(list.map(function (c) {
+          return { v: c.config, label: c.name };
+        }));
+      };
+      // Tournament mode selector (ADR-0042): picking "off" actually stops the active format (a real off
+      // switch), not just hides the section -- otherwise the next broadcast would flip the mode back.
+      scope.pickTourMode = function (mode) {
+        scope.form.tourMode = mode;
+        scope.open = null;
+        if (mode === 'off') {
+          if (scope.tournament.active) { scope.tournamentReset(); }
+          if (scope.championship.active) { scope.championshipReset(); }
+        }
+      };
+      scope.classCarLabel = function (cls) {
+        return cls.car || 'select car…';
+      };
+
+      // Serialise the class rows into the opaque server specs (ADR-0042): a fixed car becomes {car} (a config
+      // appended as model:config), a cap becomes {maxhp} or {maxpwr}. Empty rows pass through as {} -- the
+      // server buckets them as keep-own and re-validates the overall count.
+      function buildTourClasses(form) {
+        return (form.tourClasses || []).map(function (c) {
+          if (c.kind === 'cap') {
+            if (num(c.maxhp) !== undefined) {
+              return { maxhp: num(c.maxhp) };
+            }
+            if (num(c.maxpwr) !== undefined) {
+              return { maxpwr: num(c.maxpwr) };
+            }
+            return {};
+          }
+          if (c.car) {
+            return { car: c.config ? (c.car + ':' + c.config) : c.car };
+          }
+          return {};
+        });
+      }
+
+      // Tournament controls (ADR-0042): relay a structured command through GE -> server, routed through the
+      // same admin-gated handler. start begins one (ending any championship); set changes classes/order live;
+      // reset ends it + announces the winner.
+      function tournamentCmd(action) {
+        geLuaArg('tournament_cmd', JSON.stringify({
+          action: action,
+          classes: buildTourClasses(scope.form),
+          order: scope.form.tourOrder,
+        }));
+      }
+      scope.tournamentStart = function () { tournamentCmd('start'); };
+      scope.tournamentApply = function () { tournamentCmd('set'); };
+      scope.tournamentReset = function () {
+        geLuaArg('tournament_cmd', JSON.stringify({ action: 'reset' }));
+      };
+
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
       // asks GE for the lists itself (BeamCompSetupData arrives back via the $on above). Also pull the
       // remembered form (BeamCompSetupForm) so a reopen restores the last race's settings.
       scope.refresh();
       geCall('request_setup_form');
       geCall('request_championship');
+      geCall('request_tournament');
     },
   };
 }]);

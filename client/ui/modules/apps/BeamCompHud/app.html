@@ -435,6 +435,20 @@
       font-weight: bold;
       font-variant-numeric: tabular-nums;
     }
+    /* Class column on the class-drop tournament table (ADR-0042): the car/cap label can be long, so unlike
+       the points column it is not capped at 5em -- right-aligned and padded off the driver name so it does
+       not spill past the card's right edge. */
+    .beamcomp-hud .bc-tour-class-col {
+      text-align: right;
+      padding-left: 14px;
+      white-space: nowrap;
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-tour-class-col .bc-champ-meta {
+      font-weight: normal;
+      font-size: 12px;
+      opacity: 0.75;
+    }
     /* Post-race analysis overlay (ADR-0028): a wider centered fixed panel layered above the results
        card, toggled by /analysis or the card's Analysis button. Scrolls for wide segment matrices. */
     .beamcomp-hud .bc-analysis-card {
@@ -541,6 +555,19 @@
     .beamcomp-hud .bc-analysis-btn:hover {
       background: rgba(255, 255, 255, 0.22);
     }
+    /* Idle series info box (ADR-0042): the compact between-races readout in the top-right time-block slot. */
+    .beamcomp-hud .bc-series-box {
+      padding: 6px 10px;
+      margin-top: 6px;
+      min-width: 160px;
+    }
+    .beamcomp-hud .bc-series-title {
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-series-line {
+      opacity: 0.85;
+      font-size: 0.9em;
+    }
   </style>
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
@@ -585,6 +612,21 @@
           </tr>
         </table>
       </div>
+    </div>
+  </div>
+  <!-- Idle series info (ADR-0042): a compact box shown between races (lobby/free-roam) while a championship
+       or class-drop tournament is active, so the running format + progress stays visible where the in-race
+       time block sits. Only pushed in the idle window (hud.idleInfo); countdown/race/results show the full HUD. -->
+  <div class="bc-tr bc-series-idle" ng-if="hud.idleInfo">
+    <div class="bc-panel bc-series-box" ng-if="hud.tournament && hud.tournament.active">
+      <div class="bc-series-title">Class-Drop Tournament</div>
+      <div class="bc-series-line" ng-if="!hud.tournament.ended">{{hud.tournament.classCount}} classes &middot; race {{hud.tournament.raceCount}}</div>
+      <div class="bc-series-line" ng-if="hud.tournament.ended">Winner: {{hud.tournament.winner}}</div>
+    </div>
+    <div class="bc-panel bc-series-box" ng-if="hud.championship && hud.championship.active">
+      <div class="bc-series-title">Championship</div>
+      <div class="bc-series-line">{{hud.championship.preset}} &middot; race {{hud.championship.raceCount}}</div>
+      <div class="bc-series-line" ng-if="hud.championship.rows.length">Leader: {{hud.championship.rows[0].name}} ({{hud.championship.rows[0].points}} pts)</div>
     </div>
   </div>
   <!-- Qualifying (ADR-0041): the time-boxed session board -- a clock counting the window down and the live
@@ -722,6 +764,28 @@
           <td class="bc-champ-wins">{{c.wins}}</td>
           <td class="bc-champ-last">+{{c.lastGain}}</td>
           <td class="bc-champ-pts">{{c.points}}</td>
+        </tr>
+      </table>
+    </div>
+    <!-- Class-drop tournament table (ADR-0042): shown under the final standings while a tournament is active.
+         Each driver's current class is shown; the winner of each race drops a class until someone wins the
+         slowest class and takes the tournament. -->
+    <div ng-if="hud.tournament && hud.tournament.active" class="bc-champ-section">
+      <div class="bc-champ-title">Class-Drop Tournament
+        <span class="bc-champ-meta">({{hud.tournament.classCount}} classes, race {{hud.tournament.raceCount}})</span>
+      </div>
+      <div ng-if="hud.tournament.ended" class="bc-champ-title bc-p1">Winner: {{hud.tournament.winner}}</div>
+      <table class="bc-standings bc-champ">
+        <tr class="bc-results-head">
+          <td class="bc-pos"></td>
+          <td class="bc-name">Driver</td>
+          <td class="bc-tour-class-col">Class</td>
+        </tr>
+        <tr ng-repeat="c in hud.tournament.rows"
+            ng-class="{'bc-ai': c.ai, 'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
+          <td class="bc-pos">{{c.position}}</td>
+          <td class="bc-name">{{c.name}}</td>
+          <td class="bc-tour-class-col">{{c.class}}<span class="bc-champ-meta" ng-if="c.classLabel"> ({{c.classLabel}})</span></td>
         </tr>
       </table>
     </div>
