@@ -3538,11 +3538,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if full_hud then
         hud.push(build_hud_snapshot())
         M.state.idle_info_shown = false
-    elseif series_active and not M.state.race and (M.state.phase == nil or M.state.phase == "lobby") then
-        -- Between races with a championship/tournament active (ADR-0042): keep the HUD app up and push a light
-        -- snapshot so the compact series info box shows the running format + progress where the in-race time
-        -- block sits. The full HUD above takes over once a race is on; here free-roam stays otherwise untouched
-        -- (the push only fires while a series is active).
+    elseif series_active and (M.state.phase == "staging"
+            or (not M.state.race and (M.state.phase == nil or M.state.phase == "lobby"))) then
+        -- Show the compact series info box (ADR-0042) while a championship/tournament is active and the full
+        -- HUD time block is NOT up: between races (lobby/free-roam) AND during the staging prepare window, so
+        -- the running format + progress stays visible through the pre-race wait (the in-race time block slot).
+        -- The full HUD takes over from the countdown onward; free-roam stays otherwise untouched (the push
+        -- only fires while a series is active).
         if not M.state.idle_info_shown then
             hud.show()
             M.state.idle_info_shown = true

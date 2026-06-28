@@ -627,9 +627,10 @@
       </div>
     </div>
   </div>
-  <!-- Idle series info (ADR-0042): a compact box shown between races (lobby/free-roam) while a championship
-       or class-drop tournament is active, so the running format + progress stays visible where the in-race
-       time block sits. Only pushed in the idle window (hud.idleInfo); countdown/race/results show the full HUD. -->
+  <!-- Idle series info (ADR-0042): a compact box shown between races (lobby/free-roam) and during the staging
+       prepare window while a championship or class-drop tournament is active, so the running format + progress
+       stays visible where the in-race time block sits. Pushed whenever hud.idleInfo is set (idle + staging);
+       countdown/race/results show the full HUD instead. -->
   <div class="bc-tr bc-series-idle" ng-if="hud.idleInfo">
     <div class="bc-panel bc-series-box" ng-if="hud.tournament && hud.tournament.active">
       <div class="bc-series-title">Class-Drop Tournament</div>
