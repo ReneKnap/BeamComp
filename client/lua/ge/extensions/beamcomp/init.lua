@@ -2944,6 +2944,17 @@ local function build_hud_snapshot()
         analysis = build_analysis(entries, M.state.race_records, race)
     end
 
+    -- Keep the compact series info box (ADR-0042, the lobby/staging readout) up through the finished phase
+    -- too, so the running format + progress stays glanceable while everyone waits for the admin to prepare
+    -- the next race. The championship has no decider, so it shows in every finished while active; class-drop
+    -- shows only between races -- never in its *deciding* race (tournament.ended), where the champion banner
+    -- + the card's "Winner" line own the moment. The box reuses this snapshot's championship/tournament
+    -- tables (below); the app gates it on idleInfo, exactly as the build_idle_info_snapshot path does.
+    local show_series_box = phase == "finished" and (
+        (M.state.championship and M.state.championship.active)
+        or (M.state.tournament and M.state.tournament.active and not M.state.tournament.ended)
+    ) or false
+
     return {
         active = true,
         phase = phase,
@@ -2965,6 +2976,9 @@ local function build_hud_snapshot()
         -- The class-drop tournament table (ADR-0042), shown on the finished results card when active; nil or
         -- active=false hides it. Rides opaquely through to the app, like the championship.
         tournament = M.state.tournament,
+        -- Show the compact series info box in the finished phase too (see show_series_box above): the app
+        -- renders the box whenever idleInfo is set, so this lights it up alongside the results card.
+        idleInfo = show_series_box and true or nil,
         -- Qualifying (ADR-0041): the live time-remaining clock (qualifying phase), the finish-your-lap
         -- timeout once the clock expires, the pause countdown to the race, and the classification snapshot
         -- for the quali-results card. nil outside a quali event; the app reads phase to pick the view.
@@ -2988,8 +3002,10 @@ end
 
 -- A minimal HUD snapshot for the between-races idle window (ADR-0042): just enough for the compact series
 -- info box to show which multi-race format is active and how far along, without running the full per-frame
--- standings build. `idleInfo` gates the box so it never shows during the countdown/race/results (which push
--- the full snapshot, where idleInfo is absent). The championship/tournament tables ride through as on the
+-- standings build. `idleInfo` gates the box: it shows here (lobby/free-roam + staging) and through the
+-- finished phase -- the full snapshot sets idleInfo too while a series is active (except the class-drop
+-- deciding race; see show_series_box in build_hud_snapshot) -- but never during the countdown/race/quali,
+-- whose full snapshots leave idleInfo absent. The championship/tournament tables ride through as on the
 -- full snapshot; both persist across the lobby, so they are current here.
 local function build_idle_info_snapshot()
     return {
