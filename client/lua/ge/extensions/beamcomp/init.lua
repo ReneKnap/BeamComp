@@ -368,6 +368,11 @@ local function handle_race_start(payload)
         maxhp = payload.maxhp,
         maxpwr = payload.maxpwr,
     }
+    -- Capture the own-car id BEFORE respawn: a forced/fresh spawn (spawn_fixed / fresh_spawn_own)
+    -- despawns own_car inside respawn_own_at, so own_car:getId() afterwards would call a method on a
+    -- deleted handle and abort handle_race_start (no spawnReady, no AI -> the race cancels to lobby).
+    -- We only need the id below to detect a fresh spawn, so read it now while the car is still alive.
+    local own_car_id = own_car and own_car:getId() or nil
     local race_car, respawn_err, policy_abort = vehicles.respawn_own_at(race.myPose, own_car, policy)
     if policy_abort then
         -- Mode-3 abort: no installed car meets the cap (ADR-0032). Warn the player and bail BEFORE the
@@ -407,11 +412,14 @@ local function handle_race_start(payload)
         if not frozen then
             log("W", RACE_LOG_TAG, "could not freeze race car: " .. tostring(freeze_err))
         end
-        -- A fresh-spawn fallback (no own car -> default vehicle) lands center-anchored, since the spawn
-        -- path cannot front-anchor a car whose jbeam is still loading. Arm the same deferred re-stage a
-        -- staging swap uses (restage_swapped_car) so it gets front-anchored at the grid slot once its
-        -- bbox is ready -- identical placement to every other car.
-        if not own_car then
+        -- A freshly spawned race car lands center-anchored: the spawn path can't front-anchor
+        -- a car whose jbeam is still loading. Arm the deferred re-stage (restage_swapped_car) so
+        -- it front-anchors at the grid slot once its bbox loads -- identical placement to every
+        -- other car (and to the AI restage). This fires for ANY fresh spawn: a forced car
+        -- (Mode 2 / Class-Drop) or a Mode-3 substitute spawns fresh like the Mode-1 no-own-car
+        -- fallback. Detect it by id (own_car_id, captured before the respawn) -- a kept car
+        -- (keep_own / Mode-3 compliant) keeps the SAME id, a fresh spawn gets a new one.
+        if not own_car_id or race_car:getId() ~= own_car_id then
             M.state.restage_pending = true
             M.state.restage_baseline = nil
             M.state.restage_wait = RESTAGE_MAX_WAIT
@@ -3290,8 +3298,9 @@ end
 --      reliable trigger, since a replace keeps the SAME vehicle id, so an id comparison never fires
 --      (confirmed in-game: the swap produced no adoption). The replacement spawns unfrozen, would drive
 --      off in the countdown, and reloads its VE (losing the assist override + EV clamp).
---   2. A fresh-spawn default car (no own car at race start, default-vehicle-when-player-has-none):
---      handle_race_start arms restage_pending directly, since the spawn path lands it center-anchored.
+--   2. A freshly spawned race car -- no own car (default-vehicle-when-player-has-none), OR a forced
+--      car (Mode 2 / Class-Drop) or a Mode-3 substitute that spawns fresh: handle_race_start arms
+--      restage_pending directly, since the spawn path lands it center-anchored.
 -- Either way we re-place it at the grid slot, re-freeze it, and clear the VE-arm flags so onUpdate
 -- re-arms the VE.
 --
@@ -3344,7 +3353,13 @@ local function restage_swapped_car(dt_real)
     M.state.current_vehicle_id = own_id
     local pose = M.state.race and M.state.race.myPose
     if pose then
-        local placed, place_err = vehicles.respawn_own_at(pose, own)
+        -- place_at_grid, NOT respawn_own_at: respawn_own_at -> keep_own -> despawn_owned_except
+        -- deletes every OTHER owned vehicle, which on the host includes the AI cars (they are
+        -- host-owned) -- that wiped the whole AI field. place_at_grid does the same front-anchored
+        -- repair+teleport without any despawn (the exact path the AI restage uses, ai.lua).
+        -- There is no stray own car to clean here anyway: a fresh spawn already despawned at spawn
+        -- time, and a staging swap replaces in place.
+        local placed, place_err = vehicles.place_at_grid(own, pose)
         if not placed then
             log("W", RACE_LOG_TAG, "could not re-place staging car: " .. tostring(place_err))
         end
@@ -3430,6 +3445,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- Adopt a staging car swap as the new race car (re-freeze + bounce target + VE re-arm).
         restage_swapped_car(dtReal)
     elseif M.state.phase == "countdown" and M.state.race then
+        -- Finish a still-pending re-stage into the countdown too (no-op once placed): a forced/fresh
+        -- car whose jbeam loads slowly can miss its RESTAGE_MAX_WAIT inside a short staging phase.
+        -- Mirrors the AI restage, which also spans staging + countdown.
+        restage_swapped_car(dtReal)
         -- Tick the start countdown on the centered overlay (ADR-0021).
         step_start_countdown()
     elseif M.state.phase == "qualifying" and M.state.race then
