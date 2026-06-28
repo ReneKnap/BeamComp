@@ -99,6 +99,18 @@
       from { opacity: 0; transform: translate(-50%, -50%) scale(0.8); }
       to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
     }
+    /* Class-drop champion banner (ADR-0042): reuses the finish-banner overlay slot but gold, with smaller
+       type than the finish banner since the subtitle is a full sentence, not a short "P3". */
+    .beamcomp-root .bc-winner-banner .bc-fb-title {
+      font-size: 80px;
+      color: #ffcf33;
+    }
+    .beamcomp-root .bc-winner-banner .bc-fb-pos {
+      font-size: 38px;
+      color: #fff;
+      max-width: 80vw;
+      white-space: normal;
+    }
     /* The app frame is now just a logical container: the live regions and the results card are
        position:fixed children, so the frame itself carries no background or size. */
     .beamcomp-hud {
@@ -735,7 +747,7 @@
   </div>
   <!-- Finished: centered results card (hidden by /results, ADR-0022; replaced by the analysis overlay
        while that is open, ADR-0028) -->
-  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsMin && !hud.analysisOpen">
+  <div class="bc-results-card" ng-if="hud.phase === 'finished' && !hud.resultsMin && !winnerCardCollapsed && !hud.analysisOpen">
     <div class="bc-results-title">Final Standings</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
@@ -810,7 +822,7 @@
   </div>
   <!-- Minimized: a small bar that restores the final standings card, so the results are never fully lost
        (reuses the quali-results minimize pattern, ADR-0041). -->
-  <button type="button" class="bc-quali-restore" ng-if="hud.phase === 'finished' && hud.resultsMin && !hud.analysisOpen"
+  <button type="button" class="bc-quali-restore" ng-if="hud.phase === 'finished' && (hud.resultsMin || winnerCardCollapsed) && !hud.analysisOpen"
     ng-click="toggleResultsMin()">Final Standings &#9650;</button>
   <!-- Finished: full analysis overlay (opened by the card button or /analysis, ADR-0028) -->
   <div class="bc-analysis-card" ng-if="hud.phase === 'finished' && hud.analysisOpen && hud.analysis">
@@ -912,5 +924,12 @@
   <div class="bc-finish-banner" ng-show="finishBanner.active">
     <div class="bc-fb-title">FINISHED</div>
     <div class="bc-fb-pos">P{{finishBanner.position}}</div>
+  </div>
+  <!-- Class-drop champion banner (ADR-0042): fires once in the finished phase of the deciding race (app.js),
+       after the personal finish banner clears; holds ~5s then fades to the Final Standings. The winner sees a
+       personalized line, everyone else the winner's identity. -->
+  <div class="bc-finish-banner bc-winner-banner" ng-show="winnerBanner.active && hud.phase === 'finished'">
+    <div class="bc-fb-title">{{winnerBanner.local ? 'CHAMPION' : 'TOURNAMENT WINNER'}}</div>
+    <div class="bc-fb-pos">{{winnerBanner.local ? 'You won the class-drop tournament!' : winnerBanner.name}}</div>
   </div>
 </div>

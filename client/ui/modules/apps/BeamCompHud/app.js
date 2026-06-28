@@ -216,6 +216,11 @@ angular.module('beamng.apps')
       scope.hud = {active: false, entries: []};
       scope.countdown = {active: false};
       scope.finishBanner = {active: false, position: null};
+      scope.winnerBanner = {active: false, local: false, name: null};
+      // While the champion banner is owed/showing, the Final Standings card stays collapsed to its restore
+      // bar, then expands once the banner fades -- and it starts collapsed on the first finished frame so the
+      // full card never flashes behind the banner (no flicker).
+      scope.winnerCardCollapsed = false;
       scope.formatTime = formatTime;
       scope.formatDelta = formatDelta;
       scope.formatInterval = formatInterval;
@@ -250,6 +255,14 @@ angular.module('beamng.apps')
       var prevLocalFinished = null;
       var finishBannerTimer = null;
 
+      // Class-drop champion-banner state (ADR-0042): prevTournamentEnded mirrors the prevLocalFinished
+      // sentinel -- null means the ended flag has not been seen yet, so a reload mid-celebration does not
+      // re-fire. winnerBannerPending holds the resolved {local, name} while the personal finish banner is
+      // still up, so the champion banner waits its turn before showing.
+      var prevTournamentEnded = null;
+      var winnerBannerTimer = null;
+      var winnerBannerPending = null;
+
       function clearFlashTimers() {
         for (var id in flashTimers) {
           $timeout.cancel(flashTimers[id]);
@@ -271,6 +284,18 @@ angular.module('beamng.apps')
           finishBannerTimer = null;
         }
         scope.finishBanner.active = false;
+      }
+
+      // Hide the champion banner, cancel its self-hide timer, and drop any pending show. The once-only latch
+      // prevTournamentEnded is owned by trackTournamentWin and deliberately left untouched here.
+      function resetWinnerBanner() {
+        if (winnerBannerTimer) {
+          $timeout.cancel(winnerBannerTimer);
+          winnerBannerTimer = null;
+        }
+        winnerBannerPending = null;
+        scope.winnerBanner.active = false;
+        scope.winnerCardCollapsed = false;
       }
 
       // Compare each entry's rank to the last frame; a row that improved its position flashes for ~1 s.
@@ -302,6 +327,7 @@ angular.module('beamng.apps')
         $interval.cancel(heartbeat);
         clearFlashTimers();
         resetFinishBanner();
+        resetWinnerBanner();
       });
 
       // Announce the local player's own race finish: a one-shot "FINISHED" + reached position banner the
@@ -333,6 +359,59 @@ angular.module('beamng.apps')
           }, 3000);
         }
         prevLocalFinished = localFinished;
+      }
+
+      // Promote a queued champion banner once the personal finish banner has cleared, then hold it ~5 s.
+      // Called every finished-phase frame (the phase pushes per frame, GE init.lua), so a banner queued while
+      // "FINISHED" is still up appears the moment that fades.
+      function promoteWinnerBannerIfReady() {
+        if (!winnerBannerPending || scope.finishBanner.active) {
+          return;
+        }
+        scope.winnerBanner = {active: true, local: winnerBannerPending.local, name: winnerBannerPending.name};
+        winnerBannerPending = null;
+        if (winnerBannerTimer) {
+          $timeout.cancel(winnerBannerTimer);
+        }
+        winnerBannerTimer = $timeout(function () {
+          scope.winnerBanner.active = false;
+          winnerBannerTimer = null;
+        }, 5000);
+      }
+
+      // Announce the class-drop tournament champion (ADR-0042): a big centered banner shown once, in the
+      // finished phase of the race that decides the tournament (the ended false->true transition). The winner
+      // sees a personalized line, everyone else the winner's identity. Reuses the personal finish banner's
+      // slot and waits for it to clear, then auto-fades. The null sentinel makes a reload mid-celebration
+      // inert; it re-arms only after the tournament is reset (no ended snapshot is loaded).
+      function trackTournamentWin() {
+        var t = scope.hud.tournament;
+        var ended = !!(t && t.active && t.ended);
+        if (!ended) {
+          prevTournamentEnded = false;
+          resetWinnerBanner();
+          return;
+        }
+        if (prevTournamentEnded === null) {
+          prevTournamentEnded = true;
+          return;
+        }
+        if (!prevTournamentEnded) {
+          // ended just flipped true -> the deciding race. Queue the banner now, resolving the personalized
+          // line from the deciding-race standings. Display is phase-gated at promote time, so this stays
+          // correct even when the ended snapshot and the finished-phase change land on different frames
+          // (they are separate server messages -- tournament broadcast then racePhase).
+          prevTournamentEnded = true;
+          var localWin = !!(scope.hud.localEntry && scope.hud.localEntry.name === t.winner);
+          winnerBannerPending = {local: localWin, name: t.winner};
+        }
+        // Show only in the finished results window, once the personal finish banner has cleared. Outside it
+        // the template's phase gate keeps the banner hidden and the self-hide timer clears the state.
+        if (scope.hud.phase === 'finished') {
+          promoteWinnerBannerIfReady();
+          // Collapse the Final Standings while the banner is owed or up, expand it once the banner is gone.
+          scope.winnerCardCollapsed = !!(winnerBannerPending || scope.winnerBanner.active);
+        }
       }
 
       // Open/close the post-race analysis overlay via the GE flag (single source of truth, ADR-0028):
@@ -430,6 +509,7 @@ angular.module('beamng.apps')
             scope.qualiResultsMin = false;
           }
           trackLocalFinish();
+          trackTournamentWin();
           // Provisional results card: a finished/DNF'd player viewing standings while the race runs. While
           // it is up the live corner regions hide (template), so this one flag drives both ng-ifs. The
           // finish banner holds it back until it fades, so a finisher first sees "FINISHED", then the card.
