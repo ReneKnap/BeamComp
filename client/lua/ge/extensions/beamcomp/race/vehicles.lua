@@ -308,6 +308,53 @@ function M.place_at_grid(veh, pose)
     return true
 end
 
+-- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
+-- plate BEFORE a forced/substitute spawn despawns their car, then re-apply it to the new car once its
+-- jbeam has loaded (M.apply_plate). pcall-guarded -- core_vehicles.getVehicleLicenseText is unverified
+-- under BeamMP (the same read collect_player_name uses in init.lua). Returns a non-empty string, or nil
+-- when there is no vehicle, no plate set, or the read fails (nil -> keep the generated plate).
+function M.read_plate(veh)
+    if not veh then
+        return nil
+    end
+    local ok, plate = pcall(function()
+        if type(core_vehicles) == "table"
+                and type(core_vehicles.getVehicleLicenseText) == "function" then
+            return core_vehicles.getVehicleLicenseText(veh)
+        end
+        return nil
+    end)
+    if ok and type(plate) == "string" and plate ~= "" then
+        return plate
+    end
+    return nil
+end
+
+-- (public) Render a license-plate text onto an already-spawned vehicle via BeamNG's setPlateText. This
+-- is the ONLY reliable way to set a forced car's plate: spawnNewVehicle ignores a spawn-time licenseText
+-- (BeamNG's own techCore notes "licenseText not respected in spawnNewVehicle"), and the jbeam's
+-- licenseplate init (licenseplatesSkins.lua) regenerates the plate from config.licenseName -- absent on a
+-- forced spawn, so it generates a fresh random one. The jbeam init runs AFTER the GE spawn, so the plate
+-- must be applied on the deferred restage (once the jbeam has loaded) or the regeneration overrides it.
+-- No-op for an empty/nil plate (keeps the generated one). pcall-guarded (setPlateText is unverified under
+-- BeamMP). Returns true, or nil plus a reason.
+function M.apply_plate(veh, plate)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(plate) ~= "string" or plate == "" then
+        return nil, "no plate to apply"
+    end
+    if type(core_vehicles) ~= "table" or type(core_vehicles.setPlateText) ~= "function" then
+        return nil, "setPlateText unavailable"
+    end
+    local ok, err = pcall(core_vehicles.setPlateText, plate, veh:getId())
+    if not ok then
+        return nil, "setPlateText failed: " .. tostring(err)
+    end
+    return true
+end
+
 -- Split a car= token "model" or "model:config" into (model, config); config is nil when absent. Returns
 -- nil when there is no model part. Shared by the Mode-2 fixed car and the Mode-3 substitute (ADR-0032).
 local function parse_car_token(token)

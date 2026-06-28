@@ -156,6 +156,7 @@ M.state = {
     restage_pending = false,  -- a staging car (swap or fresh-spawn default) awaits re-placement at the grid slot once its bbox is ready
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
+    restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
     ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
     ai_policy = nil,          -- host only: the vehicle policy used for the AI car chain (ADR-0032), kept so a quali re-grid can re-spawn fresh AI (ADR-0041), or nil
@@ -313,6 +314,7 @@ local function handle_race_start(payload)
     -- (the abort-restart path skips the lobby reset, ADR-0017 amendment).
     M.state.freeze_hold_armed = false
     M.state.restage_pending = false
+    M.state.restage_plate = nil
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
 
@@ -373,6 +375,11 @@ local function handle_race_start(payload)
     -- deleted handle and abort handle_race_start (no spawnReady, no AI -> the race cancels to lobby).
     -- We only need the id below to detect a fresh spawn, so read it now while the car is still alive.
     local own_car_id = own_car and own_car:getId() or nil
+    -- Read the player's plate now, before respawn_own_at despawns own_car. A forced/substitute spawn
+    -- (Mode 2 / Class-Drop / Mode-3) comes up with a GENERATED plate -- spawnNewVehicle ignores a
+    -- spawn-time licenseText and the jbeam regenerates it -- so we re-apply this plate on the deferred
+    -- restage once the new car's jbeam has loaded (vehicles.apply_plate in restage_swapped_car).
+    local own_plate = vehicles.read_plate(own_car)
     local race_car, respawn_err, policy_abort = vehicles.respawn_own_at(race.myPose, own_car, policy)
     if policy_abort then
         -- Mode-3 abort: no installed car meets the cap (ADR-0032). Warn the player and bail BEFORE the
@@ -423,6 +430,10 @@ local function handle_race_start(payload)
             M.state.restage_pending = true
             M.state.restage_baseline = nil
             M.state.restage_wait = RESTAGE_MAX_WAIT
+            -- The fresh car came up with a generated plate; re-apply the player's own plate on the
+            -- restage, once its jbeam has loaded. Only this fresh-spawn path carries a plate -- a staging
+            -- swap (lock.consume_replace) is the player's own pick and keeps the plate it spawned with.
+            M.state.restage_plate = own_plate
         end
         log("I", RACE_LOG_TAG, string.format("placed at grid slot %d", race.mySlot))
     else
@@ -579,6 +590,7 @@ local function teardown_race_world()
     M.state.assist_notice = nil
     M.state.freeze_hold_armed = false
     M.state.restage_pending = false
+    M.state.restage_plate = nil
     -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
 end
@@ -3367,6 +3379,19 @@ local function restage_swapped_car(dt_real)
     vehicles.set_vehicle_frozen(own, true)
     M.state.assist_armed = false
     M.state.freeze_hold_armed = false
+    -- The new car's jbeam is loaded now (the restage waited for it), so its licenseplate init has
+    -- already run -- apply the player's captured plate here, where it sticks instead of being
+    -- regenerated. Only a forced/fresh spawn set restage_plate; a staging swap leaves it nil and keeps
+    -- its own plate. The plate is the canonical identity (ADR-0031), so re-report it once corrected.
+    if M.state.restage_plate then
+        local applied, plate_err = vehicles.apply_plate(own, M.state.restage_plate)
+        if not applied then
+            log("W", RACE_LOG_TAG, "could not apply plate to restaged car: " .. tostring(plate_err))
+        else
+            report_identity(own)
+        end
+        M.state.restage_plate = nil
+    end
     M.state.restage_pending = false
     log("I", RACE_LOG_TAG, "re-placed staging car at grid slot as race car " .. tostring(own_id))
 end
