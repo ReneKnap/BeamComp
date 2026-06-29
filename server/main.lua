@@ -71,7 +71,25 @@
 -- All commands suppress their own chat echo. Anything else relays as normal chat.
 -- The server never validates <name> (ADR-0005).
 
-local M = {}
+-- F1 light-start namespace (ADR-0043). This reuses what used to be the vestigial module-export table
+-- `M`: BeamMP registers handlers via global functions and ignores the chunk return, so `M` was never
+-- populated or read. Renaming it to `f1` lets every new F1 start-mode symbol hang off one namespace --
+-- like champ/quali/tour -- WITHOUT adding a top-level local (main.lua is at the 200/200 local ceiling).
+-- All per-race F1 state lives on session/overrides/progress; only constants + pure helpers live here.
+local f1 = {}
+f1.LIGHT_COUNT = 5            -- red lights in the start tower
+f1.LIGHT_STEP = 1.0          -- seconds between each light coming on (the build-up)
+f1.HOLD_MIN = 0.2            -- shortest random all-lit hold before lights out
+f1.HOLD_MAX = 3.0            -- longest random all-lit hold
+f1.DEFAULT_PENALTY = 15      -- default jump-start time penalty in seconds (panel-configurable)
+f1.MSG_REACTION = "reaction" -- client -> server: a car's start reaction ({race, aiId?, reaction}); jump = reaction < 0
+
+-- Roll one F1 standing start's full countdown duration (seconds): the fixed light build-up plus a random
+-- all-lit hold. math.random is seeded in on_init. Lights-out is the countdown -> racing transition, which
+-- the server broadcasts once, so every client sees the same lights-out moment.
+function f1.countdown_duration()
+    return f1.LIGHT_COUNT * f1.LIGHT_STEP + f1.HOLD_MIN + math.random() * (f1.HOLD_MAX - f1.HOLD_MIN)
+end
 
 local PLUGIN_VERSION = "0.1.0"
 local CHAT_COMMAND_RACE = "/race"
@@ -214,6 +232,8 @@ local session = {
     spawn_ready_count = 0,    -- how many distinct clients acked spawnReady this race (0 at timeout = empty race)
     identities = nil,         -- per-player {vehicle, pwr} reported via clientInfo, for records (ADR-0027) + start-order (ADR-0033); name moved to client_names (ADR-0031)
     order = nil,              -- this race's start-order {mode, rev} (ADR-0033), or nil = entry order
+    start_mode = nil,         -- this race's start style: "f1" = light start (ADR-0043), or nil = lock countdown
+    jump_penalty_seconds = nil, -- F1 jump-start time penalty in seconds for this race (ADR-0043)
     last_order = nil,         -- previous race's finishing order as a list of identities (ADR-0033); session-scoped, survives reset_to_lobby so order=last has a source
     championship = nil,       -- active multi-race championship {points_preset, order, standings, race_count} or nil (ADR-0040); session-scoped, survives reset_to_lobby like last_order
     tournament = nil,         -- active class-drop tournament {classes, order, standings, race_count, winner, ended} or nil (ADR-0042); session-scoped, survives reset_to_lobby like championship
@@ -686,6 +706,18 @@ local function enter_phase(phase, duration, extra)
     broadcast_event(MSG_RACE_PHASE, payload)
 end
 
+-- Enter the standing-race start countdown (ADR-0043). With the F1 light start active (and `allow_lights`,
+-- i.e. this countdown leads to racing, not a quali out-lap), use a longer, randomly-held countdown flagged
+-- `lights` so clients render the light tower and free the car; lights-out is the unchanged countdown ->
+-- racing transition the tick already fires. Otherwise the plain fixed countdown (the default lock start).
+function f1.enter_countdown(allow_lights)
+    if allow_lights and session.start_mode == "f1" then
+        enter_phase(PHASE.countdown, f1.countdown_duration(), {lights = true})
+    else
+        enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+    end
+end
+
 -- Shuffle an array in place (Fisher-Yates) using math.random (seeded in on_init). Used by the random
 -- start order and the no-source fallback for last (ADR-0033).
 local function shuffle(items)
@@ -916,7 +948,7 @@ end
 -- active racers rank above DNFs, finished players lead by finish time, and DNFs rank by how far they
 -- got. Each entry carries a 1-based position; `count` falls back to a shared known_count so entries
 -- agree once any report has set it (nil at race-start baseline).
-local function build_standings()
+local function build_standings(final)
     if not session.progress then
         return {}
     end
@@ -938,8 +970,14 @@ local function build_standings()
         if a.completed ~= b.completed then
             return a.completed > b.completed
         end
-        if a.total_time ~= b.total_time then
-            return a.total_time < b.total_time
+        -- The F1 jump-start penalty (ADR-0043) only moves the order in the FINAL standings (`final`): live,
+        -- a jumper keeps its on-track position and just carries the "+Ns" tag (the penalty is pending); at
+        -- the finish the effective time = raw + penalty applies, demoting the jumper -- and so its
+        -- championship/tournament points, which rank off this final order. Records keep the raw time.
+        local a_time = (a.total_time or 0) + (final and (a.jump_penalty or 0) or 0)
+        local b_time = (b.total_time or 0) + (final and (b.jump_penalty or 0) or 0)
+        if a_time ~= b_time then
+            return a_time < b_time
         end
         return a.slot < b.slot
     end)
@@ -957,6 +995,12 @@ local function build_standings()
             completed = record.completed,
             count = record.count or known_count,
             total_time = record.total_time,
+            -- F1 jump-start penalty in seconds applied to this car's result (ADR-0043), or nil. The HUD
+            -- tags the row "+Ns"; the sort above already ranks by the penalized effective time.
+            jump_penalty = record.jump_penalty,
+            -- F1 start reaction in seconds (ADR-0043): time from lights-out to first movement; negative =
+            -- jumped. nil for a non-F1 race / before the car has moved. Shown in the HUD React column.
+            reaction = record.reaction,
             finished = record.finished,
             dnf = record.dnf,
             lap = record.lap,
@@ -980,8 +1024,11 @@ end
 
 -- Broadcast the standings to every client as a `standings` envelope (ADR-0004). Fired at the
 -- racing-phase baseline and after every accepted checkpoint report.
-local function broadcast_standings()
-    broadcast_event(MSG_STANDINGS, {entries = build_standings()})
+-- Broadcast the standings. `final` applies the F1 jump penalty to the order (ADR-0043) -- passed true only
+-- for the finalize broadcast so the finished card shows the demotion; the live in-race broadcasts pass
+-- false (default), so a jumper keeps its on-track position live and just carries the "+Ns" tag.
+local function broadcast_standings(final)
+    broadcast_event(MSG_STANDINGS, {entries = build_standings(final)})
 end
 
 -- Capture the just-finished race's order as a list of identities (ADR-0033), in build_standings rank
@@ -990,7 +1037,9 @@ end
 -- what build_slots resolves (resolve_identity), so order=last maps players back to their finishing place.
 local function capture_finishing_order()
     local order = {}
-    for _, entry in ipairs(build_standings()) do
+    -- Final order (ADR-0043): the jump penalty counts, so order=last grids the next race by the penalized
+    -- result.
+    for _, entry in ipairs(build_standings(true)) do
         if entry.name then
             order[#order + 1] = entry.name
         end
@@ -1171,7 +1220,7 @@ function champ.award()
         return
     end
     local state = session.championship
-    local standings = build_standings()
+    local standings = build_standings(true)  -- final order: the jump penalty counts toward points (ADR-0043)
     local starters = #standings  -- the whole field that lined up (finishers + DNFs); linear scores off this
     -- Everyone starts this race's gain at 0; a non-participant (in the table but not this race) keeps 0, so
     -- the "last race" column reads true for the whole table.
@@ -1480,7 +1529,8 @@ function quali.advance_results()
     if session.quali then
         session.quali.done = true
     end
-    enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+    -- This second countdown always leads to racing (ADR-0041), so the F1 light start applies here (ADR-0043).
+    f1.enter_countdown(true)
 end
 
 
@@ -1702,7 +1752,7 @@ function tour.award()
         return
     end
     local state = session.tournament
-    local standings = build_standings()
+    local standings = build_standings(true)  -- final order: the jump penalty counts toward the rank (ADR-0043)
     for _, entry in ipairs(standings) do
         local identity = entry.name
         if identity then
@@ -1915,7 +1965,9 @@ end
 -- The single seam both the staging timeout and the manual /go route through.
 local function enter_countdown_from_staging()
     regrid_by_pwr()
-    enter_phase(PHASE.countdown, PHASE_DURATIONS.countdown)
+    -- The F1 light start applies only when this countdown leads to racing; for an order=quali event the
+    -- first countdown leads to the qualifying out-lap, which keeps the plain countdown (ADR-0043/0041).
+    f1.enter_countdown(not quali.is_pending())
 end
 
 -- Clear the session and announce the lobby phase. If a race was active, tell players the world is
@@ -1995,6 +2047,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- random since the car class is the handicap. champ/tour are mutually exclusive, so at most one applies.
     local effective_order = overrides.order or champ.active_order() or tour.active_order()
     session.order = effective_order
+    -- F1 light start for this race (ADR-0043), relayed opaquely (race-blind). nil = the default lock
+    -- countdown. The penalty seconds default when the option is on but no value was given.
+    session.start_mode = overrides.startMode
+    session.jump_penalty_seconds = overrides.jumpPenaltySeconds or f1.DEFAULT_PENALTY
     -- order=quali makes this a two-phase event (ADR-0041): begin the qualifying session state now; the
     -- provisional grid below is random, and quali.regrid sets the real race grid by pace after qualifying.
     -- Length precedence: an explicit per-race quali= wins; else a championship driving the quali grid
@@ -2100,6 +2156,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 direction = overrides.direction,  -- nil = forward; "reverse" if reversible (ADR-0018)
                 force = overrides.force,          -- override a geometry mismatch where possible (ADR-0018)
                 all = overrides.all,              -- opt the deprecated quickrace source into resolution (ADR-0026)
+                -- F1 light start (ADR-0043): "f1" = lights + free car + jump-start penalty; nil = the default
+                -- lock countdown. The penalty seconds ride along so the offender's client can label its banner.
+                startMode = session.start_mode,
+                jumpPenaltySeconds = session.start_mode and session.jump_penalty_seconds or nil,
                 -- Opt-in recover/repair assists (ADR-0017); clients enforce. Disabled by default.
                 recoverEnabled = assists.recoverEnabled,
                 recoverHoldSeconds = assists.recoverHoldSeconds,
@@ -2734,6 +2794,10 @@ local function finalize_race(reason)
     if tour.is_active() then
         tour.broadcast()
     end
+    -- Re-broadcast the standings with the F1 jump penalty now applied (ADR-0043): the live in-race
+    -- broadcasts left a jumper in its on-track position with just the tag, so the finished card needs this
+    -- final, penalized order. Sent before the finished phase message; the card reads this snapshot.
+    broadcast_standings(true)
     enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
 end
 
@@ -2845,7 +2909,7 @@ end
 -- three-way ambiguous (rec/rep/rev). There is deliberately no "forward" keyword -- forward is the
 -- default direction and is never typed, which keeps "f" unambiguously force. RACE_MODES and
 -- ASSIST_KEYWORDS classify a resolved keyword; only assist keywords accept a ":secs" suffix (ADR-0018).
-local RACE_KEYWORDS = {"sprint", "circuit", "reverse", "recover", "repair", "force"}
+local RACE_KEYWORDS = {"sprint", "circuit", "reverse", "recover", "repair", "force", "lights"}
 local RACE_MODES = {sprint = true, circuit = true}
 local ASSIST_KEYWORDS = {recover = true, repair = true}
 
@@ -2903,6 +2967,8 @@ local function parse_option_token(token)
         return "direction", "reverse"
     elseif keyword == "force" then
         return "force", true
+    elseif keyword == "lights" then
+        return "lights", true  -- F1 light start (ADR-0043); penalty seconds set by jumppenalty=
     end
     local assist = parse_assist_suffix(suffix)
     if not assist then
@@ -3051,6 +3117,10 @@ local function parse_race_args(argument)
             overrides.direction = value
         elseif kind == "force" then
             overrides.force = true
+        elseif kind == "lights" then
+            -- F1 light start for this race (ADR-0043): an optional start style relayed verbatim like the
+            -- other options (race-blind, ADR-0005). Default off = the lock countdown.
+            overrides.startMode = "f1"
         elseif kind == "assist" then
             local assists = overrides.assists
             if value.keyword == "recover" then
@@ -3106,6 +3176,13 @@ local function parse_race_args(argument)
             if minutes then
                 overrides.quali_duration = quali.clamp(minutes * 60)
             elseif not bad_token then
+                bad_token = token
+            end
+        elseif token:match("^[Jj][Uu][Mm][Pp][Pp][Ee][Nn][Aa][Ll][Tt][Yy]=.+$") then
+            -- jumppenalty=<secs> sets the F1 jump-start time penalty (ADR-0043); only meaningful with
+            -- `lights`. Stored as a number; a non-numeric value falls to bad_token.
+            overrides.jumpPenaltySeconds = tonumber(token:match("^[Jj][Uu][Mm][Pp][Pp][Ee][Nn][Aa][Ll][Tt][Yy]=(.+)$"))
+            if not overrides.jumpPenaltySeconds and not bad_token then
                 bad_token = token
             end
         else
@@ -3728,6 +3805,46 @@ local function on_chat_message(player_id, player_name, message)
     -- not a BeamComp command: return nothing so the message relays normally
 end
 
+-- Record an F1 start-reaction report into the car's progress (ADR-0043): reaction = first-movement time -
+-- lights-out time (negative = jumped before lights out, positive = launch reaction). A client reports its
+-- own car; the race owner proxies an AI by aiId -- accepted only from the owner for a known AI slot, like
+-- the checkpoint proxy below. Race-blind (ADR-0005): the client/owner measure it (only they read
+-- positions), the server stores it for the standings React column and, when it is negative (a jump),
+-- applies the configured time penalty once. build_standings folds the penalty into the final effective
+-- time (so it also moves championship/tournament points); the offender's own client shows its JUMP-START
+-- banner locally and this broadcasts the chat line for everyone.
+function f1.handle_reaction(player_id, payload)
+    if session.start_mode ~= "f1" or session.phase ~= PHASE.racing then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+
+    local subject_id = player_id
+    if payload.aiId ~= nil then
+        if player_id ~= session.owner_id or not is_ai_id(payload.aiId) then
+            log_info("beamcomp.race", "reaction from id " .. tostring(player_id)
+                .. " ignored: not the owner or bad aiId " .. tostring(payload.aiId))
+            return
+        end
+        subject_id = payload.aiId
+    end
+
+    local record = session.progress and session.progress[subject_id]
+    if not record or record.dnf or record.reaction ~= nil then
+        return  -- no record, terminal (DNF), or already reported -- the reaction is once per race per car
+    end
+
+    record.reaction = tonumber(payload.reaction)
+    if record.reaction and record.reaction < 0 then
+        record.jump_penalty = session.jump_penalty_seconds or f1.DEFAULT_PENALTY
+        local name = resolve_identity(subject_id) or record.name or "A driver"
+        broadcast_chat(string.format("%s jumped the start -- +%gs penalty", name, record.jump_penalty))
+    end
+    broadcast_standings()
+end
+
 -- Record one client checkpoint report into the reporting player's progress (ADR-0011 path).
 -- Advances the completed count, appends the cumulative split time, updates the running total, tracks
 -- the current lap, and arms the finish grace (the ADR-0006 racing -> finished seam) on the final
@@ -4084,6 +4201,8 @@ local function sanitize_overrides(raw)
         maxhp = tonumber(raw.maxhp),
         maxpwr = tonumber(raw.maxpwr),
         grid = (type(raw.grid) == "string" and raw.grid ~= "") and raw.grid or nil,
+        -- F1 light start (ADR-0043): only "f1" survives; nil = the default lock countdown.
+        startMode = (raw.startMode == "f1") and "f1" or nil,
     }
 
     -- Assists default both ON at the default hold (parse_race_args parity); the UI may turn either off or
@@ -4105,6 +4224,12 @@ local function sanitize_overrides(raw)
     local quali_minutes = tonumber(raw.qualiMinutes)
     if quali_minutes then
         overrides.quali_duration = quali.clamp(quali_minutes * 60)
+    end
+
+    -- F1 jump-start penalty (ADR-0043): a UI-supplied seconds value, floored at 0; nil lets start_race default it.
+    local jump_penalty = tonumber(raw.jumpPenaltySeconds)
+    if jump_penalty then
+        overrides.jumpPenaltySeconds = math.max(0, jump_penalty)
     end
 
     -- AI opponents (ADR-0036): present only when a count is given. Count clamped to [1, MAX_AI]; preset
@@ -4306,6 +4431,8 @@ local function handle_client_event(player_id, data)
         champ.handle_cmd(player_id, decoded.payload)
     elseif decoded.type == tour.MSG_CMD then
         tour.handle_cmd(player_id, decoded.payload)
+    elseif decoded.type == f1.MSG_REACTION then
+        f1.handle_reaction(player_id, decoded.payload)
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
@@ -4359,4 +4486,4 @@ MP.RegisterEvent("onPlayerDisconnect", "beamcomp_on_disconnect")
 MP.RegisterEvent(TICK_EVENT, "beamcomp_on_tick")
 MP.RegisterEvent(EVENT_CHANNEL, "beamcomp_on_client_event")
 
-return M
+return f1

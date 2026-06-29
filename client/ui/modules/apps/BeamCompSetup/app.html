@@ -183,6 +183,17 @@
       </label>
     </div>
 
+    <!-- Start (ADR-0043): optional F1 light start instead of the lock countdown; a jump start costs a
+         configurable time penalty. Off = the default lock countdown. -->
+    <div class="bc-section">
+      <div class="bc-section-title">Start</div>
+      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.f1Start"><span>F1 light start</span></label>
+      <label class="bc-row" ng-if="form.f1Start">
+        <span>Jump-start penalty (s)</span>
+        <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="15">
+      </label>
+    </div>
+
     <!-- KI -->
     <div class="bc-section">
       <div class="bc-section-title">KI</div>

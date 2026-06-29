@@ -297,6 +297,9 @@ local function handle_race_start(payload)
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
+    -- Drop any F1 light-start state (ADR-0043) so a prior race's latched jump can never leak into this one.
+    M.state.f1 = nil
+    M.state.ai_release = nil
     -- Drop any quali state from a prior event (ADR-0041) so a stale clock/results card never carries over.
     M.state.qualifying = nil
     M.state.qualiResults = nil
@@ -575,6 +578,9 @@ local function teardown_race_world()
     M.state.grace = nil
     M.state.staging = nil
     M.state.countdown = nil
+    -- Drop any F1 light-start state (ADR-0043) so a prior race's latched jump can never leak into this one.
+    M.state.f1 = nil
+    M.state.ai_release = nil
     -- Drop any quali state from a prior event (ADR-0041) so a stale clock/results card never carries over.
     M.state.qualifying = nil
     M.state.qualiResults = nil
@@ -595,6 +601,220 @@ local function teardown_race_world()
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
 end
 
+-- ===== F1 light start (ADR-0043) ===========================================================
+-- An optional standing-start style: 5 red lights fill, hold a random beat, then all go out = GO. The car
+-- is physically free from the first light (no movement lock -- only the action lock stays), so launching
+-- before lights-out is a jump start, detected here (own car) and on the host (its AI), and penalized
+-- server-side. All of this runs only for an F1 start (M.state.countdown.lights / M.state.race.startMode ==
+-- "f1"); the default lock countdown path is untouched. Timing rides os.clockhp wall-clock, not dtReal.
+local F1_LIGHT_COUNT = 5            -- red lights in the tower (matches the server's f1.LIGHT_COUNT)
+local F1_LIGHT_STEP = 1.0          -- seconds between each light coming on (matches the server)
+local F1_JUMP_DIST = 0.2           -- metres the player's car may drift before it counts as a jump (tight)
+local F1_AI_JUMP_DIST = 1.0        -- metres for AI: looser, so a frozen AI's settle jitter never false-trips
+local F1_JUMP_SPEED = 0.7          -- m/s (~2.5 km/h) that also counts as a jump (player car)
+local F1_AI_REACTION_MIN = 0.05    -- shortest AI launch reaction after lights-out
+local F1_AI_REACTION_MAX = 1.0     -- longest AI launch reaction (visibly staggered)
+local F1_REACTION_MSG = "reaction" -- client -> server start-reaction report (jump = negative; matches f1.MSG_REACTION)
+
+-- A vehicle's world position as a plain {x,y,z}, or nil. pcall-guarded (engine boundary).
+local function f1_position(veh)
+    if not veh then
+        return nil
+    end
+    local ok, pos = pcall(function() return veh:getPosition() end)
+    if ok and pos then
+        return {x = pos.x, y = pos.y, z = pos.z}
+    end
+    return nil
+end
+
+-- True if `veh` has left `start_pos` by more than the jump tolerance (distance OR speed). pcall-guarded;
+-- a missing API degrades to "no jump" (distance is the primary, reliable signal).
+local function f1_moved(veh, start_pos)
+    if not veh or not start_pos then
+        return false
+    end
+    local ok_pos, pos = pcall(function() return veh:getPosition() end)
+    if ok_pos and pos then
+        local dx, dy, dz = pos.x - start_pos.x, pos.y - start_pos.y, pos.z - start_pos.z
+        if dx * dx + dy * dy + dz * dz > F1_JUMP_DIST * F1_JUMP_DIST then
+            return true
+        end
+    end
+    local ok_spd, speed = pcall(function() return veh:getVelocity():length() end)
+    if ok_spd and speed and speed > F1_JUMP_SPEED then
+        return true
+    end
+    return false
+end
+
+-- Enter the F1 light start: free the player's car at the first light (the action lock from lock.install
+-- stays -- only the position freeze + EV clamp lift) and capture the jump baselines for the own car and,
+-- on the host, each AI (which stay frozen but can be shoved over the line).
+local function f1_begin_lights()
+    local own = getPlayerVehicle(0)
+    local released, release_err = vehicles.set_vehicle_frozen(own, false)
+    if not released then
+        log("W", RACE_LOG_TAG, "F1 start: could not free the car: " .. tostring(release_err))
+    end
+    disarm_freeze_hold_ve()
+    M.state.freeze_hold_armed = false
+    M.state.f1 = {
+        start_pos = f1_position(own),  -- own car's grid baseline
+        own_move_at = nil,             -- os.clockhp of the own car's first movement (jump or launch)
+        own_reported = false,
+        ai_start = {},                 -- per-AI settled grid baseline (first hold / racing frame)
+        ai_move_at = {},               -- per-AI first-movement time
+        ai_reported = {},
+        lights_out_at = nil,           -- os.clockhp at the racing transition (lights out); set in begin_driving
+    }
+end
+
+-- Host, during the all-lit HOLD only (`holding`): record the time an AI is shoved off its grid spot before
+-- lights-out (its move time -> a negative reaction = jump). The own car is watched inline in f1_step_lights;
+-- AI stay frozen and never launch on their own, so this only catches a push. It must NOT run during the
+-- light build-up: the deferred grid restage (ai.lua, RESTAGE_MAX_WAIT 3 s) front-anchors a car with a
+-- place_at_grid TELEPORT and ticks AFTER this in the same onUpdate, so a build-up baseline read the teleport
+-- as movement on every restaged car (the "all AI penalized" false positive). The hold starts at 5 s (> the
+-- 3 s cap), so every car is restaged + settled by then: baseline at the first hold frame, record a real
+-- shove past the (looser) AI distance tolerance.
+local function f1_watch_ai_jumps(holding)
+    local f = M.state.f1
+    if not f or not holding or not M.state.ai_cars then
+        return
+    end
+    for _, car in ipairs(M.state.ai_cars) do
+        if car.restaged and not f.ai_move_at[car.id] then
+            local veh = be and be:getObjectByID(car.veh_id)
+            if veh then
+                local base = f.ai_start[car.id]
+                if not base then
+                    f.ai_start[car.id] = f1_position(veh)  -- first hold frame: settled baseline, no move yet
+                else
+                    local ok, pos = pcall(function() return veh:getPosition() end)
+                    if ok and pos then
+                        local dx, dy, dz = pos.x - base.x, pos.y - base.y, pos.z - base.z
+                        if dx * dx + dy * dy + dz * dz > F1_AI_JUMP_DIST * F1_AI_JUMP_DIST then
+                            f.ai_move_at[car.id] = os.clockhp()
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Tick the F1 light tower in wall time: light i comes on at i * F1_LIGHT_STEP, all stay lit through the
+-- random hold, and the all-off "lights out" rides the server racing transition (begin_driving -> show_go).
+-- Also samples the now-free own car for a jump start, and the AI on the host. Replaces the numeric count.
+local function f1_step_lights(count)
+    local elapsed = os.clockhp() - count.anchor
+    local lit = math.max(0, math.min(F1_LIGHT_COUNT, math.floor(elapsed / F1_LIGHT_STEP)))
+    -- Show the "hold" hint during the build-up only, then drop it for the all-lit suspense.
+    local hint = (lit < F1_LIGHT_COUNT) and "Hold position until lights out" or nil
+    if lit ~= count.last_shown then
+        count.last_shown = lit
+        countdown.show_lights(lit, hint)
+    end
+    local f = M.state.f1
+    if f and not f.own_move_at and f1_moved(getPlayerVehicle(0), f.start_pos) then
+        f.own_move_at = os.clockhp()  -- moving during the lights = a jump (negative reaction vs lights-out)
+    end
+    -- AI only during the all-lit hold (lights fully built), so the grid restage teleport (build-up) is past.
+    f1_watch_ai_jumps(lit >= F1_LIGHT_COUNT)
+end
+
+-- Lights out (the racing transition): stamp the lights-out time so reactions are measured against it, and
+-- tell the caller whether this was an F1 light start (true -> stagger the AI release; false for a normal
+-- start and the quali out-lap, which reuse begin_driving but never ran the lights, so their AI release
+-- together as usual). The reactions themselves -- own car + AI, jump (negative) or launch (positive) -- are
+-- reported by f1_step_reactions during racing, since a clean launch only happens after lights-out.
+local function f1_arm_reactions()
+    local f = M.state.f1
+    if not f then
+        return false
+    end
+    f.lights_out_at = os.clockhp()
+    return true
+end
+
+-- Racing: release the AI on their per-car reaction delay (0.05-0.5 s after lights-out), unfreezing each as
+-- its timer comes due, then clearing the schedule once all are out. No-op without an F1 release schedule --
+-- the normal start releases the AI together in begin_driving.
+local function f1_step_ai_release()
+    local release = M.state.ai_release
+    if not release or not M.state.ai_cars then
+        return
+    end
+    local now = os.clockhp()
+    local pending = false
+    for _, car in ipairs(M.state.ai_cars) do
+        local due = release[car.id]
+        if due then
+            if now >= due then
+                vehicles.set_vehicle_frozen(be and be:getObjectByID(car.veh_id), false)
+                release[car.id] = nil
+            else
+                pending = true
+            end
+        end
+    end
+    if not pending then
+        M.state.ai_release = nil
+    end
+end
+
+-- Racing: measure each car's start reaction = first-movement time - lights-out time (negative = jumped
+-- before lights out, positive = launch reaction) and report it once per car (own + each AI by proxy, owner
+-- only). The server stores it for the standings React column and applies the jump penalty when negative.
+-- The own car / a shoved AI may already carry a move time from the lights/hold (a jump); everyone else gets
+-- theirs here on their first movement after lights-out. No-op without an armed F1 start.
+local function f1_step_reactions()
+    local f = M.state.f1
+    if not f or not f.lights_out_at then
+        return
+    end
+    local race_name = M.state.race and M.state.race.name
+    if not f.own_reported then
+        if not f.own_move_at and f1_moved(getPlayerVehicle(0), f.start_pos) then
+            f.own_move_at = os.clockhp()
+        end
+        if f.own_move_at then
+            f.own_reported = true
+            send_to_server(F1_REACTION_MSG, {race = race_name, reaction = f.own_move_at - f.lights_out_at})
+        end
+    end
+    if not M.state.ai_cars then
+        return
+    end
+    for _, car in ipairs(M.state.ai_cars) do
+        if not f.ai_reported[car.id] then
+            if not f.ai_move_at[car.id] then
+                local veh = be and be:getObjectByID(car.veh_id)
+                if veh then
+                    local base = f.ai_start[car.id]
+                    if not base then
+                        base = f1_position(veh)  -- no hold baseline yet: settle the grid pose now
+                        f.ai_start[car.id] = base
+                    end
+                    -- Responsive launch detection: in racing the restage teleport is long past, so use the
+                    -- same tight distance-OR-speed test the player uses (not the looser hold tolerance) --
+                    -- otherwise the AI "reaction" includes the time to crawl 1 m and reads as >1 s.
+                    if f1_moved(veh, base) then
+                        f.ai_move_at[car.id] = os.clockhp()
+                    end
+                end
+            end
+            if f.ai_move_at[car.id] then
+                f.ai_reported[car.id] = true
+                send_to_server(F1_REACTION_MSG,
+                    {race = race_name, aiId = car.id, reaction = f.ai_move_at[car.id] - f.lights_out_at})
+            end
+        end
+    end
+end
+-- ===== end F1 light start ===================================================================
+
 -- Release the start lock and arm detection + the lap clock for a driving phase -- the racing phase, and
 -- the qualifying session that reuses the same machinery on its unbounded plan (ADR-0041). `plan` is the
 -- traversal plan to score against (the real race plan, or the quali plan); the host's AI drive the route
@@ -612,6 +832,10 @@ local function begin_driving(plan, ai_laps)
     end
     disarm_freeze_hold_ve()
     M.state.freeze_hold_armed = false
+    -- F1 light start (ADR-0043): this racing transition is lights-out. Stamp it so each car's start reaction
+    -- is measured against it (reported during racing by f1_step_reactions). The return says whether an F1
+    -- light start actually ran (false for a normal start and the quali out-lap), gating the AI release.
+    local f1_start = f1_arm_reactions()
     -- Arm checkpoint detection on the plan: it walks the traversal plan (sprint/circuit, ADR-0013), testing
     -- the local car against the planned-next checkpoint each frame while driving (ADR-0010).
     if plan then
@@ -624,7 +848,20 @@ local function begin_driving(plan, ai_laps)
     -- reports their best lap + run-up by proxy (ADR-0022); the AI lap-time the quali plan too and qualify on
     -- pace via the server's quali.ranking (ADR-0041) rather than always gridding at the back.
     if M.state.ai_cars and #M.state.ai_cars > 0 and plan and M.state.race then
-        ai.set_frozen(M.state.ai_cars, false)
+        if f1_start then
+            -- F1 light start (ADR-0043): keep the AI frozen and release them on a per-car reaction delay
+            -- (0.05-0.5 s after lights-out) so they don't all leap as one; ai.drive still arms the route
+            -- below. f1_step_ai_release (onUpdate, racing) unfreezes each car when its timer is due.
+            local now = os.clockhp()
+            local release = {}
+            for _, car in ipairs(M.state.ai_cars) do
+                release[car.id] = now + F1_AI_REACTION_MIN
+                    + math.random() * (F1_AI_REACTION_MAX - F1_AI_REACTION_MIN)
+            end
+            M.state.ai_release = release
+        else
+            ai.set_frozen(M.state.ai_cars, false)
+        end
         local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
         local ai_route = ai.drive(M.state.ai_cars,
             M.state.race.routePoints or M.state.race.checkpoints, ai_laps or M.state.race.laps, ai_params,
@@ -717,7 +954,13 @@ local function handle_race_phase(payload)
             total = tonumber(payload.duration) or 0,
             anchor = os.clockhp(),
             last_shown = nil,
+            -- F1 light start (ADR-0043): the server flags the standing-start countdown so we render the
+            -- light tower instead of the numeric count and free the car now (the jump window).
+            lights = payload.lights == true,
         }
+        if M.state.countdown.lights then
+            f1_begin_lights()
+        end
     elseif phase == "qualifying" then
         -- Qualifying session (ADR-0041): release the lock and lap the unbounded quali plan to set lap
         -- times; the grid is set afterwards from quali pace. The AI drive too (so the session is populated),
@@ -2866,6 +3109,8 @@ local function build_hud_snapshot()
                 run_up = e.run_up,  -- gun -> start/finish run-up (ADR-0022), for the analysis S0 column
                 car = e.car,  -- driver's car (ADR-0029), for the Race section's "best lap with the car"
                 ai = e.ai or nil,  -- synthetic host-driven AI slot (ADR-0036), so the row can be tagged
+                jumpPenalty = e.jump_penalty,  -- F1 jump-start penalty seconds (ADR-0043); HUD tags "+Ns"
+                reaction = e.reaction,  -- F1 start reaction seconds (ADR-0043); HUD React column, neg = jump
             }
         end
     end
@@ -2963,6 +3208,8 @@ local function build_hud_snapshot()
         grace = grace,
         graceCanFinish = grace_can_finish,
         isCircuit = is_circuit,
+        -- F1 light start active this race (ADR-0043): gates the standings React column.
+        f1Start = (race and race.startMode == "f1") or false,
         resultsMin = M.state.results_min or false,
         analysisAvailable = analysis_available,
         analysisOpen = M.state.analysis_open or false,
@@ -3424,7 +3671,15 @@ local function step_staging(dt_real)
     local shown = math.ceil(staging.remaining)
     if shown ~= staging.last_shown then
         staging.last_shown = shown
-        countdown.show_staging(shown)
+        -- F1 light start (ADR-0043): a short pre-procedure heads-up during the staging wait, before the
+        -- lights begin. Reads the relayed start mode + penalty (the only consumer of those race fields).
+        local race = M.state.race
+        local hint = nil
+        if race and race.startMode == "f1" then
+            hint = "F1 light start -- hold until lights out (jump = +"
+                .. tostring(race.jumpPenaltySeconds or 15) .. "s)"
+        end
+        countdown.show_staging(shown, hint)
     end
 end
 
@@ -3434,6 +3689,11 @@ end
 local function step_start_countdown()
     local count = M.state.countdown
     if not count then
+        return
+    end
+    if count.lights then
+        -- F1 light start (ADR-0043): render the light tower + watch for a jump instead of the numeric count.
+        f1_step_lights(count)
         return
     end
     local remaining = math.max(0, count.total - (os.clockhp() - count.anchor))
@@ -3522,6 +3782,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         step_detection(dtSim)
         -- Host only: step the AI detectors + proxy-report their crossings (ADR-0036). Inert otherwise.
         step_ai_detections(dtSim)
+        -- F1 light start (ADR-0043): release the AI on their staggered reaction delay, and measure + report
+        -- each car's start reaction for the standings React column (both no-op for a normal start).
+        f1_step_ai_release()
+        f1_step_reactions()
         -- Drive the held recover/repair countdown (ADR-0017).
         step_assist(dtReal)
         -- Tick the finish-grace countdown in wall time (the server's cutoff is wall-time; ADR-0014).
@@ -3561,9 +3825,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         or M.state.phase == "qualifying" or M.state.phase == "qualiResults") and M.state.race then
         push_assist_arm()
     end
-    -- Arm the EV start-freeze throttle clamp over the frozen phases only (staging + countdown), so it
-    -- lifts on racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs.
-    if (M.state.phase == "staging" or M.state.phase == "countdown") and M.state.race then
+    -- Arm the EV start-freeze throttle clamp over the frozen phases (staging + countdown), so it lifts on
+    -- racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs. Skip it during an F1
+    -- light-start countdown: that frees the car at the first light (ADR-0043), so the clamp must not re-arm.
+    if M.state.race and (M.state.phase == "staging"
+            or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))) then
         push_freeze_hold()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the

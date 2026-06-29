@@ -60,6 +60,14 @@ function M.show_start(value)
     trigger_ui({active = true, kind = "start", value = value})
 end
 
+-- Show the F1 start light tower (ADR-0043) with `lit` of the red lights on (0..count). Ticked from
+-- init.lua onUpdate during an F1 light-start countdown; the all-off "lights out = GO" rides the same
+-- M.show_go on the racing transition, so no separate extinguish frame is needed. `hint` is an optional
+-- short pre-start line ("hold until lights out") the app shows above the lights early in the sequence.
+function M.show_lights(lit, hint)
+    trigger_ui({active = true, kind = "lights", lit = lit, hint = hint})
+end
+
 -- Show GO! -- driven by the server `racing` phase, so it lands on the movement-lock release. The app
 -- self-hides it after a beat (the racing phase sends no clear).
 function M.show_go()
@@ -72,9 +80,10 @@ function M.show_assist(label, value)
 end
 
 -- Show the staging-wait indicator with the remaining auto-start seconds (ADR-0021). Ticked from
--- init.lua onUpdate during the staging phase.
-function M.show_staging(remaining)
-    trigger_ui({active = true, kind = "staging", remaining = remaining})
+-- init.lua onUpdate during the staging phase. `hint` is an optional pre-procedure note (e.g. the F1
+-- light-start heads-up, ADR-0043) shown under the timer; nil for a normal staging wait.
+function M.show_staging(remaining, hint)
+    trigger_ui({active = true, kind = "staging", remaining = remaining, hint = hint})
 end
 
 -- Hide the overlay (race end / reload / count finished). Idempotent.

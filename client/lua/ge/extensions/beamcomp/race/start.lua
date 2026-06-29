@@ -135,6 +135,14 @@ local function resolve_assists(payload)
     }
 end
 
+-- The F1 jump-start penalty (seconds) for the offender's HUD banner (ADR-0043). The server owns the
+-- authoritative penalty folded into the standings; this copy is display-only, so it is defaulted +
+-- floored defensively (trust boundary, ADR-0005). nil startMode races never read it.
+local JUMP_PENALTY_DEFAULT_SECONDS = 15
+local function resolve_jump_penalty(seconds)
+    return math.max(0, tonumber(seconds) or JUMP_PENALTY_DEFAULT_SECONDS)
+end
+
 -- The grid param block to apply for `direction`, picked from a relayed raceStart.gridParams (ADR-0023).
 -- Forward uses the `forward` block; reverse uses the `reverse` block and, when a grid has none, returns
 -- nil so grid.poses falls back to the default layout for the reverse run. A nil gridParams (no custom
@@ -451,6 +459,10 @@ function M.prepare(payload)
         laps = laps,
         direction = direction,
         plan = plan,
+        -- F1 light start (ADR-0043): "f1" = lights + free car + jump-start penalty; nil = lock countdown.
+        -- jumpPenaltySeconds labels the offender's local banner; the server applies the real penalty.
+        startMode = payload.startMode == "f1" and "f1" or nil,
+        jumpPenaltySeconds = resolve_jump_penalty(payload.jumpPenaltySeconds),
         -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.
         assists = resolve_assists(payload),
         -- The aiRace authored AI defaults (ADR-0036 Etappe B): the owner fills any difficulty/vehicle

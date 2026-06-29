@@ -66,6 +66,7 @@ angular.module('beamng.apps')
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
       carModel: '', carConfig: '', maxhp: '', maxpwr: '',
       orderMode: 'random', orderRev: false, qualiMinutes: 5, grid: '',
+      f1Start: false, jumpPenalty: 15,
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
@@ -122,6 +123,13 @@ angular.module('beamng.apps')
     if (num(form.laps) !== undefined) { o.laps = num(form.laps); }
     if (form.reverse) { o.direction = 'reverse'; }
     if (form.grid) { o.grid = form.grid; }
+
+    // F1 light start (ADR-0043): off = the default lock countdown; on relays startMode + the configurable
+    // jump-start penalty seconds (a blank lets the server default it).
+    if (form.f1Start) {
+      o.startMode = 'f1';
+      if (num(form.jumpPenalty) !== undefined) { o.jumpPenaltySeconds = num(form.jumpPenalty); }
+    }
 
     if (form.recover && num(form.recoverSecs) !== undefined) { o.assists.recoverHoldSeconds = num(form.recoverSecs); }
     if (form.repair && num(form.repairSecs) !== undefined) { o.assists.repairHoldSeconds = num(form.repairSecs); }

@@ -44,6 +44,40 @@
     .beamcomp-root .bc-cd-staging .bc-cd-staging-time {
       font-size: 105px;
     }
+    /* F1 pre-procedure heads-up under the staging timer (ADR-0043): much smaller than the timer. */
+    .beamcomp-root .bc-cd-staging .bc-cd-staging-hint {
+      font-size: 28px;
+      opacity: 0.9;
+      margin-top: 6px;
+    }
+    /* F1 start light tower (ADR-0043): a centered row of 5 red lights that fill one per second, hold a
+       random beat, then all go out = GO (the racing transition replaces this overlay with GO!). Lit =
+       solid red + glow; unlit = dark. A small "hold position" hint sits above during the build-up. */
+    .beamcomp-root .bc-cd-lights .bc-cd-hint {
+      font-size: 30px;
+      /* Fixed height so the row holds its space even when the hint is empty (the all-lit hold) -- otherwise
+         the lights shift up when it clears. */
+      min-height: 38px;
+      margin-bottom: 16px;
+      opacity: 0.9;
+    }
+    .beamcomp-root .bc-cd-lights .bc-light-row {
+      display: flex;
+      gap: 22px;
+      justify-content: center;
+    }
+    .beamcomp-root .bc-cd-lights .bc-light {
+      width: 84px;
+      height: 84px;
+      border-radius: 50%;
+      background: #3a0000;
+      border: 4px solid rgba(0, 0, 0, 0.55);
+      box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.8);
+    }
+    .beamcomp-root .bc-cd-lights .bc-light.on {
+      background: #ff2222;
+      box-shadow: 0 0 28px 6px rgba(255, 40, 40, 0.85), inset 0 0 12px rgba(255, 170, 170, 0.6);
+    }
     /* Quali->race settle timer (ADR-0041): a small centered cue shown after the grid re-spawn and before the
        start countdown, so the count does not begin unexpectedly. Smaller than the start countdown. */
     .beamcomp-root .bc-quali-settle {
@@ -110,6 +144,30 @@
       color: #fff;
       max-width: 80vw;
       white-space: normal;
+    }
+    /* F1 jump-start banner (ADR-0043): reuses the finish-banner overlay slot but red -- the offending
+       driver's one-shot "JUMP START / +Ns penalty" cue, fired client-side from the relayed penalty. */
+    .beamcomp-root .bc-jump-banner .bc-fb-title {
+      font-size: 96px;
+      color: #ff3b3b;
+    }
+    .beamcomp-root .bc-jump-banner .bc-fb-pos {
+      font-size: 52px;
+      color: #fff;
+    }
+    /* The "+Ns" jump-start penalty tag on a standings row (ADR-0043). */
+    .beamcomp-root .bc-jump-tag {
+      color: #ff5b5b;
+      font-weight: bold;
+      font-size: 0.82em;
+      margin-left: 4px;
+    }
+    /* The start-reaction tag behind a name in the live timing sheet (ADR-0043); dimmer than the penalty. */
+    .beamcomp-root .bc-react-tag {
+      color: #9fd0ff;
+      font-size: 0.8em;
+      margin-left: 4px;
+      font-variant-numeric: tabular-nums;
     }
     /* The app frame is now just a logical container: the live regions and the results card are
        position:fixed children, so the frame itself carries no background or size. */
@@ -372,6 +430,12 @@
       font-variant-numeric: tabular-nums;
       color: #d4af37;
     }
+    /* F1 start-reaction column on the results cards (ADR-0043), only shown when F1 start was active. */
+    .beamcomp-hud .bc-react {
+      width: 5.5em;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
     .beamcomp-hud .bc-results-head td {
       opacity: 0.7;
       font-weight: bold;
@@ -608,7 +672,7 @@
             <tr ng-repeat="e in hud.liveEntries"
                 ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai, 'bc-flash': e.flash}">
               <td class="bc-pos">P{{e.position}}</td>
-              <td class="bc-name">{{e.name}}</td>
+              <td class="bc-name">{{e.name}}<span class="bc-react-tag" ng-if="e.reaction != null">{{formatReaction(e.reaction)}}</span><span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
               <td class="bc-int">{{formatInterval(e)}}</td>
             </tr>
           </table>
@@ -734,14 +798,16 @@
           <td class="bc-time">Time</td>
           <td class="bc-bestlap" ng-if="hud.isCircuit">Best Lap</td>
           <td class="bc-int">Gap</td>
+          <td class="bc-react" ng-if="hud.f1Start">React</td>
         </tr>
         <tr ng-repeat="e in hud.entries"
             ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai}">
           <td class="bc-pos">P{{e.position}}</td>
-          <td class="bc-name"><span class="bc-fin-mark" ng-if="e.finished">&#10003; </span>{{e.name}}</td>
+          <td class="bc-name"><span class="bc-fin-mark" ng-if="e.finished">&#10003; </span>{{e.name}}<span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
           <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : (e.finished ? formatTime(e.time) : '')}}</td>
           <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
           <td class="bc-int">{{formatLeaderGap(e)}}</td>
+          <td class="bc-react" ng-if="hud.f1Start">{{formatReaction(e.reaction)}}</td>
         </tr>
       </table>
     </div>
@@ -759,15 +825,17 @@
           <td class="bc-time">Time</td>
           <td class="bc-bestlap" ng-if="hud.isCircuit">Best Lap</td>
           <td class="bc-int">Gap</td>
+          <td class="bc-react" ng-if="hud.f1Start">React</td>
         </tr>
         <tr ng-repeat="e in hud.entries"
             ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai,
                        'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
           <td class="bc-pos">P{{e.position}}</td>
-          <td class="bc-name">{{e.name}}</td>
+          <td class="bc-name">{{e.name}}<span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
           <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
           <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
           <td class="bc-int">{{formatDelta(e.interval)}}</td>
+          <td class="bc-react" ng-if="hud.f1Start">{{formatReaction(e.reaction)}}</td>
         </tr>
       </table>
     </div>
@@ -912,6 +980,17 @@
     <div ng-switch-when="staging">
       <div class="bc-cd-staging-title">Race starting…</div>
       <div class="bc-cd-staging-time">{{formatStaging(countdown.remaining)}}</div>
+      <div class="bc-cd-staging-hint" ng-if="countdown.hint">{{countdown.hint}}</div>
+    </div>
+    <!-- F1 start lights (ADR-0043): 5 red lights fill (countdown.lit), hold, then all go out = GO (the
+         racing transition swaps this overlay to GO!). The hint shows only during the build-up. -->
+    <div ng-switch-when="lights">
+      <!-- Always rendered (no ng-if) so the hint reserves its line: removing it when it clears at the
+           all-lit hold would shift the light row upward (ADR-0043 handover fix). -->
+      <div class="bc-cd-hint">{{countdown.hint}}</div>
+      <div class="bc-light-row">
+        <div class="bc-light" ng-repeat="n in [1,2,3,4,5]" ng-class="{on: n <= countdown.lit}"></div>
+      </div>
     </div>
   </div>
   <!-- Quali->race settle window (ADR-0041): after the cars re-spawn on the earned grid, the big results card
@@ -926,6 +1005,12 @@
   <div class="bc-finish-banner" ng-show="finishBanner.active">
     <div class="bc-fb-title">FINISHED</div>
     <div class="bc-fb-pos">P{{finishBanner.position}}</div>
+  </div>
+  <!-- F1 jump-start banner (ADR-0043): fires once for the offending driver during racing (app.js), the
+       moment the server's penalty lands on our standings row; holds ~3.5s then fades. -->
+  <div class="bc-finish-banner bc-jump-banner" ng-show="jumpBanner.active">
+    <div class="bc-fb-title">JUMP START</div>
+    <div class="bc-fb-pos">+{{jumpBanner.penalty}}s penalty</div>
   </div>
   <!-- Class-drop champion banner (ADR-0042): fires once in the finished phase of the deciding race (app.js),
        after the personal finish banner clears; holds ~5s then fades to the Final Standings. The winner sees a

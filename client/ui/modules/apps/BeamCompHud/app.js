@@ -37,6 +37,15 @@ angular.module('beamng.apps')
     return sign + m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(2);
   }
 
+  // F1 start reaction (ADR-0043): seconds from lights-out to first movement, signed -- "+0.31s" = launch
+  // reaction, "-0.80s" = jumped that early. "--" until the car has moved (not measured yet) / non-F1.
+  function formatReaction(s) {
+    if (typeof s !== 'number') {
+      return '--';
+    }
+    return (s >= 0 ? '+' : '') + s.toFixed(2) + 's';
+  }
+
   // Live-standings interval cell: the time gap to the row's reference (the selected mode -- self,
   // car ahead, or leader), prefixed with the checkpoint gap when the two are more than one completed
   // checkpoint apart -> "+2 CP (+12.3)" (the frozen shared-crossing time gap, ADR-0015, is then
@@ -216,6 +225,7 @@ angular.module('beamng.apps')
       scope.hud = {active: false, entries: []};
       scope.countdown = {active: false};
       scope.finishBanner = {active: false, position: null};
+      scope.jumpBanner = {active: false, penalty: null};
       scope.winnerBanner = {active: false, local: false, name: null};
       // While the champion banner is owed/showing, the Final Standings card stays collapsed to its restore
       // bar, then expands once the banner fades -- and it starts collapsed on the first finished frame so the
@@ -223,6 +233,7 @@ angular.module('beamng.apps')
       scope.winnerCardCollapsed = false;
       scope.formatTime = formatTime;
       scope.formatDelta = formatDelta;
+      scope.formatReaction = formatReaction;
       scope.formatInterval = formatInterval;
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
@@ -255,6 +266,12 @@ angular.module('beamng.apps')
       var prevLocalFinished = null;
       var finishBannerTimer = null;
 
+      // Personal jump-start banner state (ADR-0043): null sentinel like prevLocalFinished -- the first
+      // racing frame only establishes whether our row already carries a penalty (reload-safe), so the
+      // banner fires only on a genuine no-penalty -> penalized transition.
+      var prevLocalJumped = null;
+      var jumpBannerTimer = null;
+
       // Class-drop champion-banner state (ADR-0042): prevTournamentEnded mirrors the prevLocalFinished
       // sentinel -- null means the ended flag has not been seen yet, so a reload mid-celebration does not
       // re-fire. winnerBannerPending holds the resolved {local, name} while the personal finish banner is
@@ -284,6 +301,15 @@ angular.module('beamng.apps')
           finishBannerTimer = null;
         }
         scope.finishBanner.active = false;
+      }
+
+      // Hide the jump-start banner and cancel its self-hide timer. Phase handling owns prevLocalJumped.
+      function resetJumpBanner() {
+        if (jumpBannerTimer) {
+          $timeout.cancel(jumpBannerTimer);
+          jumpBannerTimer = null;
+        }
+        scope.jumpBanner.active = false;
       }
 
       // Hide the champion banner, cancel its self-hide timer, and drop any pending show. The once-only latch
@@ -327,6 +353,7 @@ angular.module('beamng.apps')
         $interval.cancel(heartbeat);
         clearFlashTimers();
         resetFinishBanner();
+        resetJumpBanner();
         resetWinnerBanner();
       });
 
@@ -359,6 +386,37 @@ angular.module('beamng.apps')
           }, 3000);
         }
         prevLocalFinished = localFinished;
+      }
+
+      // Announce the local player's own jump start (ADR-0043): a one-shot "JUMP START -- +Ns" banner the
+      // moment our row gains a jump penalty during racing (the server applies it ~a tick after lights-out
+      // and relays it on the standings). Mirrors trackLocalFinish -- the null sentinel makes the first
+      // racing frame establish state (reload-safe), and a non-racing phase re-arms/clears the banner.
+      function trackLocalJump() {
+        var phase = scope.hud.phase;
+        if (phase !== 'racing') {
+          prevLocalJumped = false;
+          resetJumpBanner();
+          return;
+        }
+        var localEntry = scope.hud.localEntry;
+        var penalty = localEntry && localEntry.jumpPenalty;
+        var jumped = !!(penalty && penalty > 0);
+        if (prevLocalJumped === null) {
+          prevLocalJumped = jumped;
+          return;
+        }
+        if (jumped && !prevLocalJumped) {
+          scope.jumpBanner = {active: true, penalty: penalty};
+          if (jumpBannerTimer) {
+            $timeout.cancel(jumpBannerTimer);
+          }
+          jumpBannerTimer = $timeout(function () {
+            scope.jumpBanner.active = false;
+            jumpBannerTimer = null;
+          }, 3500);
+        }
+        prevLocalJumped = jumped;
       }
 
       // Promote a queued champion banner once the personal finish banner has cleared, then hold it ~5 s.
@@ -509,6 +567,7 @@ angular.module('beamng.apps')
             scope.qualiResultsMin = false;
           }
           trackLocalFinish();
+          trackLocalJump();
           trackTournamentWin();
           // Provisional results card: a finished/DNF'd player viewing standings while the race runs. While
           // it is up the live corner regions hide (template), so this one flag drives both ng-ifs. The
