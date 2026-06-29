@@ -164,7 +164,7 @@ angular.module('beamng.apps')
     replace: true,
     restrict: 'EA',
     scope: true,
-    link: function (scope) {
+    link: function (scope, element) {
       scope.data = { races: [], cars: [], grids: [], configs: [] };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
@@ -280,6 +280,24 @@ angular.module('beamng.apps')
           onModelChange();
         }
       };
+
+      // Close any open dropdown on a click outside it (standard dropdown UX). No DI here: injected
+      // services fail to resolve for this late-loaded mod directive, so use the document global. A click
+      // on this app's own .bc-dd (head or list) is left to toggle()/pick(); anything else closes it.
+      function closeOnOutsideClick(ev) {
+        if (scope.open === null) { return; }
+        var root = element[0];
+        var node = ev.target;
+        while (node && node !== document) {
+          if (node.classList && node.classList.contains('bc-dd') && root.contains(node)) { return; }
+          node = node.parentNode;
+        }
+        scope.$evalAsync(function () { scope.open = null; });
+      }
+      document.addEventListener('click', closeOnOutsideClick, false);
+      scope.$on('$destroy', function () {
+        document.removeEventListener('click', closeOnOutsideClick, false);
+      });
 
       // Car model changed: clear the stale config and lazily fetch this model's configs from GE.
       function onModelChange() {
