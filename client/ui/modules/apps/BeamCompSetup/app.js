@@ -36,17 +36,25 @@ angular.module('beamng.apps')
   };
 
   // One class-drop class row in the panel (ADR-0042): either a fixed car (kind 'car' + model[:config]) or a
-  // power cap (kind 'cap' + maxhp/maxpwr). Defaults to a cap row -- a handicap tournament is most naturally
-  // built from descending power limits, and a cap needs no car lookup.
+  // power cap (kind 'cap' + maxhp/maxpwr). The Add-class button defaults to a cap row -- a cap needs no car
+  // lookup, so growing a ladder by hand stays simplest there.
   function defaultClass() {
     return { kind: 'cap', car: '', config: '', maxhp: '', maxpwr: '' };
   }
-  function defaultClasses(n) {
-    var list = [];
-    for (var i = 0; i < n; i++) {
-      list.push(defaultClass());
-    }
-    return list;
+  // A fixed-car class row (kind 'car'); same shape as defaultClass, used to build the curated default ladder.
+  function carClass(model, config) {
+    return { kind: 'car', car: model, config: config, maxhp: '', maxpwr: '' };
+  }
+  // Curated default class ladder for a fresh form (ADR-0037 defaults): three etk800 power steps ordered
+  // fast->slow -- class 1 is the quickest, winning the slowest is the tournament win (ADR-0042). Fully
+  // editable like any class row; the session form-restore (BeamCompSetupForm) overrides it once a
+  // tournament has been configured within the session.
+  function defaultTourClasses() {
+    return [
+      carClass('etk800', '846_340_A'),
+      carClass('etk800', '844_250_A'),
+      carClass('etk800', '844_150_A'),
+    ];
   }
 
   // Curated panel defaults (ADR-0037): a fresh form opens at opinionated race settings -- random start
@@ -62,7 +70,7 @@ angular.module('beamng.apps')
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
-      tourMode: 'off', tourClasses: defaultClasses(4), tourOrder: 'random',
+      tourMode: 'off', tourClasses: defaultTourClasses(), tourOrder: 'random',
     };
   }
 
@@ -515,6 +523,15 @@ angular.module('beamng.apps')
       geCall('request_setup_form');
       geCall('request_championship');
       geCall('request_tournament');
+      // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
+      // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
+      // option list until their model is re-picked. UX only -- the tournament still starts with these cars
+      // regardless (buildTourClasses reads cls.config directly). Mirrors the form-restore prefetch above.
+      (scope.form.tourClasses || []).forEach(function (c) {
+        if (c.car) {
+          geLuaArg('request_car_configs', c.car);
+        }
+      });
     },
   };
 }]);
