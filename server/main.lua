@@ -1626,6 +1626,15 @@ function tour.reset()
     session.tournament = nil
 end
 
+-- The overall tournament winner line for the reset announcement (ADR-0042): the champion's identity, set
+-- when a driver wins in the slowest class (tour.fold), or nil when reset before anyone won. Mirrors
+-- champ.winner_text so tour.handle_cmd's reset path can announce the winner symmetrically -- without it the
+-- reset handler called a nil field and aborted before tour.reset(), so "off" never cleared the tournament.
+function tour.winner_text()
+    local state = session.tournament
+    return state and state.winner or nil
+end
+
 -- Live changes to a running tournament (ADR-0042). New class specs apply to subsequent spawns only -- a driver
 -- keeps their class_index, only the car for that index changes (non-retroactive, like a championship preset
 -- change). A nil argument leaves that setting unchanged; invalid classes are ignored. No-op when none active.
