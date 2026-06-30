@@ -3439,6 +3439,12 @@ end
 -- runs while (near) stationary, so it cannot be triggered while driving (ADR-0017).
 local ASSIST_STATIONARY_SPEED = 2.0
 
+-- Min seconds between staging repairs, so a held/mashed Insert re-places + toasts once, not every frame
+-- (os.clock is monotonic CPU seconds -- the same gate the lock's spawn-block toast uses). Not reset per
+-- race: os.clock only climbs, so a new staging is always well past the throttle.
+local STAGING_REPAIR_THROTTLE = 1.0
+local last_staging_repair_at = 0
+
 -- The (enabled, holdSeconds) setting for an assist kind, read with an explicit branch (the enabled
 -- flags are booleans, so `a and b or c` would wrongly fall through to the other assist).
 local function assist_setting(kind)
@@ -3477,10 +3483,59 @@ local function notify_assist_blocked(msg)
     })
 end
 
+-- Repair the player's own car during the pre-race staging window (ADR-0017 staging-allow-repair): the
+-- cars spawn repaired on the grid, but a car damaged ON the grid during the staging wait (a neighbour
+-- bumping it through the soft start-freeze, a botched swap) would otherwise start the race broken. Reuses
+-- the restage path -- place_at_grid (repair + front-anchored grid placement) then re-freeze -- so the car
+-- ends up undamaged, on its exact slot, and still frozen for the start (no forward-roll advantage).
+-- Skipped while a restage is pending: the swapped/fresh car is about to be placed clean anyway, and its
+-- jbeam may still be loading, which would mis-anchor an immediate place. Throttled against key spam.
+local function perform_staging_repair()
+    local race = M.state.race
+    local pose = race and race.myPose
+    if not pose or M.state.restage_pending then
+        return
+    end
+    local now = os.clock()
+    if now - last_staging_repair_at < STAGING_REPAIR_THROTTLE then
+        return
+    end
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own_car then
+        return
+    end
+    last_staging_repair_at = now
+    local placed, err = vehicles.place_at_grid(own_car, pose)
+    if not placed then
+        log("W", RACE_LOG_TAG, "staging repair failed: " .. tostring(err))
+        return
+    end
+    -- place_at_grid teleports, so re-assert the freeze for the rest of staging + the countdown, exactly
+    -- as the restage does (init.lua restage_swapped_car).
+    vehicles.set_vehicle_frozen(own_car, true)
+    log("I", RACE_LOG_TAG, "staging repair: re-placed own car on its grid slot")
+    guihooks.trigger("toastrMsg", {
+        type = "info",
+        title = "BeamComp",
+        msg = "Car repaired",
+    })
+end
+
 -- A recover/repair key went down (forwarded from the VE, ADR-0017): record which assist is held so
 -- the per-frame stepper can run the hold. Racing + qualifying (ADR-0041), enabled assists only -- a
 -- disabled assist's key is inert (blocked). The actual countdown starts in step_assist once stationary.
 function M.on_assist_key_down(kind)
+    -- Pre-race staging: a single Insert (repair) press repairs the own car on its grid slot (ADR-0017
+    -- staging-allow-repair). Instant -- no hold -- since the car is frozen, so there is no driving exploit
+    -- and the in-race hold (a time cost) would be pointless friction here. Ctrl+Insert (recover) is inert.
+    -- Works regardless of the race's repair-assist enable: "fix your car before the start" is a separate
+    -- guarantee. Returns before the in-race hold path below.
+    if M.state.phase == "staging" then
+        if M.state.race and kind == "repair" then
+            perform_staging_repair()
+        end
+        return
+    end
     if not M.state.race or (M.state.phase ~= "racing" and M.state.phase ~= "qualifying") then
         return
     end
