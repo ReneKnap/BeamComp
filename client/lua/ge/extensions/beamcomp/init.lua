@@ -157,6 +157,7 @@ M.state = {
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
+    reported_name = nil,      -- the license name last sent to the server (ADR-0031 amendment); the staging poll re-reports only when the plate changes from this
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
     ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
     ai_policy = nil,          -- host only: the vehicle policy used for the AI car chain (ADR-0032), kept so a quali re-grid can re-spawn fresh AI (ADR-0041), or nil
@@ -193,6 +194,10 @@ local send_to_server
 -- Reports this client's BeamNG license name as the canonical identity (ADR-0031); defined far below but
 -- called from handle_race_start (at spawn) above its definition, so forward-declared here.
 local report_identity
+
+-- Re-reads the own car's plate during staging and re-reports it on a change (ADR-0031 amendment); defined
+-- far below but called from handle_race_phase's countdown branch above its definition, so forward-declared.
+local poll_staging_identity
 
 -- Disarms the seated car's VE recovery override; defined far below (next to the assist push) but used
 -- earlier in handle_race_phase's lobby teardown, so forward-declared here (ADR-0017).
@@ -952,6 +957,10 @@ local function handle_race_phase(payload)
         -- each whole second and plays the final beeps on the centered overlay (ADR-0021).
         lock.install()
         M.state.staging = nil
+        -- Lock in a license name the player changed in the final staging moment (ADR-0031 amendment): the
+        -- per-frame poll is throttled, so force one last re-read at the GO boundary -- "last value at GO
+        -- wins". After this, no re-read runs (the poll is staging-gated), so an in-race change has no effect.
+        poll_staging_identity(true)
         -- Anchor the count to a wall clock (os.clockhp) rather than accumulating the clamped per-frame dt,
         -- so a spawn/despawn hitch at the quali seam can't make it finish behind the server's wall-time
         -- phase (ADR-0041); the quali re-grid now re-spawns the AI a lead time earlier, so this count is
@@ -2226,8 +2235,36 @@ function report_identity(veh)
     if name then
         log("I", LOG_TAG, "reporting client identity: " .. name)
         send_to_server("clientIdentity", {name = name})
+        -- Remember what we sent so the staging poll only re-reports on an actual change (ADR-0031 amendment).
+        M.state.reported_name = name
     else
         log("W", LOG_TAG, "no client name available; server will use the BeamMP name")
+    end
+end
+
+-- os.clock() reading of the last staging identity poll, throttling the per-frame plate re-read below.
+local last_identity_poll_at = 0
+local STAGING_IDENTITY_POLL_INTERVAL = 0.75
+
+-- Pick up a license-name change the player makes during the staging wait (ADR-0031 amendment): the name is
+-- otherwise reported only at connect and at spawn (handle_race_start), so a plate edited via BeamNG's
+-- vehicle/parts config after spawn never reaches the server. Re-read the own car's plate and re-report when
+-- it differs from the last sent name. `force` skips the throttle for the staging->countdown lock-in ("last
+-- value at GO wins"); the per-frame onUpdate call throttles. Only runs in staging (the caller gates phase),
+-- so an in-race name change still has no effect. Re-resolve the own car each time -- a staging config-respawn
+-- replaces the handle (memory beamcomp-respawn-own-at-traps); the restage repoints current_vehicle_id first.
+function poll_staging_identity(force)
+    if not force and os.clock() - last_identity_poll_at < STAGING_IDENTITY_POLL_INTERVAL then
+        return
+    end
+    last_identity_poll_at = os.clock()
+    local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own then
+        return
+    end
+    local name = collect_player_name(own)
+    if name and name ~= M.state.reported_name then
+        report_identity(own)
     end
 end
 
@@ -3905,6 +3942,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing"
         or M.state.phase == "qualifying" or M.state.phase == "qualiResults") and M.state.race then
         push_assist_arm()
+    end
+    -- Pick up a license-name change made during the staging wait (ADR-0031 amendment). Staging only, so an
+    -- in-race name change still has no effect; the GO boundary forces a final re-read (handle_race_phase).
+    if M.state.phase == "staging" and M.state.race then
+        poll_staging_identity(false)
     end
     -- Arm the EV start-freeze throttle clamp over the frozen phases (staging + countdown), so it lifts on
     -- racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs. Skip it during an F1
