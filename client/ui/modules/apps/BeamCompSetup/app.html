@@ -55,6 +55,12 @@
     .bc-preset.sel { background: #355; border-color: #4a6; }
     .bc-champ-actions button { flex: 1 1 auto; }
     .bc-champ-reset { background: #5a2d2d; color: #f0d0d0; }
+    /* Race control (ADR-0038 amendment): a second footer row -- cancel discards (no scoring); end forces
+       the finish + scores. Phase-gated via ng-disabled; merged into the footer (no doubled top border). */
+    .bc-rc-actions { border-top: none; padding-top: 0; }
+    .bc-cancel { background: #5a2d2d; color: #f0d0d0; }
+    .bc-end { background: #1565c0; color: #fff; }
+    .bc-cancel[disabled], .bc-end[disabled] { background: #444; color: #999; cursor: default; }
   </style>
 
   <div class="bc-toolbar">
@@ -379,5 +385,13 @@
     <button class="bc-prepare" ng-disabled="!form.race" ng-click="prepareRace()">Prepare Race</button>
     <button class="bc-start" ng-if="prepared" ng-click="startRaceGo()">Start Race</button>
     <button class="bc-close" ng-click="close()">Close</button>
+  </div>
+
+  <!-- Race control (ADR-0038 amendment): stop the running race straight from the panel. Always present, but
+       phase-gated -- Cancel is live in any non-lobby phase (incl. finished, to clear results + despawn);
+       End & score only during racing. One-click, no confirm. The server still admin-gates and guards. -->
+  <div class="bc-actions bc-rc-actions">
+    <button class="bc-cancel" ng-disabled="!canCancel()" ng-click="cancelRace()" title="Discard the race + despawn cars/props/results (no scoring)">Cancel race</button>
+    <button class="bc-end" ng-disabled="phase !== 'racing'" ng-click="endRace()" title="Force the finish and show final standings (cars stay)">End &amp; score</button>
   </div>
 </div>

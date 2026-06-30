@@ -921,6 +921,12 @@ local function handle_race_phase(payload)
     M.state.phase = phase
     log("I", RACE_LOG_TAG, "race phase -> " .. phase)
 
+    -- Feed the admin setup panel the current phase so it can show/hide the race-stop controls (ADR-0038
+    -- amendment). Pushed on every transition; the panel also pulls via request_race_phase on link/open.
+    if guihooks then
+        guihooks.trigger("BeamCompSetupPhase", {phase = phase})
+    end
+
     -- Ignore phases for a race this client is not in: with no resolved race (unknown name, wrong map)
     -- there is no car, plan, or checkpoints, so the server-driven countdown/racing must not render or
     -- arm detection. Lobby still runs so any prior race tears down normally.
@@ -1386,6 +1392,17 @@ function M.go_race_from_ui()
     send_to_server("raceGo", {})
 end
 
+-- The panel's race-stop controls (ADR-0038 amendment): relay a single raceControl event the server routes
+-- through the existing /raceclear (cancel, no scoring) and /raceend (end & score) handlers. Public as
+-- beamcomp_init.cancel_race_from_ui / beamcomp_init.end_race_from_ui.
+function M.cancel_race_from_ui()
+    send_to_server("raceControl", {action = "cancel"})
+end
+
+function M.end_race_from_ui()
+    send_to_server("raceControl", {action = "end"})
+end
+
 -- The setup panel's championship control (ADR-0037/0040/0041): the panel serialises
 -- {action, preset, order, qualiMinutes} and calls this; we decode and relay it as a championshipCmd
 -- that routes through the same admin-gated handler as the /championship chat command. Public as
@@ -1410,6 +1427,15 @@ end
 function M.request_championship()
     if guihooks then
         guihooks.trigger("BeamCompChampionship", M.state.championship or {active = false})
+    end
+end
+
+-- Re-push the current race phase to the setup panel (UI -> GE), mirroring request_championship so a freshly
+-- linked or reopened panel learns the phase and can show/hide the race-stop controls. Public as
+-- beamcomp_init.request_race_phase.
+function M.request_race_phase()
+    if guihooks then
+        guihooks.trigger("BeamCompSetupPhase", {phase = M.state.phase or "lobby"})
     end
 end
 

@@ -173,6 +173,7 @@ angular.module('beamng.apps')
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
+      scope.phase = 'lobby';                   // latest GE-pushed race phase, gates the race-stop controls (ADR-0038)
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -347,6 +348,16 @@ angular.module('beamng.apps')
         scope.close();
       };
 
+      // Race-stop controls (ADR-0038 amendment): one-click, no confirm; the server still admin-gates and
+      // guards the phase, so this gate is UX. Cancel works in any non-lobby phase -- including finished, to
+      // clear the lingering results window + despawn everything; End & score only during racing (gated in
+      // the HTML on phase).
+      scope.canCancel = function () {
+        return scope.phase && scope.phase !== 'lobby';
+      };
+      scope.cancelRace = function () { geCall('cancel_race_from_ui'); };  // /raceclear: discard + despawn
+      scope.endRace = function () { geCall('end_race_from_ui'); };        // /raceend: force finish + score
+
       scope.close = function () {
         // Remember the current form so the next open restores it within the session (ADR-0037).
         geLuaArg('store_setup_form', JSON.stringify(scope.form));
@@ -355,6 +366,14 @@ angular.module('beamng.apps')
 
       // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
       // Sync the section's dropdowns to the active settings so the controls reflect reality, not stale form.
+      // GE pushes the race phase on every transition and on request (request_race_phase). Gates the
+      // race-stop controls so they appear only while a race is active (ADR-0038 amendment).
+      scope.$on('BeamCompSetupPhase', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.phase = (payload && payload.phase) || 'lobby';
+        });
+      });
+
       scope.$on('BeamCompChampionship', function (event, payload) {
         scope.$evalAsync(function () {
           scope.championship = payload || { active: false };
@@ -549,6 +568,7 @@ angular.module('beamng.apps')
       geCall('request_setup_form');
       geCall('request_championship');
       geCall('request_tournament');
+      geCall('request_race_phase');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars

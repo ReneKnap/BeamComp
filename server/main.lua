@@ -4433,6 +4433,19 @@ local function handle_client_event(player_id, data)
         tour.handle_cmd(player_id, decoded.payload)
     elseif decoded.type == f1.MSG_REACTION then
         f1.handle_reaction(player_id, decoded.payload)
+    elseif decoded.type == "raceControl" then
+        -- Panel-triggered race stop (ADR-0038 amendment): delegate to the existing chat-command handlers so
+        -- the admin gate, phase guards, chat replies and logging are reused. Inlined (not a named handler)
+        -- to add no top-level local under the 200/200 ceiling.
+        local name = player_name_of(player_id)
+        local action = type(decoded.payload) == "table" and decoded.payload.action or nil
+        if name then
+            if action == "cancel" then
+                handle_raceclear_command(player_id, name)
+            elseif action == "end" then
+                handle_raceend_command(player_id, name)
+            end
+        end
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)
     end
