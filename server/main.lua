@@ -3419,10 +3419,38 @@ local function handle_client_identity(player_id, payload)
     if type(payload) ~= "table" or type(payload.name) ~= "string" or payload.name == "" then
         return
     end
-    local changed = client_names[player_id] ~= payload.name
-    client_names[player_id] = payload.name
-    log_info("beamcomp.records", string.format("clientIdentity id=%s name=%s",
-        tostring(player_id), payload.name))
+    -- Disambiguate a name that collides with ANOTHER connected player's identity (ADR-0031 amendment):
+    -- staging-time plate changes make accidental same-name collisions easy, which would silently merge two
+    -- players' live standings and this session's records. Append the lowest free integer (SPEEDY -> SPEEDY2
+    -- -> SPEEDY3). The own entry is skipped, so an unchanged re-report keeps its name and reverting to a
+    -- now-free name drops the suffix. Cross-session/historical record collisions stay accepted (decision 5).
+    -- Function-local only -- no new top-level local (the main.lua local ceiling is full).
+    local requested = payload.name
+    local function taken(candidate)
+        for id, name in pairs(client_names) do
+            if id ~= player_id and name == candidate then
+                return true
+            end
+        end
+        return false
+    end
+    local unique = requested
+    local suffix = 1
+    while taken(unique) do
+        suffix = suffix + 1
+        unique = requested .. tostring(suffix)
+    end
+    local changed = client_names[player_id] ~= unique
+    client_names[player_id] = unique
+    log_info("beamcomp.records", string.format("clientIdentity id=%s name=%s%s",
+        tostring(player_id), unique,
+        unique ~= requested and (" (requested " .. requested .. ")") or ""))
+    -- Tell the player the adjusted name when it was suffixed, so the standings name is not a silent surprise.
+    -- Gate on `changed` too, so a permanently same-named player isn't re-notified on every unchanged report
+    -- (the suffix is announced once, when it first takes effect).
+    if changed and unique ~= requested then
+        MP.SendChatMessage(player_id, "BeamComp: name taken, using " .. unique)
+    end
     -- A name arriving mid-race (license name is reported at spawn) refreshes the live board so the
     -- standings switch from the BeamMP name to the client name without waiting for the next checkpoint.
     if changed and session.progress then
