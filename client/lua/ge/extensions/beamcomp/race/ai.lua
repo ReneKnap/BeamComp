@@ -135,6 +135,29 @@ local function random_stock_model()
     return models[math.random(#models)]
 end
 
+-- A random AI vehicle {model, config}, cap-aware (ADR-0032). A Mode-3 cap is active iff there is no fixed
+-- car= and a maxhp/maxpwr is set -- mirroring the car-wins precedence the resolve chain already applies (Mode
+-- 2 before Mode 3). Cap active: draw an INDEPENDENT random car from the compliant pool
+-- (vehiclespecs.random_compliant) so the "random" AI field (ADR-0037) and the ultimate fallback vary per car
+-- yet never exceed the cap; the pinned config matters because a random model's STOCK trim can be over-cap.
+-- No cap: the unconstrained random stock model (unchanged). Empty compliant pool (pathological -- no
+-- installed car meets the cap): log + degrade to find_compliant's deterministic pick, else random_stock_model,
+-- so AI spawning never hard-fails (ADR-0036). Returns (model, config).
+local function random_ai_vehicle(policy)
+    if not policy.car and (policy.maxhp or policy.maxpwr) then
+        local pick = vehiclespecs.random_compliant(policy.maxhp, policy.maxpwr)
+        if pick then
+            return pick.model, pick.config
+        end
+        log("W", LOG_TAG, "no cap-compliant car for random AI; using best-effort fallback")
+        local fallback = vehiclespecs.find_compliant(nil, policy.maxhp, policy.maxpwr)
+        if fallback then
+            return fallback.model, fallback.config
+        end
+    end
+    return random_stock_model(), nil
+end
+
 -- Resolve one AI car's {model, config} via the Etappe-B fallback chain (ADR-0036). Precedence: explicit
 -- aicar= (config.car) -> the player vehicle policy (ADR-0032: Mode 2 fixed car / Mode 3 cap-compliant car;
 -- Mode 1 = no policy falls through) -> the aiRace content default vehicle(s) -> a random stock model.
@@ -161,9 +184,10 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
     end
 
     if config.car == "random" then
-        -- The panel's "random" AI car (ADR-0037): an independent random stock model per AI, so the field
-        -- varies. Distinct from no aicar (the content default below).
-        return random_stock_model(), nil
+        -- The panel's "random" AI car (ADR-0037): an independent random car per AI so the field varies --
+        -- cap-compliant under an active Mode-3 policy, unconstrained otherwise (random_ai_vehicle). Distinct
+        -- from no aicar (the content default below).
+        return random_ai_vehicle(policy)
     end
     if config.car then
         local model, vehicle_config = split_car_token(config.car)
@@ -192,7 +216,9 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         end
     end
 
-    return random_stock_model(), nil
+    -- Ultimate fallback: a random car, cap-compliant when a Mode-3 policy is active (random_ai_vehicle),
+    -- unconstrained otherwise -- so an AI resolved this far still honours the cap.
+    return random_ai_vehicle(policy)
 end
 
 -- Spawn one host-owned AI car per slot at its grid pose (ADR-0036). `ai_slots` is the owner's relayed
