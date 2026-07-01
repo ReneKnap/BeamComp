@@ -298,4 +298,40 @@ function M.find_compliant(own_model, max_power, max_pwr)
     return nil
 end
 
+-- The config keys of `model` whose power/weight satisfy the caps (its legal trims), as an array; empty when
+-- the model has no compliant config. Reuses is_compliant, so an unreadable power/weight under a set cap is
+-- non-compliant (excluded), per ADR-0032 -- no new rule. Backs the random AI selector (random_compliant).
+local function compliant_configs(model, max_power, max_pwr)
+    local keys = {}
+    for _, entry in ipairs(M.list_configs(model)) do
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr) then
+            keys[#keys + 1] = entry.config
+        end
+    end
+    return keys
+end
+
+-- A RANDOM cap-compliant car as {model, config}, or nil when no installed car satisfies the caps. Unlike
+-- find_compliant (deterministic strongest trim, for the player substitute) this draws a model uniformly from
+-- the pool of drivable models that have a compliant config, then a compliant trim within it uniformly -- so a
+-- field of "random" AI under a Mode-3 cap (ADR-0036 Etappe B) varies per car while never exceeding the cap.
+-- Models with no compliant config are never drawn (the pool pre-filter IS the "re-roll among compliant
+-- models"), so the cap is never violated. Draws from list_car_models so an AI never spawns as a prop/trailer.
+-- Owner-local -> math.random is fine (only the owner spawns AI, no cross-client determinism, like ai.lua's
+-- random_stock_model).
+function M.random_compliant(max_power, max_pwr)
+    local pool = {}
+    for _, model in ipairs(M.list_car_models()) do
+        local configs = compliant_configs(model, max_power, max_pwr)
+        if #configs > 0 then
+            pool[#pool + 1] = {model = model, configs = configs}
+        end
+    end
+    if #pool == 0 then
+        return nil
+    end
+    local choice = pool[math.random(#pool)]
+    return {model = choice.model, config = choice.configs[math.random(#choice.configs)]}
+end
+
 return M
