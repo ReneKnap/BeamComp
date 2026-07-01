@@ -117,6 +117,11 @@ local LOOKAHEAD_STYLE = {
 -- flood (the bounce itself still fires every time).
 local SWITCH_BLOCK_TOAST_THROTTLE = 2.0
 
+-- Min seconds between "car over the cap" toasts on a rejected staging swap (ADR-0032), so mashing the
+-- vehicle selector shows one toast, not a flood (the revert still fires each time). Mirrors the switch/
+-- spawn block throttles.
+local CAP_SWAP_TOAST_THROTTLE = 2.0
+
 -- How long to keep retrying BeamMP nametag suppression on a freshly synced cone before giving up. A
 -- remote-synced cone is registered in MPVehicleGE asynchronously, a frame or two after onVehicleSpawned
 -- fires, so the one-shot hide_nametag there misses it; we retry from onUpdate until it sticks. The
@@ -168,6 +173,10 @@ M.state = {
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
+    race_caps = nil,          -- Mode-3 power caps {maxhp, maxpwr} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
+    staged_spec = nil,        -- spec {model, config, paint...} of the last COMPLIANT staged car, to revert an over-cap staging swap back to (ADR-0032), or nil
+    revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
+    staging_swap_reverting = false,  -- true only for the restage cycle that our revert started, so its known-compliant car is adopted without re-gating; recomputed from revert_pending at each consume (prevents a revert loop, ADR-0032)
     reported_name = nil,      -- the license name last sent to the server (ADR-0031 amendment); the staging poll re-reports only when the plate changes from this
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
     ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
@@ -257,6 +266,10 @@ local function handle_race_start(payload)
         -- prior race we DID run could otherwise leave us locked through a race we are not in (ADR-0017).
         M.state.race = nil
         M.state.race_car_id = nil
+        M.state.race_caps = nil
+        M.state.staged_spec = nil
+        M.state.revert_pending = false
+        M.state.staging_swap_reverting = false
         M.state.detection = nil
         M.state.laptimer = nil
         M.state.marker_angles = nil
@@ -393,6 +406,15 @@ local function handle_race_start(payload)
         maxhp = payload.maxhp,
         maxpwr = payload.maxpwr,
     }
+    -- Remember the Mode-3 caps for the staging swap-compliance gate (ADR-0032): a car swap during staging
+    -- must not stage a car over the cap. Mode 3 only -- a fixed car (Mode 2, car=) or no policy (Mode 1)
+    -- leaves this nil and the gate is skipped. Seeded fresh here; staged_spec (the compliant car to revert
+    -- an over-cap swap back to) is captured at staging entry, once the placed car's jbeam is loaded.
+    M.state.race_caps = (not policy.car and (policy.maxhp or policy.maxpwr))
+        and {maxhp = policy.maxhp, maxpwr = policy.maxpwr} or nil
+    M.state.staged_spec = nil
+    M.state.revert_pending = false
+    M.state.staging_swap_reverting = false
     -- Capture the own-car id BEFORE respawn: a forced/fresh spawn (spawn_fixed / fresh_spawn_own)
     -- despawns own_car inside respawn_own_at, so own_car:getId() afterwards would call a method on a
     -- deleted handle and abort handle_race_start (no spawnReady, no AI -> the race cancels to lobby).
@@ -417,6 +439,10 @@ local function handle_race_start(payload)
         })
         M.state.race = nil
         M.state.race_car_id = nil
+        M.state.race_caps = nil
+        M.state.staged_spec = nil
+        M.state.revert_pending = false
+        M.state.staging_swap_reverting = false
         M.state.detection = nil
         M.state.laptimer = nil
         lock.remove()
@@ -619,6 +645,10 @@ local function teardown_race_world()
     M.state.freeze_hold_armed = false
     M.state.restage_pending = false
     M.state.restage_plate = nil
+    M.state.race_caps = nil
+    M.state.staged_spec = nil
+    M.state.revert_pending = false
+    M.state.staging_swap_reverting = false
     -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
     vehicles.set_vehicle_frozen(getPlayerVehicle(0), false)
 end
@@ -968,6 +998,15 @@ local function handle_race_phase(payload)
         lock.install({allow_replace = true})
         hud.show()
         M.state.staging = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
+        -- Seed the compliance revert target from the (guaranteed compliant) car we staged, so an over-cap
+        -- swap can be reverted to it (ADR-0032). Mode 3 only; the race car's jbeam is loaded by staging, so
+        -- the spec read is reliable. A later compliant swap moves the target forward (restage_swapped_car).
+        if M.state.race_caps and M.state.race_car_id and be then
+            local staged = be:getObjectByID(M.state.race_car_id)
+            if staged then
+                M.state.staged_spec = vehicles.capture_spec(staged) or M.state.staged_spec
+            end
+        end
     elseif phase == "countdown" then
         -- Staging over: upgrade the lock to the full fixed-car lock (no more replace or selector) for
         -- the countdown + racing span, then seed the start countdown; the local onUpdate tick renders
@@ -3744,6 +3783,48 @@ local function spawn_oobb_forward(veh)
     return nil
 end
 
+-- os.clock() reading of the last over-cap staging-swap toast, throttled by CAP_SWAP_TOAST_THROTTLE. A
+-- plain file-scope local (a Lua reload resets it -- at worst one extra toast), mirroring last_block_toast_at.
+local last_cap_swap_toast_at = 0
+
+-- Warn (throttled, English, native toast) that a staging car swap was rejected for breaking the Mode-3 cap
+-- (ADR-0032). Names the offending car and the numbers, e.g. "etk800 has 450 hp -- limit is 300 hp". Reports
+-- the axis that failed off the live power/weight and the caps: the max-HP cap first, else the
+-- power-to-weight cap; an unreadable value says the power couldn't be verified (cannot verify => blocked,
+-- ADR-0032's load-bearing rule). Uses the same guihooks toast surface as the switch/spawn block warnings.
+local function warn_over_cap(veh, power, weight, caps)
+    local now = os.clock()
+    if now - last_cap_swap_toast_at < CAP_SWAP_TOAST_THROTTLE then
+        return
+    end
+    last_cap_swap_toast_at = now
+    local name = (veh and veh.JBeam) or "That car"
+    local detail
+    if caps.maxhp and not (type(power) == "number" and power <= caps.maxhp) then
+        if type(power) == "number" then
+            detail = string.format("%s has %d hp -- limit is %d hp", name, math.floor(power + 0.5), caps.maxhp)
+        else
+            detail = string.format("%s: engine power couldn't be verified -- limit is %d hp", name, caps.maxhp)
+        end
+    elseif caps.maxpwr then
+        if type(power) == "number" and type(weight) == "number" and weight > 0 then
+            detail = string.format("%s has %.2f hp/kg -- limit is %.2f hp/kg",
+                name, power / weight, caps.maxpwr)
+        else
+            detail = string.format("%s: power-to-weight couldn't be verified -- limit is %.2f hp/kg",
+                name, caps.maxpwr)
+        end
+    else
+        detail = name .. " exceeds the vehicle limit"
+    end
+    guihooks.trigger("toastrMsg", {
+        type = "warning",
+        title = "BeamComp",
+        msg = "Can't stage that car -- " .. detail,
+    })
+    log("I", RACE_LOG_TAG, "rejected over-cap staging swap: " .. detail)
+end
+
 -- Re-stage the staging car to its grid slot, front-anchored, once its jbeam has loaded. Two arming
 -- paths share this one deferred placement:
 --   1. A staging vehicle swap (ADR-0021/0017 amendments, staging-allow-vehicle-swap): the swap-allowed
@@ -3774,6 +3855,13 @@ local function restage_swapped_car(dt_real)
         M.state.restage_pending = true
         M.state.restage_baseline = nil
         M.state.restage_wait = RESTAGE_MAX_WAIT
+        -- Scope the compliance-gate skip to THIS restage cycle only (ADR-0032): if this consumed replace is
+        -- our own over-cap revert (revert_pending), its car is the known-compliant target -- skip the gate
+        -- so a transient nil read can't loop. Any OTHER replace is a new player swap and must be re-gated,
+        -- so the skip is cleared. Recomputed here (not left latched from the revert) so it can never span
+        -- the reverted car's multi-frame load wait, which would otherwise let a second over-cap swap through.
+        M.state.staging_swap_reverting = M.state.revert_pending == true
+        M.state.revert_pending = false
         log("I", RACE_LOG_TAG, "staging vehicle replace detected; re-staging")
     end
 
@@ -3797,6 +3885,54 @@ local function restage_swapped_car(dt_real)
     local loaded = current ~= nil and baseline ~= nil and math.abs(current - baseline) > RESTAGE_MIN_DELTA
     if not loaded and M.state.restage_wait > 0 then
         return
+    end
+
+    -- Mode-3 compliance gate (ADR-0032): the swap-allowed staging lock lets the player replace their car via
+    -- the vehicle/parts selector, but must not let them stage a car over the power cap. The jbeam is loaded
+    -- here (we are past the load wait), so the car's LIVE power/weight read is reliable -- unlike pre-spawn
+    -- config metadata, and unlike a pre-intercepted replace it also handles a customized car correctly. On a
+    -- violation, warn and revert to the last compliant staged car; the reverting flag makes the next cycle
+    -- adopt that known-compliant car without re-gating, so a transient nil read can't loop. Mode 1/2
+    -- (race_caps nil) skip the gate; a fresh Mode-3 substitute is compliant by construction. See ADR-0032:
+    -- reverting (not a true pre-intercept) is the documented behavior -- the over-cap car is briefly visible
+    -- while its jbeam loads, the same load window any staging swap already has.
+    local caps = M.state.race_caps
+    local staged_ok = true  -- whether the car about to be adopted is cap-compliant (always true without caps)
+    if caps and not M.state.staging_swap_reverting then
+        local compliant, power, weight = vehicles.car_compliant(own, caps.maxhp, caps.maxpwr)
+        if not compliant then
+            staged_ok = false
+            warn_over_cap(own, power, weight, caps)
+            -- Revert only in the staging phase: replaceVehicle is a working pass-through only under the
+            -- swap-allowed staging lock. Past staging (a late swap whose jbeam loads only after the
+            -- countdown began) the full lock refuses replaceVehicle silently, so a revert can't take effect
+            -- there -- we adopt (warned) rather than falsely believe we reverted. Needs a compliant car
+            -- captured to revert to.
+            if M.state.staged_spec and M.state.phase == "staging" then
+                local reverted, revert_err = vehicles.replace_spec(own, M.state.staged_spec)
+                if reverted then
+                    -- Mark our own revert so the consume branch skips the gate for exactly the cycle it
+                    -- starts (and no later player swap); the reverted car is adopted on the next cycle.
+                    M.state.revert_pending = true
+                    log("I", RACE_LOG_TAG, "over-cap staging swap reverted to the last compliant car")
+                    return
+                end
+                -- Revert call failed outright: fall through and adopt so the player is at least frozen on
+                -- the grid -- they were warned above.
+                log("W", RACE_LOG_TAG, "could not revert over-cap staging swap: " .. tostring(revert_err))
+            else
+                -- No compliant car to revert to, or past staging where the lock refuses a replace: adopt
+                -- (warned) rather than trap the player.
+                log("W", RACE_LOG_TAG, "over-cap staging swap not reverted (no target / not staging); adopting")
+            end
+        end
+    end
+    -- Clear the one-cycle revert flag and, when the adopted car is compliant, move the revert target forward
+    -- to it (Mode 3 only) so a later over-cap swap reverts to the car actually staged now. A non-compliant
+    -- car we had to adopt (revert failed / nothing to revert to) must NOT become the revert target.
+    M.state.staging_swap_reverting = false
+    if caps and staged_ok then
+        M.state.staged_spec = vehicles.capture_spec(own) or M.state.staged_spec
     end
 
     -- Adopt the staging car: re-point the bounce target, re-place front-anchored to its now-correct

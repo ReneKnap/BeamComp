@@ -115,19 +115,15 @@ local function is_owned_race_car(veh)
     return false
 end
 
--- Snapshot the player's active vehicle so it can be respawned fresh after the despawn deletes
--- it: model + part config + all three paint layers (mirrors core_vehicles.cloneCurrent).
--- Returns the spec table, or nil when the player is not in a real own car worth copying (on foot,
--- free-cam, a prop, or nothing) -- the caller then spawns DEFAULT_VEHICLE_MODEL instead.
-local function capture_own_spec()
-    if type(getPlayerVehicle) ~= "function" then
+-- (public) Snapshot a spawned car as a spec table -- model + part config + all three paint layers (mirrors
+-- core_vehicles.cloneCurrent) -- the shape spawn_vehicle_at and replace_spec consume. Returns the spec, or
+-- nil when the read fails. pcall-guarded (the paint/handle reads are engine-boundary). Used by the staging
+-- compliance gate (init.lua) to remember the last compliant car to revert an over-cap swap back to;
+-- capture_own_spec wraps it with the owned-car guard.
+function M.capture_spec(veh)
+    if not veh then
         return nil
     end
-    local veh = getPlayerVehicle(0)
-    if not is_owned_race_car(veh) then
-        return nil
-    end
-
     local ok, spec = pcall(function()
         local paints = veh:getMetallicPaintData()
         return {
@@ -139,10 +135,54 @@ local function capture_own_spec()
         }
     end)
     if not ok then
-        log("W", LOG_TAG, "could not read own vehicle spec: " .. tostring(spec))
+        log("W", LOG_TAG, "could not read vehicle spec: " .. tostring(spec))
         return nil
     end
     return spec
+end
+
+-- Snapshot the player's active vehicle so it can be respawned fresh after the despawn deletes it.
+-- Returns the spec table, or nil when the player is not in a real own car worth copying (on foot,
+-- free-cam, a prop, or nothing) -- the caller then spawns DEFAULT_VEHICLE_MODEL instead.
+local function capture_own_spec()
+    if type(getPlayerVehicle) ~= "function" then
+        return nil
+    end
+    local veh = getPlayerVehicle(0)
+    if not is_owned_race_car(veh) then
+        return nil
+    end
+    return M.capture_spec(veh)
+end
+
+-- (public) Replace a SPAWNED car in place with a captured spec (same vehicle id) -- restoring model +
+-- config + paint -- via core_vehicles.replaceVehicle. Unlike respawn_own_at this touches NO other owned
+-- vehicle (respawn_own_at -> keep_own despawns the player's other cars, which on the host include the AI
+-- field), so it is the safe primitive for reverting an over-cap staging swap (ADR-0032). During staging the
+-- replaceVehicle it calls is the lock's swap-allowed pass-through, so the normal restage re-freezes +
+-- re-places the reverted car. pcall-guarded (replaceVehicle is engine-version-coupled). Returns true, or
+-- nil plus a reason.
+function M.replace_spec(veh, spec)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(spec) ~= "table" or not spec.model then
+        return nil, "no spec to apply"
+    end
+    if type(core_vehicles) ~= "table" or type(core_vehicles.replaceVehicle) ~= "function" then
+        return nil, "core_vehicles.replaceVehicle unavailable"
+    end
+    local opt = {
+        config = spec.config,
+        paint = spec.paint,
+        paint2 = spec.paint2,
+        paint3 = spec.paint3,
+    }
+    local ok, err = pcall(core_vehicles.replaceVehicle, spec.model, opt)
+    if not ok then
+        return nil, "replaceVehicle failed: " .. tostring(err)
+    end
+    return true
 end
 
 -- The orientation quaternion for a grid pose, BEFORE the 180-degree Z flip each placement path
@@ -425,6 +465,17 @@ local function fresh_spawn_own(pose)
     return veh
 end
 
+-- (public) Live Mode-3 compliance check for a SPAWNED car (ADR-0032): read the car's live power/weight --
+-- reliable, unlike pre-spawn config metadata (see the POWER-READ RISK note) -- and apply is_compliant,
+-- returning (compliant, power, weight) so a caller can both gate and build a warning from the readings. A
+-- nil cap is "no limit on that axis"; an unreadable input under a set cap is non-compliant (cannot verify
+-- => blocked). Shared by the race-start cap resolve (respawn_for_cap) and the staging swap gate (init.lua).
+function M.car_compliant(veh, maxhp, maxpwr)
+    local power = vehiclespecs.vehicle_power(veh)
+    local weight = vehiclespecs.vehicle_weight(veh)
+    return vehiclespecs.is_compliant(power, weight, maxhp, maxpwr), power, weight
+end
+
 -- Mode 3 (ADR-0032): keep the own car when it meets the power / power-to-weight cap, else substitute the
 -- first compliant car (own model's strongest legal trim first, then other models -- find_compliant), else
 -- abort the start for this player. Own-car power + weight are read from the spawned vehicle (reliable);
@@ -432,10 +483,12 @@ end
 -- where the third value flags the no-compliant-car abort so the caller warns and skips the spawn ack.
 local function respawn_for_cap(pose, own_car, policy)
     local own_model = own_car and own_car.JBeam or nil
-    local own_power = own_car and vehiclespecs.vehicle_power(own_car) or nil
-    local own_weight = own_car and vehiclespecs.vehicle_weight(own_car) or nil
+    local compliant, own_power, own_weight = false, nil, nil
+    if own_car then
+        compliant, own_power, own_weight = M.car_compliant(own_car, policy.maxhp, policy.maxpwr)
+    end
 
-    if own_car and vehiclespecs.is_compliant(own_power, own_weight, policy.maxhp, policy.maxpwr) then
+    if compliant then
         log("I", LOG_TAG, string.format("own car '%s' meets the cap (power=%s, weight=%s) -- kept",
             tostring(own_model), tostring(own_power), tostring(own_weight)))
         return keep_own(pose, own_car)
