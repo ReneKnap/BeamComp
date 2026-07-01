@@ -515,12 +515,28 @@ local function write_grids()
     end
 
     for _, path in ipairs(candidates) do
-        local file = io.open(path, "w")
+        -- Atomic write: fill a temp file in the same directory, then swap it into place. A crash mid-
+        -- write leaves the live file untouched (unlike truncate-then-write). os.rename can't overwrite
+        -- an existing target on Windows, so drop it first -- that gap writes no data, and the complete
+        -- temp survives a crash there for recovery.
+        local tmp = path .. ".tmp"
+        local file = io.open(tmp, "w")
         if file then
-            file:write(encoded)
-            file:close()
-            grids_file_path = path
-            return true, path
+            local ok_write = file:write(encoded)
+            local ok_close = file:close()
+            if ok_write and ok_close then
+                -- Swap only once the full content is safely on disk. On a partial write (e.g. disk
+                -- full) the live file is left untouched -- the very data loss this fix prevents.
+                os.remove(path)
+                if os.rename(tmp, path) then
+                    grids_file_path = path
+                    return true, path
+                end
+                log_info("beamcomp.grid", "could not commit grids write at " .. path)
+            else
+                log_info("beamcomp.grid", "could not write grids temp at " .. path)
+            end
+            os.remove(tmp)
         end
     end
     log_info("beamcomp.grid", "could not open any grids path for writing")
@@ -640,12 +656,28 @@ local function write_records()
     end
 
     for _, path in ipairs(candidates) do
-        local file = io.open(path, "w")
+        -- Atomic write: fill a temp file in the same directory, then swap it into place. A crash mid-
+        -- write leaves the live file untouched (unlike truncate-then-write). os.rename can't overwrite
+        -- an existing target on Windows, so drop it first -- that gap writes no data, and the complete
+        -- temp survives a crash there for recovery.
+        local tmp = path .. ".tmp"
+        local file = io.open(tmp, "w")
         if file then
-            file:write(encoded)
-            file:close()
-            records_file_path = path
-            return true, path
+            local ok_write = file:write(encoded)
+            local ok_close = file:close()
+            if ok_write and ok_close then
+                -- Swap only once the full content is safely on disk. On a partial write (e.g. disk
+                -- full) the live file is left untouched -- the very data loss this fix prevents.
+                os.remove(path)
+                if os.rename(tmp, path) then
+                    records_file_path = path
+                    return true, path
+                end
+                log_info("beamcomp.records", "could not commit records write at " .. path)
+            else
+                log_info("beamcomp.records", "could not write records temp at " .. path)
+            end
+            os.remove(tmp)
         end
     end
     log_info("beamcomp.records", "could not open any records path for writing")
