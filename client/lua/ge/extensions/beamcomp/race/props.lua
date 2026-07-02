@@ -34,6 +34,7 @@
 local M = {}
 
 local cones = require("beamcomp/race/cones")
+local grinders = require("beamcomp/race/grinders")
 local prefab = require("beamcomp/race/prefab")
 
 local LOG_TAG = "beamcomp.props"
@@ -71,15 +72,17 @@ end
 -- `cone_files` is the host-only quickrace cone source (ADR-0025): a separate track prefab whose cone
 -- vehicles the host spawns from a cones-only copy (so it does not re-spawn the track's statics/spheres);
 -- empty for missions, whose cones ride inside `prefab_files`. Non-hosts never spawn it.
--- Returns the list of prefab names spawned (for prefab cleanup) and the list of kept cone vehicle ids
--- (empty unless host; for cone cleanup). One bad prefab warns and is skipped rather than aborting.
+-- Returns the list of prefab names spawned (for prefab cleanup), the list of kept cone vehicle ids
+-- (empty unless host; for cone cleanup), and the list of kept powered-prop vehicle ids (the grinders --
+-- empty unless host; for spin + cleanup, ADR-0020 amendment). One bad prefab warns and is skipped rather
+-- than aborting.
 function M.load(prefab_files, keep_cones, cone_files)
     if type(spawnPrefab) ~= "function" or type(removePrefab) ~= "function" then
         log("W", LOG_TAG, "spawnPrefab/removePrefab unavailable -- cannot load props")
-        return {}, {}
+        return {}, {}, {}
     end
     if type(prefab_files) ~= "table" then
-        return {}, {}
+        return {}, {}, {}
     end
 
     local vehicles_before = current_vehicle_ids()
@@ -138,13 +141,20 @@ function M.load(prefab_files, keep_cones, cone_files)
         end
     end
 
-    -- Only the host instantiates cones, so only the host tracks their ids for cleanup; non-hosts
-    -- never spawned any and have nothing to track (ADR-0020/0025). keep_new diffs every new cone
-    -- vehicle in the scene, so it captures both a mission's full-prefab cones and the quickrace
-    -- cones-only spawn above.
+    -- Only the host instantiates the prefab's prop-vehicles, so only the host tracks their ids for
+    -- cleanup; non-hosts never spawned any and have nothing to track (ADR-0020/0025). keep_new diffs
+    -- every new cone vehicle in the scene, so it captures both a mission's full-prefab cones and the
+    -- quickrace cones-only spawn above.
     local cone_ids = {}
+    local grinder_ids = {}
     if keep_cones then
         cone_ids = cones.keep_new(vehicles_before)
+        -- Powered props (e.g. the GridMap GrinderGrandPrix grinders): the NEW NON-cone prefab
+        -- prop-vehicles the full-prefab spawn created (ADR-0020 amendment). Start their motor host-side
+        -- now; BeamMP syncs the rotation to every client. The caller re-asserts the spin each frame
+        -- (grinders.sustain) and clears them on race end / re-issue exactly like the cones.
+        grinder_ids = grinders.keep_new(vehicles_before)
+        grinders.activate(grinder_ids)
     end
 
     -- Rebuild the static collision mesh so the freshly spawned barriers are solid (spawnPrefab
@@ -153,9 +163,9 @@ function M.load(prefab_files, keep_cones, cone_files)
         pcall(function() be:reloadCollision(false, true) end)
     end
 
-    log("I", LOG_TAG, string.format("loaded %d prop prefab(s), %d shared cone(s)",
-        #spawned, #cone_ids))
-    return spawned, cone_ids
+    log("I", LOG_TAG, string.format("loaded %d prop prefab(s), %d shared cone(s), %d powered prop(s)",
+        #spawned, #cone_ids, #grinder_ids))
+    return spawned, cone_ids, grinder_ids
 end
 
 -- Remove every prop prefab previously spawned, by name. Tolerant of names whose object is
