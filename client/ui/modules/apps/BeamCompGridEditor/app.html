@@ -39,7 +39,9 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
-    .bc-seg { display: flex; gap: 6px; }
+    /* flex:1 1 auto lets the segmented control fill a flex .bc-row (the Mirror toggle); it is inert in
+       the Direction section where .bc-seg is a block-level child of a non-flex .bc-section. */
+    .bc-seg { display: flex; flex: 1 1 auto; min-width: 0; gap: 6px; }
     .bc-seg button { flex: 1 1 auto; padding: 4px 0; border: 1px solid rgba(255,255,255,0.18);
       border-radius: 3px; background: #2a2e35; color: #cdd; cursor: pointer; font-weight: 700; }
     .bc-seg button.on { background: #1565c0; color: #fff; border-color: #1565c0; }
@@ -113,6 +115,13 @@
     <!-- Knobs -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Layout</div>
+      <div class="bc-row bc-knob">
+        <span>Mirror</span>
+        <div class="bc-seg">
+          <button ng-class="{on: !state.knobs.mirror}" ng-click="setMirror(false)">Off</button>
+          <button ng-class="{on: state.knobs.mirror}" ng-click="setMirror(true)">On</button>
+        </div>
+      </div>
       <div class="bc-row bc-knob" ng-repeat="k in knobs">
         <span>{{k.label}}</span>
         <div class="bc-step">

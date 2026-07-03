@@ -44,6 +44,23 @@ local KNOBS = {
     columns = {min = 1, max = PREVIEW_COUNT, integer = true},
 }
 
+-- Coerce a knob value to a boolean for the `mirror` toggle (the one non-numeric knob). Accepts a real
+-- boolean, a number (non-zero is on), or a string ("true"/"1"/"on" -> on) so the UI, the GE console, and
+-- a hand-edited param file all settle on a genuine boolean in the stored block.
+local function coerce_bool(value)
+    if type(value) == "boolean" then
+        return value
+    end
+    if type(value) == "number" then
+        return value ~= 0
+    end
+    if type(value) == "string" then
+        local lowered = value:lower()
+        return lowered == "true" or lowered == "1" or lowered == "on"
+    end
+    return false
+end
+
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
@@ -154,12 +171,20 @@ function M.set_direction(direction)
     return true
 end
 
--- Set one knob on the active direction's block and re-preview. `knob` is a camelCase param name;
--- `value` is coerced to a number, clamped per the knob's constraints. Returns true + the applied value,
--- or nil + a reason (not editing, unknown knob, non-numeric value).
+-- Set one knob on the active direction's block and re-preview. `knob` is a camelCase param name. The
+-- numeric knobs coerce `value` to a number, clamped per the knob's constraints; the boolean `mirror`
+-- knob is special-cased (stored as a genuine true/false). Returns true + the applied value, or nil + a
+-- reason (not editing, unknown knob, non-numeric value).
 function M.set(knob, value)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+    end
+    -- Mirror is the one boolean toggle, not a clamped number: coerce and store it before the numeric path.
+    if knob == "mirror" then
+        local on = coerce_bool(value)
+        M.state.blocks[M.state.direction].mirror = on
+        recompute()
+        return true, on
     end
     local constraint = KNOBS[knob]
     if not constraint then
