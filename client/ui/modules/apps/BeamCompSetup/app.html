@@ -74,32 +74,6 @@
 
   <div class="bc-setup-scroll">
 
-    <!-- Presets (ADR-0037 amendment): save the current setup under a name, or load/delete a saved one.
-         Placed at the top so it frames the form. Tournament/championship fields are NOT saved in a preset. -->
-    <div class="bc-section">
-      <div class="bc-section-title">Presets</div>
-      <div class="bc-row">
-        <span>Name</span>
-        <input type="text" ng-model="presetName" placeholder="preset name">
-      </div>
-      <div class="bc-row">
-        <span>Saved</span>
-        <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('preset')">{{presetLabel()}}</button>
-          <div class="bc-dd-list" ng-if="open === 'preset'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
-              ng-click="pickPreset(o.v)">{{o.label}}</div>
-            <div class="bc-dd-opt" ng-if="!opts.preset.length">no saved presets</div>
-          </div>
-        </div>
-      </div>
-      <div class="bc-row bc-preset-actions">
-        <button class="bc-refresh" ng-disabled="!presetName.trim()" ng-click="savePreset()">Save</button>
-        <button class="bc-refresh" ng-disabled="!selectedPreset" ng-click="loadPreset()">Load</button>
-        <button class="bc-refresh bc-champ-reset" ng-disabled="!selectedPreset" ng-click="deletePreset()">Delete</button>
-      </div>
-    </div>
-
     <!-- Basis -->
     <div class="bc-section">
       <div class="bc-section-title">Basis</div>
@@ -276,6 +250,33 @@
           <label class="bc-row"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="-"></label>
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
         </div>
+      </div>
+    </div>
+
+    <!-- Presets (ADR-0037 amendment): save the current setup under a name, or load/delete a saved one.
+         The last standard section, directly above the Tournament block. Tournament/championship fields are
+         NOT saved in a preset. -->
+    <div class="bc-section">
+      <div class="bc-section-title">Presets</div>
+      <div class="bc-row">
+        <span>Name</span>
+        <input type="text" ng-model="presetName" placeholder="preset name">
+      </div>
+      <div class="bc-row">
+        <span>Saved</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('preset')">{{presetLabel()}}</button>
+          <div class="bc-dd-list" ng-if="open === 'preset'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
+              ng-click="pickPreset(o.v)">{{o.label}}</div>
+            <div class="bc-dd-opt" ng-if="!opts.preset.length">no saved presets</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row bc-preset-actions">
+        <button class="bc-refresh" ng-disabled="!presetName.trim()" ng-click="savePreset()">Save</button>
+        <button class="bc-refresh" ng-disabled="!selectedPreset" ng-click="loadPreset()">Load</button>
+        <button class="bc-refresh bc-champ-reset" ng-disabled="!selectedPreset" ng-click="deletePreset()">Delete</button>
       </div>
     </div>
 
