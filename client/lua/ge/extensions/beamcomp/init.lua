@@ -35,6 +35,7 @@ local race_start = require("beamcomp/race/start")
 local vehicles = require("beamcomp/race/vehicles")
 local props = require("beamcomp/race/props")
 local cones = require("beamcomp/race/cones")
+local grinders = require("beamcomp/race/grinders")
 local spawn_mute = require("beamcomp/race/spawn_mute")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
@@ -140,6 +141,12 @@ local RESTAGE_MIN_DELTA = 0.2
 -- on the host, so a larger field is heavier on the owner's machine.
 local AI_PERF_HINT_THRESHOLD = 6
 
+-- Seconds after a grinder spawn that the host keeps re-issuing the powered-prop activation (ADR-0020
+-- amendment). The `spinner` main-controller only exists once the freshly spawned grinder VE's powertrain
+-- init has run, so activation is re-issued each frame until it lands, then stopped -- the controller owns
+-- the throttle from then on. Wall-clock (os.clockhp) anchored: dtReal is clamped on the spawn-load spike.
+local GRINDER_ACTIVATE_WINDOW = 2.0
+
 -- Reload-surviving state (BeamNG serializes M.state across a Lua reload).
 M.state = {
     last_event_at = 0,
@@ -149,6 +156,8 @@ M.state = {
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
     cone_ids = nil,      -- ids of the shared cone vehicles we spawned + must clear (host only, ADR-0020)
+    grinder_ids = nil,   -- ids of the shared powered prop-vehicles (grinders) we spawned + must clear on teardown (host only, ADR-0020 amendment)
+    grinder_activate_until = nil,  -- os.clockhp deadline for re-issuing grinder activation over the spawn readiness window; nil when idle/non-host or the window has closed (ADR-0020 amendment)
     pending_nametag = nil,  -- map of cone game-id -> seconds waited for MPVehicleGE nametag suppression to stick; lazily created, nil when idle (ADR-0020)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
@@ -374,8 +383,17 @@ local function handle_race_start(payload)
     -- branch, so clearing here is what prevents host cone-stacking on a re-issued /race.
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
-    M.state.prop_names, M.state.cone_ids = props.load(race.prefabFiles or {}, payload.propOwner,
-        race.coneFiles or {})
+    -- Despawn any prior powered props (grinders) too, so a re-issued /race never stacks them -- the same
+    -- reason cones are cleared here (ADR-0020 amendment). Host-only state; nil on a non-owner.
+    grinders.clear(M.state.grinder_ids or {})
+    M.state.prop_names, M.state.cone_ids, M.state.grinder_ids = props.load(race.prefabFiles or {},
+        payload.propOwner, race.coneFiles or {})
+    -- Arm the powered props' (grinders') activation window: their `spinner` controller only comes up after
+    -- the freshly spawned VE's powertrain init, so onUpdate re-issues the activation each frame until the
+    -- deadline, then stops (ADR-0020 amendment). Anchored on os.clockhp (dtReal is clamped on the load
+    -- spike). nil = idle / non-host / no grinders (re-armed on every /race; nil'd again on teardown).
+    M.state.grinder_activate_until = (M.state.grinder_ids and #M.state.grinder_ids > 0)
+        and (os.clockhp() + GRINDER_ACTIVATE_WINDOW) or nil
 
     -- Clear any AI cars from a prior race up front so a re-issued /race never stacks them (ADR-0036), the
     -- same reason cones are cleared here. Host-only state; all nil on a non-owner. The new AI cars are
@@ -596,6 +614,10 @@ local function teardown_race_world()
     -- Despawn the track props and the host's shared cones (idempotent on absent names/ids, ADR-0020).
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
+    -- Despawn the host's powered props (grinders) too, so they never orphan into free-roam after the race
+    -- (ADR-0020 amendment). Idempotent + host-only (nil on a non-owner). Shared by lobby end,
+    -- onClientEndMission (session leave / level change) and onExtensionUnloaded (reload).
+    grinders.clear(M.state.grinder_ids or {})
     -- Despawn the host's AI cars (ADR-0036): stop them first so none lurches on the delete frame.
     -- Idempotent + host-only (all nil on a non-owner). Remote AI id sets are just dropped below.
     ai.stop(M.state.ai_cars or {})
@@ -613,6 +635,8 @@ local function teardown_race_world()
     M.state.ai_server_ids = nil
     M.state.prop_names = nil
     M.state.cone_ids = nil
+    M.state.grinder_ids = nil
+    M.state.grinder_activate_until = nil
     M.state.race = nil
     M.state.race_car_id = nil
     M.state.detection = nil
@@ -4054,6 +4078,20 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- Phase-independent: a synced cone's MPVehicleGE registration can land a frame or two after its
     -- spawn, so this runs until the queued nametag suppressions stick (no-op when nothing is pending).
     retry_pending_nametags(dtReal)
+    -- Phase-independent, host-only: drive the powered props' (grinders') activation over a short readiness
+    -- window after spawn. The `spinner` main-controller only comes up after the freshly spawned grinder
+    -- VE's powertrain init, so a single activation at spawn can land before getControllerSafe("spinner")
+    -- is non-nil (-> no-op); we re-issue each frame until the deadline, then stop -- the controller owns
+    -- the throttle from then on (its locked target ratio holds), so re-asserting past the window would
+    -- fight its PID (ADR-0020 amendment). grinder_activate_until is nil off-race / on a non-host / once the
+    -- window closes, so the idle path is zero-work; os.clockhp (dtReal is clamped). BeamMP syncs the spin.
+    if M.state.grinder_activate_until then
+        if os.clockhp() < M.state.grinder_activate_until then
+            grinders.activate(M.state.grinder_ids)
+        else
+            M.state.grinder_activate_until = nil
+        end
+    end
     if M.state.phase == "staging" and M.state.race then
         -- Tick the staging-wait indicator on the centered overlay (ADR-0021).
         step_staging(dtReal)
