@@ -289,13 +289,37 @@ local GRIDS_CANDIDATE_PATHS = {
 }
 
 -- grids[map][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
-local grid_store = {grids = {}, defaults = {}}
+-- presets[map][name] = <race-setup form JSON string> is the named-preset store (ADR-0037 amendment
+-- 2026-07-03), folded onto this same table -- see the preset block below.
+local grid_store = {grids = {}, defaults = {}, presets = {}}
 local grids_file_path = nil
 -- Whether grid_store has been populated from disk in THIS Lua-state instance. A BeamMP file-watch
 -- reload (recon gotcha 12) re-runs this chunk -- resetting grid_store + this flag -- which is exactly
 -- what happens when the editor writes the grids file; lazy-loading on first access (ensure_grids_loaded)
 -- repopulates the store after such a reload, so a saved default is not lost.
 local grids_loaded = false
+
+-- Named race-setup presets (ADR-0037 amendment 2026-07-03). A preset is the setup panel's form JSON,
+-- stored map-scoped and opaque -- the server never interprets it (race-blind, ADR-0005), it stores and
+-- returns the string verbatim, exactly like the grid store returns opaque numbers. Its state, message
+-- constants and helper/handler functions all hang off grid_store as *fields* rather than new top-level
+-- locals: main.lua is at LuaJIT's 200/200 local ceiling (see the f1 namespace, lines 74-92, and the
+-- inlined raceControl handler), so a sibling `local preset_store` would fail to compile. load_grids and
+-- load_presets therefore clear their fields in place (never reassign grid_store) so these folded symbols
+-- survive a reload. presets_path is the resolved data file; presets_loaded gates the lazy load like
+-- grids_loaded.
+grid_store.presets_path = nil
+grid_store.presets_loaded = false
+grid_store.PRESETS_CANDIDATE_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.presets.json",
+    "beamcomp.presets.json",
+}
+grid_store.MSG_PRESET_SAVE = "presetSave"         -- panel saves a named form preset for a map (admin-gated)
+grid_store.MSG_PRESET_DELETE = "presetDelete"     -- panel deletes a saved preset for a map (admin-gated)
+grid_store.MSG_PRESET_FETCH = "presetFetch"       -- panel loads a preset: request its form blob (read-only)
+grid_store.MSG_PRESET_LIST_REQ = "presetListReq"  -- panel lists a map's saved presets (read-only)
+grid_store.MSG_PRESET_DATA = "presetData"         -- reply to presetFetch: a preset's form blob (server -> client)
+grid_store.MSG_PRESET_LIST = "presetList"         -- reply to presetListReq: the map's saved preset names (server -> client)
 
 -- Persistent best-times records (ADR-0027). A separate data file from the settings config (ADR-0016):
 -- records[race_name] = {track_best = {...}, players = {[identity] = {...}}}. The server stores only
@@ -427,7 +451,10 @@ end
 -- empty, so every race uses the procedural grid -- the safe default. The resolved path is logged so the
 -- write target is visible in the server console (recon TODO #4). Called from on_init.
 local function load_grids()
-    grid_store = {grids = {}, defaults = {}}
+    -- Clear the grid fields in place rather than reassigning grid_store: the named-preset store folds
+    -- its state + helpers onto this same table (200/200 local ceiling), and a fresh table would drop them.
+    grid_store.grids = {}
+    grid_store.defaults = {}
 
     local data, path, err = read_grids()
     grids_file_path = path
@@ -584,6 +611,104 @@ local function delete_grid(map, name)
     end
     local ok = write_grids()
     return true, ok
+end
+
+-- Preset store helpers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200
+-- ceiling). Mirror the grid read/load/ensure/write helpers above; the handlers live near the grid
+-- handlers (below player_name_of/send_event). The server treats the form blob opaquely (ADR-0005).
+
+-- Read + JSON-decode the presets file from the first candidate path that opens. Returns the decoded
+-- table + resolved path, or nil + path + error label ("parse"/"missing"). pcall-guarded like read_grids.
+function grid_store.read_presets()
+    for _, path in ipairs(grid_store.PRESETS_CANDIDATE_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            local contents = file:read("*a")
+            file:close()
+            local ok, decoded = pcall(Util.JsonDecode, contents)
+            if not ok or type(decoded) ~= "table" then
+                return nil, path, "parse"
+            end
+            return decoded, path, nil
+        end
+    end
+    return nil, nil, "missing"
+end
+
+-- Populate grid_store.presets from the presets file. A missing or unparseable file leaves it empty
+-- (an empty preset list -- the safe default). Clears in place so the folded symbols survive; the
+-- resolved path is logged so the write target is visible in the console. Mirrors load_grids.
+function grid_store.load_presets()
+    grid_store.presets = {}
+
+    local data, path, err = grid_store.read_presets()
+    grid_store.presets_path = path
+    if not data then
+        if err == "parse" then
+            log_info("beamcomp.preset", "presets file at " .. tostring(path)
+                .. " is not valid JSON; starting with no presets")
+        else
+            log_info("beamcomp.preset", "no presets file found; starting with no presets")
+        end
+        return
+    end
+
+    if type(data.presets) == "table" then
+        grid_store.presets = data.presets
+    end
+    log_info("beamcomp.preset", "loaded presets from " .. path)
+end
+
+-- Populate grid_store.presets once per Lua-state instance, lazily on first access, so preset access is
+-- robust to a file-watch reload that resets the in-memory store without re-firing onInit (like grids).
+function grid_store.ensure_presets_loaded()
+    if grid_store.presets_loaded then
+        return
+    end
+    grid_store.presets_loaded = true
+    grid_store.load_presets()
+end
+
+-- Serialize grid_store.presets and write it back, trying the loaded path first then the candidates.
+-- Atomic temp-swap + pcall-guarded, mirroring write_grids. Returns true + path on success, false else.
+function grid_store.write_presets()
+    local ok, encoded = pcall(Util.JsonEncode, {presets = grid_store.presets})
+    if not ok then
+        log_info("beamcomp.preset", "could not encode presets: " .. tostring(encoded))
+        return false
+    end
+
+    local candidates = {}
+    if grid_store.presets_path then
+        candidates[#candidates + 1] = grid_store.presets_path
+    end
+    for _, path in ipairs(grid_store.PRESETS_CANDIDATE_PATHS) do
+        candidates[#candidates + 1] = path
+    end
+
+    for _, path in ipairs(candidates) do
+        -- Atomic write: fill a temp file, then swap it into place (a crash mid-write leaves the live
+        -- file untouched). os.rename can't overwrite on Windows, so drop the target first -- see write_grids.
+        local tmp = path .. ".tmp"
+        local file = io.open(tmp, "w")
+        if file then
+            local ok_write = file:write(encoded)
+            local ok_close = file:close()
+            if ok_write and ok_close then
+                os.remove(path)
+                if os.rename(tmp, path) then
+                    grid_store.presets_path = path
+                    return true, path
+                end
+                log_info("beamcomp.preset", "could not commit presets write at " .. path)
+            else
+                log_info("beamcomp.preset", "could not write presets temp at " .. path)
+            end
+            os.remove(tmp)
+        end
+    end
+    log_info("beamcomp.preset", "could not open any presets path for writing")
+    return false
 end
 
 -- Read and JSON-decode the records file from the first candidate path that opens (ADR-0027). Returns
@@ -4241,6 +4366,118 @@ local function handle_grid_list_request(player_id, payload)
     send_event(player_id, MSG_GRID_LIST, {names = names})
 end
 
+-- Preset handlers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200 ceiling);
+-- structured like the grid handlers above -- admin gate on the mutations, opaque form blob throughout.
+
+-- Send a map's saved preset names (sorted) to one client. Shared by save/delete (echo the post-change
+-- list) and the list request, so the panel's dropdown is always server-authoritative, not local state.
+function grid_store.send_preset_list(player_id, map)
+    grid_store.ensure_presets_loaded()
+    local names = {}
+    local map_presets = type(map) == "string" and grid_store.presets[map] or nil
+    if type(map_presets) == "table" then
+        for name in pairs(map_presets) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+    end
+    send_event(player_id, grid_store.MSG_PRESET_LIST, {names = names})
+end
+
+-- Save a named race-setup preset for a map, sent by the panel. Admin-gated like gridSave. The form is an
+-- opaque JSON string stored verbatim (race-blind, ADR-0005). Echoes the updated name list. Payload:
+-- {map, name, form}.
+function grid_store.handle_preset_save(player_id, payload)
+    local player_name = player_name_of(player_id)
+    if not player_name or not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to save presets")
+        return
+    end
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
+        or type(payload.name) ~= "string" or payload.name == ""
+        or type(payload.form) ~= "string" or payload.form == "" then
+        MP.SendChatMessage(player_id, "BeamComp: preset save rejected -- bad data")
+        log_info("beamcomp.preset", "presetSave from id " .. tostring(player_id) .. " rejected: bad payload")
+        return
+    end
+
+    grid_store.ensure_presets_loaded()
+    if type(grid_store.presets[payload.map]) ~= "table" then
+        grid_store.presets[payload.map] = {}
+    end
+    grid_store.presets[payload.map][payload.name] = payload.form
+
+    local ok, path = grid_store.write_presets()
+    if ok then
+        MP.SendChatMessage(player_id, "BeamComp: saved preset '" .. payload.name .. "' for " .. payload.map)
+        log_info("beamcomp.preset", string.format("saved preset '%s' for map '%s' (%s) by %s",
+            payload.name, payload.map, tostring(path), player_name))
+    else
+        MP.SendChatMessage(player_id, "BeamComp: could not write presets file")
+    end
+
+    grid_store.send_preset_list(player_id, payload.map)
+end
+
+-- Delete a saved preset for a map, sent by the panel. Admin-gated. Echoes the updated name list so the
+-- dropdown refreshes. Payload: {map, name}.
+function grid_store.handle_preset_delete(player_id, payload)
+    local player_name = player_name_of(player_id)
+    if not player_name or not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to delete presets")
+        return
+    end
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
+        or type(payload.name) ~= "string" or payload.name == "" then
+        MP.SendChatMessage(player_id, "BeamComp: preset delete rejected -- bad data")
+        return
+    end
+
+    grid_store.ensure_presets_loaded()
+    local map_presets = grid_store.presets[payload.map]
+    if type(map_presets) ~= "table" or map_presets[payload.name] == nil then
+        MP.SendChatMessage(player_id, "BeamComp: no preset '" .. payload.name .. "' saved for " .. payload.map)
+    else
+        map_presets[payload.name] = nil
+        if grid_store.write_presets() then
+            MP.SendChatMessage(player_id, "BeamComp: deleted preset '" .. payload.name .. "' for " .. payload.map)
+            log_info("beamcomp.preset", string.format("deleted preset '%s' for map '%s' by %s",
+                payload.name, payload.map, player_name))
+        else
+            MP.SendChatMessage(player_id, "BeamComp: could not write presets file")
+        end
+    end
+
+    grid_store.send_preset_list(player_id, payload.map)
+end
+
+-- Return a saved preset's opaque form blob so the panel can load it. Read-only, ungated like the grid
+-- fetch. A missing map/name or unknown preset replies found = false. Payload: {map, name}.
+function grid_store.handle_preset_fetch(player_id, payload)
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or type(payload.name) ~= "string" then
+        send_event(player_id, grid_store.MSG_PRESET_DATA, {found = false})
+        return
+    end
+    grid_store.ensure_presets_loaded()
+    local map_presets = grid_store.presets[payload.map]
+    local form = type(map_presets) == "table" and map_presets[payload.name] or nil
+    if type(form) ~= "string" then
+        send_event(player_id, grid_store.MSG_PRESET_DATA, {name = payload.name, found = false})
+        return
+    end
+    send_event(player_id, grid_store.MSG_PRESET_DATA, {
+        name = payload.name,
+        found = true,
+        form = form,
+    })
+end
+
+-- Return the saved preset names for a map. Read-only, sorted for a stable listing. Payload: {map}.
+function grid_store.handle_preset_list_request(player_id, payload)
+    local map = type(payload) == "table" and payload.map or nil
+    grid_store.send_preset_list(player_id, map)
+end
+
 -- Coerce the settings UI's decoded overrides into the shape begin_race_request/start_race expect (the
 -- parse_race_args output, ADR-0037). The payload is an untrusted network boundary, so every field is
 -- type-checked and clamped; unknown fields are dropped. Most values are opaque relay (race-blind,
@@ -4483,6 +4720,14 @@ local function handle_client_event(player_id, data)
         handle_grid_fetch(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_LIST_REQ then
         handle_grid_list_request(player_id, decoded.payload)
+    elseif decoded.type == grid_store.MSG_PRESET_SAVE then
+        grid_store.handle_preset_save(player_id, decoded.payload)
+    elseif decoded.type == grid_store.MSG_PRESET_DELETE then
+        grid_store.handle_preset_delete(player_id, decoded.payload)
+    elseif decoded.type == grid_store.MSG_PRESET_FETCH then
+        grid_store.handle_preset_fetch(player_id, decoded.payload)
+    elseif decoded.type == grid_store.MSG_PRESET_LIST_REQ then
+        grid_store.handle_preset_list_request(player_id, decoded.payload)
     elseif decoded.type == MSG_START_RACE then
         handle_start_race(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_GO then
@@ -4517,6 +4762,7 @@ local function on_init()
     math.randomseed(os.time())
     load_config()
     ensure_grids_loaded()
+    grid_store.ensure_presets_loaded()
     ensure_records_loaded()
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
     -- fully up; the tick is a no-op while the session sits in lobby.

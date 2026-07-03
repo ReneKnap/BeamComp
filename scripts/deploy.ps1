@@ -129,6 +129,16 @@ try {
         Copy-Item -LiteralPath $recordsTarget -Destination $recordsBackup -Force
     }
 
+    # beamcomp.presets.json is the same class of runtime data (named race-setup presets the panel writes,
+    # ADR-0037 amendment). Preserve it identically, or a redeploy resets every saved preset to the empty
+    # repo seed.
+    $presetsTarget = Join-Path $serverOut 'beamcomp.presets.json'
+    $presetsBackup = $null
+    if (Test-Path -LiteralPath $presetsTarget) {
+        $presetsBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("beamcomp_presets_" + [Guid]::NewGuid().ToString('N') + ".json")
+        Copy-Item -LiteralPath $presetsTarget -Destination $presetsBackup -Force
+    }
+
     if (Test-Path -LiteralPath $serverOut) { Remove-Item -LiteralPath $serverOut -Recurse -Force }
     New-Dir $serverOut
     Copy-Item -Path (Join-Path $serverDir '*') -Destination $serverOut -Recurse -Force
@@ -144,6 +154,12 @@ try {
         Copy-Item -LiteralPath $recordsBackup -Destination $recordsTarget -Force
         Remove-Item -LiteralPath $recordsBackup -Force
         Write-Host "  preserved existing beamcomp.records.json (accumulated best times kept)"
+    }
+
+    if ($null -ne $presetsBackup) {
+        Copy-Item -LiteralPath $presetsBackup -Destination $presetsTarget -Force
+        Remove-Item -LiteralPath $presetsBackup -Force
+        Write-Host "  preserved existing beamcomp.presets.json (saved race-setup presets kept)"
     }
 
     Write-Host "BeamComp deployed to: $resourcesDir"
