@@ -149,12 +149,12 @@ function M.load(prefab_files, keep_cones, cone_files)
     local grinder_ids = {}
     if keep_cones then
         cone_ids = cones.keep_new(vehicles_before)
-        -- Powered props (e.g. the GridMap GrinderGrandPrix grinders): the NEW NON-cone prefab
-        -- prop-vehicles the full-prefab spawn created (ADR-0020 amendment). Start their motor host-side
-        -- now; BeamMP syncs the rotation to every client. The caller re-asserts the spin each frame
-        -- (grinders.sustain) and clears them on race end / re-issue exactly like the cones.
+        -- Powered props (the GridMap GrinderGrandPrix grinders, jbeam "large_spinner"): the NEW grinder
+        -- prop-vehicles the full-prefab spawn created (ADR-0020 amendment). Just identify + return them;
+        -- the caller (init.lua) drives their motor over a short readiness window after spawn -- the
+        -- `spinner` controller only exists once the fresh VE's powertrain is up -- and clears them on race
+        -- end / re-issue exactly like the cones. BeamMP syncs the resulting rotation to every client.
         grinder_ids = grinders.keep_new(vehicles_before)
-        grinders.activate(grinder_ids)
     end
 
     -- Rebuild the static collision mesh so the freshly spawned barriers are solid (spawnPrefab
