@@ -75,6 +75,13 @@ angular.module('beamng.apps')
     };
   }
 
+  // The championship / class-drop keys are EXCLUDED from a saved preset (ADR-0037 amendment): they are
+  // activated live via championshipCmd/tournamentCmd, so baking them into a preset would mislead (a loaded
+  // tourMode would not auto-start anything). Everything else in the form -- including the selected race --
+  // is saved. Must stay in sync with freshForm's tournament fields.
+  var PRESET_EXCLUDE_KEYS = ['champPreset', 'champOrder', 'champQualiMinutes',
+    'tourMode', 'tourClasses', 'tourOrder'];
+
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
   // the JSON's double quotes pass through; backslashes and single quotes are escaped). Inert when bngApi
   // is unavailable (see header) -- the panel simply cannot submit, never throws.
@@ -165,11 +172,13 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.data = { races: [], cars: [], grids: [], configs: [] };
+      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [] };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
-      scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [] }, STATIC_OPTS);
+      scope.presetName = '';       // the name field for Save (ADR-0037 amendment)
+      scope.selectedPreset = '';   // the saved preset chosen in the dropdown, for Load / Delete
+      scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [], preset: [] }, STATIC_OPTS);
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
@@ -189,6 +198,38 @@ angular.module('beamng.apps')
       function rebuildConfigOpts() {
         scope.opts.carConfig = [{ v: '', label: 'default' }].concat(
           (scope.data.configs || []).map(function (c) { return { v: c.config, label: c.name }; }));
+      }
+      function rebuildPresetOpts() {
+        scope.opts.preset = (scope.data.presets || []).map(function (p) { return { v: p, label: p }; });
+      }
+
+      // Apply a stored form JSON string (the session-restore blob OR a loaded preset) over a fresh form,
+      // then re-sync the option lists and prefetch the configs the restored cars need. Shared by
+      // BeamCompSetupForm and BeamCompSetupPresetData so a loaded preset restores EXACTLY like the session
+      // form (ADR-0037 amendment). A preset omits the tournament fields, so those stay at freshForm defaults.
+      function applyStoredForm(formJson) {
+        if (!formJson) {
+          return;
+        }
+        var parsed;
+        try {
+          parsed = JSON.parse(formJson);
+        } catch (e) {
+          return;
+        }
+        scope.form = angular.extend(freshForm(), parsed);
+        // Re-sync the race list to the restored include-deprecated flag, and fetch the restored model's
+        // configs so the config dropdown + label resolve (without clearing the stored config).
+        scope.refresh();
+        if (scope.form.carModel) {
+          geLuaArg('request_car_configs', scope.form.carModel);
+        }
+        // Re-fetch configs for each restored class car so the per-class config dropdowns repopulate (ADR-0042).
+        (scope.form.tourClasses || []).forEach(function (c) {
+          if (c.car) {
+            geLuaArg('request_car_configs', c.car);
+          }
+        });
       }
 
       // GE pushes the dynamic lists on open AND on every refresh (the include-deprecated toggle, the Refresh
@@ -211,28 +252,15 @@ angular.module('beamng.apps')
       // (ADR-0037). Merge over freshForm so any field absent from an older stored form keeps its default.
       scope.$on('BeamCompSetupForm', function (event, payload) {
         scope.$evalAsync(function () {
-          if (!payload || !payload.form) {
-            return;
-          }
-          var parsed;
-          try {
-            parsed = JSON.parse(payload.form);
-          } catch (e) {
-            return;
-          }
-          scope.form = angular.extend(freshForm(), parsed);
-          // Re-sync the race list to the restored include-deprecated flag, and fetch the restored model's
-          // configs so the config dropdown + label resolve (without clearing the stored config).
-          scope.refresh();
-          if (scope.form.carModel) {
-            geLuaArg('request_car_configs', scope.form.carModel);
-          }
-          // Re-fetch configs for each restored class car so the per-class config dropdowns repopulate (ADR-0042).
-          (scope.form.tourClasses || []).forEach(function (c) {
-            if (c.car) {
-              geLuaArg('request_car_configs', c.car);
-            }
-          });
+          applyStoredForm(payload && payload.form);
+        });
+      });
+
+      // Apply a loaded preset's form (ADR-0037 amendment): the same restore path as the session form, so a
+      // loaded preset behaves identically. The preset omits the tournament fields -- they stay at defaults.
+      scope.$on('BeamCompSetupPresetData', function (event, payload) {
+        scope.$evalAsync(function () {
+          applyStoredForm(payload && payload.form);
         });
       });
 
@@ -240,6 +268,18 @@ angular.module('beamng.apps')
         scope.$evalAsync(function () {
           scope.data.grids = (payload && payload.names) || [];
           rebuildGridOpts();
+        });
+      });
+
+      // Authoritative saved-preset list from the server (ADR-0037 amendment): the panel reflects it as
+      // truth, not local state. Drop the current selection if it is gone (e.g. just deleted by anyone).
+      scope.$on('BeamCompSetupPresets', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.data.presets = (payload && payload.names) || [];
+          rebuildPresetOpts();
+          if (scope.selectedPreset && scope.data.presets.indexOf(scope.selectedPreset) === -1) {
+            scope.selectedPreset = '';
+          }
         });
       });
 
@@ -321,6 +361,37 @@ angular.module('beamng.apps')
       scope.editGrid = function () {
         if (scope.form.race) {
           geLuaArg('open_grid_editor_with_race', scope.form.race);
+        }
+      };
+
+      // Presets (ADR-0037 amendment): save the current form under a name, or load / delete a saved one.
+      // Save strips the tournament/championship keys (activated live, not via a preset) and sends the rest
+      // -- including the selected race -- as an opaque JSON blob GE relays to the server with the map. The
+      // server echoes the updated name list (BeamCompSetupPresets), so the dropdown reflects server truth.
+      scope.presetLabel = function () {
+        return scope.selectedPreset || 'select preset…';
+      };
+      scope.pickPreset = function (value) {
+        scope.selectedPreset = value;
+        scope.open = null;
+      };
+      scope.savePreset = function () {
+        var name = (scope.presetName || '').trim();
+        if (!name) {
+          return;
+        }
+        var formCopy = angular.extend({}, scope.form);
+        PRESET_EXCLUDE_KEYS.forEach(function (k) { delete formCopy[k]; });
+        geLuaArg('save_preset', JSON.stringify({ name: name, form: JSON.stringify(formCopy) }));
+      };
+      scope.loadPreset = function () {
+        if (scope.selectedPreset) {
+          geLuaArg('load_preset', scope.selectedPreset);
+        }
+      };
+      scope.deletePreset = function () {
+        if (scope.selectedPreset) {
+          geLuaArg('delete_preset', scope.selectedPreset);
         }
       };
 
