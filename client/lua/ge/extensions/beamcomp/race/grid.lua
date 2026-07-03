@@ -33,6 +33,7 @@ local DEFAULT_OFFSET_LATERAL = 0.0   -- metres the whole grid shifts along the r
 local DEFAULT_HEADING_DEG = 0.0      -- extra rotation about vertical applied to layout + headings
 local DEFAULT_ROW_GAP = 8.0          -- longitudinal gap between rows (metres)
 local DEFAULT_COL_GAP = 4.0          -- lateral gap between adjacent columns (metres)
+local DEFAULT_MIRROR = false         -- lateral seiten-flip: off reproduces the historical pole-left layout
 
 -- The editor's default preview field size and the rows clamp/fallback. With the columns-pinned default a
 -- slot's pose is count-independent (slot k -> a fixed row/column from k alone), so the editor's 8-car
@@ -139,6 +140,8 @@ end
 -- field); an explicit `rows` pins the row count (poses derives the columns from the live field size). When
 -- NEITHER is given -- the bare fallback / no-custom-grid case -- the default pins DEFAULT_COLUMNS columns.
 -- Both pins clamp to [1, GRID_CAPACITY]; rows always gets a value (used only when columns is nil/derived).
+-- `mirror` is a boolean (not a number): only a genuine `true` enables the lateral flip, so an absent or
+-- false flag reproduces today's pole-left layout bit-for-bit (0/1 would misfire -- 0 is truthy in Lua).
 local function resolved_params(params)
     params = params or {}
 
@@ -168,6 +171,7 @@ local function resolved_params(params)
         col_gap = params.colGap or DEFAULT_COL_GAP,
         rows = rows,
         columns = columns,
+        mirror = params.mirror == true,
     }
 end
 
@@ -183,6 +187,7 @@ function M.default_params()
         rowGap = DEFAULT_ROW_GAP,
         colGap = DEFAULT_COL_GAP,
         columns = DEFAULT_COLUMNS,
+        mirror = DEFAULT_MIRROR,
     }
 end
 
@@ -200,6 +205,9 @@ end
 -- centre, setback trails the field back along the travel axis. Within a row the columns are staggered by
 -- row_gap / columns each, so they spread evenly across one row's depth (two columns -> column 2 at half
 -- the row gap). headingDeg pivots both the layout axes and every car heading. z is taken from base_pos.
+-- The `mirror` flag (lateral seiten-flip) negates only the column-derived lateral offset, so the pole
+-- keeps its front row and swaps to the other side while the front-to-back stagger, the slot order, and
+-- offset_lateral (an absolute shift) are unchanged; car headings are untouched (cars still face forward).
 function M.poses(base_pos, base_rot, count, params, gate_normal)
     local p = resolved_params(params)
     local heading_rad = math.rad(p.heading_deg)
@@ -244,7 +252,13 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
     for slot = 0, count - 1 do
         local column = slot % columns
         local row = math.floor(slot / columns)
-        local lateral = (column - centre_column) * p.col_gap + p.offset_lateral
+        -- Column-derived lateral spread about the centre; mirror negates it so the field swaps sides.
+        -- offset_lateral is added after the flip so it stays an absolute "shift the grid N m right" knob.
+        local column_lateral = (column - centre_column) * p.col_gap
+        if p.mirror then
+            column_lateral = -column_lateral
+        end
+        local lateral = column_lateral + p.offset_lateral
         local setback = row * p.row_gap + column * column_setback + p.offset_forward
         poses[#poses + 1] = {
             pos = {

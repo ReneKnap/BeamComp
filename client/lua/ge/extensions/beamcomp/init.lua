@@ -1601,6 +1601,7 @@ local function push_grid_state()
             colGap = block.colGap,
             rows = block.rows,
             columns = block.columns,
+            mirror = block.mirror,
         } or nil,
     })
 end
@@ -4317,6 +4318,8 @@ end
 --   rows           -- number of rows (columns = ceil(field / rows); columns auto-stagger by rowGap/cols)
 --   columns        -- explicit number of columns: pins the grid width so it does not grow with a large
 --                     field (e.g. many AI); overrides rows. Setting rows again switches back to deriving.
+--   mirror         -- boolean lateral seiten-flip: on moves the pole to the other side (pole-right)
+--                     while keeping the stagger and front-to-back order; off (default) is pole-left.
 
 -- GE console command (intentionally global): start a fresh grid from the track's generated layout.
 function beamcomp_grid_new(race_name)
