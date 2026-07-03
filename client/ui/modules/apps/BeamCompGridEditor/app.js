@@ -10,10 +10,12 @@
 // list, ng-click): native <select> does not open in the BeamNG CEF overlay.
 angular.module('beamng.apps')
 .directive('beamCompGridEditor', [function () {
-  // The seven tunable knobs (ADR-0023) in display order. Each continuous knob has a fine (0.05) and a
-  // coarse (1.0) stepper pair; integer knobs (rows/columns) step by 1 only. rows and columns are mutually
-  // exclusive width pins: pinning one drops the other (GE clears it), which then shows blank ("auto") and
-  // is derived from the field at spawn. Both carry `auto: true` so whichever is unpinned reads "auto".
+  // The seven NUMERIC tunable knobs (ADR-0023) in display order. Each continuous knob has a fine (0.05)
+  // and a coarse (1.0) stepper pair; integer knobs (rows/columns) step by 1 only. rows and columns are
+  // mutually exclusive width pins: pinning one drops the other (GE clears it), which then shows blank
+  // ("auto") and is derived from the field at spawn. Both carry `auto: true` so whichever is unpinned
+  // reads "auto". The boolean `mirror` param is not in this list -- it renders as its own On/Off toggle
+  // (the first Layout row, see app.html + scope.setMirror), not a numeric stepper.
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)' },
     { key: 'offsetLateral', label: 'Offset lateral (m)' },
@@ -79,6 +81,15 @@ angular.module('beamng.apps')
     }
     var escaped = String(knob).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     bngApi.engineLua("beamcomp_init.grid_set('" + escaped + "', " + n + ')');
+  }
+
+  // Set the boolean mirror knob: grid_set('mirror', <bool>). Sent as a Lua boolean literal (no quoting,
+  // no Number coercion) so grideditor stores a genuine true/false, matching grid.lua's boolean contract.
+  function geSetMirror(on) {
+    if (typeof bngApi === 'undefined' || !bngApi.engineLua) {
+      return;
+    }
+    bngApi.engineLua("beamcomp_init.grid_set('mirror', " + (on ? 'true' : 'false') + ')');
   }
 
   // Assign a saved grid as a race default: grid_assign(race, name), both single-quoted.
@@ -268,6 +279,15 @@ angular.module('beamng.apps')
           next = Math.round(next * 100) / 100;
         }
         geSetKnob(knob.key, next);
+      };
+
+      // Mirror toggle: send the boolean to GE, which echoes it back through BeamCompGridState so the
+      // On/Off highlight reflects the authoritative value (not local state).
+      scope.setMirror = function (on) {
+        if (!scope.state.active) {
+          return;
+        }
+        geSetMirror(on);
       };
 
       // Number-field commit: send the typed value to GE (which clamps and reflects it back).
