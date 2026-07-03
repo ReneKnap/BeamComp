@@ -14,7 +14,7 @@
     .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
       margin: 4px 0; }
     .bc-row > span { flex: 0 0 42%; }
-    .bc-row input[type=number] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
+    .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
       color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
     .bc-check { justify-content: flex-start; }
     .bc-check input { flex: 0 0 auto; margin-right: 6px; }
@@ -41,6 +41,10 @@
     .bc-start { background: #1565c0; color: #fff; }
     .bc-refresh { background: #355; color: #cde; padding: 3px 10px; border: none; border-radius: 3px;
       font-weight: 700; cursor: pointer; }
+    .bc-refresh[disabled] { background: #2a2e35; color: #777; cursor: default; }
+    /* Presets (ADR-0037 amendment): a Save/Load/Delete button row sharing the refresh look. */
+    .bc-preset-actions { gap: 8px; }
+    .bc-preset-actions button { flex: 1 1 auto; }
     .bc-close { background: #444; color: #ddd; flex: 0 0 80px; }
     /* Championship section (ADR-0040): a status line plus Start/Apply/Reset buttons sharing the refresh look. */
     .bc-champ-status { flex: 1 1 auto; text-align: right; opacity: 0.85; font-size: 12px;
@@ -246,6 +250,33 @@
           <label class="bc-row"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="-"></label>
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
         </div>
+      </div>
+    </div>
+
+    <!-- Presets (ADR-0037 amendment): save the current setup under a name, or load/delete a saved one.
+         The last standard section, directly above the Tournament block. Tournament/championship fields are
+         NOT saved in a preset. -->
+    <div class="bc-section">
+      <div class="bc-section-title">Presets</div>
+      <div class="bc-row">
+        <span>Name</span>
+        <input type="text" ng-model="presetName" placeholder="preset name">
+      </div>
+      <div class="bc-row">
+        <span>Saved</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('preset')">{{presetLabel()}}</button>
+          <div class="bc-dd-list" ng-if="open === 'preset'">
+            <div class="bc-dd-opt" ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
+              ng-click="pickPreset(o.v)">{{o.label}}</div>
+            <div class="bc-dd-opt" ng-if="!opts.preset.length">no saved presets</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row bc-preset-actions">
+        <button class="bc-refresh" ng-disabled="!presetName.trim()" ng-click="savePreset()">Save</button>
+        <button class="bc-refresh" ng-disabled="!selectedPreset" ng-click="loadPreset()">Load</button>
+        <button class="bc-refresh bc-champ-reset" ng-disabled="!selectedPreset" ng-click="deletePreset()">Delete</button>
       </div>
     </div>
 

@@ -1681,6 +1681,29 @@ local function handle_grid_list(payload)
     editor_feedback("saved grids: " .. table.concat(names, ", "))
 end
 
+-- Push the current map's saved preset names to the race-setup panel (ADR-0037 amendment). The panel is
+-- the sole consumer (unlike gridList's three), so no routing target is needed -- always to the panel.
+local function handle_preset_list(payload)
+    local names = type(payload) == "table" and type(payload.names) == "table" and payload.names or {}
+    guihooks.trigger("BeamCompSetupPresets", {names = names})
+end
+
+-- Apply a loaded preset to the race-setup panel (ADR-0037 amendment). On a found reply, push the opaque
+-- form blob so the panel restores it through the same path as the session form-restore
+-- (applyStoredForm/BeamCompSetupForm). `found` false means no such preset for this map (a stale entry).
+local function handle_preset_data(payload)
+    if type(payload) ~= "table" or not payload.found or type(payload.form) ~= "string" then
+        local name = type(payload) == "table" and payload.name or "?"
+        guihooks.trigger("toastrMsg", {
+            type = "warning",
+            title = "BeamComp preset",
+            msg = "preset '" .. tostring(name) .. "' not found on this map",
+        })
+        return
+    end
+    guihooks.trigger("BeamCompSetupPresetData", {form = payload.form})
+end
+
 -- Build the race-setup panel's option dataset and push it to the app (ADR-0037): the startable races +
 -- drivable car models (built locally since the server is race/vehicle-blind, ADR-0005), plus an async
 -- request for the map's saved grids (routed back by handle_grid_list). Static enums (modes, order,
@@ -1694,6 +1717,8 @@ local function push_setup_data(include_deprecated)
     })
     M.state.grid_list_target = "setup"
     send_to_server("gridListReq", {map = map})
+    -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
+    send_to_server("presetListReq", {map = map})
 end
 
 -- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
@@ -1731,6 +1756,64 @@ end
 -- Public as beamcomp_init.request_setup_form.
 function M.request_setup_form()
     guihooks.trigger("BeamCompSetupForm", {form = M.state.setup_form})
+end
+
+-- Save the current race-setup form as a named, map-scoped preset (UI -> GE -> server, ADR-0037 amendment).
+-- The panel serialises its form minus the tournament/championship fields and passes {name, form}; GE relays
+-- the opaque blob with the current map. Public as beamcomp_init.save_preset. A bad payload is dropped.
+function M.save_preset(json)
+    local ok, decoded = pcall(jsonDecode, json)
+    if not ok or type(decoded) ~= "table"
+        or type(decoded.name) ~= "string" or decoded.name == ""
+        or type(decoded.form) ~= "string" or decoded.form == "" then
+        log("W", RACE_LOG_TAG, "save_preset: bad payload")
+        return
+    end
+    local map = maps.current()
+    if not map then
+        log("W", RACE_LOG_TAG, "save_preset: no map loaded")
+        return
+    end
+    send_to_server("presetSave", {map = map, name = decoded.name, form = decoded.form})
+end
+
+-- Load a saved preset by name (UI -> GE -> server, ADR-0037 amendment): request its form blob; the server's
+-- presetData reply is applied to the panel by handle_preset_data. Public as beamcomp_init.load_preset.
+function M.load_preset(name)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+    local map = maps.current()
+    if not map then
+        log("W", RACE_LOG_TAG, "load_preset: no map loaded")
+        return
+    end
+    send_to_server("presetFetch", {map = map, name = name})
+end
+
+-- Delete a saved preset by name (UI -> GE -> server, ADR-0037 amendment): the server echoes the updated
+-- name list (handle_preset_list), so the dropdown refreshes itself. Public as beamcomp_init.delete_preset.
+function M.delete_preset(name)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+    local map = maps.current()
+    if not map then
+        log("W", RACE_LOG_TAG, "delete_preset: no map loaded")
+        return
+    end
+    send_to_server("presetDelete", {map = map, name = name})
+end
+
+-- Request the current map's saved preset names (UI -> GE -> server, ADR-0037 amendment): the panel calls
+-- this to refresh its dropdown; the reply routes back via handle_preset_list. Public as
+-- beamcomp_init.request_presets.
+function M.request_presets()
+    local map = maps.current()
+    if not map then
+        return
+    end
+    send_to_server("presetListReq", {map = map})
 end
 
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on
@@ -2025,6 +2108,8 @@ local HANDLERS = {
     analysisToggle = handle_analysis_toggle,
     gridData = handle_grid_data,
     gridList = handle_grid_list,
+    presetData = handle_preset_data,
+    presetList = handle_preset_list,
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,
     setupOpen = handle_setup_open,
