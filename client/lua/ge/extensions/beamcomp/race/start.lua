@@ -417,9 +417,12 @@ function M.prepare(payload)
     -- Drop every pose onto the real surface and clear of walls before anyone spawns on it (ADR-0034):
     -- grid.poses is pure math at the start-line Z, so on undulating tracks the rear rows would bury or
     -- float. front-anchoring (vehicles.lua) preserves Z, so grounding here flows through every placement
-    -- path (fresh/fixed/substitute spawn, keep+teleport, regrid, restage, recover-before-CP1).
-    local poses = placement.resolve_all(grid.poses(base_pose.pos, base_pose.rot, count, grid_params,
-        gate_normal))
+    -- path (fresh/fixed/substitute spawn, keep+teleport, regrid, restage, recover-before-CP1). The block
+    -- is expanded into its ordered segment list (ADR-0023 amendment) and laid out via poses_segmented, so
+    -- the spawned field matches the editor's stacked preview exactly; a plain single-param block (or nil)
+    -- expands to one segment and reproduces today's layout bit-for-bit.
+    local poses = placement.resolve_all(grid.poses_segmented(base_pose.pos, base_pose.rot, count,
+        grid.block_to_segments(grid_params), gate_normal))
     local my_pose = poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
