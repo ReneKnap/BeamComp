@@ -70,6 +70,9 @@ angular.module('beamng.apps')
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
+      // Composable random-AI axes (aiCar='random'): stock vs random trim, and exclude big/heavy vehicles.
+      // Both default off so the fresh form reproduces today's no-cap random-AI behaviour.
+      aiRandomTrim: false, aiNoBigCars: false,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
       tourMode: 'off', tourClasses: defaultTourClasses(), tourOrder: 'random',
     };
@@ -154,6 +157,11 @@ angular.module('beamng.apps')
       var ai = { count: num(form.aiCount) || 1, explicit: true };
       if (form.aiPreset) { ai.preset = form.aiPreset; }
       if (form.aiCar) { ai.car = form.aiCar; }
+      // Composable random-AI axes (resolved client-side in race/ai.lua): sent explicitly as booleans so the
+      // resolver decouples trim from the cap. randomTrim false = stock/default config, true = random trim
+      // variant; noBigCars true excludes big/heavy vehicles (curb-weight ceiling).
+      ai.randomTrim = !!form.aiRandomTrim;
+      ai.noBigCars = !!form.aiNoBigCars;
       var params = {};
       if (num(form.aiAggr) !== undefined) { params.aggr = num(form.aiAggr); }
       if (num(form.aiSkill) !== undefined) { params.skill = num(form.aiSkill); }

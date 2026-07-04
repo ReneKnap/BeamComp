@@ -233,6 +233,12 @@
             </div>
           </div>
         </div>
+        <!-- Composable random-AI axes: only meaningful when the AI car is "random". Trim toggles stock vs
+             random config variant; Exclude big vehicles drops buses/trucks/vans by curb weight. -->
+        <div ng-if="form.aiCar === 'random'">
+          <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiRandomTrim"><span>Random trim variant</span></label>
+          <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiNoBigCars"><span>Exclude big vehicles</span></label>
+        </div>
         <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAdvanced"><span>Advanced AI settings</span></label>
         <div ng-if="form.aiAdvanced">
           <div class="bc-row">
