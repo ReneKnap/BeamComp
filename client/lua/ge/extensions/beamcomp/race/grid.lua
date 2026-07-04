@@ -209,11 +209,22 @@ function M.default_params()
     }
 end
 
--- Lay `count` cars out behind base_pos/base_rot for one param set, and report the block's stacking depth.
--- Returns (poses, depth): `poses` is a list of { pos, rot, forward, faceDir } in slot order; `depth` is
--- the deepest ROW's setback along the travel axis (column 0 of the last row, i.e. WITHOUT the intra-row
--- column stagger), which the segmented stacker uses to re-base the next segment directly behind this one
--- so their rows line up column-for-column at offsetForward = 0.
+-- The forward setback of a single grid slot at `local_index` for a resolved param set. Shared by the pose
+-- loop (placed slots 0..count-1) and the segment continuation point (the un-placed slot at index = count),
+-- so both use the exact same ramp. Because setback = local_index * (row_gap / columns) + offset_forward is
+-- LINEAR in local_index, laying the same param set out as stacked segments (each continuing at the previous
+-- segment's next slot) reproduces one continuous grid slot-for-slot along the travel axis.
+local function slot_setback(local_index, p, columns, column_setback)
+    local column = local_index % columns
+    local row = math.floor(local_index / columns)
+    return row * p.row_gap + column * column_setback + p.offset_forward
+end
+
+-- Lay `count` cars out behind base_pos/base_rot for one param set, and report the continuation setback.
+-- Returns (poses, continuation): `poses` is a list of { pos, rot, forward, faceDir } in slot order;
+-- `continuation` is the forward setback this segment WOULD give its NEXT slot (local index = count) -- the
+-- seamless continuation point where a following segment's local slot 0 lands, so the following segment's own
+-- offsetForward is a pure ADDITIONAL gap on top (0 = seamless, positive = tail further back).
 --   params      -- optional grid param set (ADR-0023): offsetForward/offsetLateral (metres, along the
 --                  travel/right axes), headingDeg (extra rotation of the whole grid about vertical),
 --                  rowGap/colGap (metres), and a width pin -- either rows (columns are derived as
@@ -280,7 +291,7 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
             column_lateral = -column_lateral
         end
         local lateral = column_lateral + p.offset_lateral
-        local setback = row * p.row_gap + column * column_setback + p.offset_forward
+        local setback = slot_setback(slot, p, columns, column_setback)
         poses[#poses + 1] = {
             pos = {
                 x = base_pos.x + right.x * lateral - forward.x * setback,
@@ -298,18 +309,13 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
         }
     end
 
-    -- Stacking depth = the DEEPEST ROW's setback (column 0), not the max staggered setback. The next
-    -- segment re-bases directly behind this by `depth`, so at offsetForward = 0 its first row lines up
-    -- with this segment's last row column-for-column (col 0 -> col 0). Using the deepest STAGGERED car
-    -- would over-reserve by up to one intra-row column-stagger step whenever the last row is full, and
-    -- that error accumulates into a growing forward gap across 3+ stacked segments. An empty segment
-    -- reserves nothing.
-    local depth = 0
-    if count > 0 then
-        local last_row = math.floor((count - 1) / columns)
-        depth = last_row * p.row_gap + p.offset_forward
-    end
-    return poses, depth
+    -- The continuation setback: the forward setback this segment WOULD give its next slot (local index =
+    -- count). A following segment re-bases here, so at its offsetForward = 0 its slot 0 lands exactly where
+    -- this segment's ramp continues -- seamless -- and a positive offsetForward is a pure extra gap. This is
+    -- the CONTINUATION point, not the block's extent: because the setback ramp is linear, a same-params
+    -- all-offsets-0 chain reproduces one continuous grid slot-for-slot.
+    local continuation = slot_setback(count, p, columns, column_setback)
+    return poses, continuation
 end
 
 -- Grid poses for `count` players behind base_pos/base_rot for a single param set (ADR-0023). Thin wrapper
@@ -347,10 +353,13 @@ end
 -- segments laid out one behind the other. `segments` is `{{startSlot, params}, ...}` (index 1 = segment 0,
 -- its startSlot forced to 0); slots [startSlot_i, startSlot_{i+1}) use segment i's params. Each segment is
 -- computed like a standalone grid from a base re-based back along the ONE shared travel axis (from base_rot
--- / gate_normal, no per-segment heading) by the cumulative depth of the preceding segments, so segment i's
--- offsetForward acts as the gap behind segment i-1. Per-segment mirror/headingDeg/offsets/gaps/pin shape
--- each block. Every pose is tagged with its 1-based `segment` index (for the editor's active highlight).
--- A single-segment list reproduces M.poses (and thus today's layout) bit-for-bit -- the base never moves.
+-- / gate_normal, no per-segment heading) by the CONTINUATION setback of the preceding segments -- the point
+-- where the previous segment's ramp would place its next slot -- so at offsetForward = 0 a segment continues
+-- the previous one seamlessly (a same-params all-offsets-0 chain equals one continuous grid slot-for-slot
+-- along the travel axis), and a positive offsetForward is a pure extra gap. Per-segment mirror/headingDeg/
+-- offsets/gaps/pin shape each block; a breakpoint off a column boundary restarts that segment's columns
+-- (its lateral pattern begins fresh at column 0). Every pose is tagged with its 1-based `segment` index
+-- (for the editor's active highlight). A single-segment list reproduces M.poses (today's layout) bit-for-bit.
 function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
     local list = normalize_segments(segments)
     -- The shared travel axis re-bases each later segment; it is derived once, WITHOUT any segment's
@@ -358,23 +367,23 @@ function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
     local shared_forward = resolve_forward(base_rot, gate_normal)
 
     local all_poses = {}
-    local cumulative_depth = 0
+    local cumulative = 0
     for index = 1, #list do
         local seg = list[index]
         local next_start = list[index + 1] and list[index + 1].startSlot or count
         local seg_count = math.min(next_start, count) - seg.startSlot
         if seg_count > 0 then
             local base = {
-                x = base_pos.x - shared_forward.x * cumulative_depth,
-                y = base_pos.y - shared_forward.y * cumulative_depth,
+                x = base_pos.x - shared_forward.x * cumulative,
+                y = base_pos.y - shared_forward.y * cumulative,
                 z = base_pos.z,
             }
-            local seg_poses, depth = compute_segment(base, base_rot, seg_count, seg.params, gate_normal)
+            local seg_poses, continuation = compute_segment(base, base_rot, seg_count, seg.params, gate_normal)
             for _, pose in ipairs(seg_poses) do
                 pose.segment = index
                 all_poses[#all_poses + 1] = pose
             end
-            cumulative_depth = cumulative_depth + depth
+            cumulative = cumulative + continuation
         end
     end
     return all_poses

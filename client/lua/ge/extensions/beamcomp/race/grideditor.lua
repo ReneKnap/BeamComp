@@ -302,9 +302,16 @@ function M.select_segment(start_slot)
             prev_index = index
         end
     end
+    -- Seed a fresh breakpoint from the covering segment so it inherits the layout (columns/rowGap/colGap/
+    -- headingDeg/mirror), but zero its position offsets so it CONTINUES the previous segment seamlessly out
+    -- of the box: offsetForward is then a pure additional gap the admin dials in (0 = seamless). Only
+    -- breakpoint segments are zeroed here; segment 0 keeps its own offsetForward (the setback from the line).
+    local seeded = copy_params(segments[prev_index].params)
+    seeded.offsetForward = 0
+    seeded.offsetLateral = 0
     table.insert(segments, prev_index + 1, {
         startSlot = number,
-        params = copy_params(segments[prev_index].params),
+        params = seeded,
     })
     M.state.segment = prev_index + 1
     recompute()
