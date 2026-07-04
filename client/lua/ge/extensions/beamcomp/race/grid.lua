@@ -19,6 +19,12 @@
 -- it comes from a gate normal -- the reliable source -- so the placement can orient the car to the
 -- grid instead of the authored start quaternion; `forward` is nil when there is no gate normal, in
 -- which case the placement keeps the start pose's own heading.
+--
+-- Segmented grids (ADR-0023 amendment): a direction's grid can be an ordered list of stacked parametric
+-- segments -- segment 0 is the base param set (today's block) and each further segment starts at a
+-- breakpoint slot with its own full param set, laid out BEHIND the previous one. M.poses_segmented runs
+-- the stacking; a single-segment list reproduces M.poses (today's layout) bit-for-bit. block_to_segments
+-- / segments_to_block convert between the stored block and the segment list.
 
 local M = {}
 
@@ -142,6 +148,18 @@ end
 -- Both pins clamp to [1, GRID_CAPACITY]; rows always gets a value (used only when columns is nil/derived).
 -- `mirror` is a boolean (not a number): only a genuine `true` enables the lateral flip, so an absent or
 -- false flag reproduces today's pole-left layout bit-for-bit (0/1 would misfire -- 0 is truthy in Lua).
+-- A shallow copy of a table (nil-tolerant), so a stored grid block / param set can be re-based into the
+-- editor's segment model or serialized back without ever aliasing (and thus mutating) the source table.
+local function shallow_copy(t)
+    local copy = {}
+    if type(t) == "table" then
+        for key, value in pairs(t) do
+            copy[key] = value
+        end
+    end
+    return copy
+end
+
 local function resolved_params(params)
     params = params or {}
 
@@ -191,8 +209,10 @@ function M.default_params()
     }
 end
 
--- Grid poses for `count` players behind base_pos/base_rot. Returns a list of
--- { pos = {x, y, z}, rot = {x, y, z, w} } in slot order.
+-- Lay `count` cars out behind base_pos/base_rot for one param set, and report the block's depth.
+-- Returns (poses, depth): `poses` is a list of { pos, rot, forward, faceDir } in slot order; `depth` is
+-- the block's furthest-back extent along the travel axis (the max setback over the placed slots), which
+-- the segmented stacker uses to re-base the next segment directly behind this one.
 --   params      -- optional grid param set (ADR-0023): offsetForward/offsetLateral (metres, along the
 --                  travel/right axes), headingDeg (extra rotation of the whole grid about vertical),
 --                  rowGap/colGap (metres), and a width pin -- either rows (columns are derived as
@@ -208,7 +228,7 @@ end
 -- The `mirror` flag (lateral seiten-flip) negates only the column-derived lateral offset, so the pole
 -- keeps its front row and swaps to the other side while the front-to-back stagger, the slot order, and
 -- offset_lateral (an absolute shift) are unchanged; car headings are untouched (cars still face forward).
-function M.poses(base_pos, base_rot, count, params, gate_normal)
+local function compute_segment(base_pos, base_rot, count, params, gate_normal)
     local p = resolved_params(params)
     local heading_rad = math.rad(p.heading_deg)
 
@@ -249,6 +269,7 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
     local column_setback = p.row_gap / columns
 
     local poses = {}
+    local depth = 0
     for slot = 0, count - 1 do
         local column = slot % columns
         local row = math.floor(slot / columns)
@@ -260,6 +281,9 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
         end
         local lateral = column_lateral + p.offset_lateral
         local setback = row * p.row_gap + column * column_setback + p.offset_forward
+        if setback > depth then
+            depth = setback
+        end
         poses[#poses + 1] = {
             pos = {
                 x = base_pos.x + right.x * lateral - forward.x * setback,
@@ -270,9 +294,135 @@ function M.poses(base_pos, base_rot, count, params, gate_normal)
             -- The travel axis the car should face, from the gate normal (+ headingDeg); nil when no
             -- gate normal, so the placement falls back to `rot`. Shared read-only across slots.
             forward = facing,
+            -- The always-present heading unit vector (the car's true facing in both the gate-normal and
+            -- the fallback case) -- draw-only, used by the editor's orientation line. Distinct from
+            -- `forward` above, which stays nil without a gate normal to preserve placement semantics.
+            faceDir = forward,
         }
     end
+    return poses, depth
+end
+
+-- Grid poses for `count` players behind base_pos/base_rot for a single param set (ADR-0023). Thin wrapper
+-- over compute_segment, kept for callers that lay out one uniform block; the segmented path uses
+-- M.poses_segmented. Returns just the pose list (see compute_segment for the param semantics).
+function M.poses(base_pos, base_rot, count, params, gate_normal)
+    local poses = compute_segment(base_pos, base_rot, count, params, gate_normal)
     return poses
+end
+
+-- Normalize an ordered segment list to a clean, sorted copy: nil/empty becomes a single default segment,
+-- malformed entries are dropped, entries are sorted ascending by startSlot, and the base segment's
+-- startSlot is forced to 0. Never mutates the input.
+local function normalize_segments(segments)
+    if type(segments) ~= "table" or #segments == 0 then
+        return {{startSlot = 0, params = nil}}
+    end
+    local list = {}
+    for _, seg in ipairs(segments) do
+        if type(seg) == "table" then
+            list[#list + 1] = {startSlot = seg.startSlot or 0, params = seg.params}
+        end
+    end
+    if #list == 0 then
+        return {{startSlot = 0, params = nil}}
+    end
+    table.sort(list, function(a, b)
+        return a.startSlot < b.startSlot
+    end)
+    list[1].startSlot = 0
+    return list
+end
+
+-- Grid poses for `count` players from an ORDERED SEGMENT LIST (ADR-0023 amendment): stacked parametric
+-- segments laid out one behind the other. `segments` is `{{startSlot, params}, ...}` (index 1 = segment 0,
+-- its startSlot forced to 0); slots [startSlot_i, startSlot_{i+1}) use segment i's params. Each segment is
+-- computed like a standalone grid from a base re-based back along the ONE shared travel axis (from base_rot
+-- / gate_normal, no per-segment heading) by the cumulative depth of the preceding segments, so segment i's
+-- offsetForward acts as the gap behind segment i-1. Per-segment mirror/headingDeg/offsets/gaps/pin shape
+-- each block. Every pose is tagged with its 1-based `segment` index (for the editor's active highlight).
+-- A single-segment list reproduces M.poses (and thus today's layout) bit-for-bit -- the base never moves.
+function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
+    local list = normalize_segments(segments)
+    -- The shared travel axis re-bases each later segment; it is derived once, WITHOUT any segment's
+    -- headingDeg, so the stacking direction is consistent no matter how a segment is angled.
+    local shared_forward = resolve_forward(base_rot, gate_normal)
+
+    local all_poses = {}
+    local cumulative_depth = 0
+    for index = 1, #list do
+        local seg = list[index]
+        local next_start = list[index + 1] and list[index + 1].startSlot or count
+        local seg_count = math.min(next_start, count) - seg.startSlot
+        if seg_count > 0 then
+            local base = {
+                x = base_pos.x - shared_forward.x * cumulative_depth,
+                y = base_pos.y - shared_forward.y * cumulative_depth,
+                z = base_pos.z,
+            }
+            local seg_poses, depth = compute_segment(base, base_rot, seg_count, seg.params, gate_normal)
+            for _, pose in ipairs(seg_poses) do
+                pose.segment = index
+                all_poses[#all_poses + 1] = pose
+            end
+            cumulative_depth = cumulative_depth + depth
+        end
+    end
+    return all_poses
+end
+
+-- Convert a STORED per-direction block into the ordered segment list the stacker consumes. Segment 0 is
+-- the block's own params (a shallow copy minus the nested `segments` array, so segment 0 carries no nested
+-- list and the stored block is never mutated); the optional `block.segments` array supplies segments 1..n,
+-- each `{startSlot >= 1, params}`. A nil block yields a single default segment. Backward-compatible: a
+-- block with no `segments` yields exactly one segment, reproducing today's layout.
+function M.block_to_segments(block)
+    if type(block) ~= "table" then
+        return {{startSlot = 0, params = {}}}
+    end
+    local base_params = shallow_copy(block)
+    base_params.segments = nil
+    local list = {{startSlot = 0, params = base_params}}
+    if type(block.segments) == "table" then
+        for _, seg in ipairs(block.segments) do
+            if type(seg) == "table" and type(seg.params) == "table" then
+                local start_slot = tonumber(seg.startSlot)
+                if start_slot and start_slot >= 1 then
+                    list[#list + 1] = {
+                        startSlot = math.floor(start_slot),
+                        params = shallow_copy(seg.params),
+                    }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        return a.startSlot < b.startSlot
+    end)
+    return list
+end
+
+-- Convert an ordered segment list back into a STORABLE per-direction block (the inverse of
+-- block_to_segments), for the editor's save snapshot. Segment 0's params become the block; segments 1..n
+-- become the optional `segments` array. A single-segment list yields exactly today's block (no `segments`
+-- key) -- so saving a grid with no breakpoints is byte-compatible with a pre-feature save.
+function M.segments_to_block(segments)
+    if type(segments) ~= "table" or #segments == 0 then
+        return {}
+    end
+    local block = shallow_copy(segments[1].params)
+    block.segments = nil
+    if #segments > 1 then
+        local extra = {}
+        for index = 2, #segments do
+            extra[#extra + 1] = {
+                startSlot = segments[index].startSlot,
+                params = shallow_copy(segments[index].params),
+            }
+        end
+        block.segments = extra
+    end
+    return block
 end
 
 return M
