@@ -22,9 +22,12 @@
 --
 -- Segmented grids (ADR-0023 amendment): a direction's grid can be an ordered list of stacked parametric
 -- segments -- segment 0 is the base param set (today's block) and each further segment starts at a
--- breakpoint slot with its own full param set, laid out BEHIND the previous one. M.poses_segmented runs
--- the stacking; a single-segment list reproduces M.poses (today's layout) bit-for-bit. block_to_segments
--- / segments_to_block convert between the stored block and the segment list.
+-- breakpoint slot with its own full param set, laid out BEHIND the previous one. M.poses_segmented runs the
+-- stacking as a KINEMATIC FRAME CHAIN: each segment lays out in a running frame and passes the next segment
+-- the frame at its own end, so a segment's forward continuation (seamless at offsetForward 0), its lateral
+-- offset, and its heading rotation all carry into the whole tail behind it (headings compose cumulatively).
+-- A single-segment list reproduces M.poses (today's layout) bit-for-bit. block_to_segments /
+-- segments_to_block convert between the stored block and the segment list.
 
 local M = {}
 
@@ -220,72 +223,66 @@ local function slot_setback(local_index, p, columns, column_setback)
     return row * p.row_gap + column * column_setback + p.offset_forward
 end
 
--- Lay `count` cars out behind base_pos/base_rot for one param set, and report the continuation setback.
--- Returns (poses, continuation): `poses` is a list of { pos, rot, forward, faceDir } in slot order;
--- `continuation` is the forward setback this segment WOULD give its NEXT slot (local index = count) -- the
--- seamless continuation point where a following segment's local slot 0 lands, so the following segment's own
--- offsetForward is a pure ADDITIONAL gap on top (0 = seamless, positive = tail further back).
---   params      -- optional grid param set (ADR-0023): offsetForward/offsetLateral (metres, along the
---                  travel/right axes), headingDeg (extra rotation of the whole grid about vertical),
---                  rowGap/colGap (metres), and a width pin -- either rows (columns are derived as
---                  ceil(count / rows) from the live field, so the columns grow/shrink with the driver
---                  count) or columns (an explicit column count that pins the width and lets the rows grow).
---                  Nil or missing fields fall back to the default layout (pinned DEFAULT_COLUMNS columns).
---   gate_normal -- optional {x, y, z} start/finish gate normal (CP0's direction of travel). When given
---                  the grid lays out behind it; when absent it derives forward from base_rot.
--- Each slot is placed as right * lateral + (-forward) * setback: lateral spreads the columns about the
--- centre, setback trails the field back along the travel axis. Within a row the columns are staggered by
--- row_gap / columns each, so they spread evenly across one row's depth (two columns -> column 2 at half
--- the row gap). headingDeg pivots both the layout axes and every car heading. z is taken from base_pos.
--- The `mirror` flag (lateral seiten-flip) negates only the column-derived lateral offset, so the pole
--- keeps its front row and swaps to the other side while the front-to-back stagger, the slot order, and
--- offset_lateral (an absolute shift) are unchanged; car headings are untouched (cars still face forward).
-local function compute_segment(base_pos, base_rot, count, params, gate_normal)
+-- The starting frame for a grid (segment 0): the moving reference the segmented stacker threads from one
+-- segment to the next. `origin` is the segment's base point and the heading pivot; `forward` is the travel
+-- axis (the gate normal, else derived from base_rot); `facing` is the gate-normal-based car heading (nil
+-- without a gate normal, so placement keeps the authored start quaternion); `rot` is the base quaternion for
+-- that no-gate fallback. The right axis is always forward's horizontal perpendicular, so it is derived on
+-- demand rather than stored.
+local function make_frame(base_pos, base_rot, gate_normal)
+    return {
+        origin = base_pos,
+        forward = resolve_forward(base_rot, gate_normal),
+        facing = gate_normal and horizontal_unit(gate_normal) or nil,
+        rot = base_rot,
+    }
+end
+
+-- Lay `count` cars out for one param set anchored on `frame`, and return (poses, next_frame) -- the frame the
+-- FOLLOWING segment starts from (a kinematic chain). `poses` is a list of { pos, rot, forward, faceDir } in
+-- slot order. Within the segment: its own headingDeg rotates the layout about the frame origin (the pivot);
+-- each slot is placed as right * lateral + (-forward) * setback, so offsetForward is a gap along the frame
+-- forward and offsetLateral a shift along the frame right; the column stagger (row_gap / columns) spreads the
+-- columns across one row's depth; mirror negates only the column-derived lateral. `next_frame` advances the
+-- origin to this segment's CONTINUATION point (the seamless Round-3 forward point) plus this segment's
+-- offsetLateral shift, and rotates forward/facing/rot by this segment's headingDeg -- so a rotated or
+-- laterally shifted segment carries the whole tail behind it and headings compose cumulatively down the
+-- chain. `params`: the ADR-0023 param set (offsets/heading/gaps + a rows-or-columns width pin; nil -> default).
+local function compute_segment(frame, count, params)
     local p = resolved_params(params)
     local heading_rad = math.rad(p.heading_deg)
 
-    -- The grid's forward axis (direction of travel off the line), preferring the gate normal. The
-    -- gate normal is the only reliable heading source; when it is present and horizontal that axis is
-    -- handed to the placement as `facing` so the car is oriented to the grid (the layout) rather than
-    -- the authored start quaternion. With no usable gate normal `facing` stays nil and the placement
-    -- keeps the start pose's heading (rot), so races with no gate normal are unchanged.
-    local facing = gate_normal and horizontal_unit(gate_normal) or nil
-    local forward = resolve_forward(base_rot, gate_normal)
-
-    -- headingDeg rotates the whole grid -- layout axes and car headings alike -- on top of that.
+    -- Rotate the incoming frame axes by this segment's headingDeg about the origin (the pivot). `forward`
+    -- is the layout/travel axis, `facing` the gate-normal car heading (nil without a gate normal, so
+    -- placement keeps the start quaternion), `rot` the no-gate fallback quaternion -- all rotate together so
+    -- the layout and the car headings stay consistent, and the rotation carries into next_frame (it chains).
+    local forward = frame.forward
+    local facing = frame.facing
+    local rot = frame.rot
     if p.heading_deg ~= 0 then
         forward = rotate_horizontal(forward, heading_rad)
         if facing then
             facing = rotate_horizontal(facing, heading_rad)
         end
+        rot = quat_mul(z_quat(heading_rad), rot)
     end
-    -- Right-hand horizontal perpendicular to forward (forward x up). Which column is left vs right is
-    -- arbitrary -- the columns are symmetric -- so any consistent perpendicular is fine.
+    -- Right-hand horizontal perpendicular to forward. Which column is left vs right is arbitrary.
     local right = {x = forward.y, y = -forward.x, z = 0}
 
-    -- Fallback heading when there is no gate normal: the authored start pose, turned about vertical by
-    -- headingDeg (the historical behaviour). The placement uses this only when `facing` is nil.
-    local rot = base_rot
-    if p.heading_deg ~= 0 then
-        rot = quat_mul(z_quat(heading_rad), base_rot)
-    end
-
-    -- Columns: an explicit count (p.columns) pins them so the grid never grows wider than asked, and the
-    -- rows grow with the field. Otherwise (rows pinned) derive the columns from the ACTUAL field size, so a
-    -- pinned 2-row grid is 2 cars wide for 4 cars and grows wider as the field grows. max(count, 1) only
-    -- guards the column_setback division below for an empty field (the slot loop then runs zero times).
+    -- Columns: an explicit count (p.columns) pins the width so the grid never grows wider than asked;
+    -- otherwise (rows pinned) derive the columns from the ACTUAL field size. max(count, 1) only guards the
+    -- column_setback division for an empty field (the slot loop then runs zero times).
     local columns = p.columns or math.ceil(math.max(count, 1) / p.rows)
     local centre_column = (columns - 1) / 2
-    -- Per-column stagger: spread the columns evenly across one row's depth so the grid forms a smooth
-    -- diagonal (two columns -> column 2 at half the row gap), continuing into the next rows.
+    -- Per-column stagger: spread the columns evenly across one row's depth (a smooth diagonal).
     local column_setback = p.row_gap / columns
 
+    local origin = frame.origin
     local poses = {}
     for slot = 0, count - 1 do
         local column = slot % columns
-        local row = math.floor(slot / columns)
         -- Column-derived lateral spread about the centre; mirror negates it so the field swaps sides.
-        -- offset_lateral is added after the flip so it stays an absolute "shift the grid N m right" knob.
+        -- offset_lateral is added after the flip so it stays an absolute shift along the frame right.
         local column_lateral = (column - centre_column) * p.col_gap
         if p.mirror then
             column_lateral = -column_lateral
@@ -294,12 +291,12 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
         local setback = slot_setback(slot, p, columns, column_setback)
         poses[#poses + 1] = {
             pos = {
-                x = base_pos.x + right.x * lateral - forward.x * setback,
-                y = base_pos.y + right.y * lateral - forward.y * setback,
-                z = base_pos.z,
+                x = origin.x + right.x * lateral - forward.x * setback,
+                y = origin.y + right.y * lateral - forward.y * setback,
+                z = origin.z,
             },
             rot = {x = rot.x, y = rot.y, z = rot.z, w = rot.w},
-            -- The travel axis the car should face, from the gate normal (+ headingDeg); nil when no
+            -- The travel axis the car should face, from the gate normal (+ chained headings); nil when no
             -- gate normal, so the placement falls back to `rot`. Shared read-only across slots.
             forward = facing,
             -- The always-present heading unit vector (the car's true facing in both the gate-normal and
@@ -310,19 +307,31 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
     end
 
     -- The continuation setback: the forward setback this segment WOULD give its next slot (local index =
-    -- count). A following segment re-bases here, so at its offsetForward = 0 its slot 0 lands exactly where
-    -- this segment's ramp continues -- seamless -- and a positive offsetForward is a pure extra gap. This is
-    -- the CONTINUATION point, not the block's extent: because the setback ramp is linear, a same-params
-    -- all-offsets-0 chain reproduces one continuous grid slot-for-slot.
+    -- count). The next segment starts here, so its offsetForward = 0 continues this one seamlessly and a
+    -- positive offsetForward is a pure extra gap (the Round-3 forward semantics, kept exactly). Because the
+    -- ramp is linear, a same-params all-offsets-0 chain reproduces one continuous grid slot-for-slot.
     local continuation = slot_setback(count, p, columns, column_setback)
-    return poses, continuation
+    -- Advance the frame to that continuation point for the next segment: forward by the continuation and
+    -- laterally by this segment's offsetLateral (so lateral chains to the tail), carrying the heading-rotated
+    -- forward/facing/rot (so heading chains cumulatively). z stays level; grounding happens downstream.
+    local next_frame = {
+        origin = {
+            x = origin.x + right.x * p.offset_lateral - forward.x * continuation,
+            y = origin.y + right.y * p.offset_lateral - forward.y * continuation,
+            z = origin.z,
+        },
+        forward = forward,
+        facing = facing,
+        rot = rot,
+    }
+    return poses, next_frame
 end
 
 -- Grid poses for `count` players behind base_pos/base_rot for a single param set (ADR-0023). Thin wrapper
--- over compute_segment, kept for callers that lay out one uniform block; the segmented path uses
--- M.poses_segmented. Returns just the pose list (see compute_segment for the param semantics).
+-- over compute_segment on a one-shot start frame, kept for callers that lay out one uniform block; the
+-- segmented path threads the frame across segments. Returns just the pose list (drops the next frame).
 function M.poses(base_pos, base_rot, count, params, gate_normal)
-    local poses = compute_segment(base_pos, base_rot, count, params, gate_normal)
+    local poses = compute_segment(make_frame(base_pos, base_rot, gate_normal), count, params)
     return poses
 end
 
@@ -350,40 +359,36 @@ local function normalize_segments(segments)
 end
 
 -- Grid poses for `count` players from an ORDERED SEGMENT LIST (ADR-0023 amendment): stacked parametric
--- segments laid out one behind the other. `segments` is `{{startSlot, params}, ...}` (index 1 = segment 0,
--- its startSlot forced to 0); slots [startSlot_i, startSlot_{i+1}) use segment i's params. Each segment is
--- computed like a standalone grid from a base re-based back along the ONE shared travel axis (from base_rot
--- / gate_normal, no per-segment heading) by the CONTINUATION setback of the preceding segments -- the point
--- where the previous segment's ramp would place its next slot -- so at offsetForward = 0 a segment continues
--- the previous one seamlessly (a same-params all-offsets-0 chain equals one continuous grid slot-for-slot
--- along the travel axis), and a positive offsetForward is a pure extra gap. Per-segment mirror/headingDeg/
--- offsets/gaps/pin shape each block; a breakpoint off a column boundary restarts that segment's columns
--- (its lateral pattern begins fresh at column 0). Every pose is tagged with its 1-based `segment` index
--- (for the editor's active highlight). A single-segment list reproduces M.poses (today's layout) bit-for-bit.
+-- segments laid out one behind the other as a KINEMATIC FRAME CHAIN. `segments` is `{{startSlot, params},
+-- ...}` (index 1 = segment 0, its startSlot forced to 0); slots [startSlot_i, startSlot_{i+1}) use segment
+-- i's params. Each segment is laid out in a running frame and hands the NEXT segment the frame at its own
+-- end (compute_segment): the frame advances forward by the continuation setback (so at offsetForward = 0 a
+-- segment continues the previous one seamlessly -- a same-params all-offsets-0 chain equals one continuous
+-- grid slot-for-slot along the travel axis, and a positive offsetForward is a pure extra gap), shifts
+-- laterally by the segment's offsetLateral (so a lateral offset carries the whole tail with it), and rotates
+-- by the segment's headingDeg about its origin (so a rotated segment turns the whole tail behind it and
+-- headings compose cumulatively down the chain). Per-segment mirror flips a segment's own lateral; a
+-- breakpoint off a column boundary restarts that segment's columns (its lateral pattern begins fresh at
+-- column 0). Every pose is tagged with its 1-based `segment` index (for the editor's active highlight). A
+-- single-segment list reproduces M.poses (today's layout) bit-for-bit.
 function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
     local list = normalize_segments(segments)
-    -- The shared travel axis re-bases each later segment; it is derived once, WITHOUT any segment's
-    -- headingDeg, so the stacking direction is consistent no matter how a segment is angled.
-    local shared_forward = resolve_forward(base_rot, gate_normal)
+    -- The running frame: starts at segment 0's anchor and is threaded from each segment to the next, so
+    -- every segment stacks relative to the previous segment's end (its rotation and lateral shift included).
+    local frame = make_frame(base_pos, base_rot, gate_normal)
 
     local all_poses = {}
-    local cumulative = 0
     for index = 1, #list do
         local seg = list[index]
         local next_start = list[index + 1] and list[index + 1].startSlot or count
         local seg_count = math.min(next_start, count) - seg.startSlot
         if seg_count > 0 then
-            local base = {
-                x = base_pos.x - shared_forward.x * cumulative,
-                y = base_pos.y - shared_forward.y * cumulative,
-                z = base_pos.z,
-            }
-            local seg_poses, continuation = compute_segment(base, base_rot, seg_count, seg.params, gate_normal)
+            local seg_poses, next_frame = compute_segment(frame, seg_count, seg.params)
             for _, pose in ipairs(seg_poses) do
                 pose.segment = index
                 all_poses[#all_poses + 1] = pose
             end
-            cumulative = cumulative + continuation
+            frame = next_frame
         end
     end
     return all_poses
