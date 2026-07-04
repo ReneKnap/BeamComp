@@ -36,9 +36,22 @@ local EXCLUDED_MODELS = {unicycle = true}
 -- power fields); an unreadable Type counts as a car, so the filter only ever removes a KNOWN non-car.
 local NON_CAR_TYPES = {Prop = true, Trailer = true}
 
+-- Big-vehicle curb-weight ceiling (kg) for the "exclude big vehicles" AI filter (max_weight axis). A
+-- config heavier than this is treated as a big vehicle and excluded. 3500 kg keeps every passenger car,
+-- sports car and SUV (all at/under ~3000 kg curb in BeamNG) while reliably excluding buses (~13000 kg)
+-- and US semi-trucks (~6000 kg+); heavy van/pickup configs near the boundary may slip through, which is
+-- accepted for a curb-weight heuristic (a class-based filter is future work). Reusable as a general
+-- vehicle-policy weight cap, though this item wires it only into the AI random path (race/ai.lua).
+M.BIG_CAR_MAX_WEIGHT = 3500
+
 -- One-shot: log the keys of the first config-info table we read, so the real power/index field names are
 -- visible in-game (the single runtime-verification point for this module). Module-scope, reset on reload.
 local probed = false
+
+-- One-shot companion to `probed` for the MODEL-level info table (data.model), whose Power/Weight fields
+-- back the filter-aware stock selector. Logged on first read so the populated stock field names can be
+-- confirmed in-game, exactly like probe_config_fields. Module-scope, reset on reload.
+local probed_model = false
 
 -- Pull the first parseable number out of a value that may be a number or a string like "150 hp" /
 -- "110 kW / 150 hp". Returns a number or nil.
@@ -83,6 +96,22 @@ local function probe_config_fields(info)
     end
     table.sort(keys)
     log("I", LOG_TAG, "config-info fields: " .. table.concat(keys, ", "))
+end
+
+-- Log one model-info table's keys the first time we read stock (default-config) power/weight from it, so
+-- the populated field can be confirmed in-game. No-op after the first call (per module load). Mirrors
+-- probe_config_fields for the model-level metadata the stock selector reads.
+local function probe_model_fields(info)
+    if probed_model or type(info) ~= "table" then
+        return
+    end
+    probed_model = true
+    local keys = {}
+    for key in pairs(info) do
+        keys[#keys + 1] = tostring(key)
+    end
+    table.sort(keys)
+    log("I", LOG_TAG, "model-info fields: " .. table.concat(keys, ", "))
 end
 
 -- The BeamNG model table for `model` ({model = info, configs = {key = info}, ...}), or nil. pcall-guarded:
@@ -237,8 +266,10 @@ end
 
 -- True when (power, weight) satisfy the caps. A nil cap is "no limit on this axis"; a set cap whose
 -- input is unreadable is NOT satisfied (cannot verify => non-compliant, per ADR-0032). max_pwr compares
--- the power-to-weight ratio power/weight (hp per kg). Both caps nil => not Mode 3.
-function M.is_compliant(power, weight, max_power, max_pwr)
+-- the power-to-weight ratio power/weight (hp per kg). max_weight caps curb weight (kg) -- a config over it
+-- is non-compliant (the "exclude big vehicles" axis). All caps nil => no policy. max_weight is additive:
+-- when nil this function is bit-for-bit its pre-weight-axis form, so every 4-arg caller is unchanged.
+function M.is_compliant(power, weight, max_power, max_pwr, max_weight)
     if max_power ~= nil and not (type(power) == "number" and power <= max_power) then
         return false
     end
@@ -250,16 +281,19 @@ function M.is_compliant(power, weight, max_power, max_pwr)
             return false
         end
     end
+    if max_weight ~= nil and not (type(weight) == "number" and weight <= max_weight) then
+        return false
+    end
     return true
 end
 
 -- The strongest compliant config of `model` under the caps, as {config, power}, or nil. "Strongest" =
 -- highest power at or under the caps (the best legal trim); configs with unreadable power rank lowest and
 -- only win when nothing has a readable power (then the lowest config key, deterministically).
-local function strongest_compliant(model, max_power, max_pwr)
+local function strongest_compliant(model, max_power, max_pwr, max_weight)
     local best
     for _, entry in ipairs(M.list_configs(model)) do
-        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr) then
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight) then
             if not best then
                 best = entry
             else
@@ -277,19 +311,20 @@ local function strongest_compliant(model, max_power, max_pwr)
     return {config = best.config, power = best.power}
 end
 
--- Find the first car satisfying the Mode-3 caps, as {model, config}, or nil. Search order (ADR-0032):
--- the player's own model first (downgrade the trim, keep the brand), then other models alphabetically;
--- within a model the strongest compliant config wins. Deterministic so the pick is predictable.
-function M.find_compliant(own_model, max_power, max_pwr)
+-- Find the first car satisfying the caps, as {model, config}, or nil. Search order (ADR-0032): the
+-- player's own model first (downgrade the trim, keep the brand), then other models alphabetically; within
+-- a model the strongest compliant config wins. Deterministic so the pick is predictable. `max_weight`
+-- (kg, optional) additionally excludes over-weight trims; nil = no weight limit (unchanged behavior).
+function M.find_compliant(own_model, max_power, max_pwr, max_weight)
     if type(own_model) == "string" and own_model ~= "" then
-        local own = strongest_compliant(own_model, max_power, max_pwr)
+        local own = strongest_compliant(own_model, max_power, max_pwr, max_weight)
         if own then
             return {model = own_model, config = own.config}
         end
     end
     for _, model in ipairs(M.list_models()) do
         if model ~= own_model then
-            local pick = strongest_compliant(model, max_power, max_pwr)
+            local pick = strongest_compliant(model, max_power, max_pwr, max_weight)
             if pick then
                 return {model = model, config = pick.config}
             end
@@ -300,11 +335,12 @@ end
 
 -- The config keys of `model` whose power/weight satisfy the caps (its legal trims), as an array; empty when
 -- the model has no compliant config. Reuses is_compliant, so an unreadable power/weight under a set cap is
--- non-compliant (excluded), per ADR-0032 -- no new rule. Backs the random AI selector (random_compliant).
-local function compliant_configs(model, max_power, max_pwr)
+-- non-compliant (excluded), per ADR-0032 -- no new rule. `max_weight` (kg, optional) additionally excludes
+-- over-weight trims. Backs the random AI selector (random_compliant).
+local function compliant_configs(model, max_power, max_pwr, max_weight)
     local keys = {}
     for _, entry in ipairs(M.list_configs(model)) do
-        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr) then
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight) then
             keys[#keys + 1] = entry.config
         end
     end
@@ -318,11 +354,11 @@ end
 -- Models with no compliant config are never drawn (the pool pre-filter IS the "re-roll among compliant
 -- models"), so the cap is never violated. Draws from list_car_models so an AI never spawns as a prop/trailer.
 -- Owner-local -> math.random is fine (only the owner spawns AI, no cross-client determinism, like ai.lua's
--- random_stock_model).
-function M.random_compliant(max_power, max_pwr)
+-- random_stock_model). `max_weight` (kg, optional) additionally excludes over-weight trims from the pool.
+function M.random_compliant(max_power, max_pwr, max_weight)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
-        local configs = compliant_configs(model, max_power, max_pwr)
+        local configs = compliant_configs(model, max_power, max_pwr, max_weight)
         if #configs > 0 then
             pool[#pool + 1] = {model = model, configs = configs}
         end
@@ -332,6 +368,34 @@ function M.random_compliant(max_power, max_pwr)
     end
     local choice = pool[math.random(#pool)]
     return {model = choice.model, config = choice.configs[math.random(#choice.configs)]}
+end
+
+-- A RANDOM car whose STOCK/DEFAULT config satisfies the caps, as {model, config = nil}, or nil when no
+-- installed car's stock config satisfies them. The filter-aware sibling of random_compliant: instead of a
+-- random compliant TRIM it keeps the stock trim (config = nil = BeamNG's built-in default), so the AI
+-- "random model + default type" path (race/ai.lua randomTrim=false) still honours the active power/weight
+-- filters. Stock power/weight are read from the model-level metadata (data.model) -- the vehicle-selector
+-- default-config representation -- via the same POWER_FIELDS/WEIGHT_FIELDS as every other read; an
+-- unreadable value under a set cap is non-compliant (cannot verify => excluded, per ADR-0032). With all
+-- caps nil the pool is every drivable model (is_compliant always true) => uniform random, identical to the
+-- unconstrained stock pick. Draws from list_car_models so an AI never spawns as a prop/trailer. Owner-local
+-- -> math.random is fine (mirrors random_compliant).
+function M.random_stock_compliant(max_power, max_pwr, max_weight)
+    local pool = {}
+    for _, model in ipairs(M.list_car_models()) do
+        local data = get_model(model)
+        local info = data and data.model
+        probe_model_fields(info)
+        local power = read_numeric(info, POWER_FIELDS)
+        local weight = read_numeric(info, WEIGHT_FIELDS)
+        if M.is_compliant(power, weight, max_power, max_pwr, max_weight) then
+            pool[#pool + 1] = model
+        end
+    end
+    if #pool == 0 then
+        return nil
+    end
+    return {model = pool[math.random(#pool)], config = nil}
 end
 
 return M
