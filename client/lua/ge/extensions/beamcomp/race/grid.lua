@@ -209,10 +209,11 @@ function M.default_params()
     }
 end
 
--- Lay `count` cars out behind base_pos/base_rot for one param set, and report the block's depth.
+-- Lay `count` cars out behind base_pos/base_rot for one param set, and report the block's stacking depth.
 -- Returns (poses, depth): `poses` is a list of { pos, rot, forward, faceDir } in slot order; `depth` is
--- the block's furthest-back extent along the travel axis (the max setback over the placed slots), which
--- the segmented stacker uses to re-base the next segment directly behind this one.
+-- the deepest ROW's setback along the travel axis (column 0 of the last row, i.e. WITHOUT the intra-row
+-- column stagger), which the segmented stacker uses to re-base the next segment directly behind this one
+-- so their rows line up column-for-column at offsetForward = 0.
 --   params      -- optional grid param set (ADR-0023): offsetForward/offsetLateral (metres, along the
 --                  travel/right axes), headingDeg (extra rotation of the whole grid about vertical),
 --                  rowGap/colGap (metres), and a width pin -- either rows (columns are derived as
@@ -269,7 +270,6 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
     local column_setback = p.row_gap / columns
 
     local poses = {}
-    local depth = 0
     for slot = 0, count - 1 do
         local column = slot % columns
         local row = math.floor(slot / columns)
@@ -281,9 +281,6 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
         end
         local lateral = column_lateral + p.offset_lateral
         local setback = row * p.row_gap + column * column_setback + p.offset_forward
-        if setback > depth then
-            depth = setback
-        end
         poses[#poses + 1] = {
             pos = {
                 x = base_pos.x + right.x * lateral - forward.x * setback,
@@ -299,6 +296,18 @@ local function compute_segment(base_pos, base_rot, count, params, gate_normal)
             -- `forward` above, which stays nil without a gate normal to preserve placement semantics.
             faceDir = forward,
         }
+    end
+
+    -- Stacking depth = the DEEPEST ROW's setback (column 0), not the max staggered setback. The next
+    -- segment re-bases directly behind this by `depth`, so at offsetForward = 0 its first row lines up
+    -- with this segment's last row column-for-column (col 0 -> col 0). Using the deepest STAGGERED car
+    -- would over-reserve by up to one intra-row column-stagger step whenever the last row is full, and
+    -- that error accumulates into a growing forward gap across 3+ stacked segments. An empty segment
+    -- reserves nothing.
+    local depth = 0
+    if count > 0 then
+        local last_row = math.floor((count - 1) / columns)
+        depth = last_row * p.row_gap + p.offset_forward
     end
     return poses, depth
 end
