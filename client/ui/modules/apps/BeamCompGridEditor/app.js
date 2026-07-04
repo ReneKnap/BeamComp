@@ -111,9 +111,11 @@ angular.module('beamng.apps')
       scope.knobs = KNOBS;
       scope.data = { races: [], grids: [] };
       scope.form = { race: '', loadName: '', saveName: '', assignRace: '' };
-      // The authoritative live session as last reflected by GE (BeamCompGridState).
+      // The authoritative live session as last reflected by GE (BeamCompGridState). `segments` is the
+      // ordered breakpoint boundaries ([{startSlot}]), `activeSegment` the 1-based index the knobs edit,
+      // `activeStartSlot` that segment's start slot (ADR-0023 amendment).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
-        previewCount: 8, knobs: null };
+        previewCount: 8, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null };
       scope.edit = {};          // editable mirror of the knob number fields, synced from state on each push
       scope.savedName = null;   // set after a save/load; gates Assign (you assign an existing grid)
       scope.open = null;        // name of the currently open dropdown, or null
@@ -138,6 +140,9 @@ angular.module('beamng.apps')
           scope.edit[k.key] = (value === undefined || value === null) ? '' : value;
         });
         scope.edit.previewCount = scope.state.previewCount;
+        // The breakpoint field baselines on the active segment's start slot (a state push resets it, like
+        // the knob fields); the admin retypes it to add/select a different breakpoint.
+        scope.edit.breakpointSlot = scope.state.activeStartSlot;
       }
 
       scope.$on('BeamCompGridData', function (event, payload) {
@@ -315,6 +320,39 @@ angular.module('beamng.apps')
           return;
         }
         geLuaNum('grid_set_preview', scope.edit.previewCount);
+      };
+
+      // Breakpoint / segment editing (ADR-0023 amendment). The GE session owns the segment list; the
+      // panel only asks it to select/create/remove and reflects the echoed state.
+
+      // Nudge the breakpoint-slot field (does not apply -- the admin then presses Select / add). Clamped
+      // to >= 0 (slot 0 is the base segment).
+      scope.stepBreakpoint = function (delta) {
+        var base = Number(scope.edit.breakpointSlot);
+        if (!isFinite(base)) {
+          base = scope.state.activeStartSlot || 0;
+        }
+        var next = base + delta;
+        if (next < 0) {
+          next = 0;
+        }
+        scope.edit.breakpointSlot = next;
+      };
+
+      // Select the segment starting at `slot`, or create one there seeded from the covering segment.
+      scope.selectSegment = function (slot) {
+        if (!scope.state.active) {
+          return;
+        }
+        geLuaNum('grid_select_segment', slot);
+      };
+
+      // Remove the active breakpoint (merges its slots into the previous segment). GE rejects segment 0.
+      scope.removeSegment = function () {
+        if (!scope.state.active) {
+          return;
+        }
+        geCall('grid_remove_segment');
       };
 
       scope.canSave = function () {

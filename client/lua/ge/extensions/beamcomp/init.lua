@@ -92,6 +92,9 @@ local MARKER_MAX_TURN_RATE = math.rad(10)   -- max post turn speed (rad/s); caps
 local MARKER_DT_CLAMP = 0.1             -- max dt (s) fed to the slew-limit, so a frame hitch can't yield a big step
 local GRID_COLUMN_HEIGHT = 2.5          -- height of a start-grid pillar (label sits on top)
 local GRID_COLUMN_RADIUS = 0.25         -- radius of a start-grid pillar
+local GRID_ORIENT_LINE_LENGTH = 2.5     -- length of the red orientation line off each preview marker (m)
+local GRID_ORIENT_LINE_RADIUS = 0.06    -- thickness of the orientation line (a thin cylinder)
+local GRID_ORIENT_LINE_HEIGHT = 0.15    -- height above the marker base the orientation line sits at (m)
 
 -- Per-target marker colors ({r, g, b, a}). The next checkpoint is colored by role: regular
 -- (pale fill + red posts), the lap line (CP0 crossed at the end of a non-final lap, blue), or the
@@ -1585,7 +1588,11 @@ end
 -- (rows or columns) is nil/derived and reads blank ("auto") in the panel.
 local function push_grid_state()
     local editor = grideditor.state
-    local block = editor.active and editor.blocks and editor.blocks[editor.direction] or nil
+    -- The knobs reflect the ACTIVE segment's params (ADR-0023 amendment); segment_bounds + activeSegment
+    -- let the panel drive the breakpoint selector and show which segment is being edited.
+    local block = editor.active and grideditor.active_params() or nil
+    local bounds = grideditor.segment_bounds()
+    local active_segment = grideditor.active_segment()
     guihooks.trigger("BeamCompGridState", {
         active = editor.active,
         race = editor.race,
@@ -1593,6 +1600,11 @@ local function push_grid_state()
         direction = editor.direction,
         hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
         previewCount = grideditor.preview_count(),
+        -- The ordered breakpoint boundaries, the active segment index (1-based) and its start slot, so the
+        -- panel shows "segment i of n, from slot s" and can add/remove/select breakpoints.
+        segments = bounds,
+        activeSegment = active_segment,
+        activeStartSlot = bounds[active_segment] and bounds[active_segment].startSlot or 0,
         knobs = block and {
             offsetForward = block.offsetForward,
             offsetLateral = block.offsetLateral,
@@ -1895,11 +1907,33 @@ function M.grid_open_saved(name, anchor_race)
     send_to_server("gridFetch", {map = map, name = name})
 end
 
--- Set one knob on the active block (UI -> GE) and reflect the clamped result back to the panel.
+-- Set one knob on the active SEGMENT (UI -> GE) and reflect the clamped result back to the panel.
 function M.grid_set(knob, value)
     local ok, applied_or_reason = grideditor.set(knob, value)
     if not ok then
         editor_feedback(tostring(applied_or_reason), "warning")
+        return
+    end
+    push_grid_state()
+end
+
+-- Select (or create) the segment starting at `start_slot` as the active one (UI -> GE, ADR-0023
+-- amendment) and reflect. A new breakpoint is seeded from the covering segment's params; the knobs then
+-- edit it. Slot 0 selects the base segment.
+function M.grid_select_segment(start_slot)
+    local ok, applied_or_reason = grideditor.select_segment(start_slot)
+    if not ok then
+        editor_feedback(tostring(applied_or_reason), "warning")
+        return
+    end
+    push_grid_state()
+end
+
+-- Remove the active breakpoint, merging its slots back into the previous segment (UI -> GE) and reflect.
+function M.grid_remove_segment()
+    local ok, reason = grideditor.remove_segment()
+    if not ok then
+        editor_feedback(tostring(reason), "warning")
         return
     end
     push_grid_state()
@@ -2138,22 +2172,39 @@ local function on_server_event(data)
     handler(payload)
 end
 
--- Draw the grid editor's live preview poses as cyan pillars with P-slot labels (ADR-0023). Immediate-
--- mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false) removes them
--- with no scene objects to clean up.
+-- Draw the grid editor's live preview poses as cyan pillars with P-slot labels, each with a red
+-- orientation line in the slot's facing (drive-up) direction (ADR-0023 + amendment). The active
+-- segment's pillars read bright and the rest are dimmed, so it is clear which slots the current knobs
+-- affect. Immediate-mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false)
+-- removes them with no scene objects to clean up.
 local function draw_editor_grid()
     if not grideditor.state.active or not grideditor.state.poses then
         return
     end
-    local color = ColorF(0.2, 0.8, 1.0, 0.85)
+    local active_segment = grideditor.active_segment()
+    local active_color = ColorF(0.35, 0.95, 1.0, 0.95)
+    local inactive_color = ColorF(0.16, 0.55, 0.72, 0.6)
+    local orient_color = ColorF(1.0, 0.15, 0.15, 0.9)
     local label_fg = ColorF(1, 1, 1, 1)
     local label_bg = ColorI(0, 0, 0, 255)
     for index, pose in ipairs(grideditor.state.poses) do
         local p = pose.pos
         local base = vec3(p.x, p.y, p.z)
         local top = vec3(p.x, p.y, p.z + GRID_COLUMN_HEIGHT)
+        local color = (pose.segment == active_segment) and active_color or inactive_color
         debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, color)
         debugDrawer:drawTextAdvanced(top, "P" .. (index - 1), label_fg, true, false, label_bg)
+        -- A short red line in the slot's facing direction so the whole field's orientation reads at a
+        -- glance (faceDir is always present -- gate-normal or the fallback heading). Drawn as a thin
+        -- cylinder just above the ground (the confirmed draw API; no unverified drawLine).
+        local dir = pose.faceDir
+        if dir then
+            local z = p.z + GRID_ORIENT_LINE_HEIGHT
+            local from = vec3(p.x, p.y, z)
+            local to = vec3(p.x + dir.x * GRID_ORIENT_LINE_LENGTH,
+                p.y + dir.y * GRID_ORIENT_LINE_LENGTH, z)
+            debugDrawer:drawCylinder(from, to, GRID_ORIENT_LINE_RADIUS, orient_color)
+        end
     end
 end
 
@@ -4405,6 +4456,10 @@ end
 --                     field (e.g. many AI); overrides rows. Setting rows again switches back to deriving.
 --   mirror         -- boolean lateral seiten-flip: on moves the pole to the other side (pole-right)
 --                     while keeping the stagger and front-to-back order; off (default) is pole-left.
+-- Segments (ADR-0023 amendment): beamcomp_grid_breakpoint(slot) selects (or creates, seeded from the
+-- covering segment) the segment starting at `slot` -- the knobs above then edit that segment, which
+-- stacks behind the previous one; beamcomp_grid_removebreak() drops the active breakpoint. Slot 0 is the
+-- base segment. A grid with no breakpoints is exactly today's single-block behaviour.
 
 -- GE console command (intentionally global): start a fresh grid from the track's generated layout.
 function beamcomp_grid_new(race_name)
@@ -4459,6 +4514,28 @@ function beamcomp_grid_dir(direction)
     local ok, reason = grideditor.set_direction(direction)
     if ok then
         editor_feedback("editing " .. tostring(direction) .. " block")
+    else
+        editor_feedback(tostring(reason), "warning")
+    end
+end
+
+-- GE console command (intentionally global): select (or create) the segment starting at `start_slot`
+-- as the active one; the knobs then edit it (ADR-0023 amendment). Slot 0 selects the base segment.
+function beamcomp_grid_breakpoint(start_slot)
+    local ok, applied = grideditor.select_segment(start_slot)
+    if ok then
+        editor_feedback("editing segment from slot " .. tostring(applied))
+    else
+        editor_feedback(tostring(applied), "warning")
+    end
+end
+
+-- GE console command (intentionally global): remove the active breakpoint, merging its slots back into
+-- the previous segment.
+function beamcomp_grid_removebreak()
+    local ok, reason = grideditor.remove_segment()
+    if ok then
+        editor_feedback("breakpoint removed -- merged into the previous segment")
     else
         editor_feedback(tostring(reason), "warning")
     end
