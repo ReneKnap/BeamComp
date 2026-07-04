@@ -135,24 +135,63 @@ local function random_stock_model()
     return models[math.random(#models)]
 end
 
--- A random AI vehicle {model, config}, cap-aware (ADR-0032). A Mode-3 cap is active iff there is no fixed
--- car= and a maxhp/maxpwr is set -- mirroring the car-wins precedence the resolve chain already applies (Mode
--- 2 before Mode 3). Cap active: draw an INDEPENDENT random car from the compliant pool
--- (vehiclespecs.random_compliant) so the "random" AI field (ADR-0037) and the ultimate fallback vary per car
--- yet never exceed the cap; the pinned config matters because a random model's STOCK trim can be over-cap.
--- No cap: the unconstrained random stock model (unchanged). Empty compliant pool (pathological -- no
--- installed car meets the cap): log + degrade to find_compliant's deterministic pick, else random_stock_model,
--- so AI spawning never hard-fails (ADR-0036). Returns (model, config).
-local function random_ai_vehicle(policy)
-    if not policy.car and (policy.maxhp or policy.maxpwr) then
-        local pick = vehiclespecs.random_compliant(policy.maxhp, policy.maxpwr)
+-- A random AI vehicle {model, config}, filter-aware (ADR-0032/0037). Composes three orthogonal filters,
+-- each rolled independently per AI:
+--   * power cap -- the relayed player policy's maxhp/maxpwr, active iff there is no fixed player car=
+--     (mirroring the car-wins precedence: Mode 2 before Mode 3);
+--   * big-car exclusion -- the AI config's noBigCars bool -> the BIG_CAR_MAX_WEIGHT curb-weight ceiling,
+--     independent of the player policy (it is the AI's own filter);
+--   * trim -- the AI config's randomTrim bool: false = the model's STOCK/default config, true = a random
+--     compliant trim. randomTrim is tri-state: nil (typed /race aicar=random, content default, legacy
+--     client -- no panel) keeps TODAY's cap-coupled behaviour (cap active -> random compliant trim, else
+--     stock) so those callers are unchanged; the panel sends it explicitly to decouple trim from the cap.
+-- With any filter active the pick draws from the matching filtered pool (random_compliant for a random
+-- trim, random_stock_compliant for the stock trim) so the field varies per car yet never breaks a filter.
+-- Empty pool (pathological -- no installed car passes the filters): log + degrade to find_compliant's
+-- deterministic pick, else random_stock_model, so AI spawning never hard-fails (ADR-0036). Returns
+-- (model, config).
+local function random_ai_vehicle(policy, config)
+    config = type(config) == "table" and config or {}
+    -- Power cap applies only as a Mode-3 policy (no fixed player car + a cap set), mirroring the resolve
+    -- chain's Mode-2-before-Mode-3 precedence.
+    local cap_active = not policy.car and (policy.maxhp or policy.maxpwr)
+    local max_power = cap_active and policy.maxhp or nil
+    local max_pwr = cap_active and policy.maxpwr or nil
+    -- The AI's own big-car exclusion (independent of the player policy): a curb-weight ceiling constant.
+    local max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil
+
+    -- Resolve the effective trim: nil keeps today's cap-coupled default (random trim under a cap, else
+    -- stock); an explicit bool from the panel overrides that coupling.
+    local random_trim = config.randomTrim
+    if random_trim == nil then
+        random_trim = cap_active and true or false
+    end
+
+    local filtered = max_power ~= nil or max_pwr ~= nil or max_weight ~= nil
+    if filtered then
+        local pick
+        if random_trim then
+            pick = vehiclespecs.random_compliant(max_power, max_pwr, max_weight)
+        else
+            pick = vehiclespecs.random_stock_compliant(max_power, max_pwr, max_weight)
+        end
         if pick then
             return pick.model, pick.config
         end
-        log("W", LOG_TAG, "no cap-compliant car for random AI; using best-effort fallback")
-        local fallback = vehiclespecs.find_compliant(nil, policy.maxhp, policy.maxpwr)
+        log("W", LOG_TAG, "no filter-compliant car for random AI; using best-effort fallback")
+        local fallback = vehiclespecs.find_compliant(nil, max_power, max_pwr, max_weight)
         if fallback then
             return fallback.model, fallback.config
+        end
+        return random_stock_model(), nil
+    end
+
+    -- No filter active: honour the trim axis over the full pool (random trim = any config of a random
+    -- model; stock = a random model's default config).
+    if random_trim then
+        local pick = vehiclespecs.random_compliant(nil, nil, nil)
+        if pick then
+            return pick.model, pick.config
         end
     end
     return random_stock_model(), nil
@@ -184,10 +223,10 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
     end
 
     if config.car == "random" then
-        -- The panel's "random" AI car (ADR-0037): an independent random car per AI so the field varies --
-        -- cap-compliant under an active Mode-3 policy, unconstrained otherwise (random_ai_vehicle). Distinct
-        -- from no aicar (the content default below).
-        return random_ai_vehicle(policy)
+        -- The panel's "random" AI car (ADR-0037): an independent random car per AI so the field varies,
+        -- refined by the composable trim + big-car axes and the active power cap (random_ai_vehicle).
+        -- Distinct from no aicar (the content default below).
+        return random_ai_vehicle(policy, config)
     end
     if config.car then
         local model, vehicle_config = split_car_token(config.car)
@@ -216,9 +255,9 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         end
     end
 
-    -- Ultimate fallback: a random car, cap-compliant when a Mode-3 policy is active (random_ai_vehicle),
-    -- unconstrained otherwise -- so an AI resolved this far still honours the cap.
-    return random_ai_vehicle(policy)
+    -- Ultimate fallback: a random car honouring the active power cap and the AI's trim/big-car axes
+    -- (random_ai_vehicle) -- so an AI resolved this far still respects every active filter.
+    return random_ai_vehicle(policy, config)
 end
 
 -- Spawn one host-owned AI car per slot at its grid pose (ADR-0036). `ai_slots` is the owner's relayed

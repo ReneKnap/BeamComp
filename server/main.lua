@@ -2307,6 +2307,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                     preset = overrides.ai.preset,
                     car = overrides.ai.car,
                     params = overrides.ai.params,
+                    -- Composable AI random-vehicle axes (relayed verbatim, resolved owner-side): stock vs
+                    -- random trim, and exclude big/heavy vehicles.
+                    randomTrim = overrides.ai.randomTrim,
+                    noBigCars = overrides.ai.noBigCars,
                 } or nil,
                 mode = overrides.mode,            -- nil = auto (client derives from meta.closed); ADR-0013
                 laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
@@ -4559,6 +4563,15 @@ local function sanitize_overrides(raw)
             if next(params) then
                 ai.params = params
             end
+        end
+        -- Composable random-vehicle axes (AI random picker): randomTrim = stock vs random trim, noBigCars =
+        -- exclude big/heavy vehicles. Opaque booleans relayed to the owner's resolver (race/ai.lua),
+        -- race-blind (ADR-0005) -- the server never maps them to a model or weight.
+        if type(raw.ai.randomTrim) == "boolean" then
+            ai.randomTrim = raw.ai.randomTrim
+        end
+        if type(raw.ai.noBigCars) == "boolean" then
+            ai.noBigCars = raw.ai.noBigCars
         end
         overrides.ai = ai
     end
