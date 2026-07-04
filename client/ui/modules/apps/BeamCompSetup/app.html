@@ -11,6 +11,8 @@
     .bc-section-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
       font-size: 11px; color: #8fd3ff; border-bottom: 1px solid rgba(255,255,255,0.12);
       padding-bottom: 2px; margin-bottom: 6px; }
+    /* Hairline separator between clusters inside one section (same 1px line as the section titles). */
+    .bc-subdivider { border-top: 1px solid rgba(255,255,255,0.12); margin: 8px 0; }
     .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
       margin: 4px 0; }
     .bc-row > span { flex: 0 0 42%; }
@@ -239,6 +241,8 @@
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiRandomTrim"><span>Random trim variant</span></label>
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiNoBigCars"><span>Exclude big vehicles</span></label>
         </div>
+        <!-- Separate the AI-car / random-pool cluster above from the advanced tuning cluster below. -->
+        <div class="bc-subdivider"></div>
         <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAdvanced"><span>Advanced AI settings</span></label>
         <div ng-if="form.aiAdvanced">
           <div class="bc-row">
