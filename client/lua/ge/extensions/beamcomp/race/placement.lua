@@ -1,7 +1,8 @@
 -- BeamComp -- placement grounding (ground-cast + wall displacement).
 --
--- Lives at lua/ge/extensions/beamcomp/race/placement.lua inside the client mod zip. Stateless and
--- reload-safe (no M.state, no file-scope engine handles) -- a Lua reload drops nothing. Target: client
+-- Lives at lua/ge/extensions/beamcomp/race/placement.lua inside the client mod zip. Reload-safe (no
+-- M.state, no file-scope engine handles) -- the only file-scope state is a one-shot probe flag whose
+-- reset on a Lua reload is intended (it re-proves the reloaded zip; see probe_height_apis). Target: client
 -- GE (LuaJIT 5.1). Unlike race/grid (pure pose math, engine-independent), THIS module is the engine
 -- boundary: it reads world collision geometry, which only the client owns (ADR-0005), so it must never
 -- move server-side.
@@ -113,9 +114,35 @@ local function is_blocked(x, y, z, forward)
 end
 
 
+-- One-shot BeamMP height-API verification probe. placement.lua does the codebase's ONLY ground casts
+-- (ADR-0034), and castRayStatic / core_terrain.getTerrainHeight are UNVERIFIED under BeamMP -- a miss
+-- degrades silently to nil (flat). Fired once, this reports whether each API answered with a real value
+-- in-game vs degraded, so a handover can confirm the grounding is actually live AND that the fresh client
+-- zip (not a stale cache) is the one running. Re-runs the two reads for the queried point rather than
+-- reusing ground_z's short-circuited result, so both APIs are reported independently. pcall-guarded so a
+-- bad read never breaks the grounding it precedes; one line per load, no per-pose spam.
+local probe_fired = false
+
+local function probe_height_apis(x, y, hint_z)
+    if probe_fired then
+        return
+    end
+    probe_fired = true
+    pcall(function()
+        local cast_z = cast_ground_z(x, y, hint_z)
+        local terrain_z = terrain_ground_z(x, y)
+        log("I", LOG_TAG, string.format(
+            "placement height-API probe (BeamMP verify, ADR-0034): castRayStatic=%s, "
+            .. "core_terrain.getTerrainHeight=%s",
+            cast_z and string.format("%.2f", cast_z) or "nil (degraded)",
+            terrain_z and string.format("%.2f", terrain_z) or "nil (degraded)"))
+    end)
+end
+
 -- The surface Z below (x, y): a downward static-geometry cast, falling back to terrain height, or nil
 -- when neither API answers. `hint_z` seeds the ray's start height (see cast_ground_z).
 function M.ground_z(x, y, hint_z)
+    probe_height_apis(x, y, hint_z)
     local z = cast_ground_z(x, y, hint_z)
     if z then
         return z
