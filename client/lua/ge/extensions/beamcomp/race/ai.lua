@@ -147,9 +147,9 @@ end
 --     stock) so those callers are unchanged; the panel sends it explicitly to decouple trim from the cap.
 -- With any filter active the pick draws from the matching filtered pool (random_compliant for a random
 -- trim, random_stock_compliant for the stock trim) so the field varies per car yet never breaks a filter.
--- Empty pool (pathological -- no installed car passes the filters): log + degrade to find_compliant's
--- deterministic pick, else random_stock_model, so AI spawning never hard-fails (ADR-0036). Returns
--- (model, config).
+-- Empty pool (pathological -- no installed car passes the filters): log + degrade to find_compliant_car's
+-- deterministic cars-only pick, else random_stock_model (also cars only), so AI spawning never hard-fails
+-- and no branch can ever return a prop/trailer (ADR-0036). Returns (model, config).
 local function random_ai_vehicle(policy, config)
     config = type(config) == "table" and config or {}
     -- Power cap applies only as a Mode-3 policy (no fixed player car + a cap set), mirroring the resolve
@@ -179,7 +179,9 @@ local function random_ai_vehicle(policy, config)
             return pick.model, pick.config
         end
         log("W", LOG_TAG, "no filter-compliant car for random AI; using best-effort fallback")
-        local fallback = vehiclespecs.find_compliant(nil, max_power, max_pwr, max_weight)
+        -- Cars-only fallback (find_compliant_car, not find_compliant): the AI random path must never yield a
+        -- prop/trailer even when no car passes the filters (ADR-0036); random_stock_model is car-only too.
+        local fallback = vehiclespecs.find_compliant_car(max_power, max_pwr, max_weight)
         if fallback then
             return fallback.model, fallback.config
         end

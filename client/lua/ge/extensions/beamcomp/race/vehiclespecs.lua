@@ -48,11 +48,6 @@ M.BIG_CAR_MAX_WEIGHT = 3500
 -- visible in-game (the single runtime-verification point for this module). Module-scope, reset on reload.
 local probed = false
 
--- One-shot companion to `probed` for the MODEL-level info table (data.model), whose Power/Weight fields
--- back the filter-aware stock selector. Logged on first read so the populated stock field names can be
--- confirmed in-game, exactly like probe_config_fields. Module-scope, reset on reload.
-local probed_model = false
-
 -- Pull the first parseable number out of a value that may be a number or a string like "150 hp" /
 -- "110 kW / 150 hp". Returns a number or nil.
 local function to_number(value)
@@ -96,22 +91,6 @@ local function probe_config_fields(info)
     end
     table.sort(keys)
     log("I", LOG_TAG, "config-info fields: " .. table.concat(keys, ", "))
-end
-
--- Log one model-info table's keys the first time we read stock (default-config) power/weight from it, so
--- the populated field can be confirmed in-game. No-op after the first call (per module load). Mirrors
--- probe_config_fields for the model-level metadata the stock selector reads.
-local function probe_model_fields(info)
-    if probed_model or type(info) ~= "table" then
-        return
-    end
-    probed_model = true
-    local keys = {}
-    for key in pairs(info) do
-        keys[#keys + 1] = tostring(key)
-    end
-    table.sort(keys)
-    log("I", LOG_TAG, "model-info fields: " .. table.concat(keys, ", "))
 end
 
 -- The BeamNG model table for `model` ({model = info, configs = {key = info}, ...}), or nil. pcall-guarded:
@@ -264,11 +243,14 @@ function M.vehicle_weight(veh)
     return weight
 end
 
--- True when (power, weight) satisfy the caps. A nil cap is "no limit on this axis"; a set cap whose
--- input is unreadable is NOT satisfied (cannot verify => non-compliant, per ADR-0032). max_pwr compares
--- the power-to-weight ratio power/weight (hp per kg). max_weight caps curb weight (kg) -- a config over it
--- is non-compliant (the "exclude big vehicles" axis). All caps nil => no policy. max_weight is additive:
--- when nil this function is bit-for-bit its pre-weight-axis form, so every 4-arg caller is unchanged.
+-- True when (power, weight) satisfy the caps. A nil cap is "no limit on this axis". The POWER axes
+-- (max_power, max_pwr) are safety guarantees: a set cap whose input is unreadable is NOT satisfied (cannot
+-- verify => non-compliant, per ADR-0032). max_pwr compares the power-to-weight ratio power/weight (hp per
+-- kg). max_weight caps curb weight (kg) for the "exclude big vehicles" NICETY filter, not a safety cap: a
+-- config with a READABLE weight over the ceiling is non-compliant, but an unreadable/nil weight is INCLUDED
+-- (it must not drop a car whose weight metadata is missing -- an unreadable weight emptying the pool is the
+-- random-stock bug). All caps nil => no policy. max_weight is additive: when nil this function is
+-- bit-for-bit its pre-weight-axis form, so every 4-arg caller is unchanged.
 function M.is_compliant(power, weight, max_power, max_pwr, max_weight)
     if max_power ~= nil and not (type(power) == "number" and power <= max_power) then
         return false
@@ -281,7 +263,8 @@ function M.is_compliant(power, weight, max_power, max_pwr, max_weight)
             return false
         end
     end
-    if max_weight ~= nil and not (type(weight) == "number" and weight <= max_weight) then
+    -- Weight axis is include-on-unreadable (see docstring): only a READABLE over-ceiling weight is excluded.
+    if max_weight ~= nil and type(weight) == "number" and weight > max_weight then
         return false
     end
     return true
@@ -333,6 +316,21 @@ function M.find_compliant(own_model, max_power, max_pwr, max_weight)
     return nil
 end
 
+-- The cars-only sibling of find_compliant (draws from list_car_models, never list_models) -- the best-effort
+-- deterministic fallback for the random-AI pool, so an AI never spawns as a prop/trailer even when no car
+-- passes the active filters (ADR-0036 "AI never spawns a prop" invariant). No own-model bias: the AI random
+-- path has no "own" car. Strongest compliant config within a model wins, models alphabetically. Returns
+-- {model, config} or nil. max_weight is include-on-unreadable via is_compliant, exactly like find_compliant.
+function M.find_compliant_car(max_power, max_pwr, max_weight)
+    for _, model in ipairs(M.list_car_models()) do
+        local pick = strongest_compliant(model, max_power, max_pwr, max_weight)
+        if pick then
+            return {model = model, config = pick.config}
+        end
+    end
+    return nil
+end
+
 -- The config keys of `model` whose power/weight satisfy the caps (its legal trims), as an array; empty when
 -- the model has no compliant config. Reuses is_compliant, so an unreadable power/weight under a set cap is
 -- non-compliant (excluded), per ADR-0032 -- no new rule. `max_weight` (kg, optional) additionally excludes
@@ -370,25 +368,25 @@ function M.random_compliant(max_power, max_pwr, max_weight)
     return {model = choice.model, config = choice.configs[math.random(#choice.configs)]}
 end
 
--- A RANDOM car whose STOCK/DEFAULT config satisfies the caps, as {model, config = nil}, or nil when no
--- installed car's stock config satisfies them. The filter-aware sibling of random_compliant: instead of a
--- random compliant TRIM it keeps the stock trim (config = nil = BeamNG's built-in default), so the AI
--- "random model + default type" path (race/ai.lua randomTrim=false) still honours the active power/weight
--- filters. Stock power/weight are read from the model-level metadata (data.model) -- the vehicle-selector
--- default-config representation -- via the same POWER_FIELDS/WEIGHT_FIELDS as every other read; an
--- unreadable value under a set cap is non-compliant (cannot verify => excluded, per ADR-0032). With all
--- caps nil the pool is every drivable model (is_compliant always true) => uniform random, identical to the
--- unconstrained stock pick. Draws from list_car_models so an AI never spawns as a prop/trailer. Owner-local
--- -> math.random is fine (mirrors random_compliant).
+-- A RANDOM car that keeps its STOCK trim (config = nil = BeamNG's built-in default) and is drawn from the
+-- pool of cars that satisfy the caps, as {model, config = nil}, or nil when no installed car qualifies. The
+-- filter-aware sibling of random_compliant: instead of a random compliant TRIM it keeps the stock trim, so
+-- the AI "random model + default type" path (race/ai.lua randomTrim=false) still honours the active
+-- power/weight filters. A car qualifies iff it has AT LEAST ONE compliant config (compliant_configs, the
+-- same CONFIG-level read random_compliant uses): the model-level metadata (data.model) is not reliably
+-- populated pre-spawn under BeamMP, so reading stock power/weight from it emptied the pool and dropped the
+-- AI back to a prop fallback (the random-stock bug); the config-level read IS populated. This is a
+-- representative check, not the default config's own specs (BeamNG exposes no clean default-config id here),
+-- so under a power cap a car whose default trim exceeds the cap but has a lighter compliant trim may still
+-- spawn stock -- accepted, matching the big-car weight heuristic's imprecision. The "exclude big vehicles"
+-- (max_weight) path -- the actual bug trigger -- is exact, because config weights are populated. With all
+-- caps nil every car that has a config qualifies => uniform random, effectively the unconstrained stock
+-- pick. Draws from list_car_models so an AI never spawns as a prop/trailer. Owner-local -> math.random is
+-- fine (mirrors random_compliant).
 function M.random_stock_compliant(max_power, max_pwr, max_weight)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
-        local data = get_model(model)
-        local info = data and data.model
-        probe_model_fields(info)
-        local power = read_numeric(info, POWER_FIELDS)
-        local weight = read_numeric(info, WEIGHT_FIELDS)
-        if M.is_compliant(power, weight, max_power, max_pwr, max_weight) then
+        if #compliant_configs(model, max_power, max_pwr, max_weight) > 0 then
             pool[#pool + 1] = model
         end
     end
