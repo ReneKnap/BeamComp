@@ -182,7 +182,15 @@ local PHASE_DURATIONS = {
     abort_window = 1.5,   -- short finished window when /race restarts a running race
     finished_hold = 900.0, -- long results + free-roam window before returning to lobby (ADR-0006 amendment)
     quali_default = 480.0, -- default qualifying session length, 8 min (ADR-0041); per-event override in session.quali.duration
-    quali_lap_grace = 45.0, -- finish-your-lap cap after the quali clock expires before quali-results (ADR-0041)
+    -- Finish-your-lap window after the quali clock expires, before quali-results (ADR-0041). Sized per
+    -- session by quali.lap_grace_window to the field's slowest best lap (a lap's worth of time) rather than
+    -- a flat cap; these keys are its fallback and clamp bounds. All defensible defaults:
+    quali_lap_grace_fallback = 120.0, -- window when no active driver has a valid best lap yet (everyone on
+                                      -- lap 1, or a sprint quali with nil best_lap); generous, well above the
+                                      -- old flat 45 s, equal to the racing finish_grace (a lap's worth)
+    quali_lap_grace_min = 20.0,  -- floor: even a pathologically small best lap still lets a mid-lap driver cross
+    quali_lap_grace_max = 300.0, -- ceiling (5 min): covers genuinely long laps yet caps one slow/limping lap
+                                 -- so it cannot hold the whole field for minutes
     quali_results = 30.0,  -- classification pause between qualifying and the race countdown (ADR-0041):
                            -- ~10 s results display + a ~20 s settle window after the re-grid (see lead)
     quali_regrid_lead = 20.0, -- lead before the countdown at which the AI re-grid + respawn run inside
@@ -1495,6 +1503,12 @@ quali.PRESETS = {5, 8, 12, 15}
 quali.MIN_SECONDS = 60.0
 quali.MAX_SECONDS = 1800.0
 
+-- Buffer applied to the slowest best lap when sizing the finish-your-lap window (quali.lap_grace_window):
+-- best_lap is by definition a driver's FASTEST lap, but the lap they are completing when the clock expires
+-- is usually slower, so a flat "= best lap" would slightly under-serve the slowest driver. +10 % covers
+-- normal lap-to-lap variance; kept minimal (the spec is "= best lap"). Applied before the clamp.
+quali.LAP_GRACE_BUFFER = 1.10
+
 -- Whether this race is a quali event at all (qualifying pending or already handed off to the race).
 function quali.is_active()
     return session.quali ~= nil
@@ -1632,6 +1646,33 @@ function quali.regrid()
     log_info("beamcomp.race", string.format("quali re-grid: %d participant(s) by best time", #ordered))
 end
 
+-- Size the finish-your-lap grace when the quali clock expires (ADR-0041): a lap's worth of time so a
+-- still-circulating driver can complete the lap they are on, instead of a flat cap that is too short on long
+-- tracks and needlessly long on short ones. Take the SLOWEST best lap of the active field -- classified
+-- drivers (players and AI) still circulating: those with a valid best_lap that are not DNF and not finished
+-- (a disconnect DNFs the record, so "connected" is captured by "not dnf"; ADR-0014) -- so the whole field
+-- can finish, add a small buffer for lap-to-lap variance (quali.LAP_GRACE_BUFFER), and clamp to sane bounds
+-- so one pathological lap cannot stall the session. Race-blind: reads only the client-reported best_lap
+-- already in build_standings, the same source quali.ranking uses (ADR-0005). Falls back to a generous fixed
+-- window when no active driver has set a lap yet (everyone on lap 1, or a sprint quali with nil best_lap).
+function quali.lap_grace_window()
+    local slowest
+    for _, entry in ipairs(build_standings()) do
+        if entry.name and not entry.dnf and not entry.finished then
+            local pace = tonumber(entry.best_lap)
+            if pace and pace > 0 and (not slowest or pace > slowest) then
+                slowest = pace
+            end
+        end
+    end
+    if not slowest then
+        return PHASE_DURATIONS.quali_lap_grace_fallback
+    end
+    local window = slowest * quali.LAP_GRACE_BUFFER
+    return math.max(PHASE_DURATIONS.quali_lap_grace_min,
+                    math.min(PHASE_DURATIONS.quali_lap_grace_max, window))
+end
+
 -- Advance the qualifying phase from the tick (ADR-0041): run for session.quali.duration, then arm a
 -- bounded finish-your-lap grace (so an in-progress lap still counts), then broadcast the classification and
 -- enter the results pause. Mirrors the racing finish-grace handling -- handled explicitly (not by the
@@ -1642,11 +1683,14 @@ function quali.advance_qualifying()
         return  -- still within the quali clock
     end
     if not q.lap_grace_deadline then
-        q.lap_grace_deadline = now() + PHASE_DURATIONS.quali_lap_grace
+        local window = quali.lap_grace_window()
+        q.lap_grace_deadline = now() + window
         -- Tell clients the finish-your-lap window length so each still-circulating driver sees the timeout
-        -- to be at the finish (reuses the racing finish-grace display, ADR-0014/0041).
-        broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.quali_lap_grace})
-        log_info("beamcomp.race", "quali clock expired; finish-your-lap grace armed")
+        -- to be at the finish (reuses the racing finish-grace display, ADR-0014/0041). The window tracks the
+        -- field's slowest best lap, so its length varies with the track/pace rather than being a flat cap.
+        broadcast_event(MSG_FINISH_GRACE, {duration = window})
+        log_info("beamcomp.race",
+            string.format("quali clock expired; finish-your-lap grace armed (%.1fs)", window))
         return
     end
     if now() >= q.lap_grace_deadline then
