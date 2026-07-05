@@ -198,15 +198,21 @@ local function pose_orientation(pose)
 end
 
 -- The world position to place the reference point at so the car's FRONT-centre lands on the grid
--- pose, instead of the reference point BeamNG puts there (which sits mid-car, ~on the seats).
+-- pose (horizontally) and its wheels sit ON the surface (vertically), instead of the reference point
+-- BeamNG puts there (which sits mid-car, ~on the seats -- above the wheels).
 --
 -- The spawn bounding box is measured from the car's CURRENT, pre-teleport transform -- a
 -- getSpawnWorldOOBB read right after setPositionRotation still reflects the old transform, so we must
 -- measure before moving. We learn the reference->front-centre offset there (decomposed along the
 -- car's current forward/right via the OOBB centre and its forward half-length, getHalfExtents().y),
 -- then re-apply it along the grid's target forward/right. This needs no vehicle-local axis or
--- quaternion-flip assumption -- it reads the real geometry and re-projects it. Returns the grid pose
--- unchanged when there is no forward axis or the bbox API is unavailable (keeps the centre anchor).
+-- quaternion-flip assumption -- it reads the real geometry and re-projects it.
+--
+-- The SAME OOBB read also anchors the Z axis: the grid pose Z is the grounded surface (placement.lua,
+-- ADR-0034) with the reference point placed there, but the reference sits above the wheels, so a
+-- taller car buried its wheels below the surface. We instead place the bounding-box BOTTOM at the
+-- grounded Z, so wheels of any size car meet the surface. Returns the grid pose unchanged when there
+-- is no forward axis or the bbox API is unavailable (keeps the centre anchor -- today's behaviour).
 local function front_anchored_target(veh, pose)
     local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
     if not pose.forward then
@@ -225,7 +231,12 @@ local function front_anchored_target(veh, pose)
         local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
         target_fwd:normalize()
         local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
-        return base - (target_fwd * forward_dist + target_right * lateral_dist)
+        local horizontal = base - (target_fwd * forward_dist + target_right * lateral_dist)
+        -- Vertical anchor: horizontal.z is still base.z (the grounded grid Z, already lifted by
+        -- placement.GROUND_CLEARANCE). bottom_offset is the reference -> bbox-bottom Z; subtracting it
+        -- lifts the reference so the bbox bottom -- not the mid-car reference -- lands on the surface.
+        local bottom_offset = to_centre.z - bb:getHalfExtents().z
+        return vec3(horizontal.x, horizontal.y, horizontal.z - bottom_offset)
     end)
     if ok and target then
         return target
