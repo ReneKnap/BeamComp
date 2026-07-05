@@ -78,8 +78,10 @@ end
 
 -- Structured vehicle options for the settings UI (ADR-0037), returned as data instead of chat lines. A
 -- model lists that model's configs ({config, name} pairs for the car= dropdown -- power/weight are dropped
--- here, the panel only needs to pick); nil/empty lists the drivable models (props/trailers excluded, so a
--- car= can't pick a cone). Configs are probed lazily per selected model since an all-models probe is heavy.
+-- here, the panel only needs to pick); nil/empty lists the drivable models as {model, label} pairs
+-- (props/trailers excluded, so a car= can't pick a cone). `model` is the selection key, `label` the human
+-- display name (e.g. "Ibishu Pessima") the dropdown shows; the key-based order of list_car_models is kept
+-- (display only, no re-sort). Configs are probed lazily per selected model since an all-models probe is heavy.
 function M.options(model)
     if type(model) == "string" and model ~= "" then
         local configs = {}
@@ -88,7 +90,11 @@ function M.options(model)
         end
         return {configs = configs}
     end
-    return {models = vehiclespecs.list_car_models()}
+    local models = {}
+    for _, key in ipairs(vehiclespecs.list_car_models()) do
+        models[#models + 1] = {model = key, label = vehiclespecs.model_label(key)}
+    end
+    return {models = models}
 end
 
 return M

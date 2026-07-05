@@ -61,6 +61,19 @@ local function to_number(value)
     return nil
 end
 
+-- Collapse a display string to its trimmed form; nil for a non-string or an all-whitespace value, so a
+-- caller can fall back cleanly (an empty Brand/Configuration never leaks a blank or leading-space label).
+local function trimmed(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local result = value:match("^%s*(.-)%s*$")
+    if result == "" then
+        return nil
+    end
+    return result
+end
+
 -- Read the first present+numeric field from an info table across candidate keys. Returns a number or nil.
 local function read_numeric(info, fields)
     if type(info) ~= "table" then
@@ -156,6 +169,36 @@ function M.list_car_models()
     return cars
 end
 
+-- The human display name of a model -- "Brand Name" (e.g. "Ibishu Pessima"), read from the model metadata
+-- (data.model Brand/Name), the same source model_type reads. Uses whichever of Brand/Name is present and
+-- falls back to the model key when both are unreadable, so it never yields an empty or whitespace-only
+-- label (degrade-don't-crash, ADR-0032). Backs the setup dropdown labels (carlist.options), display only --
+-- the model key stays the selection value.
+function M.model_label(model)
+    local data = get_model(model)
+    local info = data and data.model
+    if type(info) == "table" then
+        local brand = trimmed(info.Brand)
+        local name = trimmed(info.Name)
+        if brand and name then
+            return brand .. " " .. name
+        end
+        if brand or name then
+            return brand or name
+        end
+    end
+    return type(model) == "string" and model or ""
+end
+
+-- The human label of a config-info table -- its in-game Configuration/Name, trimmed, falling back to the
+-- config key when both are missing or blank (so an empty Configuration string never leaks a blank label).
+local function config_label(info, key)
+    if type(info) == "table" then
+        return trimmed(info.Configuration) or trimmed(info.Name) or key
+    end
+    return key
+end
+
 -- Sorted array of one model's configs: {config = key, name = label, power = n|nil, weight = n|nil}. Empty
 -- when the model is unknown or has no configs. `name` is the human label when present, else the key.
 function M.list_configs(model)
@@ -167,7 +210,7 @@ function M.list_configs(model)
     for key, info in pairs(data.configs) do
         if type(key) == "string" then
             probe_config_fields(info)
-            local label = (type(info) == "table" and (info.Configuration or info.Name)) or key
+            local label = config_label(info, key)
             configs[#configs + 1] = {
                 config = key,
                 name = label,
