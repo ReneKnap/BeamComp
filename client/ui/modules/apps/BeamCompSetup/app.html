@@ -381,7 +381,7 @@
           <div class="bc-row" ng-if="cls.kind === 'car'">
             <span>Config</span>
             <div class="bc-dd">
-              <button type="button" class="bc-dd-head" ng-click="toggle('tourCfg' + $index)">{{cls.config || 'stock'}}</button>
+              <button type="button" class="bc-dd-head" ng-click="toggle('tourCfg' + $index)">{{classConfigLabel(cls)}}</button>
               <div class="bc-dd-list" ng-if="open === 'tourCfg' + $index">
                 <div class="bc-dd-opt" ng-repeat="o in classConfigOpts(cls)" ng-class="{sel: o.v === cls.config}"
                   ng-click="pickClassConfig(cls, o.v)">{{o.label}}</div>

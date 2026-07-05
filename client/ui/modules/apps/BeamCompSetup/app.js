@@ -195,7 +195,16 @@ angular.module('beamng.apps')
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
         scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
-        var cars = (scope.data.cars || []).map(function (m) { return { v: m, label: m }; });
+        // GE pushes each car as { model: key, label: displayName } (ADR-0037 carlist.options): the option
+        // VALUE stays the model key so every consumer (car= token, AI car) is unchanged, only the shown
+        // text is the human name. A bare-string entry (a stale GE/UI hot-reload mismatch) is tolerated so
+        // the dropdown never renders "[object Object]".
+        var cars = (scope.data.cars || []).map(function (m) {
+          if (typeof m === 'string') {
+            return { v: m, label: m };
+          }
+          return { v: m.model, label: m.label || m.model };
+        });
         scope.opts.carModel = [{ v: '', label: 'keep own' }].concat(cars);
         scope.opts.aiCar = [{ v: '', label: 'default' }, { v: 'random', label: 'random' }].concat(cars);
       }
@@ -553,6 +562,18 @@ angular.module('beamng.apps')
           return { v: c.config, label: c.name };
         }));
       };
+      // The display name of a class row's selected config, resolved from the same options classConfigOpts
+      // builds so the collapsed head matches the list -- 'stock' for the empty default, the key as fallback.
+      scope.classConfigLabel = function (cls) {
+        var list = scope.classConfigOpts(cls);
+        var value = cls.config || '';
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].v === value) {
+            return list[i].label;
+          }
+        }
+        return cls.config || 'stock';
+      };
       // Tournament mode selector (ADR-0042): picking "off" actually stops the active format (a real off
       // switch), not just hides the section -- otherwise the next broadcast would flip the mode back.
       scope.pickTourMode = function (mode) {
@@ -569,8 +590,19 @@ angular.module('beamng.apps')
           if (!scope.tournament.active && tourConfigValid()) { tournamentCmd('start'); }
         }
       };
+      // Resolve a model key to its dropdown display name (Brand + Name) from the option list
+      // rebuildRaceCarOpts builds; falls back to the raw key so a not-yet-loaded model still shows text.
+      function modelLabel(model) {
+        var list = scope.opts.carModel || [];
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].v === model) {
+            return list[i].label;
+          }
+        }
+        return model;
+      }
       scope.classCarLabel = function (cls) {
-        return cls.car || 'select car…';
+        return cls.car ? modelLabel(cls.car) : 'select car…';
       };
 
       // Serialise the class rows into the opaque server specs (ADR-0042): a fixed car becomes {car} (a config
