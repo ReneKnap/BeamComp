@@ -20,8 +20,9 @@
 local M = {}
 
 local grid = require("beamcomp/race/grid")
--- Retained but intentionally unused while the editor's ground/wall-clear safe-spawn pass is disabled
--- (see recompute): kept so re-enabling the snap is a one-line change back to placement.resolve_all(...).
+-- Grounds each preview pose to terrain HEIGHT (see recompute) so the pillars follow the surface the way
+-- spawned cars do. The full ground+wall-clear pass (placement.resolve_all) stays off in the editor so
+-- tuning never nudges pillars sideways -- height-only keeps the layout exactly as the admin dialed it.
 local placement = require("beamcomp/race/placement")
 local start = require("beamcomp/race/start")
 local maps = require("beamcomp/race/maps")
@@ -108,13 +109,19 @@ end
 local function recompute()
     local anchor = M.state.anchors[M.state.direction]
     local segments = M.state.blocks[M.state.direction]
-    -- Raw computed poses, WITHOUT the ground + wall-clear safe-spawn pass (placement.resolve_all, ADR-0034)
-    -- the real start applies: the collision-snap is disabled in the editor for now so the layout shows
-    -- exactly the parametric grid the admin is tuning, without the snap nudging pillars around. Re-enable by
-    -- wrapping this in placement.resolve_all(...) again. poses_segmented stacks the segments (ADR-0023
-    -- amendment) and tags each pose with its segment index, which init.lua uses to highlight the active one.
-    M.state.poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot,
+    -- poses_segmented stacks the segments (ADR-0023 amendment) and tags each pose with its segment index
+    -- and faceDir, which init.lua reads to highlight the active segment and draw the orientation line.
+    local poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot,
         M.state.preview_count, segments, anchor.gate_normal)
+    -- Ground each pose to the surface HEIGHT ONLY (placement.ground_pose, NOT resolve_all/clear_pose):
+    -- Z follows the terrain so the preview matches where cars land, but with NO lateral wall-nudge -- the
+    -- layout stays exactly what the admin is tuning (ADR-0034 exposes ground_pose apart from the wall
+    -- snap for this). Copy back only Z: ground_pose returns a fresh {pos, rot, forward} table that would
+    -- drop the segment tag and faceDir. These pose tables are freshly built here, so mutating them is safe.
+    for _, pose in ipairs(poses) do
+        pose.pos.z = placement.ground_pose(pose).pos.z
+    end
+    M.state.poses = poses
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given STORED blocks
