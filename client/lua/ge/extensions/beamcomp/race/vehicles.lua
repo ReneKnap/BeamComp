@@ -430,18 +430,57 @@ local function keep_own(pose, own_car)
     return own_car
 end
 
--- Despawn the player's cars and fresh-spawn a chosen {model, config} (stock paint) at the grid pose.
--- Shared by Mode 2 (fixed car) and the Mode-3 substitute (ADR-0032). Returns the new car, or nil + reason.
-local function spawn_fixed(pose, model, config)
+-- Despawn the player's cars and fresh-spawn a chosen {model, config} at the grid pose. Stock paint by
+-- default; when `paint_from` (a captured spec) is given, its three paint layers ride onto the new car --
+-- the Mode-2 "you already own this model in your own colours" case (spawn the forced trim, keep the
+-- player's paint). Shared by Mode 2 (fixed car) and the Mode-3 substitute (ADR-0032). A fresh spawn
+-- either way, so the caller's deferred restage + plate re-apply (keyed on the new vehicle id) still run.
+-- Returns the new car, or nil + reason.
+local function spawn_fixed(pose, model, config, paint_from)
     M.despawn_own()
-    local veh, reason = spawn_vehicle_at(pose, {model = model, config = config})
+    local spec = {model = model, config = config}
+    if paint_from then
+        spec.paint = paint_from.paint
+        spec.paint2 = paint_from.paint2
+        spec.paint3 = paint_from.paint3
+    end
+    local veh, reason = spawn_vehicle_at(pose, spec)
     if not veh then
         log("W", LOG_TAG, "policy spawn failed: " .. tostring(reason))
         return nil, reason
     end
-    log("I", LOG_TAG, string.format("policy spawned '%s%s' at grid (%.1f, %.1f, %.1f)",
-        tostring(model), config and (":" .. config) or "", pose.pos.x, pose.pos.y, pose.pos.z))
+    log("I", LOG_TAG, string.format("policy spawned '%s%s'%s at grid (%.1f, %.1f, %.1f)",
+        tostring(model), config and (":" .. config) or "",
+        paint_from and " in own paint" or "", pose.pos.x, pose.pos.y, pose.pos.z))
     return veh
+end
+
+-- Mode 2 (ADR-0032): resolve the forced model[:config] against what the player already drives. The base
+-- behaviour is a stock forced car for everyone (spawn_fixed). But when the player ALREADY owns the forced
+-- MODEL, don't throw away their look:
+--   * exact match -- forced config absent (model-only), or equal to their current config -> keep the
+--     seated car untouched via keep_own: colours, licence plate and tuning preserved, no respawn (their
+--     car already IS the forced car).
+--   * model matches but the forced config differs -> fresh-spawn the DEMANDED config carrying the
+--     player's own paint layers (the forced trim in their colours).
+-- Any gap -- no own car, a different model, or an unreadable own spec -> stock forced car, exactly as
+-- before (degrade, don't crash). The config compare is deliberately conservative: only an equal (string
+-- ==) or absent forced config keeps the car, so a config the admin explicitly asked for is never skipped;
+-- an inline-customized own config (a table, never == a config string) falls to the config-differs branch,
+-- which still yields the correct forced config in the player's colours. capture_spec is pcall-guarded and
+-- returns nil on any read failure, which selects the stock fall-through. Returns the race car, or nil +
+-- reason.
+local function spawn_forced(pose, model, config, own_car)
+    if own_car then
+        local own_spec = M.capture_spec(own_car)
+        if own_spec and own_spec.model == model then
+            if config == nil or config == own_spec.config then
+                return keep_own(pose, own_car)
+            end
+            return spawn_fixed(pose, model, config, own_spec)
+        end
+    end
+    return spawn_fixed(pose, model, config)
 end
 
 -- Fallback for Mode 1 when there is no real own car (free-cam / walking / none): copy the current car's
@@ -508,7 +547,9 @@ end
 -- Place this client's own car at `pose` (the grid start the server assigned), per the relayed vehicle
 -- policy (ADR-0032; `policy` = {car, maxhp, maxpwr}, all nil = Mode 1). Modes:
 --   * Mode 1 (no policy) -- ADR-0007: keep the seated owned car (repair + teleport), else fresh-spawn one.
---   * Mode 2 (car=) -- ignore the own car, fresh-spawn the fixed model[:config] for everyone.
+--   * Mode 2 (car=) -- fixed model[:config] for everyone; but keep the own car when it already IS the
+--     forced car (colours/plate/tuning preserved), or spawn the forced config in the player's paint when
+--     only the config differs.
 --   * Mode 3 (maxhp/maxpwr) -- keep the own car if compliant, else substitute, else abort.
 -- Returns the resolved race car (the caller enters + freezes it), or nil plus a reason, or nil + reason
 -- + true when Mode 3 aborts (no compliant car). BeamMP propagates the despawn ('Od:'), spawn ('Os:'),
@@ -527,7 +568,7 @@ function M.respawn_own_at(pose, own_car, policy)
         if not model then
             return nil, "invalid car= '" .. tostring(policy.car) .. "'"
         end
-        return spawn_fixed(pose, model, config)
+        return spawn_forced(pose, model, config, own_car)
     end
 
     if policy.maxhp or policy.maxpwr then
