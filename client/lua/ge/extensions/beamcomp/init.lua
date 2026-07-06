@@ -219,7 +219,6 @@ M.state = {
     quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
     quali = nil,              -- latest server-broadcast quali classification snapshot {rows} (ADR-0041), or nil; rendered on the quali-results card
     sector_track = nil,       -- qualifying live sector-split tracker (race/sectors), armed on a circuit quali; nil on a sprint quali / outside qualifying
-    sector_ref_mode = "personal",  -- qualifying sector-delta reference basis: "personal" (your fastest lap) | "session" (field best per sector) | "off"; per-client DISPLAY pref, never relayed (ADR-0005), session-persistent (not reset per race) like interval_mode
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -354,7 +353,7 @@ local function handle_race_start(payload)
     M.state.quali = nil
     M.state.quali_settle = false
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
-    -- in the qualifying phase for a circuit quali. sector_ref_mode is a display pref and NOT reset here.
+    -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
@@ -668,7 +667,7 @@ local function teardown_race_world()
     M.state.quali = nil
     M.state.quali_settle = false
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
-    -- in the qualifying phase for a circuit quali. sector_ref_mode is a display pref and NOT reset here.
+    -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
@@ -1477,37 +1476,6 @@ function M.cycle_interval_mode()
     local order = {self = "ahead", ahead = "leader", leader = "self"}
     M.state.interval_mode = order[M.state.interval_mode] or "self"
     log("I", RACE_LOG_TAG, "standings interval mode -> " .. M.state.interval_mode)
-end
-
--- Set the qualifying sector-delta reference basis (feature: quali-live-sector-delta): "personal" (your
--- fastest lap this session), "session" (the field's best per sector), or "off". A per-client DISPLAY
--- preference -- never relayed to others (ADR-0005 race-blindness upheld) -- and session-persistent like
--- interval_mode (not reset per race). Public so the BeamCompSetup selector reaches it via bngApi.engineLua
--- (UI -> GE, ADR-0012/0037); the value is pushed back so the panel's selector reflects GE truth. An invalid
--- mode is ignored (the current mode stays). The next per-frame HUD snapshot reflects the change.
-function M.set_sector_ref_mode(mode)
-    if mode == "personal" or mode == "session" or mode == "off" then
-        M.state.sector_ref_mode = mode
-        log("I", RACE_LOG_TAG, "sector delta reference -> " .. mode)
-    end
-    if guihooks then
-        guihooks.trigger("BeamCompSectorRef", {mode = M.state.sector_ref_mode or "personal"})
-    end
-end
-
--- Cycle the sector-delta reference (personal -> session -> off -> personal). Public so the HUD's REF
--- toggle can call it via bngApi.engineLua (UI -> GE), mirroring cycle_interval_mode.
-function M.cycle_sector_ref_mode()
-    local order = {personal = "session", session = "off", off = "personal"}
-    M.set_sector_ref_mode(order[M.state.sector_ref_mode] or "personal")
-end
-
--- Push the current sector-delta reference basis to the setup panel (UI -> GE), so a freshly-linked panel
--- reflects GE truth. Public as beamcomp_init.request_sector_ref; mirrors request_race_phase.
-function M.request_sector_ref()
-    if guihooks then
-        guihooks.trigger("BeamCompSectorRef", {mode = M.state.sector_ref_mode or "personal"})
-    end
 end
 
 -- Heartbeat from the HUD app (UI -> GE, ADR-0012): the AngularJS directive calls this on link and once a
@@ -2822,8 +2790,9 @@ local function on_checkpoint_reached(event, count)
         end
     end
     -- Qualifying live sector delta (feature: quali-live-sector-delta): record this crossing's just-completed
-    -- sector so the HUD can flash its delta vs the chosen reference. Circuit quali only (sector_track is nil
-    -- otherwise); lt.run_up bases lap 1's first sector on the start/finish line so it reads clean.
+    -- sector (split time, per-sector personal best, lap cumulative) for the HUD readout. Circuit quali only
+    -- (sector_track is nil otherwise); lt.run_up bases lap 1's first sector on the start/finish line so it
+    -- reads clean line-to-line.
     if M.state.phase == "qualifying" and M.state.sector_track then
         sectors.on_crossing(M.state.sector_track, event.seq, event.time, lt and lt.run_up or nil)
     end
@@ -3447,6 +3416,9 @@ local function build_hud_snapshot()
             -- time. The header CP count is per-lap on a circuit (resets each lap), cumulative on sprint.
             local lap_time = nil
             local best_lap = e.best_lap
+            -- Last completed lap for the qualifying right-side lap timer (feature: quali-live-sector-delta):
+            -- laptimer already tracks it; local row only. nil until the first lap closes.
+            local last_lap = nil
             local cp_in_lap = nil
             local cp_per_lap = nil
             if is_local then
@@ -3454,6 +3426,7 @@ local function build_hud_snapshot()
                 local lt = M.state.laptimer
                 if lt then
                     best_lap = lt.best or best_lap
+                    last_lap = lt.last_lap
                     if detection and driving then
                         lap_time = laptimer.current(lt, detection.elapsed)
                     end
@@ -3486,6 +3459,7 @@ local function build_hud_snapshot()
                 currentLap = current_lap,
                 lapCount = lap_count,
                 lapTime = lap_time,
+                lastLap = last_lap,  -- last completed lap (local row), for the quali lap timer
                 bestLap = best_lap,
                 cpInLap = cp_in_lap,
                 cpPerLap = cp_per_lap,
@@ -3584,32 +3558,38 @@ local function build_hud_snapshot()
         or (M.state.tournament and M.state.tournament.active and not M.state.tournament.ended)
     ) or false
 
-    -- Qualifying live sector delta (feature: quali-live-sector-delta): diff the just-completed sector
-    -- against the chosen reference -- your fastest lap (personal) or the field's best per sector (session),
-    -- both derived here from the broadcast splits (ADR-0015) so the app stays a dumb renderer. Circuit
-    -- quali only (sector_track nil otherwise); left nil when mode=off or no reference exists yet for that
-    -- sector (first flying lap). `seq` lets the app flash only on a fresh crossing, not every snapshot.
-    local sector_ref_mode = M.state.sector_ref_mode or "personal"
-    local sector_flash = nil
+    -- Qualifying live sector readout (feature: quali-live-sector-delta): the just-completed sector's split
+    -- time, a per-segment delta vs your per-sector personal best, a cumulative delta vs your fastest lap,
+    -- and a motorsport record class (purple session best / green personal best / normal). Circuit quali only
+    -- (sector_track nil otherwise); persists the last completed sector until the next crossing. All derived
+    -- here from the tracker + the broadcast splits (ADR-0015) so the app stays a dumb renderer.
+    local sector_info = nil
     local sector_track = M.state.sector_track
-    if phase == "qualifying" and sector_track and sector_track.last and sector_ref_mode ~= "off" then
+    if phase == "qualifying" and sector_track and sector_track.last then
         local cps = (race and race.checkpoints) and #race.checkpoints or 0
         if cps >= 1 then
-            local reference
-            if sector_ref_mode == "session" then
-                reference = sectors.session_reference(entries, cps)
-            elseif local_entry then
-                reference = sectors.personal_reference(local_entry.splits, local_entry.run_up, cps)
+            local last = sector_track.last
+            local session_ref = sectors.session_reference(entries, cps)
+            local session_best = session_ref and session_ref[last.sector] or nil
+            -- Cumulative delta vs your fastest lap: this lap's time through the sector minus that lap's.
+            local cumulative = nil
+            if local_entry then
+                local best_sections = sectors.personal_reference(local_entry.splits, local_entry.run_up, cps)
+                local best_cumulative = best_sections
+                    and sectors.cumulative_through(best_sections, last.sector) or nil
+                if type(best_cumulative) == "number" then
+                    cumulative = last.lap_cumulative - best_cumulative
+                end
             end
-            local ref_time = reference and reference[sector_track.last.sector] or nil
-            if type(ref_time) == "number" then
-                sector_flash = {
-                    seq = sector_track.seq,
-                    sector = sector_track.last.sector,
-                    sectorTime = sector_track.last.time,
-                    delta = sector_track.last.time - ref_time,
-                }
-            end
+            sector_info = {
+                sector = last.sector,
+                split = last.split,
+                -- Per-segment delta vs your prior personal best for this sector (nil the first time).
+                splitDelta = (last.prev_personal_best ~= nil)
+                    and (last.split - last.prev_personal_best) or nil,
+                cumulative = cumulative,  -- vs fastest lap (nil until a lap is complete)
+                record = sectors.record_class(last.split, last.prev_personal_best, session_best),
+            }
         end
     end
 
@@ -3657,10 +3637,9 @@ local function build_hud_snapshot()
         -- qualiResultsRemaining (the freeze eats the lead's first seconds; the rest is the visible settle).
         qualiSettleActive = (phase == "qualiResults" and M.state.quali_settle) and true or false,
         quali = M.state.quali,
-        -- Qualifying live sector delta (feature: quali-live-sector-delta): the active reference basis (for
-        -- the HUD REF toggle label) and the just-completed sector's delta flash (nil = nothing to show).
-        sectorRefMode = sector_ref_mode,
-        sectorFlash = sector_flash,
+        -- Qualifying live sector readout (feature: quali-live-sector-delta): the last completed sector's
+        -- split time, per-segment + cumulative deltas, and record class (nil = nothing to show yet).
+        sector = sector_info,
     }
 end
 
