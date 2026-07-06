@@ -206,7 +206,8 @@ angular.module('beamng.apps')
           return { v: m.model, label: m.label || m.model };
         });
         scope.opts.carModel = [{ v: '', label: 'keep own' }].concat(cars);
-        scope.opts.aiCar = [{ v: '', label: 'default' }, { v: 'random', label: 'random' }].concat(cars);
+        scope.opts.aiCar = [{ v: '', label: 'default' }, { v: 'random', label: 'random' },
+          { v: 'host', label: 'same as host' }].concat(cars);
       }
       function rebuildGridOpts() {
         scope.opts.grid = [{ v: '', label: 'default' }].concat(
