@@ -71,8 +71,11 @@ angular.module('beamng.apps')
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
       // Composable random-AI axes (aiCar='random'): stock vs random trim, and exclude big/heavy vehicles.
-      // Both default off so the fresh form reproduces today's no-cap random-AI behaviour.
-      aiRandomTrim: false, aiNoBigCars: false,
+      // Both default ON (sensible-defaults, like the curated race settings): a random compliant trim plus a
+      // curb-weight ceiling that keeps oversized/heavy vehicles out. Existing saved presets keep their stored
+      // values -- presets serialise these as explicit booleans, so the new default only affects fresh forms
+      // and presets saved after this change.
+      aiRandomTrim: true, aiNoBigCars: true,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
       tourMode: 'off', tourClasses: defaultTourClasses(), tourOrder: 'random',
     };
