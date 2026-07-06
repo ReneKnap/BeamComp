@@ -141,6 +141,18 @@ local NAMETAG_RETRY_TIMEOUT = 10.0
 local RESTAGE_MAX_WAIT = 3.0
 local RESTAGE_MIN_DELTA = 0.2
 
+-- Stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): seconds to let a
+-- (re)seated car's VE streams settle after its jbeam is bindable before firing the one-shot rebind, so it
+-- acts once the car is actually bindable rather than mid-churn. A longer wait is used after a HUD-watchdog
+-- reloadUI (the whole UI must remount first), mirroring the deferred-restage readiness gate.
+local DASH_REFRESH_SETTLE = 0.75
+local DASH_REFRESH_AFTER_RELOAD = 2.0
+
+-- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
+-- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
+-- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
+local BUILD_MARKER = "dashboard-rebind/2026-07-06"
+
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
 local AI_PERF_HINT_THRESHOLD = 6
@@ -186,6 +198,8 @@ M.state = {
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
+    dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
+    dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 power caps {maxhp, maxpwr} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
     staged_spec = nil,        -- spec {model, config, paint...} of the last COMPLIANT staged car, to revert an over-cap staging swap back to (ADR-0032), or nil
     revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
@@ -220,6 +234,16 @@ M.state = {
     quali = nil,              -- latest server-broadcast quali classification snapshot {rows} (ADR-0041), or nil; rendered on the quali-results card
     sector_track = nil,       -- qualifying live sector-split tracker (race/sectors), armed on a circuit quali; nil on a sprint quali / outside qualifying
 }
+
+-- Queue a one-shot stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): armed
+-- at every point the race car is (re)seated (race start + AI reseat, regrid, the racing GO boundary, and
+-- after a HUD-watchdog reloadUI), it lets step_dashboard_refresh wait for the car's VE to be bindable and
+-- then rebind the stock apps once. A plain state setter so it stays callable from the handlers above the
+-- onUpdate step that consumes it; the optional wait overrides the default settle (longer after a reload).
+local function arm_dashboard_refresh(wait)
+    M.state.dash_refresh_pending = true
+    M.state.dash_refresh_wait = wait or DASH_REFRESH_SETTLE
+end
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
 -- HANDLERS table) above its definition can reference it.
@@ -297,6 +321,7 @@ local function handle_race_start(payload)
         M.state.assist_arming = nil
         M.state.assist_notice = nil
         M.state.freeze_hold_armed = false
+        M.state.dash_refresh_pending = false
         -- Clear any AI cars from a prior race too (ADR-0036): on an abort-restart this client may have
         -- been the previous owner, so its host-spawned AI must not linger into a race it is not in.
         ai.stop(M.state.ai_cars or {})
@@ -368,6 +393,9 @@ local function handle_race_start(payload)
     M.state.freeze_hold_armed = false
     M.state.restage_pending = false
     M.state.restage_plate = nil
+    -- Drop any queued stock-dashboard rebind from a prior race; this race re-arms it once its car is seated
+    -- (bug default-dashboard-ui-missing-at-race-start).
+    M.state.dash_refresh_pending = false
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
 
@@ -471,6 +499,7 @@ local function handle_race_start(payload)
         M.state.staging_swap_reverting = false
         M.state.detection = nil
         M.state.laptimer = nil
+        M.state.dash_refresh_pending = false
         lock.remove()
         countdown.clear()
         hud.clear()
@@ -601,6 +630,14 @@ local function handle_race_start(payload)
             end
         end
     end
+
+    -- Race-start seat churn is done (own-car seat + any AI reseat above): queue the one-shot stock
+    -- dashboard/tacho rebind so it fires once the race car's VE is bindable, instead of trusting the
+    -- implicit be:enterVehicle switch alone to have re-bound it under the spawn lag (bug
+    -- default-dashboard-ui-missing-at-race-start). No car placed -> nothing to rebind.
+    if M.state.race_car_id then
+        arm_dashboard_refresh()
+    end
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
@@ -649,6 +686,9 @@ local function teardown_race_world()
     M.state.race_car_id = nil
     M.state.detection = nil
     M.state.laptimer = nil
+    -- Drop any queued stock-dashboard rebind so it never fires in free-roam after teardown
+    -- (bug default-dashboard-ui-missing-at-race-start).
+    M.state.dash_refresh_pending = false
     -- Drop the marker orientation slew state so the next race's posts never ease from a stale angle.
     M.state.marker_angles = nil
     M.state.standings = nil
@@ -1098,6 +1138,11 @@ local function handle_race_phase(payload)
         -- Stop qualifying sector tracking; the race scores the real plan (feature: quali-live-sector-delta).
         M.state.sector_track = nil
         begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
+        -- Guaranteed rebind pass at GO: by racing the car's VE has been up through the whole countdown, so
+        -- this is the highest-confidence point to re-assert the stock dashboard/tacho binding -- it also
+        -- covers a race where the pre-race passes never caught a bindable car (bug
+        -- default-dashboard-ui-missing-at-race-start).
+        arm_dashboard_refresh()
     elseif phase == "qualiResults" then
         -- Qualifying over (ADR-0041): stop scoring -- the classification card renders from the quali
         -- snapshot. The settle window stays closed until the re-grid places the cars on the race grid.
@@ -1363,6 +1408,9 @@ local function handle_regrid(payload)
         return
     end
     vehicles.set_vehicle_frozen(race_car, true)
+    -- The regrid re-seated/re-placed the race car: re-queue the stock-dashboard rebind so the tacho
+    -- survives this reseat too (bug default-dashboard-ui-missing-at-race-start).
+    arm_dashboard_refresh()
     log("I", RACE_LOG_TAG, string.format("re-gridded to slot %d", slot))
 end
 
@@ -2568,7 +2616,10 @@ function M.onExtensionLoaded()
     -- Best-effort from the current freeroam car; refreshed reliably from the race car at spawn. Fires on
     -- a Lua reload / reconnect too, so a reconnecting client re-reports.
     report_identity(own)
-    log("I", LOG_TAG, "loaded")
+    -- Include a distinctive build marker so a redeploy can be confirmed live in beamng.log before trusting
+    -- an in-game result -- the BeamMP client mod cache can serve a stale zip (memory
+    -- beammp-client-mod-cache-stale).
+    log("I", LOG_TAG, "loaded (build " .. BUILD_MARKER .. ")")
 end
 
 -- os.clock() reading of the last switch-lock toast, for SWITCH_BLOCK_TOAST_THROTTLE (CPU seconds is
@@ -4348,6 +4399,10 @@ local function step_hud_watchdog(dt)
         M.state.hud_reshow_wait = 0
         log("W", RACE_LOG_TAG, "HUD app silent; reloading UI to recover the race overlay")
         hud.reload_ui()
+        -- The full reload restores the saved-layout apps but faces the same stock-dashboard rebind race
+        -- as a race start, so re-queue the rebind (longer settle: the UI must remount first). This is the
+        -- secondary/contributing path called out in the bug's 1-investigation.md.
+        arm_dashboard_refresh(DASH_REFRESH_AFTER_RELOAD)
         return
     end
     -- Stage A: re-assert app visibility, throttled, until it acks (or Stage B fires).
@@ -4356,6 +4411,56 @@ local function step_hud_watchdog(dt)
         M.state.hud_reshow_wait = 0
         hud.show()
     end
+end
+
+-- Re-bind the stock, vehicle-bound dashboard/tacho to the confirmed active race car after the race-start
+-- seat churn (bug default-dashboard-ui-missing-at-race-start). Fired once per anchor by
+-- step_dashboard_refresh, only after the car's VE is bindable. Two guarded layers cover the two
+-- root-cause sub-cases from 1-investigation.md:
+--   1. Re-assert the seat with the now-ready VE (be:enterVehicle, the legitimate switch path used all over
+--      this file) -- re-points the UI's vehicle-stream source at the race car. Fixes "the switch landed
+--      before the VE streams were up / onto a transient car".
+--   2. Replay the engine's own vehicle-focus dispatch (hud.rebind_vehicle_apps) so the stock apps re-bind
+--      even when the seat was ALREADY active and step 1 short-circuits. Fixes "already seated but the final
+--      refresh was missed".
+-- Both are pcall-guarded and target only the race car, so a healthy dashboard is undisturbed and the
+-- in-race lock / seat-bounce (ADR-0017) is never fought (the race car is the bounce target).
+local function refresh_stock_dashboard(race_car)
+    if not race_car then
+        return
+    end
+    local ok_id, race_id = pcall(function() return race_car:getId() end)
+    if not ok_id then
+        race_id = nil
+    end
+    if be then
+        pcall(function() be:enterVehicle(0, race_car) end)
+    end
+    hud.rebind_vehicle_apps(race_id)
+    log("I", RACE_LOG_TAG, "stock dashboard rebind fired for race car " .. tostring(race_id))
+end
+
+-- Drive the queued stock-dashboard rebind (bug default-dashboard-ui-missing-at-race-start): wait until the
+-- (re)seated race car resolves and its jbeam bbox is loaded (the same readiness proxy the deferred restage
+-- uses -- streams come up around then), then let a short settle window elapse and fire the rebind once,
+-- clearing the flag. Zero-work on the idle path (pending false). Mirrors restage_swapped_car's deferred,
+-- readiness-gated shape. Called from onUpdate in the HUD-visible phases only, so free-roam is untouched.
+local function step_dashboard_refresh(dt)
+    if not M.state.dash_refresh_pending then
+        return
+    end
+    local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if not own or spawn_oobb_forward(own) == nil then
+        -- No seated own car yet, or its jbeam is still loading: keep waiting (the settle timer only counts
+        -- down once the car is bindable, so a slow spawn never fires the rebind against a not-ready VE).
+        return
+    end
+    M.state.dash_refresh_wait = (M.state.dash_refresh_wait or 0) - (dt or 0)
+    if M.state.dash_refresh_wait > 0 then
+        return
+    end
+    refresh_stock_dashboard(own)
+    M.state.dash_refresh_pending = false
 end
 
 function M.onUpdate(dtReal, dtSim, dtRaw)
@@ -4515,6 +4620,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         or M.state.phase == "racing" or M.state.phase == "finished"
         or M.state.phase == "qualifying" or M.state.phase == "qualiResults") then
         step_hud_watchdog(dtReal)
+        -- Re-bind the stock dashboard/tacho once the (re)seated race car is ready, in the same visible
+        -- phases (bug default-dashboard-ui-missing-at-race-start). Idle unless a rebind is queued.
+        step_dashboard_refresh(dtReal)
     end
 end
 
