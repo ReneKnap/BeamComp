@@ -151,7 +151,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ai-host-car/2026-07-06"
+local BUILD_MARKER = "build maxkg-weight-cap/2026-07-07"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -200,7 +200,7 @@ M.state = {
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
-    race_caps = nil,          -- Mode-3 power caps {maxhp, maxpwr} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
+    race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
     staged_spec = nil,        -- spec {model, config, paint...} of the last COMPLIANT staged car, to revert an over-cap staging swap back to (ADR-0032), or nil
     revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
     staging_swap_reverting = false,  -- true only for the restage cycle that our revert started, so its known-compliant car is adopted without re-gating; recomputed from revert_pending at each consume (prevents a revert loop, ADR-0032)
@@ -454,18 +454,21 @@ local function handle_race_start(payload)
     -- rendering from M.state.race regardless.
     -- The relayed vehicle policy (ADR-0032), read straight off the payload like propOwner (not via
     -- race_start.prepare, which only handles race geometry): car = fixed car for all (Mode 2),
-    -- maxhp/maxpwr = per-player power / power-to-weight caps (Mode 3), all nil = keep own car (Mode 1).
+    -- maxhp/maxpwr = per-player power / power-to-weight caps, maxkg/minkg = per-player strict curb-weight
+    -- range (Mode 3), all nil = keep own car (Mode 1).
     local policy = {
         car = payload.car,
         maxhp = payload.maxhp,
         maxpwr = payload.maxpwr,
+        maxkg = payload.maxkg,
+        minkg = payload.minkg,
     }
     -- Remember the Mode-3 caps for the staging swap-compliance gate (ADR-0032): a car swap during staging
     -- must not stage a car over the cap. Mode 3 only -- a fixed car (Mode 2, car=) or no policy (Mode 1)
     -- leaves this nil and the gate is skipped. Seeded fresh here; staged_spec (the compliant car to revert
     -- an over-cap swap back to) is captured at staging entry, once the placed car's jbeam is loaded.
-    M.state.race_caps = (not policy.car and (policy.maxhp or policy.maxpwr))
-        and {maxhp = policy.maxhp, maxpwr = policy.maxpwr} or nil
+    M.state.race_caps = (not policy.car and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg))
+        and {maxhp = policy.maxhp, maxpwr = policy.maxpwr, maxkg = policy.maxkg, minkg = policy.minkg} or nil
     M.state.staged_spec = nil
     M.state.revert_pending = false
     M.state.staging_swap_reverting = false
@@ -4159,11 +4162,35 @@ end
 -- plain file-scope local (a Lua reload resets it -- at worst one extra toast), mirroring last_block_toast_at.
 local last_cap_swap_toast_at = 0
 
+-- English label for the active strict weight range: "1200-1800 kg", "<=1500 kg", or ">=1200 kg".
+-- Only called with at least one of maxkg/minkg set (the weight branch of warn_over_cap).
+local function weight_limit_label(caps)
+    if caps.minkg and caps.maxkg then
+        return string.format("%d-%d kg", math.floor(caps.minkg + 0.5), math.floor(caps.maxkg + 0.5))
+    elseif caps.maxkg then
+        return string.format("<=%d kg", math.floor(caps.maxkg + 0.5))
+    end
+    return string.format(">=%d kg", math.floor(caps.minkg + 0.5))
+end
+
+-- True when the live weight breaks the strict range: an unreadable weight under a set bound fails (cannot
+-- verify => blocked, ADR-0032), else a readable weight below minkg or above maxkg fails.
+local function breaks_weight_range(weight, caps)
+    if not (caps.maxkg or caps.minkg) then
+        return false
+    end
+    if type(weight) ~= "number" then
+        return true
+    end
+    return (caps.minkg and weight < caps.minkg) or (caps.maxkg and weight > caps.maxkg) or false
+end
+
 -- Warn (throttled, English, native toast) that a staging car swap was rejected for breaking the Mode-3 cap
 -- (ADR-0032). Names the offending car and the numbers, e.g. "etk800 has 450 hp -- limit is 300 hp". Reports
--- the axis that failed off the live power/weight and the caps: the max-HP cap first, else the
--- power-to-weight cap; an unreadable value says the power couldn't be verified (cannot verify => blocked,
--- ADR-0032's load-bearing rule). Uses the same guihooks toast surface as the switch/spawn block warnings.
+-- the first axis that failed off the live power/weight and the caps, in is_compliant order: the max-HP cap,
+-- then the power-to-weight cap, then the strict weight range (maxkg/minkg); an unreadable value says that
+-- reading couldn't be verified (cannot verify => blocked, ADR-0032's load-bearing rule). Uses the same
+-- guihooks toast surface as the switch/spawn block warnings.
 local function warn_over_cap(veh, power, weight, caps)
     local now = os.clock()
     if now - last_cap_swap_toast_at < CAP_SWAP_TOAST_THROTTLE then
@@ -4171,6 +4198,9 @@ local function warn_over_cap(veh, power, weight, caps)
     end
     last_cap_swap_toast_at = now
     local name = (veh and veh.JBeam) or "That car"
+    local pwr_ok = caps.maxpwr == nil
+        or (type(power) == "number" and type(weight) == "number" and weight > 0
+            and power / weight <= caps.maxpwr)
     local detail
     if caps.maxhp and not (type(power) == "number" and power <= caps.maxhp) then
         if type(power) == "number" then
@@ -4178,13 +4208,21 @@ local function warn_over_cap(veh, power, weight, caps)
         else
             detail = string.format("%s: engine power couldn't be verified -- limit is %d hp", name, caps.maxhp)
         end
-    elseif caps.maxpwr then
+    elseif caps.maxpwr and not pwr_ok then
         if type(power) == "number" and type(weight) == "number" and weight > 0 then
             detail = string.format("%s has %.2f hp/kg -- limit is %.2f hp/kg",
                 name, power / weight, caps.maxpwr)
         else
             detail = string.format("%s: power-to-weight couldn't be verified -- limit is %.2f hp/kg",
                 name, caps.maxpwr)
+        end
+    elseif breaks_weight_range(weight, caps) then
+        if type(weight) == "number" then
+            detail = string.format("%s weighs %d kg -- limit is %s", name, math.floor(weight + 0.5),
+                weight_limit_label(caps))
+        else
+            detail = string.format("%s: curb weight couldn't be verified -- limit is %s", name,
+                weight_limit_label(caps))
         end
     else
         detail = name .. " exceeds the vehicle limit"
@@ -4271,7 +4309,8 @@ local function restage_swapped_car(dt_real)
     local caps = M.state.race_caps
     local staged_ok = true  -- whether the car about to be adopted is cap-compliant (always true without caps)
     if caps and not M.state.staging_swap_reverting then
-        local compliant, power, weight = vehicles.car_compliant(own, caps.maxhp, caps.maxpwr)
+        local compliant, power, weight =
+            vehicles.car_compliant(own, caps.maxhp, caps.maxpwr, caps.minkg, caps.maxkg)
         if not compliant then
             staged_ok = false
             warn_over_cap(own, power, weight, caps)

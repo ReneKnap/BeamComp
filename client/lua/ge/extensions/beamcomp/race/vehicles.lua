@@ -539,23 +539,28 @@ end
 -- reliable, unlike pre-spawn config metadata (see the POWER-READ RISK note) -- and apply is_compliant,
 -- returning (compliant, power, weight) so a caller can both gate and build a warning from the readings. A
 -- nil cap is "no limit on that axis"; an unreadable input under a set cap is non-compliant (cannot verify
--- => blocked). Shared by the race-start cap resolve (respawn_for_cap) and the staging swap gate (init.lua).
-function M.car_compliant(veh, maxhp, maxpwr)
+-- => blocked). maxkg/minkg (kg) are the STRICT player weight range, exclude-on-unreadable like the power
+-- caps (distinct from the AI's lenient big-car nicety). Shared by the race-start cap resolve
+-- (respawn_for_cap) and the staging swap gate (init.lua).
+function M.car_compliant(veh, maxhp, maxpwr, minkg, maxkg)
     local power = vehiclespecs.vehicle_power(veh)
     local weight = vehiclespecs.vehicle_weight(veh)
-    return vehiclespecs.is_compliant(power, weight, maxhp, maxpwr), power, weight
+    local range = vehiclespecs.weight_range(minkg, maxkg)
+    return vehiclespecs.is_compliant(power, weight, maxhp, maxpwr, nil, range), power, weight
 end
 
--- Mode 3 (ADR-0032): keep the own car when it meets the power / power-to-weight cap, else substitute the
--- first compliant car (own model's strongest legal trim first, then other models -- find_compliant), else
--- abort the start for this player. Own-car power + weight are read from the spawned vehicle (reliable);
--- candidates from config metadata. Returns the kept/spawned car, (nil, reason), or (nil, reason, true)
--- where the third value flags the no-compliant-car abort so the caller warns and skips the spawn ack.
+-- Mode 3 (ADR-0032): keep the own car when it meets the power / power-to-weight / weight-range cap, else
+-- substitute the first compliant car (own model's strongest legal trim first, then other models --
+-- find_compliant), else abort the start for this player. Own-car power + weight are read from the spawned
+-- vehicle (reliable); candidates from config metadata. Returns the kept/spawned car, (nil, reason), or
+-- (nil, reason, true) where the third value flags the no-compliant-car abort so the caller warns and skips
+-- the spawn ack.
 local function respawn_for_cap(pose, own_car, policy)
     local own_model = own_car and own_car.JBeam or nil
     local compliant, own_power, own_weight = false, nil, nil
     if own_car then
-        compliant, own_power, own_weight = M.car_compliant(own_car, policy.maxhp, policy.maxpwr)
+        compliant, own_power, own_weight =
+            M.car_compliant(own_car, policy.maxhp, policy.maxpwr, policy.minkg, policy.maxkg)
     end
 
     if compliant then
@@ -564,7 +569,8 @@ local function respawn_for_cap(pose, own_car, policy)
         return keep_own(pose, own_car)
     end
 
-    local pick = vehiclespecs.find_compliant(own_model, policy.maxhp, policy.maxpwr)
+    local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
+    local pick = vehiclespecs.find_compliant(own_model, policy.maxhp, policy.maxpwr, nil, range)
     if not pick then
         local reason = "no installed car meets the limit"
         log("W", LOG_TAG, "policy abort: " .. reason)
@@ -576,12 +582,12 @@ local function respawn_for_cap(pose, own_car, policy)
 end
 
 -- Place this client's own car at `pose` (the grid start the server assigned), per the relayed vehicle
--- policy (ADR-0032; `policy` = {car, maxhp, maxpwr}, all nil = Mode 1). Modes:
+-- policy (ADR-0032; `policy` = {car, maxhp, maxpwr, maxkg, minkg}, all nil = Mode 1). Modes:
 --   * Mode 1 (no policy) -- ADR-0007: keep the seated owned car (repair + teleport), else fresh-spawn one.
 --   * Mode 2 (car=) -- fixed model[:config] for everyone; but keep the own car when it already IS the
 --     forced car (colours/plate/tuning preserved), or spawn the forced config in the player's paint when
 --     only the config differs.
---   * Mode 3 (maxhp/maxpwr) -- keep the own car if compliant, else substitute, else abort.
+--   * Mode 3 (maxhp/maxpwr/maxkg/minkg) -- keep the own car if compliant, else substitute, else abort.
 -- Returns the resolved race car (the caller enters + freezes it), or nil plus a reason, or nil + reason
 -- + true when Mode 3 aborts (no compliant car). BeamMP propagates the despawn ('Od:'), spawn ('Os:'),
 -- and a kept car's teleport (via normal owned-vehicle position sync).
@@ -602,7 +608,7 @@ function M.respawn_own_at(pose, own_car, policy)
         return spawn_forced(pose, model, config, own_car)
     end
 
-    if policy.maxhp or policy.maxpwr then
+    if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
         return respawn_for_cap(pose, own_car, policy)
     end
 
