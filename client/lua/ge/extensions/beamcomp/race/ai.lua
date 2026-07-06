@@ -200,10 +200,12 @@ local function random_ai_vehicle(policy, config)
 end
 
 -- Resolve one AI car's {model, config} via the Etappe-B fallback chain (ADR-0036). Precedence: explicit
--- aicar= (config.car) -> the player vehicle policy (ADR-0032: Mode 2 fixed car / Mode 3 cap-compliant car;
--- Mode 1 = no policy falls through) -> the aiRace content default vehicle(s) -> a random stock model.
--- `index` (1-based) cycles the content vehicle list so multiple AI vary. Returns (model, config).
-local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_policy)
+-- aicar= (config.car), incl. the "random" and "host" sentinels -> the player vehicle policy (ADR-0032:
+-- Mode 2 fixed car / Mode 3 cap-compliant car; Mode 1 = no policy falls through) -> the aiRace content
+-- default vehicle(s) -> a random stock model. `index` (1-based) cycles the content vehicle list so multiple
+-- AI vary. `host_car` is the owner's actual resolved race car {model, config} (aicar=host), read GE-side by
+-- the caller at spawn (only the owner spawns AI); nil when unavailable. Returns (model, config).
+local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_policy, host_car)
     config = type(config) == "table" and config or {}
     policy = type(policy) == "table" and policy or {}
     content_defaults = type(content_defaults) == "table" and content_defaults or {}
@@ -229,8 +231,18 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         -- refined by the composable trim + big-car axes and the active power cap (random_ai_vehicle).
         -- Distinct from no aicar (the content default below).
         return random_ai_vehicle(policy, config)
-    end
-    if config.car then
+    elseif config.car == "host" then
+        -- "same as host" (aicar=host): the AI inherit the OWNER's actual resolved race car (model+config),
+        -- read GE-side at spawn and passed in as host_car (only the owner spawns AI, ADR-0036; the server
+        -- relays the opaque "host" sentinel, so vehicle-blindness holds, ADR-0005). host_car.config may be a
+        -- string (a named .pc preset) or an inline parts table -- either rides straight into spawn_at. An
+        -- unresolved host car (placement degraded) falls through the chain below so the AI still races. The
+        -- elseif keeps "host" out of the split_car_token branch (there is no model named "host").
+        if type(host_car) == "table" and host_car.model then
+            return host_car.model, host_car.config
+        end
+        log("W", LOG_TAG, "aicar=host: no resolved host car; falling back to the AI-car chain")
+    elseif config.car then
         local model, vehicle_config = split_car_token(config.car)
         if model then
             return model, vehicle_config
@@ -265,10 +277,11 @@ end
 -- Spawn one host-owned AI car per slot at its grid pose (ADR-0036). `ai_slots` is the owner's relayed
 -- list of {slot, id, label}; `grid_poses` is the full resolved grid (race/start). Each car's vehicle is
 -- resolved via the Etappe-B fallback chain (resolve_ai_vehicle) from the relayed `config`/`content_defaults`
--- (ADR-0036 Etappe B) and the player `policy` (ADR-0032). Returns a list of spawned cars
--- {id, slot, label, veh_id}; a slot whose spawn fails is logged and skipped (the field degrades to fewer
--- AI rather than aborting). BeamMP propagates each spawn to all clients.
-function M.spawn(ai_slots, grid_poses, config, content_defaults, policy)
+-- (ADR-0036 Etappe B) and the player `policy` (ADR-0032). `host_car` is the owner's actual resolved race car
+-- {model, config} for the aicar=host mode, read GE-side by the caller at this spawn; nil otherwise. Returns
+-- a list of spawned cars {id, slot, label, veh_id}; a slot whose spawn fails is logged and skipped (the
+-- field degrades to fewer AI rather than aborting). BeamMP propagates each spawn to all clients.
+function M.spawn(ai_slots, grid_poses, config, content_defaults, policy, host_car)
     local cars = {}
     if type(ai_slots) ~= "table" or type(grid_poses) ~= "table" then
         return cars
@@ -280,7 +293,8 @@ function M.spawn(ai_slots, grid_poses, config, content_defaults, policy)
         else
             -- slot_info carries this AI's per-class policy (car/maxhp/maxpwr) in a class-drop tournament
             -- (ADR-0042); it takes precedence inside resolve_ai_vehicle. nil fields = the normal chain.
-            local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index, slot_info)
+            local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index,
+                slot_info, host_car)
             local veh, reason = vehicles.spawn_at(pose, model, vehicle_config)
             if veh then
                 cars[#cars + 1] = {

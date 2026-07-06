@@ -141,6 +141,26 @@ function M.capture_spec(veh)
     return spec
 end
 
+-- (public) Snapshot a spawned car's model + part config as the {model, config} the "same as host" AI mode
+-- inherits (aicar=host, ADR-0036). Unlike capture_spec this skips paint: the AI spawn seam (M.spawn_at)
+-- takes only model+config -- stock paint, like every other AI car -- so a paint-read failure must never
+-- block the inherit. `config` may be a string (a named .pc preset, e.g. "846_340_A") or an inline parts
+-- table (a tuned car); either rides straight into spawn_at. pcall-guarded (the field reads are the
+-- engine-boundary reads capture_spec uses). Returns the spec, or nil when there is no vehicle or the model
+-- is unreadable -- the caller then falls through the normal AI-car chain so the AI still races.
+function M.host_car_spec(veh)
+    if not veh then
+        return nil
+    end
+    local ok, spec = pcall(function()
+        return {model = veh.JBeam, config = veh.partConfig}
+    end)
+    if not ok or type(spec.model) ~= "string" or spec.model == "" then
+        return nil
+    end
+    return spec
+end
+
 -- Snapshot the player's active vehicle so it can be respawned fresh after the despawn deletes it.
 -- Returns the spec table, or nil when the player is not in a real own car worth copying (on foot,
 -- free-cam, a prop, or nothing) -- the caller then spawns DEFAULT_VEHICLE_MODEL instead.
