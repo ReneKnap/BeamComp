@@ -2689,23 +2689,34 @@ local function retry_pending_nametags(dt)
     end
 end
 
--- Re-arm the per-vehicle race mechanics after the player's staged race car is reset/reloaded IN PLACE
+-- Min seconds between reload re-arms. One config respawn raises several vehicle-lifecycle events
+-- (onVehicleResetted plus the onVehicleSpawned of its despawn/respawn cycle); this collapses them into a
+-- single re-arm so nothing stacks or re-fires. os.clock() is monotonic CPU seconds -- far shorter than any
+-- human vehicle-config interaction, so a genuine second tune is never swallowed. File scope (not M.state):
+-- a Lua reload only forgets it, which at worst allows one redundant re-arm.
+local RELOAD_REARM_THROTTLE = 0.5
+local last_reload_rearm_at = 0
+
+-- Re-arm the per-vehicle race mechanics IN PLACE after the player's staged race car is reset/reloaded
 -- during staging (bug prerace-car-tuning-breaks-lock-and-reset). Applying a change in the vehicle config
 -- menu -- tyre pressure, paint, any tuning -- runs veh:respawn(config) (BeamNG partmgmt.mergeConfig),
--- which reloads the car's jbeam and so re-instantiates its VE, dropping the per-VE arming (the EV
--- freeze-hold clamp + the recover/repair override, ADR-0017) and clearing the GE start-freeze. Unlike a
--- model/config SWAP this in-place reset never goes through replaceVehicle -> lock.consume_replace, so
--- restage_swapped_car never sees it and the car ends up drivable before the start with a dead 5s reset
--- assist. Re-arm generically by routing the reset through the SAME deferred restage a swap uses: it waits
--- for the reloaded jbeam, re-places the car on its grid slot, re-freezes it, and clears the VE-arm flags
--- so onUpdate re-pushes the freeze-hold + assist override to the fresh VE. Deferred (not inline) because
--- a command queued to a still-reloading VE would be lost. Reuses the restage_pending fields (no new
--- state). Called from BOTH onVehicleResetted and onVehicleSpawned, since a config respawn can raise
--- either hook (a reload runs a despawn/respawn cycle); the guards make the second call a no-op.
+-- which reloads the car's jbeam in place (the car STAYS on its slot, same game id) but re-instantiates its
+-- VE: that drops the movement freeze -- both the GE controller freeze (controller.setFreeze resets on the
+-- VE reload) and the EV throttle clamp -- and the recover/repair override (the "5s reset", ADR-0017), so
+-- the car can drive off before the start and the assist goes dead. Unlike a model/config SWAP it never
+-- goes through replaceVehicle, so restage_swapped_car never sees it.
+--
+-- Fix: re-freeze IN PLACE. Do NOT re-place/teleport/respawn the car (an earlier deferred-restage re-place
+-- looped: each re-place raised another spawn event -> re-arm -> re-place). Re-assert the GE controller
+-- freeze (holds combustion + EV bodies) and clear the two VE-arm flags so the existing onUpdate re-pushes
+-- the EV clamp (push_freeze_hold) and the recover/repair override (push_assist_arm) to the reloaded VE.
+-- Queued VE commands buffer until the reloaded VM is ready (the hooks fire post-respawn, like the engine's
+-- own setGravity-at-spawn), so no explicit wait is needed -- and none of this raises a spawn/reset event,
+-- so it cannot loop. Called from BOTH onVehicleResetted and onVehicleSpawned, since a config respawn can
+-- raise either hook; the throttle collapses the duplicates.
 local function rearm_staged_car_on_reload(vehicle_id)
     -- Staging only (the swap-allowed lock): past staging the full lock blocks every reset route, and we
-    -- must not arm a new restage into the countdown/racing -- the re-arm is a staging capability, not a
-    -- new mid-race one. A no-op (harmless) if the hook fires out of phase.
+    -- must not re-arm into the countdown/racing. A no-op (harmless) if the hook fires out of phase.
     if M.state.phase ~= "staging" or not M.state.race then
         return
     end
@@ -2719,18 +2730,27 @@ local function rearm_staged_car_on_reload(vehicle_id)
             and tostring(vehicle_id) ~= tostring(M.state.current_vehicle_id) then
         return
     end
-    -- Idempotent: a restage already in flight (a swap, a fresh spawn, or an over-cap revert) will re-place
-    -- + re-arm this car anyway, so do not restart its load-wait. This also collapses a respawn that raises
-    -- both onVehicleResetted and onVehicleSpawned into a single restage.
-    if M.state.restage_pending then
+    -- Collapse the several lifecycle events one respawn raises into a single re-arm (also stops any stray
+    -- repeat from re-freezing every frame).
+    local now = os.clock()
+    if now - last_reload_rearm_at < RELOAD_REARM_THROTTLE then
         return
     end
-    -- Arm the deferred restage exactly as a staging swap does. A reset keeps the same footprint, so the
-    -- bbox-delta never trips and placement falls back to RESTAGE_MAX_WAIT (the same-size-swap path).
-    M.state.restage_pending = true
-    M.state.restage_baseline = nil
-    M.state.restage_wait = RESTAGE_MAX_WAIT
-    log("I", RACE_LOG_TAG, "staging race car reset/reloaded (tuning); re-arming freeze + assist via restage")
+    last_reload_rearm_at = now
+    -- Re-assert the GE controller freeze in place (no teleport) -- the config respawn reset it, and it is
+    -- what holds a combustion car (the EV clamp below only holds EVs).
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if own_car then
+        local frozen, freeze_err = vehicles.set_vehicle_frozen(own_car, true)
+        if not frozen then
+            log("W", RACE_LOG_TAG, "could not re-freeze reset staging car: " .. tostring(freeze_err))
+        end
+    end
+    -- Clear the GE arm flags so onUpdate re-pushes the EV throttle clamp + the recover/repair override to
+    -- the reloaded VE (they stay true across the reset, which is why they were never re-pushed -> the bug).
+    M.state.freeze_hold_armed = false
+    M.state.assist_armed = false
+    log("I", RACE_LOG_TAG, "staging race car reset/reloaded (tuning); re-froze in place + re-armed assist")
 end
 
 -- As each shared cone appears -- the host's local set when its prefab load spawns them, and the
@@ -2750,8 +2770,8 @@ function M.onVehicleSpawned(vehicleId)
     -- or on the owner (it has no ai_server_ids).
     resolve_remote_ai()
     -- A config/tuning respawn during staging can surface as a re-spawn of the same race car (a reload runs
-    -- a despawn/respawn cycle), so re-arm here too. The guard no-ops for cones, AI, remotes, and any
-    -- vehicle that is not the player's staged race car -- see onVehicleResetted, the primary hook.
+    -- a despawn/respawn cycle), so re-freeze + re-arm here too. The guard no-ops for cones, AI, remotes,
+    -- and any vehicle that is not the player's staged race car -- see onVehicleResetted, the primary hook.
     rearm_staged_car_on_reload(vehicleId)
     if not cones.is_cone(veh) then
         return
@@ -2768,9 +2788,9 @@ end
 
 -- BeamNG fires this GE hook (lua/ge/main.lua vehicleReset -> extensions.hook('onVehicleResetted', vid))
 -- whenever a vehicle is reset/reloaded in place -- including a vehicle-config reapply (tyre pressure,
--- paint) during staging, which runs veh:respawn(config). Re-arm the movement freeze + recover/repair
--- assist on the player's staged car; rearm_staged_car_on_reload guards phase, ownership, and idempotency,
--- so a reset of any other car or outside the staging window is a no-op.
+-- paint) during staging, which runs veh:respawn(config). Re-freeze the player's staged car in place and
+-- re-arm its recover/repair assist; rearm_staged_car_on_reload guards phase, ownership, and throttling, so
+-- a reset of any other car or outside the staging window is a no-op.
 function M.onVehicleResetted(vehicleId)
     rearm_staged_car_on_reload(vehicleId)
 end
