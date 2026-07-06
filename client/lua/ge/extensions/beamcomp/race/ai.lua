@@ -137,8 +137,8 @@ end
 
 -- A random AI vehicle {model, config}, filter-aware (ADR-0032/0037). Composes three orthogonal filters,
 -- each rolled independently per AI:
---   * power cap -- the relayed player policy's maxhp/maxpwr, active iff there is no fixed player car=
---     (mirroring the car-wins precedence: Mode 2 before Mode 3);
+--   * power/weight cap -- the relayed player policy's maxhp/maxpwr and the strict maxkg/minkg weight range,
+--     active iff there is no fixed player car= (mirroring the car-wins precedence: Mode 2 before Mode 3);
 --   * big-car exclusion -- the AI config's noBigCars bool -> the BIG_CAR_MAX_WEIGHT curb-weight ceiling,
 --     independent of the player policy (it is the AI's own filter);
 --   * trim -- the AI config's randomTrim bool: false = the model's STOCK/default config, true = a random
@@ -152,11 +152,14 @@ end
 -- and no branch can ever return a prop/trailer (ADR-0036). Returns (model, config).
 local function random_ai_vehicle(policy, config)
     config = type(config) == "table" and config or {}
-    -- Power cap applies only as a Mode-3 policy (no fixed player car + a cap set), mirroring the resolve
-    -- chain's Mode-2-before-Mode-3 precedence.
-    local cap_active = not policy.car and (policy.maxhp or policy.maxpwr)
+    -- Power/weight cap applies only as a Mode-3 policy (no fixed player car + a cap set), mirroring the
+    -- resolve chain's Mode-2-before-Mode-3 precedence.
+    local cap_active = not policy.car and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg)
     local max_power = cap_active and policy.maxhp or nil
     local max_pwr = cap_active and policy.maxpwr or nil
+    -- The player's STRICT weight range (maxkg/minkg, ADR-0032): rides the same cap gate as the power caps
+    -- and is distinct from the AI's lenient big-car ceiling below (both AND together via is_compliant).
+    local weight_range = cap_active and vehiclespecs.weight_range(policy.minkg, policy.maxkg) or nil
     -- The AI's own big-car exclusion (independent of the player policy): a curb-weight ceiling constant.
     local max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil
 
@@ -167,13 +170,13 @@ local function random_ai_vehicle(policy, config)
         random_trim = cap_active and true or false
     end
 
-    local filtered = max_power ~= nil or max_pwr ~= nil or max_weight ~= nil
+    local filtered = max_power ~= nil or max_pwr ~= nil or max_weight ~= nil or weight_range ~= nil
     if filtered then
         local pick
         if random_trim then
-            pick = vehiclespecs.random_compliant(max_power, max_pwr, max_weight)
+            pick = vehiclespecs.random_compliant(max_power, max_pwr, max_weight, weight_range)
         else
-            pick = vehiclespecs.random_stock_compliant(max_power, max_pwr, max_weight)
+            pick = vehiclespecs.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
         end
         if pick then
             return pick.model, pick.config
@@ -181,7 +184,7 @@ local function random_ai_vehicle(policy, config)
         log("W", LOG_TAG, "no filter-compliant car for random AI; using best-effort fallback")
         -- Cars-only fallback (find_compliant_car, not find_compliant): the AI random path must never yield a
         -- prop/trailer even when no car passes the filters (ADR-0036); random_stock_model is car-only too.
-        local fallback = vehiclespecs.find_compliant_car(max_power, max_pwr, max_weight)
+        local fallback = vehiclespecs.find_compliant_car(max_power, max_pwr, max_weight, weight_range)
         if fallback then
             return fallback.model, fallback.config
         end
@@ -252,8 +255,9 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
     if policy.car then
         return split_car_token(policy.car)
     end
-    if policy.maxhp or policy.maxpwr then
-        local pick = vehiclespecs.find_compliant(nil, policy.maxhp, policy.maxpwr)
+    if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
+        local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
+        local pick = vehiclespecs.find_compliant(nil, policy.maxhp, policy.maxpwr, nil, range)
         if pick then
             return pick.model, pick.config
         end

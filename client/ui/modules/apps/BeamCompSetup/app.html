@@ -138,6 +138,14 @@
         <span>Max hp/kg</span>
         <input type="number" min="0" step="0.001" ng-model="form.maxpwr" placeholder="off">
       </label>
+      <label class="bc-row" ng-if="!form.carModel">
+        <span>Min kg</span>
+        <input type="number" min="0" ng-model="form.minkg" placeholder="off">
+      </label>
+      <label class="bc-row" ng-if="!form.carModel">
+        <span>Max kg</span>
+        <input type="number" min="0" ng-model="form.maxkg" placeholder="off">
+      </label>
       <div class="bc-row">
         <span>Start order</span>
         <!-- While a championship (ADR-0040) or class-drop tournament (ADR-0042) is active it sets the grid,

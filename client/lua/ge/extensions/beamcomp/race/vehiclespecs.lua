@@ -286,15 +286,33 @@ function M.vehicle_weight(veh)
     return weight
 end
 
+-- Build a STRICT weight-range spec {min, max} (kg) from the player-facing minkg/maxkg caps for is_compliant,
+-- or nil when neither bound is set (so the common no-range path stays a single nil check downstream). Unlike
+-- the lenient max_weight axis this range is exclude-on-unreadable (ADR-0032; see is_compliant). Non-numeric
+-- bounds are dropped -- the server relays numbers, but stay defensive at the boundary.
+function M.weight_range(minkg, maxkg)
+    local min_kg = type(minkg) == "number" and minkg or nil
+    local max_kg = type(maxkg) == "number" and maxkg or nil
+    if min_kg == nil and max_kg == nil then
+        return nil
+    end
+    return {min = min_kg, max = max_kg}
+end
+
 -- True when (power, weight) satisfy the caps. A nil cap is "no limit on this axis". The POWER axes
 -- (max_power, max_pwr) are safety guarantees: a set cap whose input is unreadable is NOT satisfied (cannot
 -- verify => non-compliant, per ADR-0032). max_pwr compares the power-to-weight ratio power/weight (hp per
 -- kg). max_weight caps curb weight (kg) for the "exclude big vehicles" NICETY filter, not a safety cap: a
 -- config with a READABLE weight over the ceiling is non-compliant, but an unreadable/nil weight is INCLUDED
 -- (it must not drop a car whose weight metadata is missing -- an unreadable weight emptying the pool is the
--- random-stock bug). All caps nil => no policy. max_weight is additive: when nil this function is
--- bit-for-bit its pre-weight-axis form, so every 4-arg caller is unchanged.
-function M.is_compliant(power, weight, max_power, max_pwr, max_weight)
+-- random-stock bug). weight_range ({min?, max?} kg, or nil -- build it with M.weight_range) is the
+-- player-facing STRICT weight range (maxkg/minkg, ADR-0032), deliberately DISTINCT from the lenient
+-- max_weight: an unreadable weight under EITHER set bound is non-compliant (cannot verify => blocked, like
+-- the power caps), and a readable weight below min or above max is non-compliant. All caps nil => no policy.
+-- Both weight axes are additive: with max_weight and weight_range nil this function is bit-for-bit its
+-- pre-weight-axis form (every 4-/5-arg caller is unchanged), and the lenient and strict axes AND together
+-- when both are set (the AI random path when the player set a weight range and the AI config excludes big cars).
+function M.is_compliant(power, weight, max_power, max_pwr, max_weight, weight_range)
     if max_power ~= nil and not (type(power) == "number" and power <= max_power) then
         return false
     end
@@ -306,9 +324,24 @@ function M.is_compliant(power, weight, max_power, max_pwr, max_weight)
             return false
         end
     end
-    -- Weight axis is include-on-unreadable (see docstring): only a READABLE over-ceiling weight is excluded.
+    -- Lenient weight axis is include-on-unreadable (see docstring): only a READABLE over-ceiling weight fails.
     if max_weight ~= nil and type(weight) == "number" and weight > max_weight then
         return false
+    end
+    -- Strict weight range (maxkg/minkg): an unreadable weight under a set bound is non-compliant (cannot verify).
+    if weight_range ~= nil then
+        local min_kg, max_kg = weight_range.min, weight_range.max
+        if min_kg ~= nil or max_kg ~= nil then
+            if type(weight) ~= "number" then
+                return false
+            end
+            if min_kg ~= nil and weight < min_kg then
+                return false
+            end
+            if max_kg ~= nil and weight > max_kg then
+                return false
+            end
+        end
     end
     return true
 end
@@ -316,10 +349,10 @@ end
 -- The strongest compliant config of `model` under the caps, as {config, power}, or nil. "Strongest" =
 -- highest power at or under the caps (the best legal trim); configs with unreadable power rank lowest and
 -- only win when nothing has a readable power (then the lowest config key, deterministically).
-local function strongest_compliant(model, max_power, max_pwr, max_weight)
+local function strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
     local best
     for _, entry in ipairs(M.list_configs(model)) do
-        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight) then
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, weight_range) then
             if not best then
                 best = entry
             else
@@ -339,18 +372,19 @@ end
 
 -- Find the first car satisfying the caps, as {model, config}, or nil. Search order (ADR-0032): the
 -- player's own model first (downgrade the trim, keep the brand), then other models alphabetically; within
--- a model the strongest compliant config wins. Deterministic so the pick is predictable. `max_weight`
--- (kg, optional) additionally excludes over-weight trims; nil = no weight limit (unchanged behavior).
-function M.find_compliant(own_model, max_power, max_pwr, max_weight)
+-- a model the strongest compliant config wins. Deterministic so the pick is predictable. `max_weight` (kg,
+-- optional, lenient) and `weight_range` ({min?, max?} kg, optional, strict maxkg/minkg) additionally
+-- exclude over-/under-weight trims; nil = no weight limit on that axis (unchanged behavior).
+function M.find_compliant(own_model, max_power, max_pwr, max_weight, weight_range)
     if type(own_model) == "string" and own_model ~= "" then
-        local own = strongest_compliant(own_model, max_power, max_pwr, max_weight)
+        local own = strongest_compliant(own_model, max_power, max_pwr, max_weight, weight_range)
         if own then
             return {model = own_model, config = own.config}
         end
     end
     for _, model in ipairs(M.list_models()) do
         if model ~= own_model then
-            local pick = strongest_compliant(model, max_power, max_pwr, max_weight)
+            local pick = strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
             if pick then
                 return {model = model, config = pick.config}
             end
@@ -363,10 +397,11 @@ end
 -- deterministic fallback for the random-AI pool, so an AI never spawns as a prop/trailer even when no car
 -- passes the active filters (ADR-0036 "AI never spawns a prop" invariant). No own-model bias: the AI random
 -- path has no "own" car. Strongest compliant config within a model wins, models alphabetically. Returns
--- {model, config} or nil. max_weight is include-on-unreadable via is_compliant, exactly like find_compliant.
-function M.find_compliant_car(max_power, max_pwr, max_weight)
+-- {model, config} or nil. max_weight is include-on-unreadable via is_compliant, exactly like find_compliant;
+-- the strict weight_range (maxkg/minkg) is exclude-on-unreadable, also via is_compliant.
+function M.find_compliant_car(max_power, max_pwr, max_weight, weight_range)
     for _, model in ipairs(M.list_car_models()) do
-        local pick = strongest_compliant(model, max_power, max_pwr, max_weight)
+        local pick = strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
         if pick then
             return {model = model, config = pick.config}
         end
@@ -376,12 +411,12 @@ end
 
 -- The config keys of `model` whose power/weight satisfy the caps (its legal trims), as an array; empty when
 -- the model has no compliant config. Reuses is_compliant, so an unreadable power/weight under a set cap is
--- non-compliant (excluded), per ADR-0032 -- no new rule. `max_weight` (kg, optional) additionally excludes
--- over-weight trims. Backs the random AI selector (random_compliant).
-local function compliant_configs(model, max_power, max_pwr, max_weight)
+-- non-compliant (excluded), per ADR-0032 -- no new rule. `max_weight` (lenient) and `weight_range`
+-- (strict maxkg/minkg) additionally exclude over-/under-weight trims. Backs the random AI selector (random_compliant).
+local function compliant_configs(model, max_power, max_pwr, max_weight, weight_range)
     local keys = {}
     for _, entry in ipairs(M.list_configs(model)) do
-        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight) then
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, weight_range) then
             keys[#keys + 1] = entry.config
         end
     end
@@ -395,11 +430,12 @@ end
 -- Models with no compliant config are never drawn (the pool pre-filter IS the "re-roll among compliant
 -- models"), so the cap is never violated. Draws from list_car_models so an AI never spawns as a prop/trailer.
 -- Owner-local -> math.random is fine (only the owner spawns AI, no cross-client determinism, like ai.lua's
--- random_stock_model). `max_weight` (kg, optional) additionally excludes over-weight trims from the pool.
-function M.random_compliant(max_power, max_pwr, max_weight)
+-- random_stock_model). `max_weight` (lenient) and `weight_range` (strict maxkg/minkg) additionally exclude
+-- over-/under-weight trims from the pool.
+function M.random_compliant(max_power, max_pwr, max_weight, weight_range)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
-        local configs = compliant_configs(model, max_power, max_pwr, max_weight)
+        local configs = compliant_configs(model, max_power, max_pwr, max_weight, weight_range)
         if #configs > 0 then
             pool[#pool + 1] = {model = model, configs = configs}
         end
@@ -426,10 +462,10 @@ end
 -- caps nil every car that has a config qualifies => uniform random, effectively the unconstrained stock
 -- pick. Draws from list_car_models so an AI never spawns as a prop/trailer. Owner-local -> math.random is
 -- fine (mirrors random_compliant).
-function M.random_stock_compliant(max_power, max_pwr, max_weight)
+function M.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
-        if #compliant_configs(model, max_power, max_pwr, max_weight) > 0 then
+        if #compliant_configs(model, max_power, max_pwr, max_weight, weight_range) > 0 then
             pool[#pool + 1] = model
         end
     end
