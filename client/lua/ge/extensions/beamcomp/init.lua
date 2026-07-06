@@ -2712,6 +2712,70 @@ local function retry_pending_nametags(dt)
     end
 end
 
+-- Min seconds between reload re-arms. One config respawn raises several vehicle-lifecycle events
+-- (onVehicleResetted plus the onVehicleSpawned of its despawn/respawn cycle); this collapses them into a
+-- single re-arm so nothing stacks or re-fires. os.clock() is monotonic CPU seconds -- far shorter than any
+-- human vehicle-config interaction, so a genuine second tune is never swallowed. File scope (not M.state):
+-- a Lua reload only forgets it, which at worst allows one redundant re-arm.
+local RELOAD_REARM_THROTTLE = 0.5
+local last_reload_rearm_at = 0
+
+-- Re-arm the per-vehicle race mechanics IN PLACE after the player's staged race car is reset/reloaded
+-- during staging (bug prerace-car-tuning-breaks-lock-and-reset). Applying a change in the vehicle config
+-- menu -- tyre pressure, paint, any tuning -- runs veh:respawn(config) (BeamNG partmgmt.mergeConfig),
+-- which reloads the car's jbeam in place (the car STAYS on its slot, same game id) but re-instantiates its
+-- VE: that drops the movement freeze -- both the GE controller freeze (controller.setFreeze resets on the
+-- VE reload) and the EV throttle clamp -- and the recover/repair override (the "5s reset", ADR-0017), so
+-- the car can drive off before the start and the assist goes dead. Unlike a model/config SWAP it never
+-- goes through replaceVehicle, so restage_swapped_car never sees it.
+--
+-- Fix: re-freeze IN PLACE. Do NOT re-place/teleport/respawn the car (an earlier deferred-restage re-place
+-- looped: each re-place raised another spawn event -> re-arm -> re-place). Re-assert the GE controller
+-- freeze (holds combustion + EV bodies) and clear the two VE-arm flags so the existing onUpdate re-pushes
+-- the EV clamp (push_freeze_hold) and the recover/repair override (push_assist_arm) to the reloaded VE.
+-- Queued VE commands buffer until the reloaded VM is ready (the hooks fire post-respawn, like the engine's
+-- own setGravity-at-spawn), so no explicit wait is needed -- and none of this raises a spawn/reset event,
+-- so it cannot loop. Called from BOTH onVehicleResetted and onVehicleSpawned, since a config respawn can
+-- raise either hook; the throttle collapses the duplicates.
+local function rearm_staged_car_on_reload(vehicle_id)
+    -- Staging only (the swap-allowed lock): past staging the full lock blocks every reset route, and we
+    -- must not re-arm into the countdown/racing. A no-op (harmless) if the hook fires out of phase.
+    if M.state.phase ~= "staging" or not M.state.race then
+        return
+    end
+    -- Only the player's own staged race car matters; a reset keeps the same game id, so compare against
+    -- the tracked race car. An AI car (host-owned) reset or any other vehicle is ignored.
+    local race_id = M.state.race_car_id
+    if race_id == nil then
+        return
+    end
+    if tostring(vehicle_id) ~= tostring(race_id)
+            and tostring(vehicle_id) ~= tostring(M.state.current_vehicle_id) then
+        return
+    end
+    -- Collapse the several lifecycle events one respawn raises into a single re-arm (also stops any stray
+    -- repeat from re-freezing every frame).
+    local now = os.clock()
+    if now - last_reload_rearm_at < RELOAD_REARM_THROTTLE then
+        return
+    end
+    last_reload_rearm_at = now
+    -- Re-assert the GE controller freeze in place (no teleport) -- the config respawn reset it, and it is
+    -- what holds a combustion car (the EV clamp below only holds EVs).
+    local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
+    if own_car then
+        local frozen, freeze_err = vehicles.set_vehicle_frozen(own_car, true)
+        if not frozen then
+            log("W", RACE_LOG_TAG, "could not re-freeze reset staging car: " .. tostring(freeze_err))
+        end
+    end
+    -- Clear the GE arm flags so onUpdate re-pushes the EV throttle clamp + the recover/repair override to
+    -- the reloaded VE (they stay true across the reset, which is why they were never re-pushed -> the bug).
+    M.state.freeze_hold_armed = false
+    M.state.assist_armed = false
+    log("I", RACE_LOG_TAG, "staging race car reset/reloaded (tuning); re-froze in place + re-armed assist")
+end
+
 -- As each shared cone appears -- the host's local set when its prefab load spawns them, and the
 -- remote synced set on every other client (BeamMP vehicle spawns fire this hook too) -- keep it out
 -- of the Tab vehicle cycle and suppress BeamMP's owner nametag on it. The bounce (onVehicleSwitched)
@@ -2728,6 +2792,10 @@ function M.onVehicleSpawned(vehicleId)
     -- aiMap now so it is labelled + nametag-suppressed as soon as it appears. No-op when nothing pending
     -- or on the owner (it has no ai_server_ids).
     resolve_remote_ai()
+    -- A config/tuning respawn during staging can surface as a re-spawn of the same race car (a reload runs
+    -- a despawn/respawn cycle), so re-freeze + re-arm here too. The guard no-ops for cones, AI, remotes,
+    -- and any vehicle that is not the player's staged race car -- see onVehicleResetted, the primary hook.
+    rearm_staged_car_on_reload(vehicleId)
     if not cones.is_cone(veh) then
         return
     end
@@ -2739,6 +2807,15 @@ function M.onVehicleSpawned(vehicleId)
         M.state.pending_nametag = M.state.pending_nametag or {}
         M.state.pending_nametag[vehicleId] = 0
     end
+end
+
+-- BeamNG fires this GE hook (lua/ge/main.lua vehicleReset -> extensions.hook('onVehicleResetted', vid))
+-- whenever a vehicle is reset/reloaded in place -- including a vehicle-config reapply (tyre pressure,
+-- paint) during staging, which runs veh:respawn(config). Re-freeze the player's staged car in place and
+-- re-arm its recover/repair assist; rearm_staged_car_on_reload guards phase, ownership, and throttling, so
+-- a reset of any other car or outside the staging window is a no-op.
+function M.onVehicleResetted(vehicleId)
+    rearm_staged_car_on_reload(vehicleId)
 end
 
 -- Send a typed { type, payload } envelope to the server -- the client->server mirror of the server's
