@@ -17,11 +17,12 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
---                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) = per-player caps that keep a
---                 compliant car or substitute one (Mode 3); none = keep own car (Mode 1). car= wins.
+--                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) / maxkg=<n> + minkg=<n> (curb-weight
+--                 range, kg) = per-player caps that keep a compliant car or substitute one (Mode 3); the caps
+--                 AND together; none = keep own car (Mode 1). car= wins (drops all caps).
 --                 AI opponents (ADR-0036): ai <n> [preset] adds n host-driven AI (no count = content
 --                 default, [1..16]); preset easy|medium|hard, aicar=/aiaggr=/aiskill=/airubber=/aiavoid=
 --                 configure their vehicle + driving. airoute=snap|direct picks the AI line (snap =
@@ -2336,7 +2337,8 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
             -- car/cap of their current class (ADR-0042); otherwise every client gets the uniform admin policy,
             -- byte-for-byte as before. policy_for degrades to keep-own (Mode 1) for a missing/empty class spec.
             local policy = (tour.is_active() and tour.policy_for(entry.id))
-                or {car = overrides.car, maxhp = overrides.maxhp, maxpwr = overrides.maxpwr}
+                or {car = overrides.car, maxhp = overrides.maxhp, maxpwr = overrides.maxpwr,
+                    maxkg = overrides.maxkg, minkg = overrides.minkg}
             send_event(entry.id, MSG_RACE_START, {
                 race = race_name,
                 slot = entry.slot,
@@ -2375,11 +2377,15 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 gridParams = grid_params,
                 -- Vehicle policy (ADR-0032, per-recipient since the ADR-0042 amendment), relayed verbatim and
                 -- never interpreted (ADR-0005): car = fixed "model[:config]" (Mode 2); maxhp (hp) / maxpwr
-                -- (power-to-weight, hp per kg) = caps (Mode 3); all nil = keep own car (Mode 1). car wins
-                -- client-side. `policy` is this driver's class car in a tournament, else the uniform admin policy.
+                -- (power-to-weight, hp per kg) / maxkg + minkg (strict curb-weight range, kg) = caps (Mode 3);
+                -- all nil = keep own car (Mode 1). car wins client-side. `policy` is this driver's class car in
+                -- a tournament (weight range absent -- class specs are car/maxhp/maxpwr only, ADR-0042), else
+                -- the uniform admin policy.
                 car = policy.car,
                 maxhp = policy.maxhp,
                 maxpwr = policy.maxpwr,
+                maxkg = policy.maxkg,
+                minkg = policy.minkg,
                 -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
                 -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
                 -- race from these. Same for every slot; the host (which has the file) ignores them and
@@ -3072,7 +3078,8 @@ end
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
-    .. "[maxhp=<n>] [maxpwr=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
+    .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
+    .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
     .. "[aiavoid=on|off] [airoute=snap|direct] [all]"
 
@@ -3367,6 +3374,22 @@ local function parse_race_args(argument)
             if not overrides.maxpwr and not bad_token then
                 bad_token = token
             end
+        elseif token:match("^[Mm][Aa][Xx][Kk][Gg]=.+$") then
+            -- maxkg=<n> sets the upper curb-weight (kg) bound per player (Mode 3, ADR-0032), the weight-axis
+            -- sibling of maxhp/maxpwr. Relayed as a number, never interpreted (race-blind, ADR-0005); the
+            -- client applies it as a STRICT cap. A non-numeric value falls to bad_token.
+            overrides.maxkg = tonumber(token:match("^[Mm][Aa][Xx][Kk][Gg]=(.+)$"))
+            if not overrides.maxkg and not bad_token then
+                bad_token = token
+            end
+        elseif token:match("^[Mm][Ii][Nn][Kk][Gg]=.+$") then
+            -- minkg=<n> sets the lower curb-weight (kg) bound per player (Mode 3, ADR-0032). Combines with
+            -- maxkg into a range (both AND client-side); an impossible range just yields an empty pool the
+            -- client aborts on (no minkg<=maxkg check server-side, race-blind). Non-numeric => bad_token.
+            overrides.minkg = tonumber(token:match("^[Mm][Ii][Nn][Kk][Gg]=(.+)$"))
+            if not overrides.minkg and not bad_token then
+                bad_token = token
+            end
         elseif token:match("^[Oo][Rr][Dd][Ee][Rr]=.+$") then
             -- order=<mode>[:rev] sets the grid start order (ADR-0033); server-internal, not relayed. An
             -- unknown mode or a bad suffix falls to bad_token.
@@ -3437,12 +3460,14 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         return
     end
 
-    -- Vehicle-policy precedence (ADR-0032): a fixed car= wins over a power/power-to-weight cap. Drop the
-    -- caps so the relay is unambiguous and tell the admin. Pure option bookkeeping -- no vehicle reading.
-    if overrides.car and (overrides.maxhp or overrides.maxpwr) then
+    -- Vehicle-policy precedence (ADR-0032): a fixed car= wins over the power/weight caps. Drop the caps so
+    -- the relay is unambiguous and tell the admin. Pure option bookkeeping -- no vehicle reading.
+    if overrides.car and (overrides.maxhp or overrides.maxpwr or overrides.maxkg or overrides.minkg) then
         overrides.maxhp = nil
         overrides.maxpwr = nil
-        MP.SendChatMessage(player_id, "BeamComp: car= set -- maxhp/maxpwr ignored")
+        overrides.maxkg = nil
+        overrides.minkg = nil
+        MP.SendChatMessage(player_id, "BeamComp: car= set -- maxhp/maxpwr/maxkg/minkg ignored")
     end
 
     local assists = overrides.assists
@@ -3451,7 +3476,7 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         order_echo = " order=" .. overrides.order.mode .. (overrides.order.rev and ":rev" or "")
     end
     log_info("beamcomp.race", string.format(
-        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s",
+        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
@@ -3462,6 +3487,8 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         overrides.car and (" car=" .. overrides.car) or "",
         overrides.maxhp and (" maxhp=" .. overrides.maxhp) or "",
         overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or "",
+        overrides.maxkg and (" maxkg=" .. overrides.maxkg) or "",
+        overrides.minkg and (" minkg=" .. overrides.minkg) or "",
         order_echo,
         overrides.ai and (" ai=" .. overrides.ai.count
             .. (overrides.ai.explicit and "" or "(default)")
@@ -4545,6 +4572,8 @@ local function sanitize_overrides(raw)
         car = (type(raw.car) == "string" and raw.car ~= "") and raw.car or nil,
         maxhp = tonumber(raw.maxhp),
         maxpwr = tonumber(raw.maxpwr),
+        maxkg = tonumber(raw.maxkg),
+        minkg = tonumber(raw.minkg),
         grid = (type(raw.grid) == "string" and raw.grid ~= "") and raw.grid or nil,
         -- F1 light start (ADR-0043): only "f1" survives; nil = the default lock countdown.
         startMode = (raw.startMode == "f1") and "f1" or nil,
