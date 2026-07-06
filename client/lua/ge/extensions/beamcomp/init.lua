@@ -40,6 +40,7 @@ local spawn_mute = require("beamcomp/race/spawn_mute")
 local countdown = require("beamcomp/race/countdown")
 local checkpoints = require("beamcomp/race/checkpoints")
 local laptimer = require("beamcomp/race/laptimer")
+local sectors = require("beamcomp/race/sectors")
 local lock = require("beamcomp/race/lock")
 local hud = require("beamcomp/race/hud")
 local racelist = require("beamcomp/race/racelist")
@@ -217,6 +218,7 @@ M.state = {
     qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
     quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
     quali = nil,              -- latest server-broadcast quali classification snapshot {rows} (ADR-0041), or nil; rendered on the quali-results card
+    sector_track = nil,       -- qualifying live sector-split tracker (race/sectors), armed on a circuit quali; nil on a sprint quali / outside qualifying
 }
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -350,6 +352,9 @@ local function handle_race_start(payload)
     M.state.qualiResults = nil
     M.state.quali = nil
     M.state.quali_settle = false
+    -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
+    -- in the qualifying phase for a circuit quali.
+    M.state.sector_track = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
@@ -661,6 +666,9 @@ local function teardown_race_world()
     M.state.qualiResults = nil
     M.state.quali = nil
     M.state.quali_settle = false
+    -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
+    -- in the qualifying phase for a circuit quali.
+    M.state.sector_track = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
@@ -1069,6 +1077,17 @@ local function handle_race_phase(payload)
         local quali_state = M.state.race and M.state.race.quali
         begin_driving(quali_state and quali_state.plan, M.state.race and M.state.race.laps)
         M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
+        -- Arm the live sector-delta tracker (feature: quali-live-sector-delta): a circuit quali laps the
+        -- unbounded plan, so each scored crossing closes a per-checkpoint sector the HUD diffs against the
+        -- chosen reference. cps == #checkpoints (ADR-0013 circuit plan). Sprint quali has no repeated laps
+        -- -> no sectors (delta stays inactive), so leave the tracker nil there.
+        local quali_race = M.state.race
+        if quali_race and quali_race.mode == "circuit" and quali_race.checkpoints
+            and #quali_race.checkpoints >= 1 then
+            M.state.sector_track = sectors.new(#quali_race.checkpoints)
+        else
+            M.state.sector_track = nil
+        end
     elseif phase == "racing" then
         -- Countdown over: release the lock, arm detection on the real race plan, drive the host's AI, and
         -- arm the lap clock (ADR-0006/0036/0022). After a quali event this is the second countdown -> race,
@@ -1076,6 +1095,8 @@ local function handle_race_phase(payload)
         M.state.qualifying = nil
         M.state.qualiResults = nil
         M.state.quali_settle = false
+        -- Stop qualifying sector tracking; the race scores the real plan (feature: quali-live-sector-delta).
+        M.state.sector_track = nil
         begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
     elseif phase == "qualiResults" then
         -- Qualifying over (ADR-0041): stop scoring -- the classification card renders from the quali
@@ -1085,6 +1106,8 @@ local function handle_race_phase(payload)
         M.state.detection = nil
         M.state.laptimer = nil
         M.state.quali_settle = false
+        -- Qualifying over -- drop the sector-delta tracker (feature: quali-live-sector-delta).
+        M.state.sector_track = nil
         -- Count the pause down for the card's "race starts in" line, anchored to a wall clock (os.clockhp)
         -- rather than accumulating the clamped per-frame dt, so the AI-despawn frame hitch below cannot make
         -- it drift behind the server's wall-time pause (ADR-0041). Display only -- the card hides
@@ -2766,6 +2789,13 @@ local function on_checkpoint_reached(event, count)
             M.state.detection = nil
         end
     end
+    -- Qualifying live sector delta (feature: quali-live-sector-delta): record this crossing's just-completed
+    -- sector (split time, per-sector personal best, lap cumulative) for the HUD readout. Circuit quali only
+    -- (sector_track is nil otherwise); lt.run_up bases lap 1's first sector on the start/finish line so it
+    -- reads clean line-to-line.
+    if M.state.phase == "qualifying" and M.state.sector_track then
+        sectors.on_crossing(M.state.sector_track, event.seq, event.time, lt and lt.run_up or nil)
+    end
     -- `bestLap` rides the existing report as an additive field: the server stores the latest per
     -- player and relays it in the standings (ADR-0022) so the results card can show every player's
     -- best lap. The server stays race-blind -- it just passes the number through (ADR-0005).
@@ -3386,6 +3416,9 @@ local function build_hud_snapshot()
             -- time. The header CP count is per-lap on a circuit (resets each lap), cumulative on sprint.
             local lap_time = nil
             local best_lap = e.best_lap
+            -- Last completed lap for the qualifying right-side lap timer (feature: quali-live-sector-delta):
+            -- laptimer already tracks it; local row only. nil until the first lap closes.
+            local last_lap = nil
             local cp_in_lap = nil
             local cp_per_lap = nil
             if is_local then
@@ -3393,6 +3426,7 @@ local function build_hud_snapshot()
                 local lt = M.state.laptimer
                 if lt then
                     best_lap = lt.best or best_lap
+                    last_lap = lt.last_lap
                     if detection and driving then
                         lap_time = laptimer.current(lt, detection.elapsed)
                     end
@@ -3425,6 +3459,7 @@ local function build_hud_snapshot()
                 currentLap = current_lap,
                 lapCount = lap_count,
                 lapTime = lap_time,
+                lastLap = last_lap,  -- last completed lap (local row), for the quali lap timer
                 bestLap = best_lap,
                 cpInLap = cp_in_lap,
                 cpPerLap = cp_per_lap,
@@ -3523,6 +3558,41 @@ local function build_hud_snapshot()
         or (M.state.tournament and M.state.tournament.active and not M.state.tournament.ended)
     ) or false
 
+    -- Qualifying live sector readout (feature: quali-live-sector-delta): the just-completed sector's split
+    -- time, a per-segment delta vs your per-sector personal best, a cumulative delta vs your fastest lap,
+    -- and a motorsport record class (purple session best / green personal best / normal). Circuit quali only
+    -- (sector_track nil otherwise); persists the last completed sector until the next crossing. All derived
+    -- here from the tracker + the broadcast splits (ADR-0015) so the app stays a dumb renderer.
+    local sector_info = nil
+    local sector_track = M.state.sector_track
+    if phase == "qualifying" and sector_track and sector_track.last then
+        local cps = (race and race.checkpoints) and #race.checkpoints or 0
+        if cps >= 1 then
+            local last = sector_track.last
+            local session_ref = sectors.session_reference(entries, cps)
+            local session_best = session_ref and session_ref[last.sector] or nil
+            -- Cumulative delta vs your fastest lap: this lap's time through the sector minus that lap's.
+            local cumulative = nil
+            if local_entry then
+                local best_sections = sectors.personal_reference(local_entry.splits, local_entry.run_up, cps)
+                local best_cumulative = best_sections
+                    and sectors.cumulative_through(best_sections, last.sector) or nil
+                if type(best_cumulative) == "number" then
+                    cumulative = last.lap_cumulative - best_cumulative
+                end
+            end
+            sector_info = {
+                sector = last.sector,
+                split = last.split,
+                -- Per-segment delta vs your prior personal best for this sector (nil the first time).
+                splitDelta = (last.prev_personal_best ~= nil)
+                    and (last.split - last.prev_personal_best) or nil,
+                cumulative = cumulative,  -- vs fastest lap (nil until a lap is complete)
+                record = sectors.record_class(last.split, last.prev_personal_best, session_best),
+            }
+        end
+    end
+
     return {
         active = true,
         phase = phase,
@@ -3567,6 +3637,9 @@ local function build_hud_snapshot()
         -- qualiResultsRemaining (the freeze eats the lead's first seconds; the rest is the visible settle).
         qualiSettleActive = (phase == "qualiResults" and M.state.quali_settle) and true or false,
         quali = M.state.quali,
+        -- Qualifying live sector readout (feature: quali-live-sector-delta): the last completed sector's
+        -- split time, per-segment + cumulative deltas, and record class (nil = nothing to show yet).
+        sector = sector_info,
     }
 end
 
