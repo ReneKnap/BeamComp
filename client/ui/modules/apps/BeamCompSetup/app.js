@@ -64,7 +64,7 @@ angular.module('beamng.apps')
   function freshForm() {
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
-      carModel: '', carConfig: '', maxhp: '', maxpwr: '',
+      carModel: '', carConfig: '', maxhp: '', maxpwr: '', maxkg: '', minkg: '',
       orderMode: 'random', orderRev: false, qualiMinutes: 5, grid: '',
       f1Start: false, jumpPenalty: 15,
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
@@ -147,13 +147,15 @@ angular.module('beamng.apps')
     if (form.recover && num(form.recoverSecs) !== undefined) { o.assists.recoverHoldSeconds = num(form.recoverSecs); }
     if (form.repair && num(form.repairSecs) !== undefined) { o.assists.repairHoldSeconds = num(form.repairSecs); }
 
-    // Vehicle policy: a fixed car wins; otherwise the optional power caps apply (ADR-0032). The server
-    // enforces the same precedence, but keep the payload clean.
+    // Vehicle policy: a fixed car wins; otherwise the optional power/weight caps apply (ADR-0032). The
+    // server enforces the same precedence, but keep the payload clean.
     if (form.carModel) {
       o.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
     } else {
       if (num(form.maxhp) !== undefined) { o.maxhp = num(form.maxhp); }
       if (num(form.maxpwr) !== undefined) { o.maxpwr = num(form.maxpwr); }
+      if (num(form.maxkg) !== undefined) { o.maxkg = num(form.maxkg); }
+      if (num(form.minkg) !== undefined) { o.minkg = num(form.minkg); }
     }
 
     if (form.aiEnabled) {
