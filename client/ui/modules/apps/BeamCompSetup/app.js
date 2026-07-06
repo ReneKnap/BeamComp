@@ -191,6 +191,15 @@ angular.module('beamng.apps')
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
       scope.phase = 'lobby';                   // latest GE-pushed race phase, gates the race-stop controls (ADR-0038)
+      // Qualifying sector-delta reference (feature: quali-live-sector-delta): a per-client DISPLAY preference,
+      // NOT part of scope.form -- so it is never written into a saved race preset nor relayed to others. Routed
+      // straight to GE (set_sector_ref_mode); GE pushes the current value back (BeamCompSectorRef) as truth.
+      scope.sectorRef = 'personal';
+      scope.sectorRefOpts = [
+        { v: 'personal', label: 'Personal (your best lap)' },
+        { v: 'session', label: 'Session best (field)' },
+        { v: 'off', label: 'Off' },
+      ];
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -339,6 +348,24 @@ angular.module('beamng.apps')
         }
       };
 
+      // Qualifying sector-delta reference selector (feature: quali-live-sector-delta): reuses the custom
+      // dropdown's open-state (scope.open === 'sectorRef') but a dedicated option list + pick, since the
+      // value is not a form field. Picking routes straight to GE (single source of truth, shared with the
+      // HUD REF toggle).
+      scope.sectorRefLabel = function () {
+        for (var i = 0; i < scope.sectorRefOpts.length; i++) {
+          if (scope.sectorRefOpts[i].v === scope.sectorRef) {
+            return scope.sectorRefOpts[i].label;
+          }
+        }
+        return scope.sectorRef;
+      };
+      scope.pickSectorRef = function (value) {
+        scope.sectorRef = value;
+        scope.open = null;
+        geLuaArg('set_sector_ref_mode', value);
+      };
+
       // Close any open dropdown on a click outside it (standard dropdown UX). No DI here: injected
       // services fail to resolve for this late-loaded mod directive, so use the document global. A click
       // on this app's own .bc-dd (head or list) is left to toggle()/pick(); anything else closes it.
@@ -459,6 +486,14 @@ angular.module('beamng.apps')
       scope.$on('BeamCompSetupPhase', function (event, payload) {
         scope.$evalAsync(function () {
           scope.phase = (payload && payload.phase) || 'lobby';
+        });
+      });
+
+      // Current sector-delta reference basis pushed by GE (feature: quali-live-sector-delta), so the selector
+      // reflects GE truth after a change made here or via the HUD REF toggle.
+      scope.$on('BeamCompSectorRef', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.sectorRef = (payload && payload.mode) || 'personal';
         });
       });
 
@@ -680,6 +715,7 @@ angular.module('beamng.apps')
       geCall('request_championship');
       geCall('request_tournament');
       geCall('request_race_phase');
+      geCall('request_sector_ref');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars

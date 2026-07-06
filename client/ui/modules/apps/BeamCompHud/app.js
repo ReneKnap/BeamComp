@@ -224,6 +224,9 @@ angular.module('beamng.apps')
     link: function (scope, element, attrs) {
       scope.hud = {active: false, entries: []};
       scope.countdown = {active: false};
+      // Qualifying live sector-delta flash (feature: quali-live-sector-delta): {sector, delta, active}
+      // while a just-completed sector's delta is showing, else null.
+      scope.sectorFlash = null;
       scope.finishBanner = {active: false, position: null};
       scope.jumpBanner = {active: false, penalty: null};
       scope.winnerBanner = {active: false, local: false, name: null};
@@ -280,6 +283,11 @@ angular.module('beamng.apps')
       var winnerBannerTimer = null;
       var winnerBannerPending = null;
 
+      // Qualifying sector-flash state (feature: quali-live-sector-delta): the last seen crossing seq (so a
+      // fresh crossing re-fires the flash, not every per-frame snapshot) and its self-hide timer.
+      var prevSectorSeq = null;
+      var sectorFlashTimer = null;
+
       function clearFlashTimers() {
         for (var id in flashTimers) {
           $timeout.cancel(flashTimers[id]);
@@ -324,6 +332,43 @@ angular.module('beamng.apps')
         scope.winnerCardCollapsed = false;
       }
 
+      // Hide the sector-delta flash, cancel its self-hide timer, and forget the last crossing. Used on
+      // teardown and whenever we leave the qualifying phase so the next session starts clean.
+      function resetSectorFlash() {
+        if (sectorFlashTimer) {
+          $timeout.cancel(sectorFlashTimer);
+          sectorFlashTimer = null;
+        }
+        scope.sectorFlash = null;
+        prevSectorSeq = null;
+      }
+
+      // Qualifying live sector delta (feature: quali-live-sector-delta): the GE snapshot carries the
+      // just-completed sector's delta vs the chosen reference, tagged with a monotonic seq (hud.sectorFlash;
+      // absent when mode=off or no reference exists yet). Flash it for a few seconds on each NEW crossing (a
+      // seq change), mirroring the position-gain flash. Outside qualifying, clear everything.
+      function trackSectorFlash() {
+        if (scope.hud.phase !== 'qualifying') {
+          resetSectorFlash();
+          return;
+        }
+        var f = scope.hud.sectorFlash;
+        if (!f || typeof f.seq !== 'number') {
+          return;  // no reference yet (first flying lap) / mode off -- leave any showing flash to self-hide
+        }
+        if (f.seq !== prevSectorSeq) {
+          prevSectorSeq = f.seq;
+          scope.sectorFlash = {sector: f.sector, delta: f.delta, active: true};
+          if (sectorFlashTimer) {
+            $timeout.cancel(sectorFlashTimer);
+          }
+          sectorFlashTimer = $timeout(function () {
+            scope.sectorFlash = null;
+            sectorFlashTimer = null;
+          }, 4000);
+        }
+      }
+
       // Compare each entry's rank to the last frame; a row that improved its position flashes for ~1 s.
       // A row with no prior known rank (mid-race join, first frame) only establishes its rank.
       function trackPositionGains(entries) {
@@ -355,6 +400,7 @@ angular.module('beamng.apps')
         resetFinishBanner();
         resetJumpBanner();
         resetWinnerBanner();
+        resetSectorFlash();
       });
 
       // Announce the local player's own race finish: a one-shot "FINISHED" + reached position banner the
@@ -494,6 +540,25 @@ angular.module('beamng.apps')
       scope.intervalLabel = intervalLabel;
       scope.formatLeaderGap = formatLeaderGap;
 
+      // Cycle the qualifying sector-delta reference (personal -> session -> off) via the GE flag (single
+      // source of truth, shared with the BeamCompSetup selector): the quali HUD's REF toggle routes here.
+      // bngApi is the typeof-guarded core UI global (not an injected service -- ADR-0012), so a miss is inert.
+      scope.cycleSectorRef = function () {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.cycle_sector_ref_mode() end');
+        }
+      };
+      // Short label for the sector-delta reference mode, shown on the REF toggle.
+      scope.sectorRefLabel = function (mode) {
+        if (mode === 'session') {
+          return 'SESSION';
+        }
+        if (mode === 'off') {
+          return 'OFF';
+        }
+        return 'PERSONAL';
+      };
+
       // Show/hide the provisional results card (GE flag, single source of truth): the card's Close
       // button and the live HUD's Results button both route here, as does the racing-phase /results.
       // bngApi is the typeof-guarded core UI global (ADR-0012), so a miss is inert.
@@ -569,6 +634,7 @@ angular.module('beamng.apps')
           trackLocalFinish();
           trackLocalJump();
           trackTournamentWin();
+          trackSectorFlash();
           // Provisional results card: a finished/DNF'd player viewing standings while the race runs. While
           // it is up the live corner regions hide (template), so this one flag drives both ng-ifs. The
           // finish banner holds it back until it fades, so a finisher first sees "FINISHED", then the card.

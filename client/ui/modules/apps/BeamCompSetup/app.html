@@ -206,6 +206,23 @@
       </label>
     </div>
 
+    <!-- Display (feature: quali-live-sector-delta): a per-CLIENT display preference, not a race setting --
+         the qualifying live sector-delta reference basis. Not part of the form, so it is never saved into a
+         preset nor relayed; it can also be toggled live on the qualifying HUD (the REF pill). -->
+    <div class="bc-section">
+      <div class="bc-section-title">Display (local)</div>
+      <div class="bc-row">
+        <span>Quali sector delta</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" ng-click="toggle('sectorRef')">{{sectorRefLabel()}}</button>
+          <div class="bc-dd-list" ng-if="open === 'sectorRef'">
+            <div class="bc-dd-opt" ng-repeat="o in sectorRefOpts" ng-class="{sel: o.v === sectorRef}"
+              ng-click="pickSectorRef(o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- KI -->
     <div class="bc-section">
       <div class="bc-section-title">KI</div>
