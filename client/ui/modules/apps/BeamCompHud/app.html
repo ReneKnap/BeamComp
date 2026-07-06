@@ -468,21 +468,12 @@
     .beamcomp-hud .bc-quali-grace .bc-quali-grace-t {
       font-size: 26px;
     }
-    /* Live sector readout (feature: quali-live-sector-delta): sits directly to the right of the quali
-       countdown timer. bc-quali-timeline is the flex row holding the clock column and this readout. */
-    .beamcomp-hud .bc-quali-timeline {
-      display: flex;
-      align-items: flex-start;
-      gap: 12px;
-    }
-    .beamcomp-hud .bc-quali-clockcol {
-      flex: 0 0 auto;
-    }
-    /* The sector readout panel: cumulative delta to your best lap (top, green ahead / red behind by sign),
-       then the just-completed sector's split time + per-segment delta (record-coloured). Persists the last
-       completed sector until the next crossing. Legible by text-shadow. */
+    /* Live sector readout (feature: quali-live-sector-delta): sits on the RIGHT, directly under the
+       Current/Last/Best lap-timer block. Cumulative delta to your best lap (top, green ahead / red behind by
+       sign), then the just-completed sector's split time + per-segment delta (record-coloured). Persists the
+       last completed sector until the next crossing. Right-aligned (in bc-tr), legible by text-shadow. */
     .beamcomp-hud .bc-quali-sector {
-      align-self: center;
+      margin-top: 8px;
       font-variant-numeric: tabular-nums;
       text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
     }
@@ -511,12 +502,16 @@
       font-size: 0.85em;
     }
     /* Motorsport record colours for the split time + per-segment delta: purple = session best (fastest that
-       sector by anyone), green = your personal best; default white otherwise. */
+       sector by anyone), green = your personal best, red = slower than your personal best; default white only
+       when there is no reference yet (first time through the sector). */
     .beamcomp-hud .bc-rec-session {
       color: #b06bff;
     }
     .beamcomp-hud .bc-rec-personal {
       color: #3fd96b;
+    }
+    .beamcomp-hud .bc-rec-slower {
+      color: #d9534f;
     }
     /* Minimized quali-results bar (ADR-0041): a small centered pill that restores the card. */
     .beamcomp-hud .bc-quali-restore {
@@ -777,26 +772,11 @@
   <div ng-if="hud.phase === 'qualifying'">
     <div class="bc-tl">
       <div class="bc-quali-head">QUALIFYING</div>
-      <div class="bc-quali-timeline">
-        <div class="bc-quali-clockcol">
-          <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
-          <!-- Clock expired: the finish-your-lap timeout (time left to be at the finish), or -- once this
-               driver has completed their lap -- that they are waiting for the others to finish (ADR-0041). -->
-          <div class="bc-quali-grace" ng-if="hud.qualiGrace != null && !hud.qualiDone">FINISH LAP <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
-          <div class="bc-quali-grace" ng-if="hud.qualiDone">Waiting <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
-        </div>
-        <!-- Live sector readout (feature: quali-live-sector-delta), directly to the right of the timer:
-             cumulative delta vs your best lap (green ahead / red behind by sign), then the just-completed
-             sector's split time + per-segment delta vs your per-sector best, record-coloured (purple =
-             session best, green = personal best). Persists the last completed sector until the next
-             crossing; hidden until the first crossing of the session. -->
-        <div class="bc-quali-sector" ng-if="hud.sector">
-          <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
-               ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
-          <div class="bc-qd-seg"
-               ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
-        </div>
-      </div>
+      <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
+      <!-- Clock expired: the finish-your-lap timeout (time left to be at the finish), or -- once this driver
+           has completed their lap -- that they are waiting for the others to finish (ADR-0041). -->
+      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null && !hud.qualiDone">FINISH LAP <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiDone">Waiting <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
       <div class="bc-panel bc-standings-panel">
         <div class="bc-scroll">
           <table class="bc-standings">
@@ -810,8 +790,9 @@
         </div>
       </div>
     </div>
-    <!-- Right side: the qualifying lap timer (feature: quali-live-sector-delta) where the race lap timer
-         normally sits -- Current (live running lap), Last (last completed lap), Best (best lap). -->
+    <!-- Right side (feature: quali-live-sector-delta): the qualifying lap timer where the race lap timer
+         normally sits -- Current (live running lap) / Last (last completed lap) / Best (best lap) -- and,
+         directly under it, the live sector readout. -->
     <div class="bc-tr" ng-if="hud.localEntry">
       <div class="bc-panel bc-timepanel">
         <table class="bc-timeblock">
@@ -828,6 +809,16 @@
             <td class="bc-tb-value">{{formatTime(hud.localEntry.bestLap)}}</td>
           </tr>
         </table>
+      </div>
+      <!-- Sector readout: cumulative delta vs your best lap (green ahead / red behind by sign), then the
+           just-completed sector's split time + per-segment delta vs your per-sector best, record-coloured
+           (purple = session best, green = personal best, red = slower than your best). Persists the last
+           completed sector until the next crossing; hidden until the first crossing of the session. -->
+      <div class="bc-quali-sector" ng-if="hud.sector">
+        <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+             ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
+        <div class="bc-qd-seg"
+             ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
       </div>
     </div>
   </div>

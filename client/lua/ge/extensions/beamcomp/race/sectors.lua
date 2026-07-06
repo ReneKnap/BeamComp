@@ -170,19 +170,21 @@ end
 
 -- The motorsport record class for a just-completed sector `split`: "session" (purple) when it is the
 -- fastest that sector by anyone (<= the field's known best, which excludes this fresh split), else
--- "personal" (green) when it is your own best for that sector (the first time counts, or it beat your
--- prior best), else "normal". `session_best` / `prev_personal_best` may be nil (no data yet).
+-- "personal" (green) when it matched/beat your own best for that sector, else "slower" (red) when it is
+-- slower than your best for that sector. "normal" only when there is no reference yet -- the first time
+-- you complete this sector (prev_personal_best nil), so nothing to compare against. `session_best` /
+-- `prev_personal_best` may be nil (no data yet).
 function M.record_class(split, prev_personal_best, session_best)
-    if type(split) ~= "number" then
+    if type(split) ~= "number" or prev_personal_best == nil then
         return "normal"
     end
     if type(session_best) == "number" and split <= session_best then
         return "session"
     end
-    if prev_personal_best == nil or split <= prev_personal_best then
+    if split <= prev_personal_best then
         return "personal"
     end
-    return "normal"
+    return "slower"
 end
 
 return M
