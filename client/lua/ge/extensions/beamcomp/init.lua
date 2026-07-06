@@ -151,7 +151,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "dashboard-rebind/2026-07-06"
+local BUILD_MARKER = "ai-host-car/2026-07-06"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -591,8 +591,14 @@ local function handle_race_start(payload)
         M.state.ai_config = payload.aiConfig
         -- Keep the policy so a quali re-grid (ADR-0041) can re-spawn fresh AI on the earned grid.
         M.state.ai_policy = policy
-        -- The AI vehicle chain reuses the relayed player policy (ADR-0032) as its second tier.
-        local cars = ai.spawn(payload.aiSlots, race.gridPoses, payload.aiConfig, race.aiDefaults, policy)
+        -- The AI vehicle chain reuses the relayed player policy (ADR-0032) as its second tier. The
+        -- "same as host" mode (aicar=host) inherits the owner's ACTUAL seated race car (model+config), read
+        -- GE-side here from race_car so the server stays vehicle-blind (ADR-0005/0036); re-read on each
+        -- (re)spawn so the AI follow if the host's car changes. nil when placement degraded -> the resolver
+        -- logs and falls through so the AI still race.
+        local host_car = race_car and vehicles.host_car_spec(race_car) or nil
+        local cars = ai.spawn(payload.aiSlots, race.gridPoses, payload.aiConfig, race.aiDefaults, policy,
+            host_car)
         if #cars > 0 then
             ai.set_frozen(cars, true)
             for _, car in ipairs(cars) do
@@ -1331,8 +1337,12 @@ local function respawn_ai_for_quali(ai_slots)
     -- from quali start to finish.
     lock.remove()
     spawn_mute.mute_for(SPAWN_NOTIFICATION_MUTE_SECONDS)
+    -- Re-read the owner's current race car for the aicar=host mode so the re-spawned AI follow the host's
+    -- car onto the quali grid (ADR-0036); nil -> the resolver falls through so the AI still race.
+    local host_race_car = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+    local host_car = host_race_car and vehicles.host_car_spec(host_race_car) or nil
     local cars = ai.spawn(ai_slots, M.state.race.gridPoses, M.state.ai_config, M.state.race.aiDefaults,
-        M.state.ai_policy)
+        M.state.ai_policy, host_car)
     if type(cars) ~= "table" or #cars == 0 then
         log("W", RACE_LOG_TAG, "quali AI re-spawn: ai.spawn returned no cars")
         lock.install()  -- restore the lock removed above, even on the spawn-failure path
