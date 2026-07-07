@@ -120,7 +120,7 @@
           </div>
         </div>
       </div>
-      <div class="bc-row" ng-if="form.carModel">
+      <div class="bc-row" ng-if="form.carModel && form.carModel !== 'random'">
         <span>Config</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" ng-click="toggle('carConfig')">{{labelFor('carConfig')}}</button>
@@ -130,24 +130,31 @@
           </div>
         </div>
       </div>
+      <!-- Composable player random-car axes: only meaningful when the player car is "random" (mirrors the AI
+           section). Trim toggles stock vs random config variant; Exclude big vehicles drops buses/trucks/vans
+           by curb weight. Both default ON (freshForm). -->
+      <div ng-if="form.carModel === 'random'">
+        <label class="bc-row bc-check"><input type="checkbox" ng-model="form.carRandomTrim"><span>Random trim variant</span></label>
+        <label class="bc-row bc-check"><input type="checkbox" ng-model="form.carNoBigCars"><span>Exclude big vehicles</span></label>
+      </div>
       <!-- Vehicle restrictions toggle: the car-limiting caps (hp / hp per kg / weight range) declutter the
            default view -- off by default, so a fresh panel hides them. app.js auto-reveals it when a restored
-           form/preset carries any cap value, so an active restriction is never hidden. Only meaningful without
-           a fixed car (Car (all)), so it rides the same !form.carModel guard as the caps. -->
-      <label class="bc-row bc-check" ng-if="!form.carModel"><input type="checkbox" ng-model="form.restrictVehicles"><span>Vehicle restrictions</span></label>
-      <label class="bc-row" ng-if="!form.carModel && form.restrictVehicles">
+           form/preset carries any cap value, so an active restriction is never hidden. Shown for "keep own"
+           and for car=random (which composes with the caps), but not for a fixed car -- see showRestrictions. -->
+      <label class="bc-row bc-check" ng-if="showRestrictions()"><input type="checkbox" ng-model="form.restrictVehicles"><span>Vehicle restrictions</span></label>
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
         <span>Max hp</span>
         <input type="number" min="0" ng-model="form.maxhp" placeholder="off">
       </label>
-      <label class="bc-row" ng-if="!form.carModel && form.restrictVehicles">
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
         <span>Max hp/kg</span>
         <input type="number" min="0" step="0.001" ng-model="form.maxpwr" placeholder="off">
       </label>
-      <label class="bc-row" ng-if="!form.carModel && form.restrictVehicles">
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
         <span>Min kg</span>
         <input type="number" min="0" ng-model="form.minkg" placeholder="off">
       </label>
-      <label class="bc-row" ng-if="!form.carModel && form.restrictVehicles">
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
         <span>Max kg</span>
         <input type="number" min="0" ng-model="form.maxkg" placeholder="off">
       </label>

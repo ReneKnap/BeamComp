@@ -169,6 +169,16 @@ function M.list_car_models()
     return cars
 end
 
+-- True only when `model` is a KNOWN non-car Type (Prop/Trailer via NON_CAR_TYPES) -- the guard that keeps a
+-- player focused on an owned prop/"Stange" from being treated as a real race car (ADR-0032 amendment). An
+-- unreadable Type returns false (counts as a car), so the guard only ever drops a KNOWN non-car, matching
+-- list_car_models' "unreadable Type => keep" rule. Reuses model_type (data.model Type). Used by
+-- race/vehicles.lua is_owned_race_car.
+function M.is_known_non_car(model)
+    local kind = model_type(model)
+    return kind ~= nil and NON_CAR_TYPES[kind] == true
+end
+
 -- The human display name of a model -- "Brand Name" (e.g. "Ibishu Pessima"), read from the model metadata
 -- (data.model Brand/Name), the same source model_type reads. Uses whichever of Brand/Name is present and
 -- falls back to the model key when both are unreadable, so it never yields an empty or whitespace-only
@@ -473,6 +483,54 @@ function M.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
         return nil
     end
     return {model = pool[math.random(#pool)], config = nil}
+end
+
+-- Build the random-vehicle spec (for M.random_vehicle) from a relayed PLAYER vehicle policy (ADR-0032
+-- amendment). Shared by the player car=random path (race/vehicles.lua respawn_random) and a DEFAULT AI that
+-- INHERITS the player's car=random (race/ai.lua resolve_ai_vehicle), so the player and the inheriting AI
+-- cannot drift. The player caps compose: max_power/max_pwr from maxhp/maxpwr, the strict weight_range from
+-- minkg/maxkg. The two axes default ON when the field is nil (a typed /race car=random; the panel sends
+-- explicit booleans): random_trim from policy.randomTrim, and the big-car curb-weight ceiling from
+-- policy.noBigCars. The AI caller adds its own best-effort fallback on an empty pool (never a prop).
+function M.random_spec_from_policy(policy)
+    policy = type(policy) == "table" and policy or {}
+    local random_trim = policy.randomTrim
+    if random_trim == nil then
+        random_trim = true
+    end
+    local no_big_cars = policy.noBigCars
+    if no_big_cars == nil then
+        no_big_cars = true
+    end
+    return {
+        max_power = policy.maxhp,
+        max_pwr = policy.maxpwr,
+        weight_range = M.weight_range(policy.minkg, policy.maxkg),
+        max_weight = no_big_cars and M.BIG_CAR_MAX_WEIGHT or nil,
+        random_trim = random_trim,
+    }
+end
+
+-- The SHARED random-vehicle composition for the player (car=random, ADR-0032 amendment) and the AI
+-- (aicar=random, ADR-0036) random paths -- extracted so the two pick IDENTICALLY and cannot drift. Given a
+-- resolved cap+axis `spec`, draw ONE random car from the matching pool. `spec` fields, all optional:
+--   * max_power (hp), max_pwr (hp/kg) -- the power caps;
+--   * max_weight (kg) -- the lenient big-car curb-weight ceiling (noBigCars);
+--   * weight_range ({min?, max?} kg) -- the strict maxkg/minkg range (build with M.weight_range);
+--   * random_trim (bool) -- true = a random compliant TRIM (random_compliant), false/nil = the stock/default
+--     trim (random_stock_compliant).
+-- All caps nil is an unconstrained pool (both selectors treat nil caps as "no limit"), so this one call
+-- covers both the capped and the uncapped case -- no separate branch. Returns {model, config} or nil when NO
+-- installed car qualifies (an impossible cap, or no cars installed). The CALLER owns the ultimate fallback,
+-- which differs by path: the AI degrades best-effort to a cap-ignoring stock car (silent); the player spawns
+-- the fixed default car + warns. Draws only from list_car_models (cars only), so no branch ever returns a
+-- prop/trailer.
+function M.random_vehicle(spec)
+    spec = type(spec) == "table" and spec or {}
+    if spec.random_trim then
+        return M.random_compliant(spec.max_power, spec.max_pwr, spec.max_weight, spec.weight_range)
+    end
+    return M.random_stock_compliant(spec.max_power, spec.max_pwr, spec.max_weight, spec.weight_range)
 end
 
 return M

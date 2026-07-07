@@ -151,7 +151,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "vehicle-restrictions-toggle/2026-07-07"
+local BUILD_MARKER = "player-random-car/2026-07-08"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -462,6 +462,11 @@ local function handle_race_start(payload)
         maxpwr = payload.maxpwr,
         maxkg = payload.maxkg,
         minkg = payload.minkg,
+        -- car=random composable axes (ADR-0032 amendment), relayed verbatim + resolved client-side: a random
+        -- compliant trim vs. the stock trim, and the big-car curb-weight exclusion. Meaningful only for
+        -- car=random; nil (any other car) is ignored by respawn_own_at.
+        randomTrim = payload.randomTrim,
+        noBigCars = payload.noBigCars,
     }
     -- Remember the Mode-3 caps for the staging swap-compliance gate (ADR-0032): a car swap during staging
     -- must not stage a car over the cap. Mode 3 only -- a fixed car (Mode 2, car=) or no policy (Mode 1)
@@ -482,31 +487,19 @@ local function handle_race_start(payload)
     -- spawn-time licenseText and the jbeam regenerates it -- so we re-apply this plate on the deferred
     -- restage once the new car's jbeam has loaded (vehicles.apply_plate in restage_swapped_car).
     local own_plate = vehicles.read_plate(own_car)
-    local race_car, respawn_err, policy_abort = vehicles.respawn_own_at(race.myPose, own_car, policy)
-    if policy_abort then
-        -- Mode-3 abort: no installed car meets the cap (ADR-0032). Warn the player and bail BEFORE the
-        -- spawnReady ack so the server's spawning gate is not told we're in. The gate's timeout caps the
-        -- wait; if every player aborts, the 0-ack path cancels the race (ADR-0006). Drop the race state
-        -- so countdown/lock/HUD never target a car we never got.
-        log("W", RACE_LOG_TAG, "vehicle policy abort: " .. tostring(respawn_err))
+    local race_car, respawn_err, degraded = vehicles.respawn_own_at(race.myPose, own_car, policy)
+    if degraded then
+        -- No-suitable-car fallback (ADR-0032 §5 superseded): the resolver spawned the fixed default car
+        -- because no cap-compliant / random-pool car was available (a Mode-3 cap with no compliant car, or
+        -- car=random with an empty cap-composed pool). Warn the player, then STILL race -- the cap is
+        -- best-effort now, never a non-participation outcome. The ordinary Mode-1 on-foot fresh-spawn does
+        -- NOT set this flag, so a plain foot-start stays silent (it is not a no-suitable-car case).
+        log("W", RACE_LOG_TAG, "no suitable car -- spawned default; warning and racing")
         guihooks.trigger("toastrMsg", {
-            type = "error",
+            type = "warning",
             title = "BeamComp -- " .. race.name,
-            msg = "No car under the limit -- you can't join (" .. tostring(respawn_err) .. ")",
+            msg = "No suitable car available -- spawning default car",
         })
-        M.state.race = nil
-        M.state.race_car_id = nil
-        M.state.race_caps = nil
-        M.state.staged_spec = nil
-        M.state.revert_pending = false
-        M.state.staging_swap_reverting = false
-        M.state.detection = nil
-        M.state.laptimer = nil
-        M.state.dash_refresh_pending = false
-        lock.remove()
-        countdown.clear()
-        hud.clear()
-        return
     end
     if race_car then
         -- Remember the race car as the bounce target for the in-race switch lock (onVehicleSwitched):
