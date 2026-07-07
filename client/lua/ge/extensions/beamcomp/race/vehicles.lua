@@ -91,14 +91,21 @@ function M.despawn_owned_except(keep_id)
 end
 
 -- True when `veh` is a real, race-eligible owned car: present in this client's owned-vehicle map
--- (so BeamMP-safe to touch) and not the walking unicycle. The single definition of "a real own car",
--- shared by resolve_own_car (which car to keep) and capture_own_spec (which spec is worth copying) --
--- it also keeps the shared prop cones out, since they are not owned (ADR-0009).
+-- (so BeamMP-safe to touch), not the walking unicycle, and not a known non-car prop/trailer. The single
+-- definition of "a real own car", shared by resolve_own_car (which car to keep) and capture_own_spec (which
+-- spec is worth copying) -- it also keeps the shared prop cones out, since they are not owned (ADR-0009).
+-- The non-car guard (ADR-0032 amendment) closes the prop/"Stange" leak: a player focused on an OWNED prop
+-- (a barrier/trailer they spawned) must not have it copied and re-spawned as their race car -- they fall
+-- through to a fresh default car instead. An unreadable Type still counts as a car (is_known_non_car drops
+-- only a KNOWN non-car), so a car with missing metadata is never wrongly rejected.
 local function is_owned_race_car(veh)
     if not veh or type(getOwnMap) ~= "function" or not be then
         return false
     end
     if veh.JBeam == "unicycle" then
+        return false
+    end
+    if vehiclespecs.is_known_non_car(veh.JBeam) then
         return false
     end
     local own = getOwnMap()
@@ -535,6 +542,20 @@ local function fresh_spawn_own(pose)
     return veh
 end
 
+-- Spawn the fixed default car and flag it as a "no suitable car" degrade (ADR-0032 amendment): the shared
+-- best-effort fallback for the paths where no cap-compliant / random-pool car was available (the Mode-3 cap
+-- with no compliant car, and car=random with an empty cap-composed pool). Always a real car (never a prop),
+-- even if it violates the active cap. Returns (car, nil, true) so the caller raises the no-suitable-car
+-- warning and STILL races, or (nil, reason) on a spawn failure. Distinct from fresh_spawn_own, whose default
+-- spawn (on-foot Mode 1) is NOT a no-suitable-car case and stays silent.
+local function spawn_default_degraded(pose)
+    local veh, reason = spawn_fixed(pose, DEFAULT_VEHICLE_MODEL, nil)
+    if not veh then
+        return nil, reason
+    end
+    return veh, nil, true
+end
+
 -- (public) Live Mode-3 compliance check for a SPAWNED car (ADR-0032): read the car's live power/weight --
 -- reliable, unlike pre-spawn config metadata (see the POWER-READ RISK note) -- and apply is_compliant,
 -- returning (compliant, power, weight) so a caller can both gate and build a warning from the readings. A
@@ -549,12 +570,13 @@ function M.car_compliant(veh, maxhp, maxpwr, minkg, maxkg)
     return vehiclespecs.is_compliant(power, weight, maxhp, maxpwr, nil, range), power, weight
 end
 
--- Mode 3 (ADR-0032): keep the own car when it meets the power / power-to-weight / weight-range cap, else
--- substitute the first compliant car (own model's strongest legal trim first, then other models --
--- find_compliant), else abort the start for this player. Own-car power + weight are read from the spawned
--- vehicle (reliable); candidates from config metadata. Returns the kept/spawned car, (nil, reason), or
--- (nil, reason, true) where the third value flags the no-compliant-car abort so the caller warns and skips
--- the spawn ack.
+-- Mode 3 (ADR-0032, §5 superseded by the 2026-07-07 amendment): keep the own car when it meets the power /
+-- power-to-weight / weight-range cap, else substitute the first compliant car (own model's strongest legal
+-- trim first, then other models -- find_compliant), else -- when NO installed car meets the cap -- spawn the
+-- fixed default car (even though it violates the cap) so the player still races (best-effort cap), instead of
+-- the old abort. Own-car power + weight are read from the spawned vehicle (reliable); candidates from config
+-- metadata. Returns the kept/spawned car, (nil, reason) on a spawn failure, or (car, nil, true) where the
+-- third value flags "degraded to the default because no suitable car" so the caller warns, then races.
 local function respawn_for_cap(pose, own_car, policy)
     local own_model = own_car and own_car.JBeam or nil
     local compliant, own_power, own_weight = false, nil, nil
@@ -571,26 +593,71 @@ local function respawn_for_cap(pose, own_car, policy)
 
     local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
     local pick = vehiclespecs.find_compliant(own_model, policy.maxhp, policy.maxpwr, nil, range)
-    if not pick then
-        local reason = "no installed car meets the limit"
-        log("W", LOG_TAG, "policy abort: " .. reason)
-        return nil, reason, true
+    if pick then
+        log("I", LOG_TAG, string.format("own car over the cap -- substituting '%s:%s'",
+            tostring(pick.model), tostring(pick.config)))
+        return spawn_fixed(pose, pick.model, pick.config)
     end
-    log("I", LOG_TAG, string.format("own car over the cap -- substituting '%s:%s'",
-        tostring(pick.model), tostring(pick.config)))
-    return spawn_fixed(pose, pick.model, pick.config)
+
+    -- No installed car meets the cap: best-effort default (ADR-0032 §5 superseded) -- spawn etk800 even
+    -- over the cap and signal the caller to warn; the player races rather than sitting out.
+    log("W", LOG_TAG, "no car meets the cap -- spawning default '" .. DEFAULT_VEHICLE_MODEL .. "'")
+    return spawn_default_degraded(pose)
+end
+
+-- car=random (ADR-0032 amendment): roll a per-player random car locally at race start, composing with the
+-- active caps (the deliberate exception to the car-wins precedence -- unlike a FIXED car=, the caps still
+-- apply here). The pool pick is the SHARED composition vehiclespecs.random_vehicle, identical to the AI
+-- random path (random_ai_vehicle), so the two never drift. Two composable axes, defaults ON when the field
+-- is nil (a typed /race car=random; the panel sends explicit booleans): randomTrim (a random compliant trim
+-- vs. the stock/default trim) and noBigCars (the BIG_CAR_MAX_WEIGHT curb-weight ceiling). An empty
+-- cap-composed pool degrades to the fixed default car (never a prop) and signals the caller to warn; the
+-- player still races. Returns the spawned car, (nil, reason) on a spawn failure, or (car, nil, true) when it
+-- degraded to the default because no suitable car was available.
+local function respawn_random(pose, policy)
+    local random_trim = policy.randomTrim
+    if random_trim == nil then
+        random_trim = true
+    end
+    local no_big_cars = policy.noBigCars
+    if no_big_cars == nil then
+        no_big_cars = true
+    end
+    local spec = {
+        max_power = policy.maxhp,
+        max_pwr = policy.maxpwr,
+        weight_range = vehiclespecs.weight_range(policy.minkg, policy.maxkg),
+        max_weight = no_big_cars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil,
+        random_trim = random_trim,
+    }
+    local pick = vehiclespecs.random_vehicle(spec)
+    if pick then
+        log("I", LOG_TAG, string.format("car=random -> '%s%s'",
+            tostring(pick.model), pick.config and (":" .. pick.config) or ""))
+        return spawn_fixed(pose, pick.model, pick.config)
+    end
+
+    -- Empty compliant pool (impossible cap, or no installed car): best-effort default + warn, never a prop.
+    log("W", LOG_TAG, "car=random: no compliant car -- spawning default '" .. DEFAULT_VEHICLE_MODEL .. "'")
+    return spawn_default_degraded(pose)
 end
 
 -- Place this client's own car at `pose` (the grid start the server assigned), per the relayed vehicle
--- policy (ADR-0032; `policy` = {car, maxhp, maxpwr, maxkg, minkg}, all nil = Mode 1). Modes:
+-- policy (ADR-0032; `policy` = {car, maxhp, maxpwr, maxkg, minkg, randomTrim, noBigCars}, all nil = Mode 1).
+-- Modes:
 --   * Mode 1 (no policy) -- ADR-0007: keep the seated owned car (repair + teleport), else fresh-spawn one.
---   * Mode 2 (car=) -- fixed model[:config] for everyone; but keep the own car when it already IS the
+--   * car=random -- a per-player random car composing with the active caps (ADR-0032 amendment); the two
+--     random axes ride randomTrim/noBigCars. Branched BEFORE parse_car_token so "random" is not treated as
+--     a model name.
+--   * Mode 2 (car=<model>) -- fixed model[:config] for everyone; but keep the own car when it already IS the
 --     forced car (colours/plate/tuning preserved), or spawn the forced config in the player's paint when
 --     only the config differs.
---   * Mode 3 (maxhp/maxpwr/maxkg/minkg) -- keep the own car if compliant, else substitute, else abort.
--- Returns the resolved race car (the caller enters + freezes it), or nil plus a reason, or nil + reason
--- + true when Mode 3 aborts (no compliant car). BeamMP propagates the despawn ('Od:'), spawn ('Os:'),
--- and a kept car's teleport (via normal owned-vehicle position sync).
+--   * Mode 3 (maxhp/maxpwr/maxkg/minkg) -- keep the own car if compliant, else substitute, else the
+--     best-effort default car (ADR-0032 §5 superseded -- no more abort).
+-- Returns the resolved race car (the caller enters + freezes it), (nil, reason) on a failure, or
+-- (car, nil, true) where the third value flags "degraded to the default because no suitable car was
+-- available" (car=random empty pool, or the Mode-3 no-compliant-car case) so the caller warns then races.
+-- BeamMP propagates the despawn ('Od:'), spawn ('Os:'), and a kept car's teleport (owned-vehicle sync).
 function M.respawn_own_at(pose, own_car, policy)
     if type(getOwnMap) ~= "function" or not be then
         return nil, "not in a multiplayer session"
@@ -599,6 +666,10 @@ function M.respawn_own_at(pose, own_car, policy)
         return nil, "invalid grid pose"
     end
     policy = policy or {}
+
+    if policy.car == "random" then
+        return respawn_random(pose, policy)
+    end
 
     if policy.car then
         local model, config = parse_car_token(policy.car)
