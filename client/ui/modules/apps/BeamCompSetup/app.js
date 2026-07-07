@@ -65,6 +65,10 @@ angular.module('beamng.apps')
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
       carModel: '', carConfig: '', maxhp: '', maxpwr: '', maxkg: '', minkg: '', restrictVehicles: false,
+      // Composable player random-car axes (carModel='random'): a random compliant trim, and exclude
+      // big/heavy vehicles. Both default ON (parity with the AI freshForm defaults), sent as explicit
+      // booleans so a saved preset round-trips the admin's choice.
+      carRandomTrim: true, carNoBigCars: true,
       orderMode: 'random', orderRev: false, qualiMinutes: 5, grid: '',
       f1Start: false, jumpPenalty: 15,
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
@@ -147,17 +151,27 @@ angular.module('beamng.apps')
     if (form.recover && num(form.recoverSecs) !== undefined) { o.assists.recoverHoldSeconds = num(form.recoverSecs); }
     if (form.repair && num(form.repairSecs) !== undefined) { o.assists.repairHoldSeconds = num(form.repairSecs); }
 
-    // Vehicle policy: a fixed car wins; otherwise the optional power/weight caps apply, but only when the
-    // "Vehicle restrictions" toggle is on (ADR-0032/0037). The toggle gates whether the caps apply so an
-    // unchecked restriction sends nothing even if a stale value lingers in a field; the server enforces the
-    // same car-wins precedence, but keep the payload clean.
-    if (form.carModel) {
-      o.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
-    } else if (form.restrictVehicles) {
+    // Vehicle policy (ADR-0032/0037). A FIXED car wins and drops the caps; car=random is the exception -- it
+    // composes with the caps (the client draws from the cap-compliant pool), so relay them too. Otherwise the
+    // optional power/weight caps apply on their own. The "Vehicle restrictions" toggle gates whether the caps
+    // apply, so an unchecked restriction sends nothing even if a stale value lingers in a field.
+    function relayCaps() {
       if (num(form.maxhp) !== undefined) { o.maxhp = num(form.maxhp); }
       if (num(form.maxpwr) !== undefined) { o.maxpwr = num(form.maxpwr); }
       if (num(form.maxkg) !== undefined) { o.maxkg = num(form.maxkg); }
       if (num(form.minkg) !== undefined) { o.minkg = num(form.minkg); }
+    }
+    if (form.carModel === 'random') {
+      o.car = 'random';
+      if (form.restrictVehicles) { relayCaps(); }
+      // The two composable axes, explicit booleans (like the AI axes): randomTrim false = stock/default trim,
+      // true = a random compliant trim; noBigCars true excludes big/heavy vehicles (curb-weight ceiling).
+      o.randomTrim = !!form.carRandomTrim;
+      o.noBigCars = !!form.carNoBigCars;
+    } else if (form.carModel) {
+      o.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
+    } else if (form.restrictVehicles) {
+      relayCaps();
     }
 
     if (form.aiEnabled) {
@@ -212,7 +226,7 @@ angular.module('beamng.apps')
           }
           return { v: m.model, label: m.label || m.model };
         });
-        scope.opts.carModel = [{ v: '', label: 'keep own' }].concat(cars);
+        scope.opts.carModel = [{ v: '', label: 'keep own' }, { v: 'random', label: 'random' }].concat(cars);
         scope.opts.aiCar = [{ v: '', label: 'default' }, { v: 'random', label: 'random' },
           { v: 'host', label: 'same as host' }].concat(cars);
       }
@@ -253,7 +267,7 @@ angular.module('beamng.apps')
         // Re-sync the race list to the restored include-deprecated flag, and fetch the restored model's
         // configs so the config dropdown + label resolve (without clearing the stored config).
         scope.refresh();
-        if (scope.form.carModel) {
+        if (scope.form.carModel && scope.form.carModel !== 'random') {
           geLuaArg('request_car_configs', scope.form.carModel);
         }
         // Re-fetch configs for each restored class car so the per-class config dropdowns repopulate (ADR-0042).
@@ -372,15 +386,22 @@ angular.module('beamng.apps')
         document.removeEventListener('click', closeOnOutsideClick, false);
       });
 
-      // Car model changed: clear the stale config and lazily fetch this model's configs from GE.
+      // Car model changed: clear the stale config and lazily fetch this model's configs from GE. The
+      // 'random' sentinel is not a real model (no configs to fetch, no Config row), so skip the fetch.
       function onModelChange() {
         scope.form.carConfig = '';
         scope.data.configs = [];
         rebuildConfigOpts();
-        if (scope.form.carModel) {
+        if (scope.form.carModel && scope.form.carModel !== 'random') {
           geLuaArg('request_car_configs', scope.form.carModel);
         }
       }
+
+      // Whether the vehicle-restriction toggle + caps are shown: for "keep own" and for car=random (which
+      // composes with the caps), but not for a fixed car (its caps are dropped by the car-wins precedence).
+      scope.showRestrictions = function () {
+        return !scope.form.carModel || scope.form.carModel === 'random';
+      };
 
       // Re-pull the option lists from GE (Refresh button, the include-deprecated toggle, and on link). The
       // flag tells GE whether to include deprecated races in the list.
