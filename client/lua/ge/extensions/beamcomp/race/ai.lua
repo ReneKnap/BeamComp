@@ -145,59 +145,42 @@ end
 --     compliant trim. randomTrim is tri-state: nil (typed /race aicar=random, content default, legacy
 --     client -- no panel) keeps TODAY's cap-coupled behaviour (cap active -> random compliant trim, else
 --     stock) so those callers are unchanged; the panel sends it explicitly to decouple trim from the cap.
--- With any filter active the pick draws from the matching filtered pool (random_compliant for a random
--- trim, random_stock_compliant for the stock trim) so the field varies per car yet never breaks a filter.
--- Empty pool (pathological -- no installed car passes the filters): log + degrade to find_compliant_car's
--- deterministic cars-only pick, else random_stock_model (also cars only), so AI spawning never hard-fails
--- and no branch can ever return a prop/trailer (ADR-0036). Returns (model, config).
+-- The pool pick is the SHARED composition vehiclespecs.random_vehicle (also used by the player car=random
+-- path, ADR-0032 amendment) so player and AI pick identically. Empty pool (no installed car passes the
+-- filters): log + degrade to find_compliant_car's deterministic cars-only pick, else random_stock_model
+-- (also cars only), so AI spawning never hard-fails and no branch can ever return a prop/trailer (ADR-0036).
+-- Returns (model, config).
 local function random_ai_vehicle(policy, config)
     config = type(config) == "table" and config or {}
     -- Power/weight cap applies only as a Mode-3 policy (no fixed player car + a cap set), mirroring the
-    -- resolve chain's Mode-2-before-Mode-3 precedence.
+    -- resolve chain's Mode-2-before-Mode-3 precedence. The player's STRICT weight range (maxkg/minkg) rides
+    -- the same cap gate; the AI's lenient big-car ceiling (noBigCars) is independent of the player policy.
     local cap_active = not policy.car and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg)
-    local max_power = cap_active and policy.maxhp or nil
-    local max_pwr = cap_active and policy.maxpwr or nil
-    -- The player's STRICT weight range (maxkg/minkg, ADR-0032): rides the same cap gate as the power caps
-    -- and is distinct from the AI's lenient big-car ceiling below (both AND together via is_compliant).
-    local weight_range = cap_active and vehiclespecs.weight_range(policy.minkg, policy.maxkg) or nil
-    -- The AI's own big-car exclusion (independent of the player policy): a curb-weight ceiling constant.
-    local max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil
-
     -- Resolve the effective trim: nil keeps today's cap-coupled default (random trim under a cap, else
     -- stock); an explicit bool from the panel overrides that coupling.
     local random_trim = config.randomTrim
     if random_trim == nil then
         random_trim = cap_active and true or false
     end
+    local spec = {
+        max_power = cap_active and policy.maxhp or nil,
+        max_pwr = cap_active and policy.maxpwr or nil,
+        weight_range = cap_active and vehiclespecs.weight_range(policy.minkg, policy.maxkg) or nil,
+        max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil,
+        random_trim = random_trim,
+    }
 
-    local filtered = max_power ~= nil or max_pwr ~= nil or max_weight ~= nil or weight_range ~= nil
-    if filtered then
-        local pick
-        if random_trim then
-            pick = vehiclespecs.random_compliant(max_power, max_pwr, max_weight, weight_range)
-        else
-            pick = vehiclespecs.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
-        end
-        if pick then
-            return pick.model, pick.config
-        end
-        log("W", LOG_TAG, "no filter-compliant car for random AI; using best-effort fallback")
-        -- Cars-only fallback (find_compliant_car, not find_compliant): the AI random path must never yield a
-        -- prop/trailer even when no car passes the filters (ADR-0036); random_stock_model is car-only too.
-        local fallback = vehiclespecs.find_compliant_car(max_power, max_pwr, max_weight, weight_range)
-        if fallback then
-            return fallback.model, fallback.config
-        end
-        return random_stock_model(), nil
+    local pick = vehiclespecs.random_vehicle(spec)
+    if pick then
+        return pick.model, pick.config
     end
-
-    -- No filter active: honour the trim axis over the full pool (random trim = any config of a random
-    -- model; stock = a random model's default config).
-    if random_trim then
-        local pick = vehiclespecs.random_compliant(nil, nil, nil)
-        if pick then
-            return pick.model, pick.config
-        end
+    log("W", LOG_TAG, "no compliant car for random AI; using best-effort fallback")
+    -- Cars-only fallback (find_compliant_car, not find_compliant): the AI random path must never yield a
+    -- prop/trailer even when no car passes the filters (ADR-0036); random_stock_model is car-only too.
+    local fallback = vehiclespecs.find_compliant_car(spec.max_power, spec.max_pwr, spec.max_weight,
+        spec.weight_range)
+    if fallback then
+        return fallback.model, fallback.config
     end
     return random_stock_model(), nil
 end
