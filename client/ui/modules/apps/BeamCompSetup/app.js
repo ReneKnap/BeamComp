@@ -64,7 +64,7 @@ angular.module('beamng.apps')
   function freshForm() {
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
-      carModel: '', carConfig: '', maxhp: '', maxpwr: '', maxkg: '', minkg: '',
+      carModel: '', carConfig: '', maxhp: '', maxpwr: '', maxkg: '', minkg: '', restrictVehicles: false,
       orderMode: 'random', orderRev: false, qualiMinutes: 5, grid: '',
       f1Start: false, jumpPenalty: 15,
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
@@ -147,11 +147,13 @@ angular.module('beamng.apps')
     if (form.recover && num(form.recoverSecs) !== undefined) { o.assists.recoverHoldSeconds = num(form.recoverSecs); }
     if (form.repair && num(form.repairSecs) !== undefined) { o.assists.repairHoldSeconds = num(form.repairSecs); }
 
-    // Vehicle policy: a fixed car wins; otherwise the optional power/weight caps apply (ADR-0032). The
-    // server enforces the same precedence, but keep the payload clean.
+    // Vehicle policy: a fixed car wins; otherwise the optional power/weight caps apply, but only when the
+    // "Vehicle restrictions" toggle is on (ADR-0032/0037). The toggle gates whether the caps apply so an
+    // unchecked restriction sends nothing even if a stale value lingers in a field; the server enforces the
+    // same car-wins precedence, but keep the payload clean.
     if (form.carModel) {
       o.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
-    } else {
+    } else if (form.restrictVehicles) {
       if (num(form.maxhp) !== undefined) { o.maxhp = num(form.maxhp); }
       if (num(form.maxpwr) !== undefined) { o.maxpwr = num(form.maxpwr); }
       if (num(form.maxkg) !== undefined) { o.maxkg = num(form.maxkg); }
@@ -241,6 +243,13 @@ angular.module('beamng.apps')
           return;
         }
         scope.form = angular.extend(freshForm(), parsed);
+        // Auto-reveal the vehicle-restriction fields when a restored form or loaded preset carries any cap
+        // value, so a saved restriction is never silently hidden-but-inactive (and older presets that predate
+        // the restrictVehicles flag still show their caps).
+        if (num(scope.form.maxhp) !== undefined || num(scope.form.maxpwr) !== undefined
+            || num(scope.form.maxkg) !== undefined || num(scope.form.minkg) !== undefined) {
+          scope.form.restrictVehicles = true;
+        }
         // Re-sync the race list to the restored include-deprecated flag, and fetch the restored model's
         // configs so the config dropdown + label resolve (without clearing the stored config).
         scope.refresh();
