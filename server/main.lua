@@ -17,12 +17,14 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
+--                 car=random = a per-player random car composing with the caps (the exception to car-wins);
 --                 maxhp=<n> (hp) / maxpwr=<n> (power-to-weight, hp per kg) / maxkg=<n> + minkg=<n> (curb-weight
 --                 range, kg) = per-player caps that keep a compliant car or substitute one (Mode 3); the caps
---                 AND together; none = keep own car (Mode 1). car= wins (drops all caps).
+--                 AND together; none = keep own car (Mode 1). A FIXED car= wins (drops all caps); car=random
+--                 keeps them. The two random axes (randomTrim/noBigCars) are panel-only, relayed verbatim.
 --                 AI opponents (ADR-0036): ai <n> [preset] adds n host-driven AI (no count = content
 --                 default, [1..16]); preset easy|medium|hard, aicar=/aiaggr=/aiskill=/airubber=/aiavoid=
 --                 configure their vehicle + driving. airoute=snap|direct picks the AI line (snap =
@@ -2386,6 +2388,12 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 maxpwr = policy.maxpwr,
                 maxkg = policy.maxkg,
                 minkg = policy.minkg,
+                -- car=random composable axes (ADR-0032 amendment): the random trim + big-car exclusion for a
+                -- car=random player, relayed verbatim and resolved client-side. A GLOBAL admin choice (not
+                -- per-class), so read from overrides, not the per-recipient policy (a tournament fills policy
+                -- with car/maxhp/maxpwr only). nil for a non-random car -- the client ignores them then.
+                randomTrim = overrides.randomTrim,
+                noBigCars = overrides.noBigCars,
                 -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
                 -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
                 -- race from these. Same for every slot; the host (which has the file) ignores them and
@@ -3077,7 +3085,7 @@ end
 
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
-    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]>] "
+    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]|random>] "
     .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
     .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
@@ -3460,9 +3468,12 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         return
     end
 
-    -- Vehicle-policy precedence (ADR-0032): a fixed car= wins over the power/weight caps. Drop the caps so
-    -- the relay is unambiguous and tell the admin. Pure option bookkeeping -- no vehicle reading.
-    if overrides.car and (overrides.maxhp or overrides.maxpwr or overrides.maxkg or overrides.minkg) then
+    -- Vehicle-policy precedence (ADR-0032): a FIXED car= wins over the power/weight caps. Drop the caps so
+    -- the relay is unambiguous and tell the admin. Pure option bookkeeping -- no vehicle reading. car=random
+    -- is the DELIBERATE exception (ADR-0032 amendment): the caps still COMPOSE with the random pick, so they
+    -- are kept -- the client draws the random car from the cap-compliant pool.
+    if overrides.car and overrides.car ~= "random"
+            and (overrides.maxhp or overrides.maxpwr or overrides.maxkg or overrides.minkg) then
         overrides.maxhp = nil
         overrides.maxpwr = nil
         overrides.maxkg = nil
@@ -4578,6 +4589,17 @@ local function sanitize_overrides(raw)
         -- F1 light start (ADR-0043): only "f1" survives; nil = the default lock countdown.
         startMode = (raw.startMode == "f1") and "f1" or nil,
     }
+
+    -- car=random composable player-policy axes (ADR-0032 amendment): opaque booleans relayed verbatim to the
+    -- client's respawn_own_at resolver (race-blind, ADR-0005 -- the server never maps them to a model or
+    -- weight). Kept only as booleans; absent/non-bool drops (the client then defaults both ON). Meaningful
+    -- only for car=random, but relayed regardless of the car value -- the client ignores them otherwise.
+    if type(raw.randomTrim) == "boolean" then
+        overrides.randomTrim = raw.randomTrim
+    end
+    if type(raw.noBigCars) == "boolean" then
+        overrides.noBigCars = raw.noBigCars
+    end
 
     -- Assists default both ON at the default hold (parse_race_args parity); the UI may turn either off or
     -- set a custom hold.
