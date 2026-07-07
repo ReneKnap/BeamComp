@@ -485,6 +485,32 @@ function M.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
     return {model = pool[math.random(#pool)], config = nil}
 end
 
+-- Build the random-vehicle spec (for M.random_vehicle) from a relayed PLAYER vehicle policy (ADR-0032
+-- amendment). Shared by the player car=random path (race/vehicles.lua respawn_random) and a DEFAULT AI that
+-- INHERITS the player's car=random (race/ai.lua resolve_ai_vehicle), so the player and the inheriting AI
+-- cannot drift. The player caps compose: max_power/max_pwr from maxhp/maxpwr, the strict weight_range from
+-- minkg/maxkg. The two axes default ON when the field is nil (a typed /race car=random; the panel sends
+-- explicit booleans): random_trim from policy.randomTrim, and the big-car curb-weight ceiling from
+-- policy.noBigCars. The AI caller adds its own best-effort fallback on an empty pool (never a prop).
+function M.random_spec_from_policy(policy)
+    policy = type(policy) == "table" and policy or {}
+    local random_trim = policy.randomTrim
+    if random_trim == nil then
+        random_trim = true
+    end
+    local no_big_cars = policy.noBigCars
+    if no_big_cars == nil then
+        no_big_cars = true
+    end
+    return {
+        max_power = policy.maxhp,
+        max_pwr = policy.maxpwr,
+        weight_range = M.weight_range(policy.minkg, policy.maxkg),
+        max_weight = no_big_cars and M.BIG_CAR_MAX_WEIGHT or nil,
+        random_trim = random_trim,
+    }
+end
+
 -- The SHARED random-vehicle composition for the player (car=random, ADR-0032 amendment) and the AI
 -- (aicar=random, ADR-0036) random paths -- extracted so the two pick IDENTICALLY and cannot drift. Given a
 -- resolved cap+axis `spec`, draw ONE random car from the matching pool. `spec` fields, all optional:

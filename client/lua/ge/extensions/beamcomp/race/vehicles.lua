@@ -615,22 +615,7 @@ end
 -- player still races. Returns the spawned car, (nil, reason) on a spawn failure, or (car, nil, true) when it
 -- degraded to the default because no suitable car was available.
 local function respawn_random(pose, policy)
-    local random_trim = policy.randomTrim
-    if random_trim == nil then
-        random_trim = true
-    end
-    local no_big_cars = policy.noBigCars
-    if no_big_cars == nil then
-        no_big_cars = true
-    end
-    local spec = {
-        max_power = policy.maxhp,
-        max_pwr = policy.maxpwr,
-        weight_range = vehiclespecs.weight_range(policy.minkg, policy.maxkg),
-        max_weight = no_big_cars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil,
-        random_trim = random_trim,
-    }
-    local pick = vehiclespecs.random_vehicle(spec)
+    local pick = vehiclespecs.random_vehicle(vehiclespecs.random_spec_from_policy(policy))
     if pick then
         log("I", LOG_TAG, string.format("car=random -> '%s%s'",
             tostring(pick.model), pick.config and (":" .. pick.config) or ""))
