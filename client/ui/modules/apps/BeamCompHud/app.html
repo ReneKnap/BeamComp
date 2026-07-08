@@ -768,8 +768,8 @@
   </div>
   <!-- Qualifying (ADR-0041): the time-boxed session board -- a clock counting the window down and the live
        classification ranked by best lap, fastest on pole. The right-side time block shows the local
-       driver's live lap + best. -->
-  <div ng-if="hud.phase === 'qualifying'">
+       driver's live lap + best. The staged sprint variant (ADR-0044) has its own view below. -->
+  <div ng-if="hud.phase === 'qualifying' && !hud.qualiStaged">
     <div class="bc-tl">
       <div class="bc-quali-head">QUALIFYING</div>
       <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
@@ -819,6 +819,43 @@
              ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
         <div class="bc-qd-seg"
              ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
+      </div>
+    </div>
+  </div>
+  <!-- Staged sprint quali (ADR-0044): the rally staggered single-car-from-P1 view. Left: window clock (or
+       the finish-your-run grace once it expires) + the holding queue ordered by turn. Right: the local
+       driver's own status line ("you're up / next / N ahead / running / done") and best complete run time.
+       The per-driver 3+5 s count rides the shared centered countdown overlay (no markup here). -->
+  <div ng-if="hud.phase === 'qualifying' && hud.qualiStaged">
+    <div class="bc-tl">
+      <div class="bc-quali-head">QUALIFYING</div>
+      <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
+      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null">FINISH RUN <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-panel bc-standings-panel">
+        <div class="bc-scroll">
+          <table class="bc-standings">
+            <tr ng-repeat="r in hud.qualiQueueSorted"
+                ng-class="{'bc-local': hud.qualiMine && r.slot === hud.qualiMine.slot, 'bc-ai': r.ai}">
+              <td class="bc-pos"><span ng-if="r.status === 'done'">&#10003;</span><span ng-if="r.status !== 'done'">{{r.position != null ? ('P' + r.position) : '--'}}</span></td>
+              <td class="bc-name">{{r.name}}</td>
+              <td class="bc-int">{{r.best != null ? formatTime(r.best) : '--'}}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="bc-tr">
+      <div class="bc-panel bc-timepanel">
+        <table class="bc-timeblock">
+          <tr>
+            <td class="bc-tb-label">Queue</td>
+            <td class="bc-tb-value">{{qualiStatusText(hud.qualiMine)}}</td>
+          </tr>
+          <tr class="bc-tb-best">
+            <td class="bc-tb-label">Best</td>
+            <td class="bc-tb-value">{{hud.qualiMine && hud.qualiMine.best != null ? formatTime(hud.qualiMine.best) : '--'}}</td>
+          </tr>
+        </table>
       </div>
     </div>
   </div>
