@@ -280,12 +280,28 @@ function M.validate(payload)
     --
     -- raceData + prefabContent serialize the race for distribution (ADR-0039): the server relays them
     -- verbatim in raceStart so a client without the local race file can still build + spawn it.
+    -- Staged sprint quali activation (ADR-0044): the race-blind server cannot read meta.closed, so tell it
+    -- whether an order=quali on this race is the rally staged sprint variant. Effective mode = the
+    -- sprint|circuit override else meta.closed; a sprint means the staged single-car-from-P1 quali, a
+    -- circuit keeps the ADR-0041 all-at-once best-lap quali. Reported on every verdict; only read when the
+    -- race is order=quali (harmless otherwise).
+    local closed = race.meta and race.meta.closed
+    local staged_quali
+    if payload.mode == "sprint" then
+        staged_quali = true
+    elseif payload.mode == "circuit" then
+        staged_quali = false
+    else
+        staged_quali = not closed
+    end
+
     return {
         ok = true,
         raceId = locator.id,
         aiDefaults = race.meta and race.meta.aiDefaults,
         raceData = build_race_data(race, locator),
         prefabContent = build_prefab_content(race),
+        stagedQuali = staged_quali,
     }
 end
 
@@ -364,13 +380,18 @@ local function quali_for(payload, race_checkpoints, mode, race_plan)
     local duration = tonumber(payload.quali.duration) or 480
     local plan = race_plan
     local laps = 1
+    -- Rally staged sprint quali (ADR-0044): on a sprint, drivers run one at a time from P1 and the plan is
+    -- the single Start->Ziel race plan (each staged run drives it once). The client decides staged from its
+    -- own resolved mode, consistent with the server activation (both derive from the same meta.closed /
+    -- mode-override, ADR-0044). A circuit keeps the ADR-0041 all-at-once best-lap quali below.
+    local staged = (mode == "sprint")
     if mode == "circuit" then
         -- Size the lap count to the window so neither a player nor the AI can run the plan out before the
         -- clock ends (~8 s/lap floor is far quicker than any real lap).
         laps = math.max(10, math.min(MAX_LAPS, math.ceil(duration / 8)))
         plan = checkpoints.plan(race_checkpoints, mode, laps)
     end
-    return {duration = duration, plan = plan, laps = laps, mode = mode}
+    return {duration = duration, plan = plan, laps = laps, mode = mode, staged = staged}
 end
 
 function M.prepare(payload)
