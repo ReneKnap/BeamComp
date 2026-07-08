@@ -15,14 +15,22 @@ local parser = require("beamcomp/race/parser")
 local maps = require("beamcomp/race/maps")
 
 -- The user-facing word for a race's source (ADR-0024/0035): the freeroam timeTrial set is "map", the
--- aiRace set is "ai", the level quickrace set is "menu" -- matching the "map:"/"ai:"/"menu:" prefix
--- /race accepts to pick same-named variants.
+-- aiRace set is "ai", the rallyStage set is "rally", the crawl set is "crawl", the level quickrace set is
+-- "menu" -- matching the "map:"/"ai:"/"rally:"/"crawl:"/"menu:" prefix /race accepts to pick same-named
+-- variants. rallyStage/crawl are Sprint-normalized in the parser, so the mode column reads "sprint";
+-- this source tag only names which mission type the track came from.
 local function source_label(source)
     if source == "quickrace" then
         return "menu"
     end
     if source == "aiRace" then
         return "ai"
+    end
+    if source == "rallyStage" then
+        return "rally"
+    end
+    if source == "crawl" then
+        return "crawl"
     end
     return "map"
 end
