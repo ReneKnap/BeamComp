@@ -442,8 +442,24 @@ function M.prepare(payload)
     -- is expanded into its ordered segment list (ADR-0023 amendment) and laid out via poses_segmented, so
     -- the spawned field matches the editor's stacked preview exactly; a plain single-param block (or nil)
     -- expands to one segment and reproduces today's layout bit-for-bit.
-    local poses = placement.resolve_all(grid.poses_segmented(base_pose.pos, base_pose.rot, count,
+    -- Rally staged sprint quali (ADR-0044/Round4): P1 is a dedicated, initially-EMPTY start ramp. Lay out
+    -- ONE extra grid pose and split the front one off as the ramp; the field spawns + holds on the remaining
+    -- poses (grid positions 2..N+1), so P1 is never occupied at the start. The active driver is teleported
+    -- onto the ramp (rampPose) for their run and returns to their own holding slot after. gridPoses stays the
+    -- holding poses re-indexed (slot k -> gridPoses[k+1]), so spawn / AI / regrid keep their usual mapping.
+    local staged_quali = (mode == "sprint") and (type(payload.quali) == "table")
+    local layout_count = staged_quali and (count + 1) or count
+    local poses = placement.resolve_all(grid.poses_segmented(base_pose.pos, base_pose.rot, layout_count,
         grid.block_to_segments(grid_params), gate_normal))
+    local ramp_pose = nil
+    if staged_quali then
+        ramp_pose = poses[1]
+        local holding = {}
+        for i = 2, #poses do
+            holding[#holding + 1] = poses[i]
+        end
+        poses = holding
+    end
     local my_pose = poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
@@ -465,6 +481,10 @@ function M.prepare(payload)
         mySlot = my_slot,
         myPose = my_pose,
         gridPoses = poses,
+        -- Rally staged sprint quali (ADR-0044/Round4): the dedicated P1 start ramp, split off the front of the
+        -- grid so P1 stays empty at the start. The active driver is teleported here for their run; nil for a
+        -- normal race / circuit quali (no separate ramp).
+        rampPose = ramp_pose,
         roster = roster,
         prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
         -- The host-only cone source (ADR-0025): the quickrace track prefab whose cone vehicles the host

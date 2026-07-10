@@ -239,9 +239,11 @@ M.state = {
     -- outside a staged qualifying phase, so every staged code path no-ops on a normal race or circuit quali.
     quali_staged = false,     -- true during a staged sprint qualifying phase (M.state.race.quali.staged)
     quali_status = nil,       -- local driver's staged status "queued"|"staged"|"running"|"done", or nil
-    quali_run = nil,          -- local per-driver run (qualisprint.new_run) while staging/counting to GO, or nil
-    quali_queue = nil,        -- latest server-broadcast staged queue snapshot {rows}, for the HUD; or nil
-    quali_ai_runs = nil,      -- host only: {[ai id] = per-driver run} for AI currently staging at P1, or nil
+    quali_run = nil,          -- local per-driver run (qualisprint.new_run) while counting to GO at the ramp, or nil
+    quali_queue = nil,        -- latest server-broadcast staged queue snapshot {rows, waiting}, for the HUD; or nil
+    quali_ai_runs = nil,      -- host only: {[ai id] = per-driver run} for AI currently counting at the ramp, or nil
+    quali_clear_sent = false, -- local driver has reported clearing the ramp (>=10 m) for its current run (Round 4)
+    quali_ai_cleared = nil,   -- host only: {[ai id] = true} once a launched AI has reported clearing the ramp
 }
 
 -- Queue a one-shot stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): armed
@@ -392,6 +394,8 @@ local function handle_race_start(payload)
     M.state.quali_run = nil
     M.state.quali_queue = nil
     M.state.quali_ai_runs = nil
+    M.state.quali_clear_sent = false
+    M.state.quali_ai_cleared = nil
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
@@ -729,6 +733,8 @@ local function teardown_race_world()
     M.state.quali_run = nil
     M.state.quali_queue = nil
     M.state.quali_ai_runs = nil
+    M.state.quali_clear_sent = false
+    M.state.quali_ai_cleared = nil
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
@@ -1190,6 +1196,8 @@ local function handle_race_phase(payload)
         M.state.quali_status = nil
         M.state.quali_run = nil
         M.state.quali_ai_runs = nil
+        M.state.quali_clear_sent = false
+        M.state.quali_ai_cleared = nil
         -- Stop qualifying sector tracking; the race scores the real plan (feature: quali-live-sector-delta).
         M.state.sector_track = nil
         begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
@@ -1211,6 +1219,8 @@ local function handle_race_phase(payload)
         M.state.quali_status = nil
         M.state.quali_run = nil
         M.state.quali_ai_runs = nil
+        M.state.quali_clear_sent = false
+        M.state.quali_ai_cleared = nil
         -- Qualifying over -- drop the sector-delta tracker (feature: quali-live-sector-delta).
         M.state.sector_track = nil
         -- Count the pause down for the card's "race starts in" line, anchored to a wall clock (os.clockhp)
@@ -1507,25 +1517,49 @@ local function quali_place_own(pose)
     arm_dashboard_refresh()
 end
 
--- The grid pose for a 0-based slot index (P1 = slot 0 = gridPoses[1]; holding slots 1..N-1 = poses 2..N),
--- from the grid poses we already hold (ADR-0044/Round3). nil for a missing slot/pose.
-local function quali_grid_pose(slot)
+-- Distance (m) the launched driver must be from the ramp before the next may stage (ADR-0044/Round4 gate).
+local STAGE_CLEAR_DIST = 10.0
+
+-- The dedicated P1 start ramp pose (ADR-0044/Round4), split off the front of the grid so P1 is empty at the
+-- start; the active driver is teleported here for their run. nil for a normal race / circuit quali.
+local function quali_ramp_pose()
+    return M.state.race and M.state.race.rampPose or nil
+end
+
+-- A driver's OWN fixed holding pose = gridPoses[slot+1] (grid positions 2..N+1; no roll-forward, so a driver
+-- always returns to their own slot). Defaults to the local player's slot.
+local function quali_own_hold_pose(slot)
     local poses = M.state.race and M.state.race.gridPoses
-    if type(slot) ~= "number" or not poses then
+    slot = slot or (M.state.race and M.state.race.mySlot) or 0
+    if not poses then
         return nil
     end
     return poses[slot + 1]
 end
-local function quali_p1_pose()
-    return quali_grid_pose(0)
+
+-- Distance from a vehicle to the ramp (ADR-0044/Round4), or nil if unavailable. Used for the >=10 m gate.
+local function quali_dist_from_ramp(veh)
+    local ramp = quali_ramp_pose()
+    if not veh or type(ramp) ~= "table" or type(ramp.pos) ~= "table" then
+        return nil
+    end
+    local ok, pos = pcall(function() return veh:getPosition() end)
+    if not ok or not pos then
+        return nil
+    end
+    local dx = pos.x - ramp.pos.x
+    local dy = pos.y - ramp.pos.y
+    local dz = pos.z - ramp.pos.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
 -- Launch the local car at the end of its per-driver count (ADR-0044): show GO, release the freeze, and arm
 -- the checkpoint detector on the real race plan so the Start->Ziel run is scored + reported (the existing
--- path). A sprint has no lap clock / sector tracker.
+-- path). A sprint has no lap clock / sector tracker. Re-arm the ramp-clear report for this run.
 local function quali_launch_local()
     M.state.quali_run = nil
     M.state.quali_status = "running"
+    M.state.quali_clear_sent = false  -- report once we clear the ramp (>=10 m)
     countdown.show_go()
     countdown.play_go()
     local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
@@ -1556,11 +1590,11 @@ local function quali_find_ai(ai_id)
     return nil
 end
 
--- Owner: stage an AI car at P1 for its run (ADR-0044/0036). Reposition it (front-anchored, no other car
--- touched) + freeze, then start its per-driver run; quali_launch_ai releases + drives it at GO.
-local function quali_stage_ai(ai_id, spawn, count)
+-- Owner: stage an AI car at the ramp for its run (ADR-0044/0036). Reposition it (front-anchored, no other
+-- car touched) + freeze, then start its per-driver count; quali_launch_ai releases + drives it at GO.
+local function quali_stage_ai(ai_id, count)
     local car = quali_find_ai(ai_id)
-    local pose = quali_p1_pose()
+    local pose = quali_ramp_pose()
     if not car or not pose then
         return
     end
@@ -1570,13 +1604,13 @@ local function quali_stage_ai(ai_id, spawn, count)
         pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
     end
     M.state.quali_ai_runs = M.state.quali_ai_runs or {}
-    M.state.quali_ai_runs[car.id] = qualisprint.new_run(os.clockhp(), spawn, count)
-    log("I", RACE_LOG_TAG, string.format("staged quali: AI '%s' staged at P1", tostring(car.label)))
+    M.state.quali_ai_runs[car.id] = qualisprint.new_run(os.clockhp(), count)
+    log("I", RACE_LOG_TAG, string.format("staged quali: AI '%s' staged at the ramp", tostring(car.label)))
 end
 
--- Owner: release + drive one AI at the end of its per-driver count (ADR-0044/0036). Arms its proxy
--- detector so step_ai_detections scores + reports it exactly like a player. Single-car ai.drive; the
--- default snap route does not swap the navgraph, so repeated staged launches do not thrash it.
+-- Owner: release + drive one AI at the end of its per-driver count (ADR-0044/0036). Arms its proxy detector
+-- so step_ai_detections scores + reports it, and re-arms the ramp-clear report for this AI. Single-car
+-- ai.drive; the default snap route does not swap the navgraph, so repeated staged launches do not thrash it.
 local function quali_launch_ai(car_id)
     if M.state.quali_ai_runs then
         M.state.quali_ai_runs[car_id] = nil
@@ -1593,12 +1627,13 @@ local function quali_launch_ai(car_id)
     if M.state.race.plan then
         M.state.ai_detections[car.id] = checkpoints.new(M.state.race.plan)
     end
+    M.state.quali_ai_cleared = M.state.quali_ai_cleared or {}
+    M.state.quali_ai_cleared[car.id] = false  -- report once this AI clears the ramp
 end
 
--- Owner: stop an AI + hold it (ADR-0044/Round3). The server sends qualiHold for an AI on its finish (single
--- run -> done, slot nil = stop in place) or a requeue (slot = its new holding grid slot, 0-based). A given
--- slot front-anchor-re-places the AI onto poses[slot+1]; a nil slot just freezes it where it is.
-local function quali_hold_ai(ai_id, slot)
+-- Owner: stop an AI + hold it (ADR-0044/Round4). stop=true -> freeze in place (a done AI at the window's
+-- end); else -> re-place it at its OWN fixed holding slot (car.pose, its spawned grid position) and freeze.
+local function quali_hold_ai(ai_id, stop)
     local car = quali_find_ai(ai_id)
     if not car then
         return
@@ -1610,89 +1645,93 @@ local function quali_hold_ai(ai_id, slot)
     if M.state.quali_ai_runs then
         M.state.quali_ai_runs[car.id] = nil
     end
+    if M.state.quali_ai_cleared then
+        M.state.quali_ai_cleared[car.id] = nil
+    end
     local veh = be and be:getObjectByID(car.veh_id)
     if not veh then
         return
     end
-    local pose = quali_grid_pose(slot)
-    if pose then
-        pcall(function() vehicles.place_at_grid(veh, pose) end)
+    if not stop and car.pose then
+        pcall(function() vehicles.place_at_grid(veh, car.pose) end)
     end
     pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
 end
 
--- "You're up" (server qualiStage, ADR-0044): a player payload -> stage the local car at P1; an aiId (owner
--- only) -> stage that AI. Guarded to a staged qualifying phase.
+-- "You're up" (server qualiStage, ADR-0044/Round4): a player payload -> stage the local car at the ramp; an
+-- aiId (owner only) -> stage that AI. Guarded to a staged qualifying phase.
 local function handle_quali_stage(payload)
     if not M.state.race or not M.state.quali_staged or type(payload) ~= "table" then
         return
     end
     if payload.aiId ~= nil then
-        quali_stage_ai(payload.aiId, payload.spawnDelay, payload.countdown)
+        quali_stage_ai(payload.aiId, payload.countdown)
         return
     end
-    local pose = quali_p1_pose()
+    local pose = quali_ramp_pose()
     if not pose then
-        log("W", RACE_LOG_TAG, "qualiStage ignored: no P1 pose")
+        log("W", RACE_LOG_TAG, "qualiStage ignored: no ramp pose")
         return
     end
     quali_place_own(pose)
     M.state.quali_status = "staged"
     M.state.detection = nil
-    M.state.quali_run = qualisprint.new_run(os.clockhp(), payload.spawnDelay, payload.countdown)
-    log("I", RACE_LOG_TAG, "staged quali: your turn -- staged at P1")
+    M.state.quali_clear_sent = false
+    M.state.quali_run = qualisprint.new_run(os.clockhp(), payload.countdown)
+    log("I", RACE_LOG_TAG, "staged quali: your turn -- staged at the ramp")
 end
 
--- "Hold at a grid slot" (server qualiHold, ADR-0044/Round3): a player payload -> hold the local car; an aiId
--- (owner only) -> stop + hold that AI. payload.slot is the 0-based holding grid slot (poses 2..N); a nil
--- slot means "stop + freeze in place" (a driver marked done at the window's end). Sent on the initial field
--- placement, when the queue rolls forward, and on a finish/reset requeue.
+-- "Hold" (server qualiHold, ADR-0044/Round4): a player payload -> hold the local car; an aiId (owner only)
+-- -> stop + hold that AI. payload.stop=true means "stop + freeze in place" (a driver marked done at the
+-- window's end); otherwise the driver returns to its OWN fixed holding slot (no roll-forward). Sent on a
+-- finish/reset requeue and when marked done.
 local function handle_quali_hold(payload)
     if not M.state.race or not M.state.quali_staged then
         return
     end
     if type(payload) == "table" and payload.aiId ~= nil then
-        quali_hold_ai(payload.aiId, payload.slot)
+        quali_hold_ai(payload.aiId, payload.stop)
         return
     end
     M.state.quali_run = nil
     M.state.detection = nil
     M.state.laptimer = nil
-    if M.state.quali_status ~= "done" then
-        M.state.quali_status = "queued"
-    end
-    local slot = type(payload) == "table" and payload.slot or nil
-    local pose = quali_grid_pose(slot)
-    if pose then
-        quali_place_own(pose)
-    else
-        -- No slot (done): stop the run + freeze in place, no teleport.
+    M.state.quali_clear_sent = true  -- not running anymore; suppress the ramp-clear report
+    local stop = type(payload) == "table" and payload.stop
+    if stop then
+        M.state.quali_status = "done"
+        -- Stop the run + freeze in place, no teleport.
         local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
         if own then
             vehicles.set_vehicle_frozen(own, true)
         end
+    else
+        M.state.quali_status = "queued"
+        quali_place_own(quali_own_hold_pose())
     end
     countdown.clear()
 end
 
--- Store the staged queue snapshot for the HUD (server qualiQueue, ADR-0044): own position/status/best are
--- read from it in build_hud_snapshot. Receive + store only.
+-- Store the staged queue snapshot for the HUD (server qualiQueue, ADR-0044): own position/status/best +
+-- the "waiting for driver to start" flag are read from it in build_hud_snapshot. Receive + store only.
 local function handle_quali_queue(payload)
     M.state.quali_queue = (type(payload) == "table" and type(payload.rows) == "table") and payload or nil
 end
 
--- Reset -> requeue (ADR-0044/Round3): the local driver hit their reset/recover key mid-run. Tell the server
--- (it appends us to the back of the queue and teleports us behind the last occupied grid position via a
--- qualiHold) and freeze the car in place NOW, so it does not keep driving before that qualiHold lands.
--- Called from M.on_assist_key_down while the run's detector is armed; the recover/reset key is owned by the
--- VE override during the race (ADR-0017), so it works with assists off.
+-- RECOVER -> new attempt (ADR-0044/Round4): the local driver hit their recover key mid-run. Tell the server
+-- (it appends us to the back of the queue and sends a qualiHold to return us to our holding slot) and freeze
+-- the car in place NOW, so it does not keep driving before that qualiHold lands. Repair does NOT come here
+-- (it repairs in place, the run continues) -- only the recover key requeues. Called from M.on_assist_key_down
+-- while the run's detector is armed; the recover key is owned by the VE override during the race (ADR-0017),
+-- so it works with assists off.
 local function quali_request_requeue()
     M.state.quali_run = nil
     M.state.detection = nil
     M.state.laptimer = nil
     M.state.quali_status = "queued"
+    M.state.quali_clear_sent = true
     send_to_server("qualiReset", {})
-    -- Freeze in place immediately; the server's qualiHold teleports us to the back holding slot momentarily.
+    -- Freeze in place immediately; the server's qualiHold returns us to our holding slot momentarily.
     local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
     if own then
         vehicles.set_vehicle_frozen(own, true)
@@ -1701,24 +1740,52 @@ local function quali_request_requeue()
     guihooks.trigger("toastrMsg", {
         type = "info",
         title = "BeamComp",
-        msg = "Reset -- back of the queue",
+        msg = "Recover -- new attempt, back of the queue",
     })
-    log("I", RACE_LOG_TAG, "staged quali: requeued self on reset")
+    log("I", RACE_LOG_TAG, "staged quali: requeued self on recover")
 end
 
--- Per-frame staged-quali step (ADR-0044), from onUpdate during a staged qualifying phase. Advances the
--- local per-driver run (spawn -> count -> GO) and each staging AI's run; the detector stepping + reporting
--- rides the existing step_detection / step_ai_detections (they no-op until a run launches).
+-- Report to the server when the just-launched driver has cleared the ramp (>=10 m, ADR-0044/Round4), so the
+-- next may stage. Once per run: the local player reports its own car; the owner reports each launched AI.
+local function step_quali_clearing()
+    if M.state.quali_status == "running" and not M.state.quali_clear_sent
+        and M.state.detection and not M.state.detection.done then
+        local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+        local dist = own and quali_dist_from_ramp(own)
+        if dist and dist >= STAGE_CLEAR_DIST then
+            M.state.quali_clear_sent = true
+            send_to_server("qualiCleared", {})
+        end
+    end
+    -- Owner: the same gate for a launched AI (only one is ever clearing at a time; the server matches).
+    local cars = M.state.ai_cars
+    local dets = M.state.ai_detections
+    if cars and dets then
+        M.state.quali_ai_cleared = M.state.quali_ai_cleared or {}
+        for _, car in ipairs(cars) do
+            local det = dets[car.id]
+            if det and not det.done and not M.state.quali_ai_cleared[car.id] then
+                local veh = be and be:getObjectByID(car.veh_id)
+                local dist = veh and quali_dist_from_ramp(veh)
+                if dist and dist >= STAGE_CLEAR_DIST then
+                    M.state.quali_ai_cleared[car.id] = true
+                    send_to_server("qualiCleared", {aiId = car.id})
+                end
+            end
+        end
+    end
+end
+
+-- Per-frame staged-quali step (ADR-0044/Round4), from onUpdate during a staged qualifying phase. Advances
+-- the local per-driver count (count -> GO) and each staging AI's count, then reports ramp-clear. The detector
+-- stepping + reporting rides the existing step_detection / step_ai_detections (they no-op until a run
+-- launches). There is no pre-settle -- the count begins as soon as the driver is on the ramp.
 local function step_quali_staged()
     local now = os.clockhp()
     local run = M.state.quali_run
     if run then
         local st = qualisprint.step(run, now)
-        if st.stage == "spawn" then
-            -- Settling at P1, still frozen: the short "you're at the line" settle cue on the staging overlay,
-            -- before the 8 s start count (Round 3 two-count structure: settle then count).
-            countdown.show_staging(math.max(0, math.ceil(st.remaining)), "You're up - get ready")
-        elseif st.stage == "count" then
+        if st.stage == "count" then
             if run.last_count ~= st.count then
                 run.last_count = st.count
                 countdown.play_beat(st.count)
@@ -1737,6 +1804,7 @@ local function step_quali_staged()
             end
         end
     end
+    step_quali_clearing()
 end
 -- ===== end rally staged sprint quali (client) ============================================
 
@@ -4121,6 +4189,10 @@ local function build_hud_snapshot()
         qualiStaged = (phase == "qualifying" and M.state.quali_staged) and true or false,
         qualiQueue = (M.state.quali_queue and M.state.quali_queue.rows) or nil,
         qualiMine = quali_local_row(my_slot),
+        -- A driver has launched but not yet cleared the ramp (Round 4): the HUD shows "Waiting for driver to
+        -- start" so waiters know why the next stage is held. From the server queue snapshot's `waiting` flag.
+        qualiWaiting = (phase == "qualifying" and M.state.quali_staged
+            and M.state.quali_queue and M.state.quali_queue.waiting) and true or false,
         -- Qualifying live sector readout (feature: quali-live-sector-delta): the last completed sector's
         -- split time, per-segment + cumulative deltas, and record class (nil = nothing to show yet).
         sector = sector_info,
@@ -4419,12 +4491,12 @@ function M.on_assist_key_down(kind)
     if not M.state.race or (M.state.phase ~= "racing" and M.state.phase ~= "qualifying") then
         return
     end
-    -- Staged sprint quali (ADR-0044): the reset/recover key requeues a RUNNING driver to the back of the
-    -- queue instead of the normal recover/repair assist -- "reset -> back of the queue". Available
-    -- regardless of the assist enable (a reset must always be possible in a staged run) and while moving (no
-    -- hold, no stationary check), unlike the normal assist. Gated on the run's detector being armed and not
-    -- done, so a press while holding/staged or after finishing is inert.
-    if M.state.quali_staged and M.state.phase == "qualifying"
+    -- Staged sprint quali (ADR-0044/Round4): the RECOVER key starts a new attempt -- requeue the running
+    -- driver to the back of the queue. ONLY recover (not repair): repair falls through to the normal in-place
+    -- repair below, which does NOT end the run (ADR-0017). Available regardless of the assist enable (a
+    -- recover-requeue must always be possible) and while moving (no hold), unlike the normal assist. Gated on
+    -- the run's detector being armed and not done, so a press while holding/staged or after finishing is inert.
+    if kind == "recover" and M.state.quali_staged and M.state.phase == "qualifying"
         and M.state.detection and not M.state.detection.done then
         quali_request_requeue()
         return

@@ -822,15 +822,16 @@
       </div>
     </div>
   </div>
-  <!-- Staged sprint quali (ADR-0044): the rally staggered single-car-from-P1 view. Left: window clock (or
-       the finish-your-run grace once it expires) + the holding queue ordered by turn. Right: the local
-       driver's own status line ("you're up / next / N ahead / running / done") and best complete run time.
-       The per-driver 3+5 s count rides the shared centered countdown overlay (no markup here). -->
+  <!-- Staged sprint quali (ADR-0044/Round4): the rally staggered single-car ramp view. Left: window clock (or
+       the finish-your-run grace once it expires), a "waiting for driver to start" note while a launched driver
+       clears the ramp, and the holding queue ordered by turn. Right: the local driver's own status line and
+       best complete run time. The per-driver 8 s ramp count rides the shared centered countdown overlay. -->
   <div ng-if="hud.phase === 'qualifying' && hud.qualiStaged">
     <div class="bc-tl">
       <div class="bc-quali-head">QUALIFYING</div>
       <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
       <div class="bc-quali-grace" ng-if="hud.qualiGrace != null">FINISH RUN <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiWaiting">Waiting for driver to start</div>
       <div class="bc-panel bc-standings-panel">
         <div class="bc-scroll">
           <table class="bc-standings">
