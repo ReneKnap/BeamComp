@@ -1878,6 +1878,14 @@ function quali.broadcast_queue()
     for i, id in ipairs(order) do
         position[id] = i
     end
+    -- queuePos (Round 5): the driver's 1-based place in the WAITING line only (q.queue, excluding the driver
+    -- currently at the ramp). queuePos 1 = truly next to stage; nil for the staged/running/done drivers. The
+    -- HUD "you're next" keys off THIS, not `position` (which counts the staged driver first, so it read the
+    -- second waiter as "next" when the ramp was momentarily free -- the recover-requeue "you're next" bug).
+    local queue_pos = {}
+    for i, id in ipairs(q.queue or {}) do
+        queue_pos[id] = i
+    end
     local rows = {}
     for id, record in pairs(session.progress) do
         local identity = quali.identity_of(id)
@@ -1886,6 +1894,7 @@ function quali.broadcast_queue()
             name = identity,
             status = (q.status and q.status[id]) or "queued",
             position = position[id],
+            queuePos = queue_pos[id],
             best = q.best and q.best[identity] or nil,
             ai = is_ai_id(id) or nil,
         }
@@ -1909,7 +1918,12 @@ function quali.start_session()
     for id in pairs(session.progress) do
         ids[#ids + 1] = id
     end
+    -- Deterministic base (slot order) then a single random shuffle at session start (ADR-0044/Round5): the
+    -- staged running order (who goes to the ramp first, second, ...) is random rather than the slot order. AI
+    -- shuffle in as regular queue participants. Race-blind -- just an ordering of participant ids; the server
+    -- owns + broadcasts the positions, so every client stays consistent. Reset/requeue still appends to the back.
     table.sort(ids, function(a, b) return session.progress[a].slot < session.progress[b].slot end)
+    shuffle(ids)
     local q = session.quali
     q.queue = ids
     q.staging_id = nil
