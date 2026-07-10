@@ -1511,11 +1511,11 @@ quali.MSG_RESET = "qualiReset"  -- client->server: I reset, requeue me to the ba
 -- server frees P1 and releases the next driver STAGE_INTERVAL (= spawn + count) later, so starts are that
 -- far apart with exactly one car at P1 at a time. The per-driver count is rendered client-side; the server
 -- only paces on these timers, holding no geometry (race-blind, ADR-0005).
-quali.STAGE_SPAWN = 3.0
-quali.STAGE_COUNTDOWN = 5.0
-quali.STAGE_INTERVAL = 8.0
--- Clearance after a driver launches before the next is staged at P1, so the two do not overlap on the line
--- (the launcher accelerates away in this window). Keeps starts ~STAGE_INTERVAL + STAGE_GAP apart.
+quali.STAGE_SPAWN = 3.0     -- settle window after the teleport to P1 ("you're at the line, get ready")
+quali.STAGE_COUNTDOWN = 8.0 -- start count at P1 (8 -> GO), then the driver launches (Round 3: 8 s, was 5)
+quali.STAGE_INTERVAL = quali.STAGE_SPAWN + quali.STAGE_COUNTDOWN  -- 11 s at P1 before the driver launches
+-- Clearance AFTER a driver launches and BEFORE the next is teleported onto P1, so the next never spawns into
+-- the one just driving off (Round 3 collision fix). The launcher accelerates clear of P1 in this window.
 quali.STAGE_GAP = 2.0
 
 -- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
@@ -1581,6 +1581,7 @@ function quali.begin(duration, staged)
         staged_at = nil,    -- now() when staging_id was released (flips to running STAGE_INTERVAL later)
         status = nil,       -- per-id "queued|staged|running|done" for the HUD (seeded by start_session)
         best = nil,         -- per-identity best complete run time in seconds (ADR-0031)
+        hold = nil,         -- per-id assigned holding grid slot (0-based; nil = not holding), for update_holds
     }
 end
 
@@ -1807,8 +1808,8 @@ end
 -- TIMES (race-blind, ADR-0005) -- the client owns the P1 teleport, the per-driver count, the drive, and the
 -- reset. All logic hangs off the existing `quali` table (no new top-level local, 200/200 ceiling).
 
--- Tell one driver to stage at P1 and run the per-driver count (ADR-0044). A player id -> that client; an AI
--- id -> the race owner tagged with aiId, since the owner spawns/drives the AI (ADR-0036).
+-- Tell one driver to stage at P1 and run the per-driver settle + start count (ADR-0044). A player id -> that
+-- client; an AI id -> the race owner tagged with aiId, since the owner spawns/drives the AI (ADR-0036).
 function quali.stage_driver(id)
     local payload = {spawnDelay = quali.STAGE_SPAWN, countdown = quali.STAGE_COUNTDOWN}
     if is_ai_id(id) then
@@ -1821,16 +1822,62 @@ function quali.stage_driver(id)
     end
 end
 
--- Tell one driver to return to its holding slot and wait its turn (ADR-0044). Same routing as stage_driver:
--- direct to a player, via the owner (aiId) for an AI. Sent on requeue after a finish/reset and when a
--- driver is marked done at the window's end.
-function quali.hold_driver(id)
+-- Tell one driver to hold at a grid slot and wait its turn (ADR-0044/Round3). `slot` is the 0-based grid
+-- slot index (P1 = slot 0 stays the empty start ramp; waiting drivers hold on slots 1..N-1 = poses 2..N).
+-- A nil slot means "stop + freeze in place" (a driver marked done at the window's end). Same routing as
+-- stage_driver: direct to a player, via the owner (aiId) for an AI.
+function quali.hold_driver(id, slot)
     if is_ai_id(id) then
         if session.owner_id then
-            send_event(session.owner_id, quali.MSG_HOLD, {aiId = id})
+            send_event(session.owner_id, quali.MSG_HOLD, {aiId = id, slot = slot})
         end
     else
-        send_event(id, quali.MSG_HOLD, {})
+        send_event(id, quali.MSG_HOLD, {slot = slot})
+    end
+end
+
+-- Release the front of the queue to P1 (ADR-0044/Round3): pop the queue front, mark it staged, clear its
+-- holding assignment, and tell it to stage at P1. P1 is a single start ramp -- only one driver at a time.
+function quali.release_next()
+    local q = session.quali
+    local id = table.remove(q.queue, 1)
+    if not id then
+        return
+    end
+    q.staging_id = id
+    q.staged_at = now()
+    q.status[id] = "staged"
+    if q.hold then
+        q.hold[id] = nil
+    end
+    quali.stage_driver(id)
+end
+
+-- Assign each waiting driver a holding grid slot and teleport the ones whose slot changed (ADR-0044/Round3).
+-- P1 (grid slot 0) stays the empty start ramp; waiting drivers hold on slots 1..N-1 (poses 2..N), COMPACTED
+-- in queue order -- so the line rolls forward as drivers stage out, and a reset driver appended at the back
+-- lands behind the last occupied slot. Sends only the 0-based grid slot INDEX (ordering, not geometry), so
+-- the server stays race-blind (ADR-0005). Only re-sends when a driver's slot actually changed.
+function quali.update_holds()
+    local q = session.quali
+    if not q.hold then
+        q.hold = {}
+    end
+    -- Highest holding grid slot: N-1 (grid slots 1..N-1 = poses 2..N; P1 = slot 0 is the ramp). N = the
+    -- participant count (a roster size, not geometry -- race-blind). Clamp so a rare transient overflow
+    -- (e.g. a reset right after launch during the clearance gap, when the queue briefly holds N drivers)
+    -- stacks on the last holding slot instead of addressing a non-existent pose.
+    local count = 0
+    for _ in pairs(session.progress or {}) do
+        count = count + 1
+    end
+    local max_slot = math.max(1, count - 1)
+    for index, id in ipairs(q.queue) do
+        local slot = math.min(index, max_slot)  -- queue[1] -> slot 1 (pose 2), ... ; P1 (slot 0) stays free
+        if q.hold[id] ~= slot then
+            q.hold[id] = slot
+            quali.hold_driver(id, slot)
+        end
     end
 end
 
@@ -1870,9 +1917,11 @@ function quali.broadcast_queue()
     broadcast_event(quali.MSG_QUEUE, {rows = rows})
 end
 
--- Seed the holding queue at the countdown -> qualifying seam (ADR-0044): every participant starts queued in
--- slot order (session.progress exists by now, unlike at quali.begin). No-op for the circuit all-at-once
--- quali. The tick's quali.advance_staged then paces the releases.
+-- Seed the holding queue at the staging -> qualifying seam and start the staggered releases immediately
+-- (ADR-0044/Round3): there is NO global pre-quali countdown for a staged sprint quali -- the first driver is
+-- staged at P1 right away and the rest hold on slots 2..N (P1 = slot 0 stays the empty start ramp). Every
+-- participant is seeded queued in slot order (session.progress exists by now, unlike at quali.begin). No-op
+-- for the circuit all-at-once quali. The tick's quali.advance_staged then paces the subsequent releases.
 function quali.start_session()
     if not quali.is_staged() or not session.progress then
         return
@@ -1889,10 +1938,14 @@ function quali.start_session()
     q.next_stage_at = nil
     q.status = {}
     q.best = {}
+    q.hold = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
     log_info("beamcomp.race", string.format("staged sprint quali started with %d driver(s)", #ids))
+    -- Fill P1 now (no global countdown) and place the waiting field on slots 2..N.
+    quali.release_next()
+    quali.update_holds()
     quali.broadcast_queue()
 end
 
@@ -1936,14 +1989,21 @@ function quali.requeue(id, terminal)
         end
     end
     q.queue = filtered
+    if q.hold then
+        q.hold[id] = nil
+    end
     local window_open = session.phase == PHASE.qualifying and phase_elapsed() < q.duration
     if terminal or not window_open then
         q.status[id] = "done"
+        -- Done: stop + freeze where you are (nil slot); no holding position needed.
+        quali.hold_driver(id, nil)
     else
+        -- Back of the queue -> update_holds assigns the last holding slot (behind the last occupied grid
+        -- position) and teleports the driver there (Round 3 reset behaviour).
         q.queue[#q.queue + 1] = id
         q.status[id] = "queued"
     end
-    quali.hold_driver(id)
+    quali.update_holds()
     quali.broadcast_queue()
 end
 
@@ -2022,14 +2082,11 @@ function quali.advance_staged()
 
     local window_open = phase_elapsed() < q.duration
 
-    -- Release the next holding driver to P1 while the window is open, P1 is free, and it has cleared.
-    if window_open and not q.staging_id and q.queue and #q.queue > 0
-        and t >= (q.next_stage_at or 0) then
-        local id = table.remove(q.queue, 1)
-        q.staging_id = id
-        q.staged_at = t
-        q.status[id] = "staged"
-        quali.stage_driver(id)
+    -- Release the next holding driver to P1 while the window is open, P1 is free, and it has cleared. Then
+    -- roll the remaining holding line forward one slot (update_holds) so the queue compacts behind P1.
+    if window_open and not q.staging_id and #q.queue > 0 and t >= (q.next_stage_at or 0) then
+        quali.release_next()
+        quali.update_holds()
         changed = true
     end
 
@@ -3406,22 +3463,28 @@ local function tick()
     end
 
     if phase == PHASE.staging then
-        enter_countdown_from_staging()
+        -- Staged sprint quali (ADR-0044/Round3): NO global pre-quali countdown -- it confused testers -- so a
+        -- staged event goes straight from staging into the qualifying queue, where each driver gets their own
+        -- per-driver settle + start count at P1. The circuit quali (and every normal race) still runs the
+        -- global countdown via enter_countdown_from_staging.
+        if quali.is_staged() then
+            enter_phase(PHASE.qualifying, session.quali.duration)
+            broadcast_standings()
+            quali.start_session()
+        else
+            enter_countdown_from_staging()
+        end
     elseif phase == PHASE.countdown then
-        -- For a quali event the first countdown gates the qualifying session, not the race (ADR-0041): the
-        -- second countdown (after quali-results sets the grid) gates the race. Either way send the baseline
-        -- standings (every participant at zero) so clients have a table to show from the start.
+        -- For a (circuit) quali event the first countdown gates the qualifying session, not the race
+        -- (ADR-0041): the second countdown (after quali-results sets the grid) gates the race. Either way
+        -- send the baseline standings (every participant at zero) so clients have a table from the start.
+        -- (A staged sprint quali never reaches this branch -- it skips the global countdown above.)
         if quali.is_pending() then
             enter_phase(PHASE.qualifying, session.quali.duration)
         else
             enter_phase(PHASE.racing, nil)
         end
         broadcast_standings()
-        -- Staged sprint quali (ADR-0044): now that progress exists, seed + broadcast the holding queue and
-        -- begin the staggered P1 releases. No-op for the circuit all-at-once quali and a normal race.
-        if session.phase == PHASE.qualifying and quali.is_staged() then
-            quali.start_session()
-        end
     elseif phase == PHASE.quali_results then
         quali.advance_results()
     elseif phase == PHASE.finished then
