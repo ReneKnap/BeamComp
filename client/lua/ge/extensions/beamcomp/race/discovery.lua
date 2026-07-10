@@ -3,15 +3,16 @@
 -- Lives at lua/ge/extensions/beamcomp/race/discovery.lua inside the client mod zip.
 -- Stateless: require it and call M.list() / M.resolve(name).
 --
--- Discovers installed races by scanning the BeamNG virtual filesystem, from three sources: the freeroam
--- mission set under /gameplay/missions/<map>/<type>/, two mission types treated as race sources --
--- timeTrial (source "mission", ADR-0005) and aiRace (source "aiRace", ADR-0035) -- plus the Time Trial
--- menu's level quickrace tracks (/levels/<map>/quickrace/, source "quickrace", ADR-0024). The scan is
--- robust against the missions subsystem not being initialized in a multiplayer session. Each locator
--- carries a source and format ("racePath"/"quickrace"), and a map-qualified id ("<map>/<slug>" for
--- timeTrial, "<map>/aiRace/<slug>" for aiRace, "<map>/quickrace/<slug>" for quickrace) so names never
--- collide. M.resolve maps a requested name (optionally "map:"/"ai:"/"menu:"-prefixed to pick a source)
--- to a single locator, or reports a miss / ambiguity.
+-- Discovers installed races by scanning the BeamNG virtual filesystem, from two roots: the freeroam
+-- mission set under /gameplay/missions/<map>/<type>/, whose race-source mission types are timeTrial
+-- (source "mission", ADR-0005), aiRace (source "aiRace", ADR-0035), and rallyStage + crawl (their own
+-- sources; both point-to-point stages the parser normalizes to Sprint) -- plus the Time Trial menu's
+-- level quickrace tracks (/levels/<map>/quickrace/, source "quickrace", ADR-0024). The scan is robust
+-- against the missions subsystem not being initialized in a multiplayer session. Each locator carries a
+-- source and format ("racePath"/"quickrace"), and a map-qualified id ("<map>/<slug>" for timeTrial,
+-- "<map>/<type>/<slug>" for the other mission types, "<map>/quickrace/<slug>" for quickrace) so names
+-- never collide. M.resolve maps a requested name (optionally "map:"/"ai:"/"rally:"/"crawl:"/"menu:"-
+-- prefixed to pick a source) to a single locator, or reports a miss / ambiguity.
 
 local M = {}
 
@@ -30,21 +31,26 @@ local RACE_FILENAME = "race.race.json"
 -- Left unanchored so it matches whether FS:findFiles returns absolute or root-relative paths, and so
 -- vendored/mod races mounted under the same convention are picked up too (ADR-0005).
 local MISSION_PATTERN = "([^/]+)/([^/]+)/([^/]+)/race%.race%.json$"
--- The mission types treated as race sources, mapping each to its locator source. Other types (crawl,
--- drift, ...) are not races and are skipped. timeTrial is the original mission source (ADR-0024);
--- aiRace is the first-class third source (ADR-0035).
+-- The mission types treated as race sources, mapping each to its locator source. Other types (drift,
+-- ...) are not races and are skipped. timeTrial is the original mission source (ADR-0024); aiRace is the
+-- first-class third source (ADR-0035); rallyStage and crawl are point-to-point stages the parser
+-- normalizes to Sprint (feature: parse-rally-and-crawl-stages). Each non-timeTrial type keeps its own
+-- source string so ids and prefixes stay distinct.
 local MISSION_SOURCES = {
     timeTrial = "mission",
     aiRace = "aiRace",
+    rallyStage = "rallyStage",
+    crawl = "crawl",
 }
 -- The map is the segment before /quickrace/, the file the one after (flat folder):
 -- ".../<map>/quickrace/<file>". Unanchored for the same reason as the time-trial pattern (ADR-0024).
 local QUICKRACE_PATTERN = "([^/]+)/quickrace/([^/]+)$"
 
 -- Build a locator from a missions race.race.json VFS path, or nil if its mission type is not a race
--- source (MISSION_SOURCES). format = "racePath" (path:onDeserialized loadable) for both mission types.
--- timeTrial keeps the legacy id "<map>/<slug>" (ADR-0023 grid defaults are keyed on it); aiRace is
--- type-qualified "<map>/aiRace/<slug>" so the two namespaces never collide (ADR-0035).
+-- source (MISSION_SOURCES). format = "racePath" (path:onDeserialized loadable) for every race-source
+-- mission type. timeTrial keeps the legacy id "<map>/<slug>" (ADR-0023 grid defaults are keyed on it);
+-- every other type is type-qualified "<map>/<type>/<slug>" (aiRace ADR-0035, rallyStage, crawl) so the
+-- namespaces never collide.
 local function locator_from_race_file(race_file)
     local map, mission_type, slug = race_file:match(MISSION_PATTERN)
     local source = map and MISSION_SOURCES[mission_type]
@@ -114,7 +120,8 @@ local function level_names()
 end
 
 -- Every installed race across all sources, as locators, sorted by id: the freeroam mission set
--- (timeTrial + aiRace, ADR-0024/0035) and the level quickrace set (the Time Trial menu, ADR-0024).
+-- (timeTrial + aiRace + rallyStage + crawl, ADR-0024/0035) and the level quickrace set (the Time Trial
+-- menu, ADR-0024).
 function M.list()
     local locators = {}
 
@@ -163,9 +170,11 @@ local function single_or_ambiguous(name, matches)
 end
 
 -- An optional source prefix on a /race name (ADR-0024/0035): "map:" restricts the match to the freeroam
--- timeTrial set, "ai:" to the aiRace set, "menu:" to the level quickrace set -- so same-named variants
--- across the sources can be picked deterministically. Returns the source ("mission"/"aiRace"/
--- "quickrace") or nil, plus the name with the prefix stripped. Case-insensitive on the prefix.
+-- timeTrial set, "ai:" to the aiRace set, "rally:" to the rallyStage set, "crawl:" to the crawl set,
+-- "menu:" to the level quickrace set -- so same-named variants across the sources can be picked
+-- deterministically. Returns the source ("mission"/"aiRace"/"rallyStage"/"crawl"/"quickrace") or nil,
+-- plus the name with the prefix stripped. Case-insensitive on the prefix. The prefixes only match with
+-- their trailing colon, so a slug like "crawl_long" is a plain name, not a "crawl:" pick.
 local function split_source_prefix(name)
     local rest = name:match("^[Mm][Aa][Pp]:(.*)$")
     if rest then
@@ -175,6 +184,14 @@ local function split_source_prefix(name)
     if rest then
         return "aiRace", rest
     end
+    rest = name:match("^[Rr][Aa][Ll][Ll][Yy]:(.*)$")
+    if rest then
+        return "rallyStage", rest
+    end
+    rest = name:match("^[Cc][Rr][Aa][Ww][Ll]:(.*)$")
+    if rest then
+        return "crawl", rest
+    end
     rest = name:match("^[Mm][Ee][Nn][Uu]:(.*)$")
     if rest then
         return "quickrace", rest
@@ -182,11 +199,12 @@ local function split_source_prefix(name)
     return nil, name
 end
 
--- Resolve a requested race name to a single locator. An optional "map:"/"ai:"/"menu:" prefix first
--- restricts to that source (ADR-0024/0035). Tiers, exact-first: map-qualified id ("<map>/<slug>",
--- "<map>/aiRace/<slug>", "<map>/quickrace/<slug>"), then bare slug ("<slug>"), then a unique
--- case-insensitive substring of a slug ("med" -> "004-mediumcourse") -- all case-insensitive. An exact
--- name can never be diverted to a different race by the substring tier, since the exact tiers run first.
+-- Resolve a requested race name to a single locator. An optional "map:"/"ai:"/"rally:"/"crawl:"/"menu:"
+-- prefix first restricts to that source (ADR-0024/0035). Tiers, exact-first: map-qualified id
+-- ("<map>/<slug>", "<map>/<type>/<slug>", "<map>/quickrace/<slug>"), then bare slug ("<slug>"), then a
+-- unique case-insensitive substring of a slug ("med" -> "004-mediumcourse") -- all case-insensitive. An
+-- exact name can never be diverted to a different race by the substring tier, since the exact tiers run
+-- first.
 --
 -- When loaded_map is given the match set is restricted to races startable on that map (a race
 -- only starts on its own map anyway), which keeps the set small so shorter substrings stay

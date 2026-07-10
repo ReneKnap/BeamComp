@@ -20,6 +20,16 @@ local quickrace = require("beamcomp/race/quickrace")
 local LOG_TAG = "beamcomp.race"
 local RACE_PATH_MODULE = "/lua/ge/extensions/gameplay/race/path"
 
+-- Locator sources whose races are normalized to Sprint output (point-to-point, meta.closed = false)
+-- regardless of the loaded path's own classification. rallyStage and crawl author point-to-point stages
+-- already, but BeamComp lists both as Sprint by contract (feature: parse-rally-and-crawl-stages), so the
+-- normalization is explicit rather than relying on the source geometry happening to be open. Keyed on
+-- locator.source, which for these two equals the mission-type name (discovery MISSION_SOURCES).
+local SPRINT_NORMALIZED_SOURCES = {
+    rallyStage = true,
+    crawl = true,
+}
+
 -- Flatten an engine vec3 to a plain {x, y, z} table.
 local function vec3_to_table(v)
     return {x = v.x, y = v.y, z = v.z}
@@ -185,9 +195,11 @@ end
 -- A mission's authoritative default lap count, from its missionTypeData (ADR-0024). BeamNG stores a
 -- mission's real default there; the race.race.json's own defaultLaps is an editor value that disagrees
 -- for stock closed circuits (e.g. 004-mediumcourse: info 1 vs race 2). The field name is mission-type-
--- specific: timeTrial uses "defaultLaps", aiRace uses "lapCount" (ADR-0035; its goalLaps/goalTime are
--- challenge targets, not the race length). Returns the number, or nil -- the caller then keeps the path
--- object's value (mod races that ship only a race.race.json).
+-- specific: timeTrial and rallyStage use "defaultLaps", aiRace uses "lapCount" (ADR-0035; its goalLaps/
+-- goalTime are challenge targets, not the race length). crawl is a points/recoveries type with no lap
+-- field, so this returns nil there -- moot anyway, since crawl (like rallyStage) is Sprint-normalized and
+-- laps are ignored for point-to-point races. Returns the number, or nil -- the caller then keeps the
+-- path object's value (mod races that ship only a race.race.json).
 local function mission_default_laps(mission_type_data)
     if type(mission_type_data) ~= "table" then
         return nil
@@ -220,14 +232,20 @@ local function mission_ai_defaults(mission_type_data)
 end
 
 -- defaultLaps is the override (from the mission info.json) when given, else the path object's own value;
--- closed/branching/reversible always come from the loaded path so meta stays consistent with the
--- checkpoints/segments the path produced. aiDefaults carries the aiRace content AI defaults (ADR-0036
--- Etappe B), nil for non-aiRace content.
-local function build_meta(path, default_laps_override, ai_defaults)
+-- branching/reversible always come from the loaded path so meta stays consistent with the checkpoints/
+-- segments the path produced. closed likewise follows the path, EXCEPT when force_open is set: the
+-- Sprint-normalized sources (rallyStage/crawl) always list as point-to-point (closed = false) by
+-- contract, independent of their authored geometry. aiDefaults carries the aiRace content AI defaults
+-- (ADR-0036 Etappe B), nil for non-aiRace content.
+local function build_meta(path, default_laps_override, ai_defaults, force_open)
+    local closed = path.config.closed and true or false
+    if force_open then
+        closed = false
+    end
     return {
         name = path.name,
         defaultLaps = default_laps_override or path.defaultLaps,
-        closed = path.config.closed and true or false,
+        closed = closed,
         branching = path.config.branching and true or false,
         reversible = is_reversible(path),
         aiDefaults = ai_defaults,
@@ -237,10 +255,11 @@ end
 -- Parse a discovery locator into the normalized BeamComp race-content table (ADR-0005). Dispatches by
 -- locator.format: a "quickrace" track is loaded via the engine quickrace importer (race/quickrace), any
 -- other locator (a race.race.json -- mission or level .race.json) via path:onDeserialized; both reduce
--- to the same model. A mission's default lap count is taken from its sibling info.json (ADR-0024).
--- Quickrace props are the track's nested barrier prefabs (statics, all clients) plus the track prefab
--- itself as a host-only cone source (coneFiles, ADR-0025). Returns the table, or nil plus a reason
--- string on failure.
+-- to the same model. A mission's default lap count is taken from its sibling info.json (ADR-0024). The
+-- Sprint-normalized sources (rallyStage/crawl) are pinned to meta.closed = false regardless of their
+-- authored geometry (feature: parse-rally-and-crawl-stages). Quickrace props are the track's nested
+-- barrier prefabs (statics, all clients) plus the track prefab itself as a host-only cone source
+-- (coneFiles, ADR-0025). Returns the table, or nil plus a reason string on failure.
 function M.parse(locator)
     if type(locator) ~= "table" or not locator.raceFile or locator.raceFile == "" then
         return nil, "no race file given"
@@ -279,10 +298,11 @@ function M.parse(locator)
 
     local props = (locator.source == "quickrace") and quickrace.prop_refs(locator)
         or build_prop_refs(folder)
+    local force_open = SPRINT_NORMALIZED_SOURCES[locator.source]
     local race = {
         raceFile = race_file,
         folder = folder,
-        meta = build_meta(path, default_laps, ai_defaults),
+        meta = build_meta(path, default_laps, ai_defaults, force_open),
         startPositions = build_start_positions(path),
         checkpoints = build_checkpoints(path),
         -- The dense authored race line for AI driving (ADR-0036); display/scoring use checkpoints.
