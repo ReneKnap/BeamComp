@@ -14,8 +14,8 @@ local M = {}
 
 -- Per-driver timing defaults (ADR-0044), mirrored from the server (quali.STAGE_SPAWN / STAGE_COUNTDOWN).
 -- The qualiStage payload carries the server's values, which override these; the defaults are the fallback.
-M.SPAWN = 3.0      -- settle-at-P1 window (car teleported to P1 + frozen) before the numeric count
-M.COUNTDOWN = 5.0  -- per-driver 5..1 count, then GO
+M.SPAWN = 3.0      -- settle-at-P1 window (car teleported to P1 + frozen), "get ready", before the count
+M.COUNTDOWN = 8.0  -- per-driver 8..1 start count at P1, then GO (Round 3: 8 s, was 5)
 
 -- Start a per-driver run at wall-clock `now` (os.clockhp, like the ADR-0041 self-rendered counts).
 -- `spawn` / `countdown` override the defaults from the server qualiStage payload. Returns a run table

@@ -199,7 +199,7 @@ angular.module('beamng.apps')
       return 'On your run';
     }
     if (mine.status === 'staged') {
-      return 'Staging - get ready';
+      return 'At the line - get ready';
     }
     if (mine.status === 'done') {
       return 'Run complete';

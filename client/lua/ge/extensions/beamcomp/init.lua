@@ -1140,10 +1140,16 @@ local function handle_race_phase(payload)
         local quali_state = M.state.race and M.state.race.quali
         M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
         if quali_state and quali_state.staged then
-            -- Rally staged sprint quali (ADR-0044): nobody drives at the gun. Keep the car frozen at its
-            -- holding grid slot (it already is, from the countdown lock); the server releases drivers one at
-            -- a time from P1 (qualiStage). No detector, lap clock, or sector tracker until this driver
-            -- launches. The global pre-quali count is over -> clear the overlay for the per-driver counts.
+            -- Rally staged sprint quali (ADR-0044/Round3): nobody drives at the gun and there is NO global
+            -- pre-quali countdown -- the server sent us straight from staging into qualifying. Upgrade to the
+            -- full fixed-car lock (normally done at the countdown phase we skipped) and lock in the license
+            -- name now; keep the car frozen at its slot. The server places the field: it stages the front
+            -- driver at P1 (qualiStage) and holds the rest on slots 2..N (qualiHold). No detector, lap clock,
+            -- or sector tracker until this driver launches; clear the overlay for the per-driver counts.
+            lock.install()
+            poll_staging_identity(true)
+            M.state.staging = nil
+            M.state.countdown = nil
             M.state.quali_staged = true
             M.state.quali_status = "queued"
             M.state.quali_run = nil
@@ -1501,15 +1507,17 @@ local function quali_place_own(pose)
     arm_dashboard_refresh()
 end
 
--- The local driver's pole (P1) pose and its own holding-slot pose, from the grid poses we already hold.
-local function quali_p1_pose()
+-- The grid pose for a 0-based slot index (P1 = slot 0 = gridPoses[1]; holding slots 1..N-1 = poses 2..N),
+-- from the grid poses we already hold (ADR-0044/Round3). nil for a missing slot/pose.
+local function quali_grid_pose(slot)
     local poses = M.state.race and M.state.race.gridPoses
-    return poses and poses[1] or nil
+    if type(slot) ~= "number" or not poses then
+        return nil
+    end
+    return poses[slot + 1]
 end
-local function quali_hold_pose()
-    local poses = M.state.race and M.state.race.gridPoses
-    local slot = (M.state.race and M.state.race.mySlot) or 0
-    return poses and poses[slot + 1] or nil
+local function quali_p1_pose()
+    return quali_grid_pose(0)
 end
 
 -- Launch the local car at the end of its per-driver count (ADR-0044): show GO, release the freeze, and arm
@@ -1587,9 +1595,10 @@ local function quali_launch_ai(car_id)
     end
 end
 
--- Owner: stop an AI + return it to its holding slot (ADR-0044). The server sends qualiHold for an AI on its
--- finish (single run -> done) or a requeue. Front-anchored re-place (car.pose is the AI's grid slot).
-local function quali_hold_ai(ai_id)
+-- Owner: stop an AI + hold it (ADR-0044/Round3). The server sends qualiHold for an AI on its finish (single
+-- run -> done, slot nil = stop in place) or a requeue (slot = its new holding grid slot, 0-based). A given
+-- slot front-anchor-re-places the AI onto poses[slot+1]; a nil slot just freezes it where it is.
+local function quali_hold_ai(ai_id, slot)
     local car = quali_find_ai(ai_id)
     if not car then
         return
@@ -1602,10 +1611,14 @@ local function quali_hold_ai(ai_id)
         M.state.quali_ai_runs[car.id] = nil
     end
     local veh = be and be:getObjectByID(car.veh_id)
-    if veh and car.pose then
-        pcall(function() vehicles.place_at_grid(veh, car.pose) end)
-        pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
+    if not veh then
+        return
     end
+    local pose = quali_grid_pose(slot)
+    if pose then
+        pcall(function() vehicles.place_at_grid(veh, pose) end)
+    end
+    pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
 end
 
 -- "You're up" (server qualiStage, ADR-0044): a player payload -> stage the local car at P1; an aiId (owner
@@ -1630,15 +1643,16 @@ local function handle_quali_stage(payload)
     log("I", RACE_LOG_TAG, "staged quali: your turn -- staged at P1")
 end
 
--- "Return to holding" (server qualiHold, ADR-0044): a player payload -> re-hold the local car; an aiId
--- (owner only) -> stop + re-hold that AI. Sent on requeue after a finish/reset and when marked done at the
--- window's end. The local status stays "done" if it was already terminal.
+-- "Hold at a grid slot" (server qualiHold, ADR-0044/Round3): a player payload -> hold the local car; an aiId
+-- (owner only) -> stop + hold that AI. payload.slot is the 0-based holding grid slot (poses 2..N); a nil
+-- slot means "stop + freeze in place" (a driver marked done at the window's end). Sent on the initial field
+-- placement, when the queue rolls forward, and on a finish/reset requeue.
 local function handle_quali_hold(payload)
     if not M.state.race or not M.state.quali_staged then
         return
     end
     if type(payload) == "table" and payload.aiId ~= nil then
-        quali_hold_ai(payload.aiId)
+        quali_hold_ai(payload.aiId, payload.slot)
         return
     end
     M.state.quali_run = nil
@@ -1647,7 +1661,17 @@ local function handle_quali_hold(payload)
     if M.state.quali_status ~= "done" then
         M.state.quali_status = "queued"
     end
-    quali_place_own(quali_hold_pose())
+    local slot = type(payload) == "table" and payload.slot or nil
+    local pose = quali_grid_pose(slot)
+    if pose then
+        quali_place_own(pose)
+    else
+        -- No slot (done): stop the run + freeze in place, no teleport.
+        local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+        if own then
+            vehicles.set_vehicle_frozen(own, true)
+        end
+    end
     countdown.clear()
 end
 
@@ -1657,17 +1681,22 @@ local function handle_quali_queue(payload)
     M.state.quali_queue = (type(payload) == "table" and type(payload.rows) == "table") and payload or nil
 end
 
--- Reset -> requeue (ADR-0044): the local driver hit their reset/recover key mid-run. Tell the server (it
--- appends us to the back of the queue) and re-hold the car now, so it does not keep driving before the
--- server's qualiHold lands. Called from M.on_assist_key_down while the run's detector is armed; the
--- recover/reset key is owned by the VE override during the race (ADR-0017), so it works with assists off.
+-- Reset -> requeue (ADR-0044/Round3): the local driver hit their reset/recover key mid-run. Tell the server
+-- (it appends us to the back of the queue and teleports us behind the last occupied grid position via a
+-- qualiHold) and freeze the car in place NOW, so it does not keep driving before that qualiHold lands.
+-- Called from M.on_assist_key_down while the run's detector is armed; the recover/reset key is owned by the
+-- VE override during the race (ADR-0017), so it works with assists off.
 local function quali_request_requeue()
     M.state.quali_run = nil
     M.state.detection = nil
     M.state.laptimer = nil
     M.state.quali_status = "queued"
     send_to_server("qualiReset", {})
-    quali_place_own(quali_hold_pose())
+    -- Freeze in place immediately; the server's qualiHold teleports us to the back holding slot momentarily.
+    local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+    if own then
+        vehicles.set_vehicle_frozen(own, true)
+    end
     countdown.clear()
     guihooks.trigger("toastrMsg", {
         type = "info",
@@ -1686,8 +1715,9 @@ local function step_quali_staged()
     if run then
         local st = qualisprint.step(run, now)
         if st.stage == "spawn" then
-            -- Settling at P1, still frozen: a brief "get ready" cue on the shared staging overlay.
-            countdown.show_staging(math.max(0, math.ceil(st.remaining)), "Your run")
+            -- Settling at P1, still frozen: the short "you're at the line" settle cue on the staging overlay,
+            -- before the 8 s start count (Round 3 two-count structure: settle then count).
+            countdown.show_staging(math.max(0, math.ceil(st.remaining)), "You're up - get ready")
         elseif st.stage == "count" then
             if run.last_count ~= st.count then
                 run.last_count = st.count
