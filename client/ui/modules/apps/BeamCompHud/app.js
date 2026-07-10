@@ -189,8 +189,10 @@ angular.module('beamng.apps')
     return list;
   }
 
-  // The local driver's staged-quali status line (ADR-0044) from their own queue row {status, position}.
-  // "You're next" is the front of the holding queue (position 2 -- position 1 is the car currently at P1).
+  // The local driver's staged-quali status line (ADR-0044/Round5) from their own queue row. Uses `queuePos`
+  // -- the 1-based place in the WAITING line only (queuePos 1 = truly next to the ramp) -- NOT `position`,
+  // which counts the staged driver first and so read the second waiter as "next" when the ramp was free (the
+  // recover-requeue "you're next" bug). "You're next" only when the driver is genuinely front of the queue.
   function qualiStatusText(mine) {
     if (!mine) {
       return '';
@@ -204,11 +206,11 @@ angular.module('beamng.apps')
     if (mine.status === 'done') {
       return 'Run complete';
     }
-    if (typeof mine.position === 'number' && mine.position <= 2) {
+    if (mine.queuePos === 1) {
       return "You're next";
     }
-    if (typeof mine.position === 'number') {
-      return 'Queued - ' + (mine.position - 1) + ' ahead';
+    if (typeof mine.queuePos === 'number') {
+      return 'Queued - ' + (mine.queuePos - 1) + ' ahead';
     }
     return 'Queued';
   }
