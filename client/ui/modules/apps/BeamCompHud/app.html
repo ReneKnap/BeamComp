@@ -839,7 +839,7 @@
                 ng-class="{'bc-local': hud.qualiMine && r.slot === hud.qualiMine.slot, 'bc-ai': r.ai}">
               <td class="bc-pos"><span ng-if="r.status === 'done'">&#10003;</span><span ng-if="r.status !== 'done'">{{r.position != null ? ('P' + r.position) : '--'}}</span></td>
               <td class="bc-name">{{r.name}}</td>
-              <td class="bc-int">{{r.best != null ? formatTime(r.best) : '--'}}</td>
+              <td class="bc-int">{{qualiRowTime(r)}}</td>
             </tr>
           </table>
         </div>
@@ -852,11 +852,29 @@
             <td class="bc-tb-label">Queue</td>
             <td class="bc-tb-value">{{qualiStatusText(hud.qualiMine)}}</td>
           </tr>
+          <!-- Live run clock while the local driver is on their staged run (Round 4/6): the point-to-point
+               equivalent of the circuit quali's Current lap clock, so the driver sees their run climbing. -->
+          <tr ng-if="hud.qualiMine && hud.qualiMine.status === 'running' && hud.localEntry">
+            <td class="bc-tb-label">Run</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.time)}}</td>
+          </tr>
           <tr class="bc-tb-best">
             <td class="bc-tb-label">Best</td>
             <td class="bc-tb-value">{{hud.qualiMine && hud.qualiMine.best != null ? formatTime(hud.qualiMine.best) : '--'}}</td>
           </tr>
         </table>
+      </div>
+      <!-- Live sector readout (feature: quali-live-sector-delta, extended to the staged sprint in Round 6):
+           the same right-side split display as the circuit quali, adapted to the point-to-point run -- a
+           cumulative delta vs your best complete run (RUN, green ahead / red behind by sign), then the
+           just-completed sector's split + per-segment delta vs your per-sector best, record-coloured (purple
+           session best / green personal best / red slower). Hidden until the first crossing of the run; no
+           reference on the first run shows white (no crash). -->
+      <div class="bc-quali-sector" ng-if="hud.sector">
+        <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+             ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">RUN</span>{{formatDelta(hud.sector.cumulative)}}</div>
+        <div class="bc-qd-seg"
+             ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
       </div>
     </div>
   </div>

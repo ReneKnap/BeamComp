@@ -215,6 +215,16 @@ angular.module('beamng.apps')
     return 'Queued';
   }
 
+  // The time cell for a staged-quali board row (ADR-0044/Round6): a driver on their run shows their live
+  // run elapsed (the on-stage car's climbing time, so the board keeps moving through the finish grace),
+  // everyone else their best complete run time (or "--" before their first). Server-relayed numbers only.
+  function qualiRowTime(r) {
+    if (r && r.status === 'running' && typeof r.live === 'number') {
+      return formatTime(r.live);
+    }
+    return (r && typeof r.best === 'number') ? formatTime(r.best) : '--';
+  }
+
   // The local player's full entry (the one flagged isLocal), or null. Resolved from the full field
   // -- not the windowed live rows -- so the header, time block, and results best-lap bind to it even
   // when the local player is scrolled out of the live row window.
@@ -283,8 +293,9 @@ angular.module('beamng.apps')
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
-      // Staged sprint quali status line (ADR-0044).
+      // Staged sprint quali status line (ADR-0044) + board row time (ADR-0044/Round6).
       scope.qualiStatusText = qualiStatusText;
+      scope.qualiRowTime = qualiRowTime;
 
       // UI-presence heartbeat (self-healing HUD: race/hud.lua + the init.lua watchdog). Tell GE this app
       // is alive on link and once a second after. If GE stops hearing it while a race wants the HUD up --
