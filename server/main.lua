@@ -1889,13 +1889,21 @@ function quali.broadcast_queue()
     local rows = {}
     for id, record in pairs(session.progress) do
         local identity = quali.identity_of(id)
+        local status = (q.status and q.status[id]) or "queued"
         rows[#rows + 1] = {
             slot = record.slot,
             name = identity,
-            status = (q.status and q.status[id]) or "queued",
+            status = status,
             position = position[id],
             queuePos = queue_pos[id],
             best = q.best and q.best[identity] or nil,
+            -- The driver's live run elapsed while they are on track (Round 6), so the board shows the
+            -- running car's climbing time (checkpoint-granular) rather than a static best/`--`. This is
+            -- what keeps the live-timing table moving through the finish-your-run grace. nil otherwise.
+            live = (status == "running" and (record.completed or 0) > 0) and record.total_time or nil,
+            -- The best complete run's cumulative crossing splits (Round 6), for the staged HUD sector
+            -- readout's personal + session references. nil until this identity has finished a run.
+            bestSplits = q.best_splits and q.best_splits[identity] or nil,
             ai = is_ai_id(id) or nil,
         }
     end
@@ -1933,6 +1941,10 @@ function quali.start_session()
     q.cleared = false
     q.status = {}
     q.best = {}
+    -- Best complete run's cumulative crossing splits per identity (Round 6), relayed on the queue snapshot
+    -- so the staged HUD can show the same live sector readout as the circuit quali (its reference is the
+    -- best run, not the per-run splits, which reset_progress wipes on each requeue). Keyed like q.best.
+    q.best_splits = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
@@ -2016,6 +2028,14 @@ function quali.finish_run(id)
         local time = tonumber(record.total_time)
         if time and time > 0 and (not q.best[identity] or time < q.best[identity]) then
             q.best[identity] = time
+            -- Snapshot this run's cumulative crossing splits as the identity's best-run reference (Round 6),
+            -- before requeue -> reset_progress replaces record.splits with a fresh table. Copied so a later
+            -- run mutating its own splits array never disturbs the stored best.
+            local best_splits = {}
+            for i, split in ipairs(record.splits or {}) do
+                best_splits[i] = split
+            end
+            q.best_splits[identity] = best_splits
             log_info("beamcomp.race", string.format("staged quali: %s run %.2fs (best)", identity, time))
         end
     end
@@ -2157,6 +2177,11 @@ function quali.advance_staged()
         q.lap_grace_deadline = t  -- no one on track -> classify immediately
     end
     if anyone_out and t < q.lap_grace_deadline then
+        -- Keep the live board refreshing through the finish-your-run grace (Round 6). The release path
+        -- above, which drove the periodic broadcast during the window, is gated on window_open, so without
+        -- this the board would freeze until classification. Per-crossing broadcasts (handle_checkpoint_report)
+        -- already refresh it as the running driver progresses; this covers the between-crossing ticks.
+        quali.broadcast_queue()
         return
     end
     quali.finish_session()
@@ -4684,6 +4709,13 @@ local function handle_checkpoint_report(player_id, payload)
         time, final and " (final)" or ""))
 
     broadcast_standings()
+    -- Staged sprint quali (Round 6): refresh the holding-queue board on every crossing, so the live-timing
+    -- table shows the running driver's progress in real time -- including through the finish-your-run grace,
+    -- where the window-gated release path no longer broadcasts. The final crossing is covered by finish_run
+    -- below (it folds the best, then broadcasts). Circuit quali / normal race: no-op.
+    if not final and quali.is_staged() and session.phase == PHASE.qualifying then
+        quali.broadcast_queue()
+    end
     if final then
         maybe_end_race()
         -- Staged sprint quali (ADR-0044): a completed Start->Ziel run folds its time into the best and
