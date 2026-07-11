@@ -468,12 +468,24 @@
     .beamcomp-hud .bc-quali-grace .bc-quali-grace-t {
       font-size: 26px;
     }
-    /* Live sector readout (feature: quali-live-sector-delta): sits on the RIGHT, directly under the
-       Current/Last/Best lap-timer block. Cumulative delta to your best lap (top, green ahead / red behind by
-       sign), then the just-completed sector's split time + per-segment delta (record-coloured). Persists the
-       last completed sector until the next crossing. Right-aligned (in bc-tr), legible by text-shadow. */
+    /* Live sector readout (feature: quali-live-sector-delta; repositioned top-center by
+       quali-sector-times-top-center): moved out of the right bc-tr column into a screen-centered overlay near
+       the top, in the driver's line of sight. Used by both qualifying views (circuit LAP delta + staged sprint
+       RUN delta). Cumulative delta to your best (top, green ahead / red behind by sign), then the
+       just-completed sector's split time + per-segment delta (record-coloured). Persists the last completed
+       sector until the next crossing. position:fixed centered overlay like the countdown (ADR-0021);
+       pointer-events:none so it never eats clicks; hidden until the first crossing (ng-if="hud.sector"). */
     .beamcomp-hud .bc-quali-sector {
-      margin-top: 8px;
+      /* Vertical position from the top of the viewport -- the single knob to re-tune in-game. ~1/5 of screen
+         height, sitting just above the staged-quali ramp countdown (25%) / settle timer (22%). */
+      --bc-quali-sector-top: 20%;
+      position: fixed;
+      top: var(--bc-quali-sector-top);
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 900;
       font-variant-numeric: tabular-nums;
       text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
     }
@@ -791,8 +803,9 @@
       </div>
     </div>
     <!-- Right side (feature: quali-live-sector-delta): the qualifying lap timer where the race lap timer
-         normally sits -- Current (live running lap) / Last (last completed lap) / Best (best lap) -- and,
-         directly under it, the live sector readout. -->
+         normally sits -- Current (live running lap) / Last (last completed lap) / Best (best lap). The live
+         sector readout used to sit under it; it now lives in the centered top overlay below (feature
+         quali-sector-times-top-center). -->
     <div class="bc-tr" ng-if="hud.localEntry">
       <div class="bc-panel bc-timepanel">
         <table class="bc-timeblock">
@@ -810,16 +823,17 @@
           </tr>
         </table>
       </div>
-      <!-- Sector readout: cumulative delta vs your best lap (green ahead / red behind by sign), then the
-           just-completed sector's split time + per-segment delta vs your per-sector best, record-coloured
-           (purple = session best, green = personal best, red = slower than your best). Persists the last
-           completed sector until the next crossing; hidden until the first crossing of the session. -->
-      <div class="bc-quali-sector" ng-if="hud.sector">
-        <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
-             ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
-        <div class="bc-qd-seg"
-             ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
-      </div>
+    </div>
+    <!-- Sector readout (moved out of the right bc-tr column to a centered top overlay by
+         quali-sector-times-top-center): cumulative LAP delta vs your best lap (green ahead / red behind by
+         sign), then the just-completed sector's split time + per-segment delta vs your per-sector best,
+         record-coloured (purple = session best, green = personal best, red = slower than your best). Persists
+         the last completed sector until the next crossing; hidden until the first crossing of the session. -->
+    <div class="bc-quali-sector" ng-if="hud.sector">
+      <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+           ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
+      <div class="bc-qd-seg"
+           ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
     </div>
   </div>
   <!-- Staged sprint quali (ADR-0044/Round4): the rally staggered single-car ramp view. Left: window clock (or
@@ -864,18 +878,19 @@
           </tr>
         </table>
       </div>
-      <!-- Live sector readout (feature: quali-live-sector-delta, extended to the staged sprint in Round 6):
-           the same right-side split display as the circuit quali, adapted to the point-to-point run -- a
-           cumulative delta vs your best complete run (RUN, green ahead / red behind by sign), then the
-           just-completed sector's split + per-segment delta vs your per-sector best, record-coloured (purple
-           session best / green personal best / red slower). Hidden until the first crossing of the run; no
-           reference on the first run shows white (no crash). -->
-      <div class="bc-quali-sector" ng-if="hud.sector">
-        <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
-             ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">RUN</span>{{formatDelta(hud.sector.cumulative)}}</div>
-        <div class="bc-qd-seg"
-             ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
-      </div>
+    </div>
+    <!-- Live sector readout (feature: quali-live-sector-delta, extended to the staged sprint in Round 6;
+         moved out of the right bc-tr column to a centered top overlay by quali-sector-times-top-center):
+         the same split display as the circuit quali, adapted to the point-to-point run -- a cumulative delta
+         vs your best complete run (RUN, green ahead / red behind by sign), then the just-completed sector's
+         split + per-segment delta vs your per-sector best, record-coloured (purple session best / green
+         personal best / red slower). Hidden until the first crossing of the run; no reference on the first
+         run shows white (no crash). -->
+    <div class="bc-quali-sector" ng-if="hud.sector">
+      <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+           ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">RUN</span>{{formatDelta(hud.sector.cumulative)}}</div>
+      <div class="bc-qd-seg"
+           ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
     </div>
   </div>
   <!-- Qualifying results (ADR-0041): the classification that sets the race grid, shown during the pause
