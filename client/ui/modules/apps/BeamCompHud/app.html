@@ -768,8 +768,8 @@
   </div>
   <!-- Qualifying (ADR-0041): the time-boxed session board -- a clock counting the window down and the live
        classification ranked by best lap, fastest on pole. The right-side time block shows the local
-       driver's live lap + best. -->
-  <div ng-if="hud.phase === 'qualifying'">
+       driver's live lap + best. The staged sprint variant (ADR-0044) has its own view below. -->
+  <div ng-if="hud.phase === 'qualifying' && !hud.qualiStaged">
     <div class="bc-tl">
       <div class="bc-quali-head">QUALIFYING</div>
       <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
@@ -817,6 +817,62 @@
       <div class="bc-quali-sector" ng-if="hud.sector">
         <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
              ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
+        <div class="bc-qd-seg"
+             ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
+      </div>
+    </div>
+  </div>
+  <!-- Staged sprint quali (ADR-0044/Round4): the rally staggered single-car ramp view. Left: window clock (or
+       the finish-your-run grace once it expires), a "waiting for driver to start" note while a launched driver
+       clears the ramp, and the holding queue ordered by turn. Right: the local driver's own status line and
+       best complete run time. The per-driver 8 s ramp count rides the shared centered countdown overlay. -->
+  <div ng-if="hud.phase === 'qualifying' && hud.qualiStaged">
+    <div class="bc-tl">
+      <div class="bc-quali-head">QUALIFYING</div>
+      <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
+      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null">FINISH RUN <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiWaiting">Waiting for driver to start</div>
+      <div class="bc-panel bc-standings-panel">
+        <div class="bc-scroll">
+          <table class="bc-standings">
+            <tr ng-repeat="r in hud.qualiQueueSorted"
+                ng-class="{'bc-local': hud.qualiMine && r.slot === hud.qualiMine.slot, 'bc-ai': r.ai}">
+              <td class="bc-pos"><span ng-if="r.status === 'done'">&#10003;</span><span ng-if="r.status !== 'done'">{{r.position != null ? ('P' + r.position) : '--'}}</span></td>
+              <td class="bc-name">{{r.name}}</td>
+              <td class="bc-int">{{qualiRowTime(r)}}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="bc-tr">
+      <div class="bc-panel bc-timepanel">
+        <table class="bc-timeblock">
+          <tr>
+            <td class="bc-tb-label">Queue</td>
+            <td class="bc-tb-value">{{qualiStatusText(hud.qualiMine)}}</td>
+          </tr>
+          <!-- Live run clock while the local driver is on their staged run (Round 4/6): the point-to-point
+               equivalent of the circuit quali's Current lap clock, so the driver sees their run climbing. -->
+          <tr ng-if="hud.qualiMine && hud.qualiMine.status === 'running' && hud.localEntry">
+            <td class="bc-tb-label">Run</td>
+            <td class="bc-tb-value">{{formatTime(hud.localEntry.time)}}</td>
+          </tr>
+          <tr class="bc-tb-best">
+            <td class="bc-tb-label">Best</td>
+            <td class="bc-tb-value">{{hud.qualiMine && hud.qualiMine.best != null ? formatTime(hud.qualiMine.best) : '--'}}</td>
+          </tr>
+        </table>
+      </div>
+      <!-- Live sector readout (feature: quali-live-sector-delta, extended to the staged sprint in Round 6):
+           the same right-side split display as the circuit quali, adapted to the point-to-point run -- a
+           cumulative delta vs your best complete run (RUN, green ahead / red behind by sign), then the
+           just-completed sector's split + per-segment delta vs your per-sector best, record-coloured (purple
+           session best / green personal best / red slower). Hidden until the first crossing of the run; no
+           reference on the first run shows white (no crash). -->
+      <div class="bc-quali-sector" ng-if="hud.sector">
+        <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+             ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">RUN</span>{{formatDelta(hud.sector.cumulative)}}</div>
         <div class="bc-qd-seg"
              ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
       </div>

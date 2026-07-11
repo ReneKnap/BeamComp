@@ -170,6 +170,61 @@ angular.module('beamng.apps')
     return list;
   }
 
+  // Staged sprint quali holding-queue board (ADR-0044): order by the server-assigned position (the staged/
+  // running driver first, then the holding queue), with the already-done drivers (no position) at the back
+  // by slot. Display only -- the server owns the queue + the grid it sets from the best complete run times.
+  function qualiQueueSorted(rows) {
+    var list = (rows || []).slice();
+    list.sort(function (a, b) {
+      var ap = typeof a.position === 'number';
+      var bp = typeof b.position === 'number';
+      if (ap && bp) {
+        return a.position - b.position;
+      }
+      if (ap !== bp) {
+        return ap ? -1 : 1;
+      }
+      return (a.slot || 0) - (b.slot || 0);
+    });
+    return list;
+  }
+
+  // The local driver's staged-quali status line (ADR-0044/Round5) from their own queue row. Uses `queuePos`
+  // -- the 1-based place in the WAITING line only (queuePos 1 = truly next to the ramp) -- NOT `position`,
+  // which counts the staged driver first and so read the second waiter as "next" when the ramp was free (the
+  // recover-requeue "you're next" bug). "You're next" only when the driver is genuinely front of the queue.
+  function qualiStatusText(mine) {
+    if (!mine) {
+      return '';
+    }
+    if (mine.status === 'running') {
+      return 'On your run';
+    }
+    if (mine.status === 'staged') {
+      return 'At the line - get ready';
+    }
+    if (mine.status === 'done') {
+      return 'Run complete';
+    }
+    if (mine.queuePos === 1) {
+      return "You're next";
+    }
+    if (typeof mine.queuePos === 'number') {
+      return 'Queued - ' + (mine.queuePos - 1) + ' ahead';
+    }
+    return 'Queued';
+  }
+
+  // The time cell for a staged-quali board row (ADR-0044/Round6): a driver on their run shows their live
+  // run elapsed (the on-stage car's climbing time, so the board keeps moving through the finish grace),
+  // everyone else their best complete run time (or "--" before their first). Server-relayed numbers only.
+  function qualiRowTime(r) {
+    if (r && r.status === 'running' && typeof r.live === 'number') {
+      return formatTime(r.live);
+    }
+    return (r && typeof r.best === 'number') ? formatTime(r.best) : '--';
+  }
+
   // The local player's full entry (the one flagged isLocal), or null. Resolved from the full field
   // -- not the windowed live rows -- so the header, time block, and results best-lap bind to it even
   // when the local player is scrolled out of the live row window.
@@ -238,6 +293,9 @@ angular.module('beamng.apps')
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
+      // Staged sprint quali status line (ADR-0044) + board row time (ADR-0044/Round6).
+      scope.qualiStatusText = qualiStatusText;
+      scope.qualiRowTime = qualiRowTime;
 
       // UI-presence heartbeat (self-healing HUD: race/hud.lua + the init.lua watchdog). Tell GE this app
       // is alive on link and once a second after. If GE stops hearing it while a race wants the HUD up --
@@ -558,8 +616,13 @@ angular.module('beamng.apps')
           }
           scope.hud.localEntry = findLocalEntry(scope.hud.entries);
           // Qualifying live board (ADR-0041): rank the field by best lap for the quali session view.
+          // Staged sprint quali (ADR-0044) uses the holding-queue board instead (own position/status/best).
           if (scope.hud.phase === 'qualifying') {
-            scope.hud.qualiBoard = qualiBoard(scope.hud.entries);
+            if (scope.hud.qualiStaged) {
+              scope.hud.qualiQueueSorted = qualiQueueSorted(scope.hud.qualiQueue);
+            } else {
+              scope.hud.qualiBoard = qualiBoard(scope.hud.entries);
+            }
           }
           // The quali-results minimize is per-event: clear it outside the results pause so the next
           // qualifying shows the card again (ADR-0041).

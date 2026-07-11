@@ -72,6 +72,21 @@ function M.new(cps)
     }
 end
 
+-- Reset the per-run progress of a tracker for a new run, keeping the accumulated per-sector personal best
+-- (Round 6, staged sprint quali). A circuit quali laps one continuous detector, so a tracker lives one
+-- run; a staged sprint re-arms a fresh detector on every launch (crossing_seq restarts at 0, detector time
+-- restarts at 0), so the sector splits must base from 0 again -- but `personal_best` (and thus the record
+-- colouring vs your own sector bests) is kept across the driver's runs. No-op on a nil tracker.
+function M.reset_run(state)
+    if not state then
+        return
+    end
+    state.prev_time = nil
+    state.lap_start = nil
+    state.seq = 0
+    state.last = nil
+end
+
 -- Record a scored crossing at 0-based plan ordinal `crossing_seq` and detector time `time`. Computes
 -- the just-completed sector into `state.last`:
 --   sector               -- its 1-based index within the lap,
