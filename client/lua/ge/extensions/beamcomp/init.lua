@@ -1161,7 +1161,16 @@ local function handle_race_phase(payload)
             M.state.quali_run = nil
             M.state.detection = nil
             M.state.laptimer = nil
-            M.state.sector_track = nil
+            -- Arm the live sector-delta tracker for the staged run (Round 6): the point-to-point run scores
+            -- each checkpoint once (crossing_seq 0..N-1), so #checkpoints sectors. The tracker persists across
+            -- the driver's runs so the per-sector personal best accumulates; quali_launch_local resets the
+            -- per-run progress on each launch. Feeds the same right-side split readout as the circuit quali.
+            local staged_race = M.state.race
+            if staged_race and staged_race.checkpoints and #staged_race.checkpoints >= 1 then
+                M.state.sector_track = sectors.new(#staged_race.checkpoints)
+            else
+                M.state.sector_track = nil
+            end
             M.state.quali_ai_runs = {}
             M.state.results_min = false
             M.state.analysis_open = false
@@ -1555,7 +1564,8 @@ end
 
 -- Launch the local car at the end of its per-driver count (ADR-0044): show GO, release the freeze, and arm
 -- the checkpoint detector on the real race plan so the Start->Ziel run is scored + reported (the existing
--- path). A sprint has no lap clock / sector tracker. Re-arm the ramp-clear report for this run.
+-- path). A sprint has no lap clock; the sector tracker's per-run progress is reset here (Round 6). Re-arm
+-- the ramp-clear report for this run.
 local function quali_launch_local()
     M.state.quali_run = nil
     M.state.quali_status = "running"
@@ -1578,6 +1588,9 @@ local function quali_launch_local()
         log("W", RACE_LOG_TAG, "staged quali launch: no race plan; detection disabled")
     end
     M.state.laptimer = nil
+    -- New run: base the sector splits from 0 again (fresh detector, crossing_seq restarts) while keeping the
+    -- accumulated per-sector personal best for the record colouring (Round 6).
+    sectors.reset_run(M.state.sector_track)
 end
 
 -- Find one of the owner's AI cars by its synthetic id, or nil.
@@ -4105,27 +4118,52 @@ local function build_hud_snapshot()
     ) or false
 
     -- Qualifying live sector readout (feature: quali-live-sector-delta): the just-completed sector's split
-    -- time, a per-segment delta vs your per-sector personal best, a cumulative delta vs your fastest lap,
-    -- and a motorsport record class (purple session best / green personal best / normal). Circuit quali only
-    -- (sector_track nil otherwise); persists the last completed sector until the next crossing. All derived
-    -- here from the tracker + the broadcast splits (ADR-0015) so the app stays a dumb renderer.
+    -- time, a per-segment delta vs your per-sector personal best, a cumulative delta vs your fastest run,
+    -- and a motorsport record class (purple session best / green personal best / normal). Persists the last
+    -- completed sector until the next crossing. All derived here from the tracker + the reference splits so
+    -- the app stays a dumb renderer.
     local sector_info = nil
     local sector_track = M.state.sector_track
-    if phase == "qualifying" and sector_track and sector_track.last then
+    local show_sector = phase == "qualifying" and sector_track and sector_track.last
+    -- The staged sprint (Round 6) only shows the readout while the local driver is actually on their run;
+    -- between runs the tracker's last sector would otherwise linger. Circuit persists it as before.
+    if show_sector and M.state.quali_staged and M.state.quali_status ~= "running" then
+        show_sector = false
+    end
+    if show_sector then
         local cps = (race and race.checkpoints) and #race.checkpoints or 0
         if cps >= 1 then
             local last = sector_track.last
-            local session_ref = sectors.session_reference(entries, cps)
-            local session_best = session_ref and session_ref[last.sector] or nil
-            -- Cumulative delta vs your fastest lap: this lap's time through the sector minus that lap's.
-            local cumulative = nil
-            if local_entry then
-                local best_sections = sectors.personal_reference(local_entry.splits, local_entry.run_up, cps)
-                local best_cumulative = best_sections
-                    and sectors.cumulative_through(best_sections, last.sector) or nil
-                if type(best_cumulative) == "number" then
-                    cumulative = last.lap_cumulative - best_cumulative
+            -- Reference source differs by variant (Round 6). The circuit laps one continuous detector, so the
+            -- personal + session sector references come from the live standings splits. The staged sprint
+            -- wipes a driver's splits on every requeue, so the reference is the server-relayed best COMPLETE
+            -- run splits carried per row on the queue snapshot (quali.bestSplits); there is no run-up (the run
+            -- starts at the ramp = the line).
+            local personal_splits, personal_run_up, session_source
+            if M.state.quali_staged then
+                local mine = quali_local_row(my_slot)
+                personal_splits = mine and mine.bestSplits or nil
+                personal_run_up = nil
+                session_source = {}
+                for _, row in ipairs((M.state.quali_queue and M.state.quali_queue.rows) or {}) do
+                    if type(row.bestSplits) == "table" then
+                        session_source[#session_source + 1] = {splits = row.bestSplits}
+                    end
                 end
+            else
+                personal_splits = local_entry and local_entry.splits or nil
+                personal_run_up = local_entry and local_entry.run_up or nil
+                session_source = entries
+            end
+            local session_ref = sectors.session_reference(session_source, cps)
+            local session_best = session_ref and session_ref[last.sector] or nil
+            -- Cumulative delta vs your fastest run: this run's time through the sector minus that run's.
+            local best_sections = sectors.personal_reference(personal_splits, personal_run_up, cps)
+            local best_cumulative = best_sections
+                and sectors.cumulative_through(best_sections, last.sector) or nil
+            local cumulative = nil
+            if type(best_cumulative) == "number" then
+                cumulative = last.lap_cumulative - best_cumulative
             end
             sector_info = {
                 sector = last.sector,
@@ -4133,7 +4171,7 @@ local function build_hud_snapshot()
                 -- Per-segment delta vs your prior personal best for this sector (nil the first time).
                 splitDelta = (last.prev_personal_best ~= nil)
                     and (last.split - last.prev_personal_best) or nil,
-                cumulative = cumulative,  -- vs fastest lap (nil until a lap is complete)
+                cumulative = cumulative,  -- vs fastest run (nil until a run is complete)
                 record = sectors.record_class(last.split, last.prev_personal_best, session_best),
             }
         end
