@@ -1505,20 +1505,21 @@ quali.MSG_QUEUE = "qualiQueue"    -- holding-queue snapshot for the staged-quali
 quali.MSG_STAGE = "qualiStage"    -- "you're up": stage at the ramp and run the per-driver count (to driver / owner+aiId)
 quali.MSG_HOLD = "qualiHold"      -- return to your holding slot (or stop in place) (to driver / owner+aiId)
 quali.MSG_RESET = "qualiReset"    -- client->server: I hit recover, requeue me to the back of the queue
-quali.MSG_CLEARED = "qualiCleared"-- client->server: the launched driver has cleared the ramp (>=10 m; Round 4)
+quali.MSG_CLEARED = "qualiCleared"-- client->server: the launched driver has cleared the ramp (>=15 m; Round 4)
 
 -- Rally staged sprint quali timing (ADR-0044/Round4): a driver is teleported from its holding slot onto the
 -- ramp, counts down STAGE_COUNTDOWN, then launches; the NEXT driver is not staged until the launcher has both
--- physically cleared the ramp (the client >=10 m gate) AND STAGE_GAP has passed since GO. The per-driver
+-- physically cleared the ramp (the client >=15 m gate) AND STAGE_GAP has passed since GO. The per-driver
 -- count is rendered client-side; the server only paces on these timers, holding no geometry (race-blind).
 quali.STAGE_COUNTDOWN = 8.0 -- start count at the ramp (8 -> GO), then the driver launches; NO pre-settle
                             -- (Round 4: the driver is teleported onto the ramp and the count begins at once)
 -- Clearance countdown AFTER a driver launches and BEFORE the next is teleported onto the ramp, so the next
 -- never spawns into the one just driving off. Round 4: the next stages only once BOTH this gap has passed
--- AND the launched driver has physically cleared the ramp (the >=10 m gate the client reports, quali.MSG_CLEARED).
-quali.STAGE_GAP = 3.0
+-- AND the launched driver has physically cleared the ramp (the >=15 m gate the client reports, quali.MSG_CLEARED).
+quali.STAGE_GAP = 5.0
 -- Fallback so a stuck/AFK driver who never clears the ramp cannot stall the whole field: proceed anyway this
--- long after the launch even without the clear report (Round 4). The client 10 m gate normally fires first.
+-- long after the launch even without the clear report (Round 4). The client 15 m gate normally fires first.
+-- Stays well above STAGE_GAP (5 s) so the raised gap never collides with this stuck-driver fallback.
 quali.STAGE_CLEAR_TIMEOUT = 20.0
 
 -- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
@@ -1584,7 +1585,7 @@ function quali.begin(duration, staged)
         staged_at = nil,    -- now() when staging_id was released (its count ends STAGE_COUNTDOWN later)
         clearing_id = nil,  -- the id that launched but has not yet cleared the ramp (blocks the next), or nil
         launched_at = nil,  -- now() when clearing_id launched (GO); the clearance gap runs from here
-        cleared = false,    -- true once clearing_id reported it is >=10 m clear of the ramp (Round 4 gate)
+        cleared = false,    -- true once clearing_id reported it is >=15 m clear of the ramp (Round 4 gate)
         status = nil,       -- per-id "queued|staged|running|done" for the HUD (seeded by start_session)
         best = nil,         -- per-identity best complete run time in seconds (ADR-0031)
     }
@@ -2091,7 +2092,7 @@ function quali.handle_reset(player_id, payload)
     log_info("beamcomp.race", "player " .. tostring(player_id) .. " recover -> requeued (staged quali)")
 end
 
--- The launched driver has cleared the ramp (client->server qualiCleared, ADR-0044/Round4): the >=10 m gate
+-- The launched driver has cleared the ramp (client->server qualiCleared, ADR-0044/Round4): the >=15 m gate
 -- the client (player, or the owner for an AI) reports, so the next driver may stage once the clearance gap
 -- has also passed. Accepted only for the current clearing driver: a player reports its own clear; the owner
 -- reports an AI's with aiId. A stale/spoofed report for anyone else is dropped.
@@ -2125,7 +2126,7 @@ end
 
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
 -- the staged driver counts for STAGE_COUNTDOWN, then launches (-> clearing_id); the next driver is not staged
--- until the launcher has BOTH cleared the ramp (the client >=10 m report, or the STAGE_CLEAR_TIMEOUT fallback)
+-- until the launcher has BOTH cleared the ramp (the client >=15 m report, or the STAGE_CLEAR_TIMEOUT fallback)
 -- AND the STAGE_GAP clearance has passed. The waiting field stays put on their fixed slots (no roll-forward).
 -- When the window expires, stop releasing and arm a finish-your-run grace, then classify. Circuit uses
 -- quali.advance_qualifying instead.
@@ -2155,7 +2156,7 @@ function quali.advance_staged()
         changed = true
     end
 
-    -- The launched driver has cleared the ramp: both the >=10 m gate (q.cleared, client-reported) and the
+    -- The launched driver has cleared the ramp: both the >=15 m gate (q.cleared, client-reported) and the
     -- clearance gap have passed -- OR the stuck-driver timeout fires. Free the ramp for the next.
     if q.clearing_id then
         local gate_ok = q.cleared and t >= (q.launched_at or 0) + quali.STAGE_GAP
@@ -5382,7 +5383,7 @@ local function handle_client_event(player_id, data)
         -- Staged sprint quali (ADR-0044): a player hit recover -> requeue to the back for a new attempt.
         quali.handle_reset(player_id, decoded.payload)
     elseif decoded.type == quali.MSG_CLEARED then
-        -- Staged sprint quali (ADR-0044/Round4): the launched driver cleared the ramp (>=10 m gate).
+        -- Staged sprint quali (ADR-0044/Round4): the launched driver cleared the ramp (>=15 m gate).
         quali.handle_cleared(player_id, decoded.payload)
     elseif decoded.type == "raceControl" then
         -- Panel-triggered race stop (ADR-0038 amendment): delegate to the existing chat-command handlers so
