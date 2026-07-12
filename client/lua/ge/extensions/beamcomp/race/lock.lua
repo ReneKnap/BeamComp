@@ -10,8 +10,9 @@
 --   1. core_input_actionFilter -- BeamNG's own input-action blocker (the mechanism scenarios use).
 --      We block the switch / vehicle-selector / parts-selector / reload keys (no car swap or extra
 --      spawn) and the teleport/reset family (no alternative recover/repair route). recover_vehicle /
---      recover_vehicle_alt are deliberately NOT blocked here: the VE recovery override owns them so
---      the opt-in recover/repair assists can use those keys.
+--      recover_vehicle_alt are deliberately NOT in this group: the VE recovery override owns them so
+--      the opt-in recover/repair assists can use those keys. (They ARE blocked by the separate hold
+--      lock below, but only while a qualifying driver is being held put.)
 --   2. A guard on core_vehicles.spawnNewVehicle / replaceVehicle. The action filter only blocks key
 --      bindings; the vehicle selector is also reachable from the Esc/UI menu, which is not an input
 --      action. Guarding the spawn/replace functions themselves closes that route too. BeamComp's own
@@ -26,6 +27,10 @@
 --     bounce target, VE re-arm).
 --   * full -- the original fixed-car lock. install() with no opts, or re-installed at countdown to
 --     upgrade the staging lock: setGroup redefines the action group and the replace guard is added.
+--
+-- On top of those, an independent HOLD LOCK (ADR-0017 amendment, quali-hold-reset-and-repaint-leak)
+-- blocks the two recover keys for the span of a qualifying hold -- see set_recover_blocked below. It is
+-- a separate action group with its own toggle, so it composes with either mode above without touching it.
 
 local M = {}
 
@@ -40,6 +45,11 @@ M.replace_seen = false
 -- its own named group on filter 0, so we only ever flip our group on/off and never clear(0).
 local FILTER_ID = 0
 local ACTION_GROUP = "beamcomp_race_lock"
+
+-- Second action group on the SAME filter, toggled independently of the race lock (set_recover_blocked).
+-- BeamNG keys blocked groups per filter and re-applies every flagged one on each update
+-- (core/input/actionFilter.lua), so the two groups never interfere.
+local HOLD_ACTION_GROUP = "beamcomp_race_hold_lock"
 
 -- Input actions hard-blocked for the duration of the race. Only the two hold-capable recover keys
 -- are REPURPOSED into the assists (recover_vehicle = Insert, recover_vehicle_alt = Ctrl+Insert) via
@@ -79,6 +89,16 @@ local BLOCKED_ACTIONS = {
 local SELECTOR_ACTIONS = {
     "vehicle_selector",
     "parts_selector",
+}
+
+-- The two recover keys, blocked only for the span of a qualifying hold (set_recover_blocked). Absent from
+-- BLOCKED_ACTIONS because the assists own them for every other phase; blocking them here -- at the engine's
+-- input filter rather than only GE-side -- is what also closes the window right after a vehicle-config
+-- respawn, where the VE recovery override has been reloaded away and the keys are momentarily vanilla.
+-- Both names are taken verbatim from the engine's own `vehicleTeleporting` action template.
+local HOLD_ACTIONS = {
+    "recover_vehicle",
+    "recover_vehicle_alt",
 }
 
 -- Keys for stashing the original core_vehicles functions. Stored ON the core_vehicles table (not in
@@ -137,6 +157,24 @@ local function set_action_filter(blocked, allow_replace)
     end)
     if not ok then
         log("W", LOG_TAG, "action filter update failed: " .. tostring(err))
+    end
+end
+
+-- Block or unblock the two recover keys, independently of the race lock's own group. Same pcall guard as
+-- set_action_filter: the input API is engine-version-coupled, and a wrong action name no-ops silently, so
+-- the caller keeps a GE-side guard as a second layer.
+local function set_hold_filter(blocked)
+    if type(core_input_actionFilter) ~= "table" then
+        return
+    end
+    local ok, err = pcall(function()
+        if blocked then
+            core_input_actionFilter.setGroup(HOLD_ACTION_GROUP, HOLD_ACTIONS)
+        end
+        core_input_actionFilter.addAction(FILTER_ID, HOLD_ACTION_GROUP, blocked)
+    end)
+    if not ok then
+        log("W", LOG_TAG, "hold filter update failed: " .. tostring(err))
     end
 end
 
@@ -201,10 +239,27 @@ function M.install(opts)
         .. (allow_replace and "swap-allowed" or "full") .. ")")
 end
 
+-- Block or unblock the two recover keys for a qualifying hold (ADR-0017 amendment): while a driver waits in
+-- the queue, sits staged at the ramp, or is done for the session, the hold must actually hold -- and a
+-- frozen car satisfies the assists' stationary gate, so an unblocked recover key would happily free it.
+-- A separate group from the race lock, so the in-run recover-requeue (ADR-0044) and the in-race assists
+-- keep both keys in every state that is NOT held.
+--
+-- Deliberately unconditional (no internal "already applied" flag): a Lua reload resets this module's state
+-- while the engine's filter state survives (actionFilter serializes it), so an internal flag could desync
+-- and strand the keys blocked. The caller owns the change detection against its own reload-surviving state.
+function M.set_recover_blocked(blocked)
+    set_hold_filter(blocked == true)
+    log("I", LOG_TAG, "recover keys " .. (blocked and "blocked (quali hold)" or "released"))
+end
+
 -- Lift the lock: unblock the input actions and restore the spawn/replace functions. Idempotent, so
--- it is safe to call on lobby, on a fresh race start, and on extension unload.
+-- it is safe to call on lobby, on a fresh race start, and on extension unload. Clears the hold group too --
+-- without that, a race ending while a driver is held would leave the recover keys dead in the finished
+-- free-roam window and the lobby.
 function M.remove()
     set_action_filter(false)
+    set_hold_filter(false)
     unguard_core_vehicles()
     M.replace_seen = false
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
