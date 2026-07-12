@@ -919,8 +919,9 @@ track.MSG_DATA = "trackData"      -- server -> a needing client: the serialized 
 
 track.content = {}   -- raceId -> the opaque prefab-content blob, cached for this server's lifetime
 track.waiting = {}   -- raceId -> {player_id -> true}: who asked while no blob was cached yet
+track.probed = {}    -- raceId -> true: the races the SERVER itself announced; only these are ever served
+track.fetching = {}  -- raceId -> true: an upload we have asked the CURRENT issuer for (one per race)
 track.owner_id = nil -- the last validated race's issuer: the one client known to hold the files
-track.fetch_race = nil -- raceId of the upload we have asked for, so one request is in flight per race
 
 -- Announce a validated race to everyone but its issuer, so a client without the files can pull them now
 -- rather than at the start. Records the issuer as the client to fetch from -- it just parsed this race for
@@ -929,11 +930,14 @@ function track.probe(race_id, owner_id)
     if type(race_id) ~= "string" or race_id == "" then
         return
     end
+    -- A DIFFERENT issuer voids every request we still have outstanding: those were addressed to the old
+    -- one, which may well be gone. Only on a change, though -- the same admin queuing a second race must
+    -- not invalidate the upload that the *running* race's clients are still waiting on.
+    if track.owner_id ~= owner_id then
+        track.fetching = {}
+    end
     track.owner_id = owner_id
-    -- Drop any request still marked in flight. A new validation means a new issuer to ask, and an old
-    -- request may be waiting on a client that has since disconnected -- without this, that race id would
-    -- stay "already asked" forever and its scenery could never be fetched again.
-    track.fetch_race = nil
+    track.probed[race_id] = true
     for player_id in pairs(MP.GetPlayers()) do
         if player_id ~= owner_id then
             send_event(player_id, track.MSG_PROBE, {raceId = race_id})
@@ -949,6 +953,17 @@ function track.handle_need(player_id, payload)
     end
     local race_id = payload.raceId
 
+    -- Only ever service a race the server itself announced. Without this, any client could name an
+    -- arbitrary string and have us order the ISSUER's client to resolve and parse it -- unbounded work on
+    -- someone else's machine, driven from the network, once per made-up id. Everything legitimate is
+    -- covered: a probe answer echoes an id we sent, and the race-start backstop's id was probed in
+    -- commit_validated_race, which is the only way into a race at all.
+    if not track.probed[race_id] then
+        log_info("beamcomp.track", "ignored track request for an unannounced race from id "
+            .. tostring(player_id))
+        return
+    end
+
     local cached = track.content[race_id]
     if cached then
         send_event(player_id, track.MSG_DATA, {raceId = race_id, prefabContent = cached})
@@ -962,32 +977,33 @@ function track.handle_need(player_id, payload)
     end
     waiting[player_id] = true
 
-    if track.fetch_race == race_id then
+    if track.fetching[race_id] then
         return  -- already asked; this client rides the same upload
     end
     if not track.owner_id then
         log_info("beamcomp.track", "no issuer to fetch '" .. race_id .. "' from")
         return
     end
-    track.fetch_race = race_id
+    track.fetching[race_id] = true
     send_event(track.owner_id, track.MSG_FETCH, {raceId = race_id})
 end
 
--- The issuer's serialized scenery. Accepted ONLY from the client we asked and ONLY for the race we asked
--- about: this content is written to disk and spawned as scene objects on every receiver, so an unguarded
--- upload would let any client poison the cache and spawn arbitrary objects on everyone else (the same
--- owner/nonce discipline as the ADR-0019 handshake). Cached opaquely, then fanned out to whoever waited.
+-- The issuer's serialized scenery. Accepted ONLY from the client we asked and ONLY for a race we actually
+-- asked it about: this content is written to disk and spawned as scene objects on every receiver, so an
+-- unguarded upload would let any client poison the cache and spawn arbitrary objects on everyone else (the
+-- same owner discipline as the ADR-0019 handshake). Cached opaquely, then fanned out to whoever waited.
+-- The request is cleared before caching, so a second upload for the same race can never overwrite it.
 function track.handle_upload(player_id, payload)
     if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
         return
     end
-    if player_id ~= track.owner_id or payload.raceId ~= track.fetch_race then
+    if player_id ~= track.owner_id or not track.fetching[payload.raceId] then
         log_info("beamcomp.track", "dropped unsolicited track upload from id " .. tostring(player_id))
         return
     end
 
     local race_id = payload.raceId
-    track.fetch_race = nil
+    track.fetching[race_id] = nil
     -- An empty list is a legitimate answer (a race with no prefabs, or one the issuer could not read):
     -- cache it too, so the waiting clients are released instead of hanging on a fetch that never repeats.
     local content = type(payload.prefabContent) == "table" and payload.prefabContent or {}
