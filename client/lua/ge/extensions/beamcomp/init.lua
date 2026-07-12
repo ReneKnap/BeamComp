@@ -153,7 +153,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-sector-purple/2026-07-12"
+local BUILD_MARKER = "quali-polish/2026-07-12"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -242,7 +242,7 @@ M.state = {
     quali_run = nil,          -- local per-driver run (qualisprint.new_run) while counting to GO at the ramp, or nil
     quali_queue = nil,        -- latest server-broadcast staged queue snapshot {rows, waiting}, for the HUD; or nil
     quali_ai_runs = nil,      -- host only: {[ai id] = per-driver run} for AI currently counting at the ramp, or nil
-    quali_clear_sent = false, -- local driver has reported clearing the ramp (>=10 m) for its current run (Round 4)
+    quali_clear_sent = false, -- local driver has reported clearing the ramp (>=15 m) for its current run (Round 4)
     quali_ai_cleared = nil,   -- host only: {[ai id] = true} once a launched AI has reported clearing the ramp
 }
 
@@ -1527,7 +1527,9 @@ local function quali_place_own(pose)
 end
 
 -- Distance (m) the launched driver must be from the ramp before the next may stage (ADR-0044/Round4 gate).
-local STAGE_CLEAR_DIST = 10.0
+-- Paired with the server's quali.STAGE_GAP (5 s): the next stages only once BOTH are satisfied. Raise either
+-- to give the next driver more room behind the one launching.
+local STAGE_CLEAR_DIST = 15.0
 
 -- The dedicated P1 start ramp pose (ADR-0044/Round4), split off the front of the grid so P1 is empty at the
 -- start; the active driver is teleported here for their run. nil for a normal race / circuit quali.
@@ -1546,7 +1548,7 @@ local function quali_own_hold_pose(slot)
     return poses[slot + 1]
 end
 
--- Distance from a vehicle to the ramp (ADR-0044/Round4), or nil if unavailable. Used for the >=10 m gate.
+-- Distance from a vehicle to the ramp (ADR-0044/Round4), or nil if unavailable. Used for the >=15 m gate.
 local function quali_dist_from_ramp(veh)
     local ramp = quali_ramp_pose()
     if not veh or type(ramp) ~= "table" or type(ramp.pos) ~= "table" then
@@ -1569,7 +1571,7 @@ end
 local function quali_launch_local()
     M.state.quali_run = nil
     M.state.quali_status = "running"
-    M.state.quali_clear_sent = false  -- report once we clear the ramp (>=10 m)
+    M.state.quali_clear_sent = false  -- report once we clear the ramp (>=15 m)
     countdown.show_go()
     countdown.play_go()
     local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
@@ -1758,7 +1760,7 @@ local function quali_request_requeue()
     log("I", RACE_LOG_TAG, "staged quali: requeued self on recover")
 end
 
--- Report to the server when the just-launched driver has cleared the ramp (>=10 m, ADR-0044/Round4), so the
+-- Report to the server when the just-launched driver has cleared the ramp (>=15 m, ADR-0044/Round4), so the
 -- next may stage. Once per run: the local player reports its own car; the owner reports each launched AI.
 local function step_quali_clearing()
     if M.state.quali_status == "running" and not M.state.quali_clear_sent
