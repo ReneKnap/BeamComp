@@ -210,39 +210,24 @@ local function resolve_race(payload)
     return race, locator, nil
 end
 
--- ===== race-distribution policy (ADR-0039 / ADR-0046) ====================================
--- Two switches govern how much of the race the host ships through the pre-flight handshake. Declared
--- here, above both the builders (M.validate) and the consumer (resolve_race_for_prepare), so one block
--- states the whole policy.
+-- ===== race distribution (ADR-0039 / ADR-0046) ===========================================
+-- A client without the race installed still races it: the issuer serializes the race and the race-blind
+-- server relays it. The GEOMETRY (raceData) rides the raceStart -- it is small and needed the moment
+-- M.prepare runs. The SCENERY is tens of KB and is pulled separately, on demand and ahead of the start
+-- (ADR-0046), so it never bloats the race-start seam and is only ever sent to clients that lack the files.
 
 -- ADR-0039 decision 6: with the file installed a client parses locally (no behavior change); a file-less
 -- client builds from the host's relayed definition. Flip this to true to make the relayed model the
 -- PRIMARY source (local parse becomes the fallback), once the 2-client perf/size check clears it.
 local PREFER_RELAYED_RACE_DATA = false
 
--- ADR-0046: whether the host also ships the race's STATIC SCENERY (barriers/signs/arrows) as full prefab
--- file text, so a file-less client can spawn it. Off by default -- it is the single biggest thing on the
--- wire (measured: ~55 KB of a 59 KB raceValidation on 017-OffRoad) and on a server where everyone has the
--- track installed it is decoded, relayed once per player inside raceStart, and then thrown away, every
--- single race start (bug offroad-race-massive-network-payload-lag).
---
--- What a file-less client loses with this off is exactly the degradation ADR-0039 decision 5 sanctions:
--- no barriers/signs. Its GEOMETRY still ships (raceData, always -- start positions + checkpoints), so it
--- spawns on the exact grid, is scored identically and cannot shortcut the race; the cones still reach it
--- too (host-spawned + BeamMP-synced, never relayed -- ADR-0020/0025). Turn this on if players race tracks
--- they do not have installed and the scenery matters more than the payload.
-local DISTRIBUTE_PREFAB_CONTENT = false
+-- Scenery this client pulled from the server, per race: raceId -> the temp vpaths it was materialized to.
+-- Kept for the session, so a track is fetched ONCE however often it is raced. Cleared by an extension
+-- reload, which just means the next race re-pulls it (the server serves it straight from its cache).
+local track_cache = {}
 
--- Ship the statics whenever the relayed model is PRIMARY: then every client -- not just a file-less one --
--- builds its props from the relay, so withholding the content would strip the scenery from the whole
--- field. Coupling the two switches here means the ADR-0039 decision-6 promotion stays a one-line change.
-local function ships_prefab_content()
-    return DISTRIBUTE_PREFAB_CONTENT or PREFER_RELAYED_RACE_DATA
-end
-
--- The encoded size of a relayed blob, in bytes -- the measurement the payload fix rests on. Size only,
--- never content. pcall-guarded and non-fatal (-1 = could not encode): a measurement must never be the
--- thing that breaks a race start.
+-- The encoded size of a blob, in bytes -- for the payload-size log points. Size only, never content.
+-- pcall-guarded and non-fatal (-1 = could not encode): a measurement must never break a race start.
 local function encoded_size(value)
     if value == nil then
         return 0
@@ -253,7 +238,7 @@ local function encoded_size(value)
     end
     return #encoded
 end
--- ===== end race-distribution policy ======================================================
+-- ===== end race distribution =============================================================
 
 -- The host's serialized race definition for a file-less client (ADR-0039): only the normalized model a
 -- relayed M.prepare needs -- start positions, checkpoints, meta. routePoints and the local prop paths are
@@ -343,36 +328,31 @@ function M.validate(payload)
         staged_quali = not closed
     end
 
-    -- Geometry always ships; the statics only when the relay is actually consumed (ADR-0046). They are
-    -- built either way -- local file reads, once per /race, on the host only -- so the size line below can
-    -- state what the gate is holding back. That keeps the trade-off in the log instead of in folklore: a
-    -- future "why does my friend see no barriers?" has a breadcrumb, and the payload measurement the fix
-    -- rests on stays reproducible (bug offroad-race-massive-network-payload-lag).
+    -- Only the GEOMETRY goes with the verdict (ADR-0046). The scenery used to ride along here and be
+    -- relayed into every player's raceStart -- tens of KB, on every start, thrown away by everyone who has
+    -- the track. It is now pulled on demand instead (M.track_content, answering a trackFetch), so the host
+    -- does not even read the prefab files unless somebody actually needs them.
     local race_data = build_race_data(race, locator)
-    local prefab_content = build_prefab_content(race)
-    local ships_statics = ships_prefab_content()
-    log("I", LOG_TAG, string.format(
-        "distribution '%s': raceData=%d B, prefabContent=%d B in %d prefab(s) -- statics %s",
-        tostring(locator.id), encoded_size(race_data), encoded_size(prefab_content),
-        #prefab_content, ships_statics and "shipped" or "withheld (ADR-0046)"))
+    log("I", LOG_TAG, string.format("distribution '%s': raceData=%d B (scenery on demand)",
+        tostring(locator.id), encoded_size(race_data)))
 
     return {
         ok = true,
         raceId = locator.id,
         aiDefaults = race.meta and race.meta.aiDefaults,
         raceData = race_data,
-        prefabContent = ships_statics and prefab_content or nil,
         stagedQuali = staged_quali,
     }
 end
 
--- Reconstruct the parsed race model + locator from the host's relayed definition (ADR-0039). The host
--- ships only the geometry, so the prop side the consumer owns is rebuilt here: the shipped statics are
--- materialized to temp vpaths (best-effort), and cones stay host-only (BeamMP-synced, never spawned
--- here). Guards the map -- the relayed coordinates are world-absolute and valid only on the race's own
--- map, so a client elsewhere refuses rather than spawn at alien coordinates. Returns race, locator on
--- success, or nil plus a reason.
-local function race_from_distribution(race_data, prefab_content)
+-- Reconstruct the parsed race model + locator from the host's relayed definition (ADR-0039). The relay
+-- carries geometry only, so the prop side the consumer owns is rebuilt here from whatever scenery this
+-- client has already pulled for the race (ADR-0046); an empty list is fine and expected when the pull is
+-- still in flight -- the props are loaded the moment it lands (init.handle_track_data). Cones stay
+-- host-only (BeamMP-synced, never spawned here). Guards the map -- the relayed coordinates are
+-- world-absolute and valid only on the race's own map, so a client elsewhere refuses rather than spawn at
+-- alien coordinates. Returns race, locator on success, or nil plus a reason.
+local function race_from_distribution(race_data)
     if type(race_data) ~= "table" or type(race_data.race) ~= "table"
         or type(race_data.locator) ~= "table" then
         return nil, "no relayed race definition"
@@ -387,7 +367,7 @@ local function race_from_distribution(race_data, prefab_content)
 
     local race = race_data.race
     race.props = {
-        prefabFiles = prefab.materialize(prefab_content),
+        prefabFiles = track_cache[locator.id] or {},
         coneFiles = {},
     }
     return race, locator
@@ -395,27 +375,28 @@ end
 
 -- Resolve a raceStart payload to its parsed race model + locator (ADR-0039): a client with the file
 -- parses locally (unchanged), a file-less client falls back to the host's relayed definition. The flag
--- above flips the order so the relayed model can become primary. Returns race, locator or nil + reason.
+-- above flips the order so the relayed model can become primary. Returns race, locator, reason, relayed --
+-- the last one telling the caller this race was built from the relay, so it knows to make sure the scenery
+-- has been pulled (ADR-0046) without re-parsing anything to find out.
 local function resolve_race_for_prepare(payload)
     local has_relayed = type(payload.raceData) == "table"
 
     if PREFER_RELAYED_RACE_DATA and has_relayed then
-        local race, locator = race_from_distribution(payload.raceData, payload.prefabContent)
+        local race, locator = race_from_distribution(payload.raceData)
         if race then
-            return race, locator
+            return race, locator, nil, true
         end
     end
 
     local race, locator, err = resolve_race(payload)
     if race then
-        return race, locator
+        return race, locator, nil, false
     end
 
     if has_relayed then
-        local relayed_race, relayed_locator_or_err = race_from_distribution(payload.raceData,
-            payload.prefabContent)
+        local relayed_race, relayed_locator_or_err = race_from_distribution(payload.raceData)
         if relayed_race then
-            return relayed_race, relayed_locator_or_err
+            return relayed_race, relayed_locator_or_err, nil, true
         end
         return nil, nil, relayed_locator_or_err
     end
@@ -455,7 +436,7 @@ function M.prepare(payload)
         return nil, "malformed raceStart payload"
     end
 
-    local race, locator, err = resolve_race_for_prepare(payload)
+    local race, locator, err, relayed = resolve_race_for_prepare(payload)
     if not race then
         return nil, err
     end
@@ -542,6 +523,11 @@ function M.prepare(payload)
         -- normal race / circuit quali (no separate ramp).
         rampPose = ramp_pose,
         roster = roster,
+        -- This race was built from the host's relayed definition, i.e. we do NOT have the track installed
+        -- (ADR-0039). The caller uses it to make sure the scenery has actually been pulled (ADR-0046):
+        -- with an empty prefabFiles the pull is still in flight (or was missed), and the props are loaded
+        -- as soon as it lands. A client that parsed locally never needs any of that.
+        relayed = relayed or nil,
         prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
         -- The host-only cone source (ADR-0025): the quickrace track prefab whose cone vehicles the host
         -- spawns once for BeamMP to sync. Empty for missions (their cones ride in prefabFiles). Not run
@@ -637,6 +623,68 @@ function M.resolve_id(race_name)
         return nil, "race not found: '" .. race_name .. "'"
     end
     return locator.id
+end
+
+-- ===== the on-demand scenery pull (ADR-0046) =============================================
+-- Four seams, all driven from init.lua's message handlers:
+--   needs_track   -- answer the server's trackProbe: do I have to pull this race's scenery?
+--   track_content -- the issuer answers a trackFetch: serialize the scenery it alone has on disk.
+--   absorb_track  -- a trackData landed: write it out and remember it for the rest of the session.
+--   track_prefabs -- the materialized paths for a race + direction, to hand to props.load.
+
+-- Whether this client must pull the scenery for `race_id`: only when it cannot find the race locally
+-- (then it has no prefab files to spawn) and has not already pulled it this session. Discovery-only --
+-- no parse -- so answering a probe stays cheap on the clients that DO have the track, which is everyone,
+-- normally. A local file that exists but fails to parse slips through here; the backstop at race start
+-- (state.relayed with no prefabFiles, init.lua) catches exactly that case.
+function M.needs_track(race_id)
+    if type(race_id) ~= "string" or race_id == "" then
+        return false
+    end
+    if track_cache[race_id] then
+        return false
+    end
+    return M.resolve_id(race_id) == nil
+end
+
+-- The scenery for `race_id`, serialized for a client that lacks it (ADR-0039 decision 2: statics only --
+-- the cone VEHICLES are dropped, because the host spawns those and BeamMP syncs them to everyone, so
+-- relaying them would spawn them twice, ADR-0020). Only the race's issuer is ever asked for this, and it
+-- provably holds the files: it just parsed the race for its pre-flight verdict. Returns the content list
+-- (possibly empty) or nil if the race cannot be resolved here after all.
+function M.track_content(race_id)
+    local race = resolve_race({race = race_id, all = true})
+    if not race then
+        log("W", LOG_TAG, "asked for track '" .. tostring(race_id) .. "' but cannot resolve it locally")
+        return nil
+    end
+    local content = build_prefab_content(race)
+    log("I", LOG_TAG, string.format("track '%s': serialized %d prefab(s), %d B",
+        tostring(race_id), #content, encoded_size(content)))
+    return content
+end
+
+-- Materialize a pulled scenery blob to temp vpaths and remember them for the session, so this track is
+-- only ever pulled once however often it is raced. Returns the written paths (best-effort: an entry that
+-- cannot be written is skipped -- geometry is independent, so a missing barrier never blocks the race).
+function M.absorb_track(race_id, content)
+    if type(race_id) ~= "string" or race_id == "" or type(content) ~= "table" then
+        return {}
+    end
+    local paths = prefab.materialize(content)
+    track_cache[race_id] = paths
+    log("I", LOG_TAG, string.format("track '%s': pulled %d prefab(s), %d B",
+        race_id, #content, encoded_size(content)))
+    return paths
+end
+
+-- The pulled prefabs for a race, filtered to the ones this direction spawns (the same filter a locally
+-- parsed race goes through). Empty when nothing has been pulled for it.
+function M.track_prefabs(race_id, direction)
+    if type(race_id) ~= "string" then
+        return {}
+    end
+    return direction_prefabs(track_cache[race_id] or {}, direction)
 end
 
 return M

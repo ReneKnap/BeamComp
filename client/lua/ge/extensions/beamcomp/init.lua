@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "payload-gate/2026-07-12"
+local BUILD_MARKER = "track-prefetch/2026-07-13"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -412,6 +412,16 @@ local function handle_race_start(payload)
     end
 
     M.state.race = race
+
+    -- Backstop for the scenery pull (ADR-0046): we are racing off the host's relayed definition -- so we
+    -- do NOT have this track -- and have no scenery for it. Either the prefetch probe never reached us or
+    -- its answer is still in flight. Ask (again): the server serves it from its cache, and
+    -- handle_track_data spawns the props the moment they land, still inside the frozen pre-race phases. A
+    -- duplicate request is harmless (the server dedupes on its waiting set), and a client that has the
+    -- track never gets here at all.
+    if race.relayed and #(race.prefabFiles or {}) == 0 then
+        send_to_server("trackNeed", {raceId = race.raceId})
+    end
     M.state.marker_warned = false
     -- Mute BeamMP's spawn notifications for the spawn burst: the host's ~14 synced cones would
     -- otherwise flood every other client's notification list (ADR-0020 finding #2b). Armed on every
@@ -1963,18 +1973,79 @@ local function handle_validate_race(payload)
         -- The aiRace content AI defaults (ADR-0036 Etappe B): the server uses aiDefaults.count to seed the
         -- AI slots when /race requested AI without an explicit number. nil for non-aiRace content.
         aiDefaults = result.aiDefaults,
-        -- The serialized race definition + statics content (ADR-0039): the race-blind server relays these
-        -- verbatim in raceStart so a client without the local race file can build + spawn it. Both nil on
-        -- a refusal (no parse happened); prefabContent alone is also nil whenever the distribution policy
-        -- withholds the scenery -- the default (ADR-0046). Geometry (raceData) always ships.
+        -- The serialized race GEOMETRY (ADR-0039): the race-blind server relays it verbatim in raceStart so
+        -- a client without the local race file can still build the grid + checkpoints. nil on a refusal (no
+        -- parse happened). The SCENERY is not here any more -- it is pulled on demand, ahead of the start,
+        -- and only by the clients that actually lack the files (ADR-0046, trackProbe/trackNeed/trackData).
         raceData = result.raceData,
-        prefabContent = result.prefabContent,
         -- Staged sprint quali activation (ADR-0044): whether an order=quali on this race is the rally
         -- staged single-car variant (sprint) vs. the ADR-0041 all-at-once circuit quali. The race-blind
         -- server reads this (it cannot see meta.closed) only when the race is order=quali.
         stagedQuali = result.stagedQuali,
     })
 end
+
+-- ===== the on-demand scenery pull (ADR-0046) =============================================
+-- A client that does not have the race installed races it off the host's relayed definition (ADR-0039).
+-- The geometry rides the raceStart; the scenery -- tens of KB -- is pulled here instead, so it never sits
+-- in the race-start burst and is only ever sent to the clients that actually need it.
+
+-- The server announces a validated race to everyone but its issuer. Answer only if we cannot build this
+-- track ourselves -- then the scenery is pulled NOW, during spawning (and for a queued race, a whole race
+-- early), rather than arriving with the start. Everyone who has the track stays silent, which is the
+-- normal case and costs nothing.
+local function handle_track_probe(payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    if race_start.needs_track(payload.raceId) then
+        log("I", LOG_TAG, "track '" .. payload.raceId .. "' not installed here -- requesting it")
+        send_to_server("trackNeed", {raceId = payload.raceId})
+    end
+end
+
+-- We are the issuer, and somebody on the server cannot build this race. We are the one client known to
+-- hold the files (we just parsed the race for the pre-flight verdict), so serialize the scenery and ship
+-- it once; the server caches it and fans it out to whoever needs it.
+local function handle_track_fetch(payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    local content = race_start.track_content(payload.raceId)
+    if not content then
+        return
+    end
+    send_to_server("trackUpload", {raceId = payload.raceId, prefabContent = content})
+end
+
+-- The scenery for a race we lack. Write it out and keep it for the session. If the race is already
+-- prepared and running without its props (the pull did not beat the start), spawn them now -- we are in
+-- the frozen pre-race phases, so nothing is missed. If it beat the start, M.prepare picks the paths up
+-- from the cache and the props load with the car, exactly like a locally parsed race.
+local function handle_track_data(payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    race_start.absorb_track(payload.raceId, payload.prefabContent)
+
+    local race = M.state.race
+    if not race or not race.relayed or race.raceId ~= payload.raceId then
+        return
+    end
+    if M.state.prop_names and #M.state.prop_names > 0 then
+        return  -- already spawned (a re-sent blob, or a second race on the same track)
+    end
+    local files = race_start.track_prefabs(payload.raceId, race.direction)
+    if #files == 0 then
+        return
+    end
+    -- Never the prop owner here: a client that lacks the files is never the host, so no cones are kept
+    -- (they are BeamMP-synced from the host, ADR-0020) and there is no cone source to spawn.
+    race.prefabFiles = files
+    M.state.prop_names = props.load(files, false, {})
+    log("I", LOG_TAG, string.format("track '%s': spawned %d late prefab(s)", payload.raceId, #files))
+end
+-- ===== end the on-demand scenery pull ====================================================
 
 -- Store the server-issued finish-grace countdown (ADR-0014): once the first player finishes, every
 -- still-racing player has this many seconds to finish or be marked DNF. Ticked down locally in
@@ -2748,6 +2819,10 @@ local HANDLERS = {
     regrid = handle_regrid,
     aiMap = handle_ai_map,
     validateRace = handle_validate_race,
+    -- On-demand scenery pull for a client without the track (ADR-0046).
+    trackProbe = handle_track_probe,
+    trackFetch = handle_track_fetch,
+    trackData = handle_track_data,
     finishGrace = handle_finish_grace,
     resultsToggle = handle_results_toggle,
     analysisToggle = handle_analysis_toggle,

@@ -235,7 +235,6 @@ local session = {
     pending_map = nil,       -- queued race's issuer-reported map, for grid resolution (ADR-0023)
     pending_race_id = nil,   -- queued race's canonical id, the default-grid lookup key (ADR-0023)
     pending_race_data = nil, -- queued race's serialized definition, relayed verbatim in raceStart (ADR-0039)
-    pending_prefab_content = nil, -- queued race's serialized statics content, relayed verbatim (ADR-0039)
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
@@ -894,6 +893,121 @@ local function broadcast_event(message_type, payload)
         send_event(player_id, message_type, payload)
     end
 end
+
+-- ===== targeted track distribution (ADR-0046) ============================================
+-- A client that does not have the race installed still races it: the issuer serializes the track and the
+-- server relays it (ADR-0039). It used to ride the raceValidation + every player's raceStart -- tens of KB
+-- shipped to EVERYONE at the busiest instant of the session, and thrown away by everyone who has the track
+-- (they parse locally). Now it is pulled on demand instead:
+--
+--   race validated -> trackProbe (all but the issuer) -> trackNeed (only from clients that cannot resolve
+--   the race locally) -> trackFetch (to the issuer, which provably has the files) -> trackUpload -> cached
+--   here -> trackData (only to the clients that asked).
+--
+-- If everyone has the track, not one further byte is sent. The probe fires the moment the race passes
+-- validation -- before the spawning phase, and for a QUEUED race an entire race early -- so the content is
+-- there before it is needed rather than inside the race-start burst.
+--
+-- The blob is opaque: cached, relayed, never parsed. Race-blindness (ADR-0005) holds.
+local track = {}
+
+track.MSG_PROBE = "trackProbe"    -- server -> all but the issuer: "this race is coming; do you need it?"
+track.MSG_NEED = "trackNeed"      -- client -> server: "I cannot resolve that race locally, send it"
+track.MSG_FETCH = "trackFetch"    -- server -> issuer: "serialize that race's scenery for me"
+track.MSG_UPLOAD = "trackUpload"  -- issuer -> server: the serialized scenery
+track.MSG_DATA = "trackData"      -- server -> a needing client: the serialized scenery
+
+track.content = {}   -- raceId -> the opaque prefab-content blob, cached for this server's lifetime
+track.waiting = {}   -- raceId -> {player_id -> true}: who asked while no blob was cached yet
+track.owner_id = nil -- the last validated race's issuer: the one client known to hold the files
+track.fetch_race = nil -- raceId of the upload we have asked for, so one request is in flight per race
+
+-- Announce a validated race to everyone but its issuer, so a client without the files can pull them now
+-- rather than at the start. Records the issuer as the client to fetch from -- it just parsed this race for
+-- its pre-flight verdict (ADR-0019), so it demonstrably has the content.
+function track.probe(race_id, owner_id)
+    if type(race_id) ~= "string" or race_id == "" then
+        return
+    end
+    track.owner_id = owner_id
+    -- Drop any request still marked in flight. A new validation means a new issuer to ask, and an old
+    -- request may be waiting on a client that has since disconnected -- without this, that race id would
+    -- stay "already asked" forever and its scenery could never be fetched again.
+    track.fetch_race = nil
+    for player_id in pairs(MP.GetPlayers()) do
+        if player_id ~= owner_id then
+            send_event(player_id, track.MSG_PROBE, {raceId = race_id})
+        end
+    end
+end
+
+-- A client reports it cannot build this race locally. Serve it from the cache, or ask the issuer once and
+-- park the client until the upload lands.
+function track.handle_need(player_id, payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    local race_id = payload.raceId
+
+    local cached = track.content[race_id]
+    if cached then
+        send_event(player_id, track.MSG_DATA, {raceId = race_id, prefabContent = cached})
+        return
+    end
+
+    local waiting = track.waiting[race_id]
+    if not waiting then
+        waiting = {}
+        track.waiting[race_id] = waiting
+    end
+    waiting[player_id] = true
+
+    if track.fetch_race == race_id then
+        return  -- already asked; this client rides the same upload
+    end
+    if not track.owner_id then
+        log_info("beamcomp.track", "no issuer to fetch '" .. race_id .. "' from")
+        return
+    end
+    track.fetch_race = race_id
+    send_event(track.owner_id, track.MSG_FETCH, {raceId = race_id})
+end
+
+-- The issuer's serialized scenery. Accepted ONLY from the client we asked and ONLY for the race we asked
+-- about: this content is written to disk and spawned as scene objects on every receiver, so an unguarded
+-- upload would let any client poison the cache and spawn arbitrary objects on everyone else (the same
+-- owner/nonce discipline as the ADR-0019 handshake). Cached opaquely, then fanned out to whoever waited.
+function track.handle_upload(player_id, payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    if player_id ~= track.owner_id or payload.raceId ~= track.fetch_race then
+        log_info("beamcomp.track", "dropped unsolicited track upload from id " .. tostring(player_id))
+        return
+    end
+
+    local race_id = payload.raceId
+    track.fetch_race = nil
+    -- An empty list is a legitimate answer (a race with no prefabs, or one the issuer could not read):
+    -- cache it too, so the waiting clients are released instead of hanging on a fetch that never repeats.
+    local content = type(payload.prefabContent) == "table" and payload.prefabContent or {}
+    track.content[race_id] = content
+
+    local waiting = track.waiting[race_id]
+    track.waiting[race_id] = nil
+    if not waiting then
+        return
+    end
+
+    local served = 0
+    for waiting_id in pairs(waiting) do
+        send_event(waiting_id, track.MSG_DATA, {raceId = race_id, prefabContent = content})
+        served = served + 1
+    end
+    log_info("beamcomp.track", string.format(
+        "track '%s': %d prefab(s) cached, served to %d client(s)", race_id, #content, served))
+end
+-- ===== end targeted track distribution ===================================================
 
 -- Send a chat line to every connected player. Like broadcast_event, BeamMP has no single broadcast,
 -- so loop the player table (server API note, section 7).
@@ -2720,7 +2834,6 @@ local function reset_to_lobby()
     session.pending_map = nil
     session.pending_race_id = nil
     session.pending_race_data = nil
-    session.pending_prefab_content = nil
     session.cleanup_warned = false
     session.spawn_pending = nil
     session.spawn_ready_count = 0
@@ -2774,7 +2887,7 @@ end
 -- race file, ADR-0013/0018). `owner_id` is the player that issued /race; exactly that player's
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
-local function start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
+local function start_race(race_name, owner_id, overrides, map, race_id, race_data)
     -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
@@ -2827,7 +2940,6 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     session.pending_map = nil
     session.pending_race_id = nil
     session.pending_race_data = nil
-    session.pending_prefab_content = nil
     session.cleanup_warned = false
 
     -- Seed the spawn-ready gate: await one spawnReady ack per rostered player before leaving the
@@ -2929,15 +3041,16 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- with car/maxhp/maxpwr only). nil for a non-random car -- the client ignores them then.
                 randomTrim = overrides.randomTrim,
                 noBigCars = overrides.noBigCars,
-                -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
-                -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
-                -- race from these. Same for every slot; the host (which has the file) ignores them and
-                -- parses locally. Either is nil when the issuer's client did not ship it (an older
-                -- client); prefabContent is additionally nil whenever the issuer's distribution policy
-                -- withholds the scenery -- the default since ADR-0046, which is why the relay is normally
-                -- geometry only. A file-less client then races the exact course without the barriers.
+                -- The issuer-serialized race GEOMETRY (ADR-0039), relayed verbatim and never interpreted
+                -- (ADR-0005): a client without the local race file builds the grid + checkpoints from this,
+                -- so it is scored identically and cannot cut the course. Same for every slot; the host
+                -- (which has the file) ignores it and parses locally. nil from an older client.
+                --
+                -- The SCENERY no longer rides here (ADR-0046). It is tens of KB, it was duplicated into
+                -- every player's raceStart, and everyone who has the track threw it away. It is now pulled
+                -- on demand (trackProbe/trackNeed/trackData), before the start, only by clients that lack
+                -- the files -- so this message stays lean and most races ship none of it at all.
                 raceData = race_data,
-                prefabContent = prefab_content,
                 -- Qualifying event (ADR-0041): present only for order=quali, carrying the session length so
                 -- the client builds an unbounded-lap quali plan + shows the quali clock. nil = normal race.
                 quali = session.quali and {duration = session.quali.duration} or nil,
@@ -2971,15 +3084,13 @@ local function advance_from_finished()
         local map = session.pending_map
         local race_id = session.pending_race_id
         local race_data = session.pending_race_data
-        local prefab_content = session.pending_prefab_content
         session.pending_race = nil
         session.pending_owner = nil
         session.pending_overrides = nil
         session.pending_map = nil
         session.pending_race_id = nil
         session.pending_race_data = nil
-        session.pending_prefab_content = nil
-        start_race(pending, owner, overrides, map, race_id, race_data, prefab_content)
+            start_race(pending, owner, overrides, map, race_id, race_data)
         return
     end
     reset_to_lobby()
@@ -4104,9 +4215,15 @@ end
 -- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
 -- phase is re-checked here, not at request time, since the race may have ended while the check was in
 -- flight: from lobby/finished start now; from an active phase queue + run the brief abort window.
-local function commit_validated_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
+local function commit_validated_race(race_name, owner_id, overrides, map, race_id, race_data)
+    -- Prefetch the track for anyone who lacks it (ADR-0046). Fired here, at the earliest moment the race
+    -- is known to be going ahead: a client can pull the scenery during the spawning phase instead of
+    -- receiving it inside its raceStart -- and when this race is QUEUED behind a running one (below), an
+    -- entire race early. Costs nothing on a server where everyone has the track: nobody answers.
+    track.probe(race_id, owner_id)
+
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
+        start_race(race_name, owner_id, overrides, map, race_id, race_data)
         MP.SendChatMessage(owner_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
@@ -4117,7 +4234,6 @@ local function commit_validated_race(race_name, owner_id, overrides, map, race_i
     session.pending_map = map
     session.pending_race_id = race_id
     session.pending_race_data = race_data
-    session.pending_prefab_content = prefab_content
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
     MP.SendChatMessage(owner_id, "BeamComp: restarting with race '" .. race_name .. "'")
 end
@@ -4154,9 +4270,7 @@ local function handle_race_validation(player_id, payload)
         -- blob and relayed verbatim into raceStart so a file-less client can build the race. The server
         -- never parses or inspects it -- race-blindness holds (ADR-0005). nil from an older client.
         local race_data = type(payload.raceData) == "table" and payload.raceData or nil
-        local prefab_content = type(payload.prefabContent) == "table" and payload.prefabContent or nil
-        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id,
-            race_data, prefab_content)
+        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id, race_data)
     else
         local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
         MP.SendChatMessage(pending.owner_id, "BeamComp: " .. reason)
@@ -5394,6 +5508,10 @@ local function handle_client_event(player_id, data)
         handle_vehicle_list(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_VALIDATION then
         handle_race_validation(player_id, decoded.payload)
+    elseif decoded.type == track.MSG_NEED then
+        track.handle_need(player_id, decoded.payload)
+    elseif decoded.type == track.MSG_UPLOAD then
+        track.handle_upload(player_id, decoded.payload)
     elseif decoded.type == MSG_SPAWN_READY then
         handle_spawn_ready(player_id, decoded.payload)
     elseif decoded.type == MSG_CLIENT_INFO then
