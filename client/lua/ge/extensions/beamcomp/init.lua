@@ -27,6 +27,24 @@
 --                 also arms the local checkpoint detector (race/checkpoints, ADR-0010), which walks
 --                 the race's sprint/circuit traversal plan (ADR-0013), stepped each frame in onUpdate
 --                 and surfacing each passed checkpoint as a toast + log line + server report.
+--
+-- !! THIS CHUNK SITS AT LUA'S 200-LOCAL CEILING. READ BEFORE ADDING A TOP-LEVEL LOCAL. !!
+--
+-- LuaJIT / Lua 5.1 allow at most LUAI_MAXVARS = 200 active local variables per function, and the
+-- main chunk of a file IS a function. Every top-level `local x` / `local function f` in this file
+-- counts against that 200. Blowing it is NOT a runtime error you can catch: the file fails to
+-- COMPILE ("main function has more than 200 local variables"), so the whole GE extension never
+-- loads -- no HUD, no setup panel, no chat commands, no clue why. It has happened once already
+-- (bug quali-hold-reset-and-repaint-leak, round 1: 203/200).
+--
+-- So: DO NOT add a bare top-level local for a new helper. Hang it on an existing namespace table
+-- (`quali`, `hold`, ...) or open a new one -- a table costs ONE local no matter how many functions
+-- it holds. This is the same ceiling `server/main.lua` has managed for a while with its `f1` /
+-- `quali` / `tour` tables (memory beamcomp-server-200-local-limit); it applies to BOTH big files.
+--
+-- Count before you commit -- do not estimate:
+--   grep -c "^local " on this file UNDER-counts (it misses multi-name declarations and counts
+--   nothing about scope). Count `local` declarations at block depth 0.
 
 local M = {}
 
@@ -51,6 +69,22 @@ local placement = require("beamcomp/race/placement")
 local ai = require("beamcomp/race/ai")
 -- Rally staged sprint qualifying per-driver run state machine (ADR-0044); pure timing helpers.
 local qualisprint = require("beamcomp/race/qualisprint")
+
+-- ===== namespace tables (the 200-local ceiling, see the header) ==========================
+-- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
+-- the only reason this file still compiles. Mirrors the `f1` / `quali` / `tour` tables in
+-- server/main.lua. Declared up here so every definition below can just assign into them -- which
+-- also means a table field never needs a forward declaration, unlike a plain local function.
+--
+-- quali -- everything the qualifying session owns client-side: the staged sprint's per-driver
+--          geometry + queue handling (ramp/holding teleports, launch, requeue, the AI proxy
+--          sequence, the ramp-clear gate, ADR-0044), the quali snapshot handler and the results
+--          re-grid AI respawn (ADR-0041), and the HUD's quali row.
+-- hold  -- the qualifying HOLD: the single `is_held()` predicate and the layers that enforce it
+--          (bug quali-hold-reset-and-repaint-leak).
+local quali = {}
+local hold = {}
+-- ===== end namespace tables =============================================================
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
 -- cone-spawn burst on every other client (race/spawn_mute, ADR-0020 finding #2b).
@@ -153,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-polish/2026-07-12"
+local BUILD_MARKER = "quali-hold-r2/2026-07-12"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -244,6 +278,10 @@ M.state = {
     quali_ai_runs = nil,      -- host only: {[ai id] = per-driver run} for AI currently counting at the ramp, or nil
     quali_clear_sent = false, -- local driver has reported clearing the ramp (>=15 m) for its current run (Round 4)
     quali_ai_cleared = nil,   -- host only: {[ai id] = true} once a launched AI has reported clearing the ramp
+    -- The qualifying HOLD (bug quali-hold-reset-and-repaint-leak, ADR-0017 amendment). hold.is_held() is
+    -- the single truth; these two carry the state it cannot derive from the fields above.
+    quali_lap_done = false,    -- circuit quali: the local driver's lap closed inside the finish-your-lap grace, so their session is over and the car is held (ADR-0041 amendment)
+    quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. Kept in M.state (not a file local): it survives a Lua reload in lockstep with the engine's own serialized filter state
 }
 
 -- Queue a one-shot stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): armed
@@ -396,6 +434,10 @@ local function handle_race_start(payload)
     M.state.quali_ai_runs = nil
     M.state.quali_clear_sent = false
     M.state.quali_ai_cleared = nil
+    -- Drop the quali hold (bug quali-hold-reset-and-repaint-leak): handle_race_start lifts the whole lock
+    -- (lock.remove above), which releases the recover keys, so the record of the block must follow it.
+    M.state.quali_lap_done = false
+    M.state.quali_hold_locked = false
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
@@ -735,6 +777,11 @@ local function teardown_race_world()
     M.state.quali_ai_runs = nil
     M.state.quali_clear_sent = false
     M.state.quali_ai_cleared = nil
+    -- Drop the quali hold (bug quali-hold-reset-and-repaint-leak): lock.remove above already released the
+    -- recover keys, so the record of the block must follow it -- otherwise the next quali hold would see a
+    -- stale "already blocked" and never push the block.
+    M.state.quali_lap_done = false
+    M.state.quali_hold_locked = false
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
@@ -1062,6 +1109,46 @@ local function begin_driving(plan, ai_laps)
     hud.show()
 end
 
+-- ===== the qualifying hold (bug quali-hold-reset-and-repaint-leak) =======================
+-- THE single truth for "the local driver's car must stay put in this qualifying session". Every
+-- enforcement layer -- the recover-key block (lock.set_recover_blocked), the GE assist-key guard, the
+-- re-freeze after a vehicle-config respawn, and the EV throttle clamp -- reads this one predicate, so a
+-- held state can never be enforced by some layers and not others.
+--
+-- Held is every quali state in which the driver is frozen and MUST stay frozen:
+--   * staged sprint (ADR-0044): queued (holding slot), staged (at the ramp), done (session over).
+--     "running" is the one state that is free -- there the recover key is the requeue (ADR-0044/Round4).
+--   * circuit (ADR-0041): once the driver's lap has closed inside the finish-your-lap grace, their
+--     session is over and they are parked for the rest of the window (ADR-0041 amendment).
+function hold.is_held()
+    if M.state.phase ~= "qualifying" then
+        return false
+    end
+    if M.state.quali_staged then
+        local status = M.state.quali_status
+        return status == "queued" or status == "staged" or status == "done"
+    end
+    return M.state.quali_lap_done == true
+end
+
+-- Push the current held-ness to the recover-key block. Called from every transition that can change it
+-- (the phase handler, each staged queue transition, the circuit run's close) and once per qualifying frame
+-- as a net, so no path can leave the block out of step with hold.is_held().
+--
+-- The engine call only fires on a real edge: comparing against the last pushed value keeps the per-frame
+-- net down to a boolean compare, and the engine's filter update is not free (it rebuilds the filter and
+-- broadcasts an extension hook). The record lives in M.state, which survives a Lua reload in lockstep with
+-- the engine's own serialized filter state -- a file-local flag would reset and could strand the block.
+function hold.sync()
+    local held = hold.is_held()
+    if held == M.state.quali_hold_locked then
+        return
+    end
+    M.state.quali_hold_locked = held
+    lock.set_recover_blocked(held)
+end
+-- ===== end the qualifying hold ===========================================================
+
 -- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
 -- server broadcasts a racePhase on every transition (ADR-0006/0041). The car is spawned frozen in
 -- handle_race_start and held through the countdown; here we release it on racing/qualifying, and release
@@ -1145,6 +1232,8 @@ local function handle_race_phase(payload)
         -- duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs server-side.
         local quali_state = M.state.race and M.state.race.quali
         M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
+        -- Fresh session: nobody has finished their graced lap yet (ADR-0041 amendment).
+        M.state.quali_lap_done = false
         if quali_state and quali_state.staged then
             -- Rally staged sprint quali (ADR-0044/Round3): nobody drives at the gun and there is NO global
             -- pre-quali countdown -- the server sent us straight from staging into qualifying. Upgrade to the
@@ -1163,7 +1252,7 @@ local function handle_race_phase(payload)
             M.state.laptimer = nil
             -- Arm the live sector-delta tracker for the staged run (Round 6): the point-to-point run scores
             -- each checkpoint once (crossing_seq 0..N-1), so #checkpoints sectors. The tracker persists across
-            -- the driver's runs so the per-sector personal best accumulates; quali_launch_local resets the
+            -- the driver's runs so the per-sector personal best accumulates; quali.launch_local resets the
             -- per-run progress on each launch. Feeds the same right-side split readout as the circuit quali.
             local staged_race = M.state.race
             if staged_race and staged_race.checkpoints and #staged_race.checkpoints >= 1 then
@@ -1207,6 +1296,7 @@ local function handle_race_phase(payload)
         M.state.quali_ai_runs = nil
         M.state.quali_clear_sent = false
         M.state.quali_ai_cleared = nil
+        M.state.quali_lap_done = false
         -- Stop qualifying sector tracking; the race scores the real plan (feature: quali-live-sector-delta).
         M.state.sector_track = nil
         begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
@@ -1230,6 +1320,7 @@ local function handle_race_phase(payload)
         M.state.quali_ai_runs = nil
         M.state.quali_clear_sent = false
         M.state.quali_ai_cleared = nil
+        M.state.quali_lap_done = false
         -- Qualifying over -- drop the sector-delta tracker (feature: quali-live-sector-delta).
         M.state.sector_track = nil
         -- Count the pause down for the card's "race starts in" line, anchored to a wall clock (os.clockhp)
@@ -1275,6 +1366,11 @@ local function handle_race_phase(payload)
         -- lobby (finished -> spawning), where handle_race_start reloads props and re-freezes instead.
         teardown_race_world()
     end
+
+    -- One sync for every phase transition (bug quali-hold-reset-and-repaint-leak): the qualifying entry
+    -- blocks the recover keys for a staged driver holding in the queue, and every phase after qualifying
+    -- releases them again. Placed after the branch so it reads the phase's freshly-set quali state.
+    hold.sync()
 
     -- Surface the phase as a toast, except staging/countdown/racing/qualifying -- the centered overlay
     -- covers those (the staging indicator, the count, GO!, and the quali drive).
@@ -1338,7 +1434,7 @@ end
 -- Store the latest qualifying classification (ADR-0041), broadcast by the server when qualifying ends.
 -- The HUD reads it from the per-frame snapshot to render the quali-results card during the pause; cleared
 -- on the next race start so a stale card never lingers.
-local function handle_quali(payload)
+function quali.handle_snapshot(payload)
     M.state.quali = (type(payload) == "table" and type(payload.rows) == "table") and payload or nil
 end
 
@@ -1395,7 +1491,7 @@ end
 -- despawns the quali AI and spawns clean cars at the new slots via the proven race-start spawn path. The
 -- regrid carries each AI's {id, slot, label}; the config + policy were kept from the spawn. No-op for a
 -- non-owner or when the inputs are missing.
-local function respawn_ai_for_quali(ai_slots)
+function quali.respawn_ai_for_regrid(ai_slots)
     if type(ai_slots) ~= "table" or #ai_slots == 0 or not M.state.race then
         return
     end
@@ -1463,7 +1559,7 @@ local function handle_regrid(payload)
     -- Re-place / re-spawn the host's AI cars (owner-only; no-op otherwise) before the own-car logic, so a
     -- missing own slot/pose below never skips it.
     if payload.qualiRespawnAi then
-        respawn_ai_for_quali(payload.aiSlots)
+        quali.respawn_ai_for_regrid(payload.aiSlots)
     else
         replace_ai_for_regrid(payload.aiSlots)
     end
@@ -1508,7 +1604,7 @@ end
 -- the return-to-holding (hold / requeue). Uses place_at_grid (front-anchored repair+teleport, ADR-0034) --
 -- NOT respawn_own_at: on the host, respawn_own_at despawns the player's OTHER owned cars, which would delete
 -- the AI mid-quali; place_at_grid touches no other vehicle. No-op if the car/pose is unavailable.
-local function quali_place_own(pose)
+function quali.place_own(pose)
     if type(pose) ~= "table" then
         return
     end
@@ -1529,17 +1625,17 @@ end
 -- Distance (m) the launched driver must be from the ramp before the next may stage (ADR-0044/Round4 gate).
 -- Paired with the server's quali.STAGE_GAP (5 s): the next stages only once BOTH are satisfied. Raise either
 -- to give the next driver more room behind the one launching.
-local STAGE_CLEAR_DIST = 15.0
+quali.STAGE_CLEAR_DIST = 15.0
 
 -- The dedicated P1 start ramp pose (ADR-0044/Round4), split off the front of the grid so P1 is empty at the
 -- start; the active driver is teleported here for their run. nil for a normal race / circuit quali.
-local function quali_ramp_pose()
+function quali.ramp_pose()
     return M.state.race and M.state.race.rampPose or nil
 end
 
 -- A driver's OWN fixed holding pose = gridPoses[slot+1] (grid positions 2..N+1; no roll-forward, so a driver
 -- always returns to their own slot). Defaults to the local player's slot.
-local function quali_own_hold_pose(slot)
+function quali.own_hold_pose(slot)
     local poses = M.state.race and M.state.race.gridPoses
     slot = slot or (M.state.race and M.state.race.mySlot) or 0
     if not poses then
@@ -1549,8 +1645,8 @@ local function quali_own_hold_pose(slot)
 end
 
 -- Distance from a vehicle to the ramp (ADR-0044/Round4), or nil if unavailable. Used for the >=15 m gate.
-local function quali_dist_from_ramp(veh)
-    local ramp = quali_ramp_pose()
+function quali.dist_from_ramp(veh)
+    local ramp = quali.ramp_pose()
     if not veh or type(ramp) ~= "table" or type(ramp.pos) ~= "table" then
         return nil
     end
@@ -1568,10 +1664,12 @@ end
 -- the checkpoint detector on the real race plan so the Start->Ziel run is scored + reported (the existing
 -- path). A sprint has no lap clock; the sector tracker's per-run progress is reset here (Round 6). Re-arm
 -- the ramp-clear report for this run.
-local function quali_launch_local()
+function quali.launch_local()
     M.state.quali_run = nil
     M.state.quali_status = "running"
     M.state.quali_clear_sent = false  -- report once we clear the ramp (>=15 m)
+    -- The one queue state that is NOT held: hand the recover key back, so recover = requeue again (Round 4).
+    hold.sync()
     countdown.show_go()
     countdown.play_go()
     local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
@@ -1596,7 +1694,7 @@ local function quali_launch_local()
 end
 
 -- Find one of the owner's AI cars by its synthetic id, or nil.
-local function quali_find_ai(ai_id)
+function quali.find_ai(ai_id)
     for _, car in ipairs(M.state.ai_cars or {}) do
         if car.id == ai_id then
             return car
@@ -1606,10 +1704,10 @@ local function quali_find_ai(ai_id)
 end
 
 -- Owner: stage an AI car at the ramp for its run (ADR-0044/0036). Reposition it (front-anchored, no other
--- car touched) + freeze, then start its per-driver count; quali_launch_ai releases + drives it at GO.
-local function quali_stage_ai(ai_id, count)
-    local car = quali_find_ai(ai_id)
-    local pose = quali_ramp_pose()
+-- car touched) + freeze, then start its per-driver count; quali.launch_ai releases + drives it at GO.
+function quali.stage_ai(ai_id, count)
+    local car = quali.find_ai(ai_id)
+    local pose = quali.ramp_pose()
     if not car or not pose then
         return
     end
@@ -1626,11 +1724,11 @@ end
 -- Owner: release + drive one AI at the end of its per-driver count (ADR-0044/0036). Arms its proxy detector
 -- so step_ai_detections scores + reports it, and re-arms the ramp-clear report for this AI. Single-car
 -- ai.drive; the default snap route does not swap the navgraph, so repeated staged launches do not thrash it.
-local function quali_launch_ai(car_id)
+function quali.launch_ai(car_id)
     if M.state.quali_ai_runs then
         M.state.quali_ai_runs[car_id] = nil
     end
-    local car = quali_find_ai(car_id)
+    local car = quali.find_ai(car_id)
     if not car or not M.state.race then
         return
     end
@@ -1648,8 +1746,8 @@ end
 
 -- Owner: stop an AI + hold it (ADR-0044/Round4). stop=true -> freeze in place (a done AI at the window's
 -- end); else -> re-place it at its OWN fixed holding slot (car.pose, its spawned grid position) and freeze.
-local function quali_hold_ai(ai_id, stop)
-    local car = quali_find_ai(ai_id)
+function quali.hold_ai(ai_id, stop)
+    local car = quali.find_ai(ai_id)
     if not car then
         return
     end
@@ -1675,24 +1773,26 @@ end
 
 -- "You're up" (server qualiStage, ADR-0044/Round4): a player payload -> stage the local car at the ramp; an
 -- aiId (owner only) -> stage that AI. Guarded to a staged qualifying phase.
-local function handle_quali_stage(payload)
+function quali.handle_stage(payload)
     if not M.state.race or not M.state.quali_staged or type(payload) ~= "table" then
         return
     end
     if payload.aiId ~= nil then
-        quali_stage_ai(payload.aiId, payload.countdown)
+        quali.stage_ai(payload.aiId, payload.countdown)
         return
     end
-    local pose = quali_ramp_pose()
+    local pose = quali.ramp_pose()
     if not pose then
         log("W", RACE_LOG_TAG, "qualiStage ignored: no ramp pose")
         return
     end
-    quali_place_own(pose)
+    quali.place_own(pose)
     M.state.quali_status = "staged"
     M.state.detection = nil
     M.state.quali_clear_sent = false
     M.state.quali_run = qualisprint.new_run(os.clockhp(), payload.countdown)
+    -- Still held: the car sits frozen on the ramp until GO, so the recover key stays blocked.
+    hold.sync()
     log("I", RACE_LOG_TAG, "staged quali: your turn -- staged at the ramp")
 end
 
@@ -1700,12 +1800,12 @@ end
 -- -> stop + hold that AI. payload.stop=true means "stop + freeze in place" (a driver marked done at the
 -- window's end); otherwise the driver returns to its OWN fixed holding slot (no roll-forward). Sent on a
 -- finish/reset requeue and when marked done.
-local function handle_quali_hold(payload)
+function quali.handle_hold(payload)
     if not M.state.race or not M.state.quali_staged then
         return
     end
     if type(payload) == "table" and payload.aiId ~= nil then
-        quali_hold_ai(payload.aiId, payload.stop)
+        quali.hold_ai(payload.aiId, payload.stop)
         return
     end
     M.state.quali_run = nil
@@ -1722,14 +1822,17 @@ local function handle_quali_hold(payload)
         end
     else
         M.state.quali_status = "queued"
-        quali_place_own(quali_own_hold_pose())
+        quali.place_own(quali.own_hold_pose())
     end
+    -- Held either way (done in place, or queued back on the holding slot): block the recover key so the car
+    -- cannot free itself out of the hold (bug quali-hold-reset-and-repaint-leak).
+    hold.sync()
     countdown.clear()
 end
 
 -- Store the staged queue snapshot for the HUD (server qualiQueue, ADR-0044): own position/status/best +
 -- the "waiting for driver to start" flag are read from it in build_hud_snapshot. Receive + store only.
-local function handle_quali_queue(payload)
+function quali.handle_queue(payload)
     M.state.quali_queue = (type(payload) == "table" and type(payload.rows) == "table") and payload or nil
 end
 
@@ -1739,12 +1842,14 @@ end
 -- (it repairs in place, the run continues) -- only the recover key requeues. Called from M.on_assist_key_down
 -- while the run's detector is armed; the recover key is owned by the VE override during the race (ADR-0017),
 -- so it works with assists off.
-local function quali_request_requeue()
+function quali.request_requeue()
     M.state.quali_run = nil
     M.state.detection = nil
     M.state.laptimer = nil
     M.state.quali_status = "queued"
     M.state.quali_clear_sent = true
+    -- Back in the queue = held again: block the recover key until this driver is staged and launched anew.
+    hold.sync()
     send_to_server("qualiReset", {})
     -- Freeze in place immediately; the server's qualiHold returns us to our holding slot momentarily.
     local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
@@ -1762,12 +1867,12 @@ end
 
 -- Report to the server when the just-launched driver has cleared the ramp (>=15 m, ADR-0044/Round4), so the
 -- next may stage. Once per run: the local player reports its own car; the owner reports each launched AI.
-local function step_quali_clearing()
+function quali.step_clearing()
     if M.state.quali_status == "running" and not M.state.quali_clear_sent
         and M.state.detection and not M.state.detection.done then
         local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
-        local dist = own and quali_dist_from_ramp(own)
-        if dist and dist >= STAGE_CLEAR_DIST then
+        local dist = own and quali.dist_from_ramp(own)
+        if dist and dist >= quali.STAGE_CLEAR_DIST then
             M.state.quali_clear_sent = true
             send_to_server("qualiCleared", {})
         end
@@ -1781,8 +1886,8 @@ local function step_quali_clearing()
             local det = dets[car.id]
             if det and not det.done and not M.state.quali_ai_cleared[car.id] then
                 local veh = be and be:getObjectByID(car.veh_id)
-                local dist = veh and quali_dist_from_ramp(veh)
-                if dist and dist >= STAGE_CLEAR_DIST then
+                local dist = veh and quali.dist_from_ramp(veh)
+                if dist and dist >= quali.STAGE_CLEAR_DIST then
                     M.state.quali_ai_cleared[car.id] = true
                     send_to_server("qualiCleared", {aiId = car.id})
                 end
@@ -1795,7 +1900,7 @@ end
 -- the local per-driver count (count -> GO) and each staging AI's count, then reports ramp-clear. The detector
 -- stepping + reporting rides the existing step_detection / step_ai_detections (they no-op until a run
 -- launches). There is no pre-settle -- the count begins as soon as the driver is on the ramp.
-local function step_quali_staged()
+function quali.step_staged()
     local now = os.clockhp()
     local run = M.state.quali_run
     if run then
@@ -1807,7 +1912,7 @@ local function step_quali_staged()
             end
             countdown.show_start(st.count)
         elseif st.stage == "go" and st.launch then
-            quali_launch_local()
+            quali.launch_local()
         end
     end
     local ai_runs = M.state.quali_ai_runs
@@ -1815,11 +1920,11 @@ local function step_quali_staged()
         for car_id, ai_run in pairs(ai_runs) do
             local st = qualisprint.step(ai_run, now)
             if st.stage == "go" and st.launch then
-                quali_launch_ai(car_id)
+                quali.launch_ai(car_id)
             end
         end
     end
-    step_quali_clearing()
+    quali.step_clearing()
 end
 -- ===== end rally staged sprint quali (client) ============================================
 
@@ -2615,11 +2720,11 @@ local HANDLERS = {
     standings = handle_standings,
     championship = handle_championship,
     tournament = handle_tournament,
-    quali = handle_quali,
+    quali = quali.handle_snapshot,
     -- Rally staged sprint quali (ADR-0044): the staged queue snapshot + the per-driver stage/hold commands.
-    qualiQueue = handle_quali_queue,
-    qualiStage = handle_quali_stage,
-    qualiHold = handle_quali_hold,
+    qualiQueue = quali.handle_queue,
+    qualiStage = quali.handle_stage,
+    qualiHold = quali.handle_hold,
     listRaces = handle_list_races,
     listVehicles = handle_list_vehicles,
     regrid = handle_regrid,
@@ -3188,8 +3293,9 @@ end
 local RELOAD_REARM_THROTTLE = 0.5
 local last_reload_rearm_at = 0
 
--- Re-arm the per-vehicle race mechanics IN PLACE after the player's staged race car is reset/reloaded
--- during staging (bug prerace-car-tuning-breaks-lock-and-reset). Applying a change in the vehicle config
+-- Re-arm the per-vehicle race mechanics IN PLACE after the player's own race car is reset/reloaded while it
+-- must stay put -- on the start grid during staging (bug prerace-car-tuning-breaks-lock-and-reset), or held
+-- in a qualifying session (bug quali-hold-reset-and-repaint-leak). Applying a change in the vehicle config
 -- menu -- tyre pressure, paint, any tuning -- runs veh:respawn(config) (BeamNG partmgmt.mergeConfig),
 -- which reloads the car's jbeam in place (the car STAYS on its slot, same game id) but re-instantiates its
 -- VE: that drops the movement freeze -- both the GE controller freeze (controller.setFreeze resets on the
@@ -3206,9 +3312,14 @@ local last_reload_rearm_at = 0
 -- so it cannot loop. Called from BOTH onVehicleResetted and onVehicleSpawned, since a config respawn can
 -- raise either hook; the throttle collapses the duplicates.
 local function rearm_staged_car_on_reload(vehicle_id)
-    -- Staging only (the swap-allowed lock): past staging the full lock blocks every reset route, and we
-    -- must not re-arm into the countdown/racing. A no-op (harmless) if the hook fires out of phase.
-    if M.state.phase ~= "staging" or not M.state.race then
+    -- The two windows in which the own car is frozen and a config respawn can reach it: the staging wait
+    -- (the swap-allowed lock) and a qualifying HOLD (queued / staged / done / graced-lap-done). Everywhere
+    -- else -- countdown, racing, a live quali run -- the car is either meant to be drivable or the full lock
+    -- blocks every reset route, and re-freezing there would be wrong. A no-op if the hook fires out of phase.
+    if not M.state.race then
+        return
+    end
+    if M.state.phase ~= "staging" and not hold.is_held() then
         return
     end
     -- Only the player's own staged race car matters; a reset keeps the same game id, so compare against
@@ -3234,14 +3345,15 @@ local function rearm_staged_car_on_reload(vehicle_id)
     if own_car then
         local frozen, freeze_err = vehicles.set_vehicle_frozen(own_car, true)
         if not frozen then
-            log("W", RACE_LOG_TAG, "could not re-freeze reset staging car: " .. tostring(freeze_err))
+            log("W", RACE_LOG_TAG, "could not re-freeze the reset car: " .. tostring(freeze_err))
         end
     end
     -- Clear the GE arm flags so onUpdate re-pushes the EV throttle clamp + the recover/repair override to
     -- the reloaded VE (they stay true across the reset, which is why they were never re-pushed -> the bug).
     M.state.freeze_hold_armed = false
     M.state.assist_armed = false
-    log("I", RACE_LOG_TAG, "staging race car reset/reloaded (tuning); re-froze in place + re-armed assist")
+    log("I", RACE_LOG_TAG, "race car reset/reloaded (tuning) in " .. tostring(M.state.phase)
+        .. "; re-froze in place + re-armed assist")
 end
 
 -- As each shared cone appears -- the host's local set when its prefab load spawns them, and the
@@ -3260,9 +3372,10 @@ function M.onVehicleSpawned(vehicleId)
     -- aiMap now so it is labelled + nametag-suppressed as soon as it appears. No-op when nothing pending
     -- or on the owner (it has no ai_server_ids).
     resolve_remote_ai()
-    -- A config/tuning respawn during staging can surface as a re-spawn of the same race car (a reload runs
-    -- a despawn/respawn cycle), so re-freeze + re-arm here too. The guard no-ops for cones, AI, remotes,
-    -- and any vehicle that is not the player's staged race car -- see onVehicleResetted, the primary hook.
+    -- A config/tuning respawn while the car must stay put (staging, or a quali hold) can surface as a
+    -- re-spawn of the same race car (a reload runs a despawn/respawn cycle), so re-freeze + re-arm here too.
+    -- The guard no-ops for cones, AI, remotes, and any vehicle that is not the player's own race car -- see
+    -- onVehicleResetted, the primary hook.
     rearm_staged_car_on_reload(vehicleId)
     if not cones.is_cone(veh) then
         return
@@ -3279,9 +3392,9 @@ end
 
 -- BeamNG fires this GE hook (lua/ge/main.lua vehicleReset -> extensions.hook('onVehicleResetted', vid))
 -- whenever a vehicle is reset/reloaded in place -- including a vehicle-config reapply (tyre pressure,
--- paint) during staging, which runs veh:respawn(config). Re-freeze the player's staged car in place and
--- re-arm its recover/repair assist; rearm_staged_car_on_reload guards phase, ownership, and throttling, so
--- a reset of any other car or outside the staging window is a no-op.
+-- paint) during staging or a qualifying hold, which runs veh:respawn(config). Re-freeze the player's car in
+-- place and re-arm its recover/repair assist; rearm_staged_car_on_reload guards phase, ownership, and
+-- throttling, so a reset of any other car or outside those windows is a no-op.
 function M.onVehicleResetted(vehicleId)
     rearm_staged_car_on_reload(vehicleId)
 end
@@ -3308,6 +3421,36 @@ function send_to_server(message_type, payload)
     end
 end
 
+-- Park the local car for the rest of a CIRCUIT qualifying window (ADR-0041 amendment, bug
+-- quali-hold-reset-and-repaint-leak): the driver closed a lap inside the finish-your-lap grace, so their
+-- session is over -- they are held exactly as a done driver is in the staged sprint (ADR-0044), instead of
+-- driving on in a session they are no longer scored in. The car is released again by the quali re-grid,
+-- which teleports + repairs it onto the earned race grid.
+--
+-- Accepted trade-off (user decision 2026-07-12): on a circuit everyone laps at once, so a parked car is a
+-- static obstacle on the racing line while the others finish their lap. Chosen for consistency with the
+-- staged sprint; if it proves disruptive live, drop the freeze here -- the recover-key guard is an
+-- independent layer and keys off hold.is_held() alone.
+function hold.circuit_run()
+    M.state.quali_lap_done = true
+    local own = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+    if own then
+        local frozen, err = vehicles.set_vehicle_frozen(own, true)
+        if not frozen then
+            log("W", RACE_LOG_TAG, "quali hold: could not park the finished car: " .. tostring(err))
+        end
+    end
+    -- Block the recover keys and (via the same predicate) arm the EV throttle clamp + the re-freeze after a
+    -- vehicle-config respawn, so the freeze cannot be thrown off again.
+    hold.sync()
+    log("I", RACE_LOG_TAG, "quali hold: lap closed in the grace window; car parked for the session")
+    guihooks.trigger("toastrMsg", {
+        type = "info",
+        title = "BeamComp",
+        msg = "Qualifying run complete -- your car stays parked until the session ends",
+    })
+end
+
 -- Surface one detected checkpoint passage: log + toast + report to the server. This is the single
 -- emission seam for a passage -- keep it the one place a passage is reported. The report carries
 -- `seq` (the plan ordinal, the server's ordering key), `lap`, the display `index`/`name`, the time,
@@ -3329,9 +3472,12 @@ local function on_checkpoint_reached(event, count)
         laptimer.complete_lap(lt, event.time)
         -- During the qualifying finish-your-lap window (ADR-0041), completing a lap ends this driver's
         -- quali: stop the detector after this crossing is reported, so no further checkpoints are scored or
-        -- shown for them. The report below still carries this lap's best time.
+        -- shown for them, and park the car for the rest of the window (ADR-0041 amendment). The report below
+        -- still carries this lap's best time. Circuit only by construction -- a staged sprint run has no lap
+        -- clock (quali.launch_local nils it), so it can never reach this branch.
         if M.state.phase == "qualifying" and M.state.grace then
             M.state.detection = nil
+            hold.circuit_run()
         end
     end
     -- Qualifying live sector delta (feature: quali-live-sector-delta): record this crossing's just-completed
@@ -3917,7 +4063,7 @@ end
 -- The local driver's own row in the staged-quali holding queue (ADR-0044), resolved from the broadcast
 -- queue snapshot by slot: {status, position, best, name, ai}. nil outside a staged quali or before the
 -- first snapshot. Feeds the HUD "you're up / next / Pn queued / running" line + own best time.
-local function quali_local_row(my_slot)
+function quali.local_row(my_slot)
     local queue = M.state.quali_queue
     if not queue or type(queue.rows) ~= "table" or my_slot == nil then
         return nil
@@ -4143,7 +4289,7 @@ local function build_hud_snapshot()
             -- starts at the ramp = the line).
             local personal_splits, personal_run_up, session_source
             if M.state.quali_staged then
-                local mine = quali_local_row(my_slot)
+                local mine = quali.local_row(my_slot)
                 personal_splits = mine and mine.bestSplits or nil
                 personal_run_up = nil
                 session_source = {}
@@ -4228,7 +4374,7 @@ local function build_hud_snapshot()
         -- false outside a staged qualifying phase, so the app falls back to the circuit best-lap board.
         qualiStaged = (phase == "qualifying" and M.state.quali_staged) and true or false,
         qualiQueue = (M.state.quali_queue and M.state.quali_queue.rows) or nil,
-        qualiMine = quali_local_row(my_slot),
+        qualiMine = quali.local_row(my_slot),
         -- A driver has launched but not yet cleared the ramp (Round 4): the HUD shows "Waiting for driver to
         -- start" so waiters know why the next stage is held. From the server queue snapshot's `waiting` flag.
         qualiWaiting = (phase == "qualifying" and M.state.quali_staged
@@ -4475,6 +4621,19 @@ local function notify_assist_blocked(msg)
     })
 end
 
+-- Tell a held qualifying driver why their recover key did nothing (bug quali-hold-reset-and-repaint-leak).
+-- The key is normally already blocked at the input filter, so this only ever fires as the second layer --
+-- but it also has to read right for a player who has that filter silently no-op on a future engine version.
+function hold.notify_blocked()
+    if M.state.quali_status == "done" or M.state.quali_lap_done then
+        notify_assist_blocked("Your qualifying run is over -- the car stays put")
+    elseif M.state.quali_status == "staged" then
+        notify_assist_blocked("Reset is locked -- your run starts in a moment")
+    else
+        notify_assist_blocked("Reset is locked -- wait for your turn")
+    end
+end
+
 -- Repair the player's own car during the pre-race staging window (ADR-0017 staging-allow-repair): the
 -- cars spawn repaired on the grid, but a car damaged ON the grid during the staging wait (a neighbour
 -- bumping it through the soft start-freeze, a botched swap) would otherwise start the race broken. Reuses
@@ -4531,6 +4690,17 @@ function M.on_assist_key_down(kind)
     if not M.state.race or (M.state.phase ~= "racing" and M.state.phase ~= "qualifying") then
         return
     end
+    -- Qualifying HOLD (bug quali-hold-reset-and-repaint-leak): a held driver's car must not move, so neither
+    -- recover nor repair may act. This is the SECOND layer -- lock.set_recover_blocked already stops both
+    -- keys at the engine's input filter, which is what also covers the moment right after a vehicle-config
+    -- respawn, where the VE override has been reloaded away and the keys are briefly vanilla. This guard
+    -- catches a key that reaches GE anyway (a silently no-op'd filter on a future engine version).
+    -- Nothing is lost by refusing repair too: every entry into a held state re-places the car with
+    -- place_at_grid, which repairs it, so a held car is already pristine.
+    if hold.is_held() then
+        hold.notify_blocked()
+        return
+    end
     -- Staged sprint quali (ADR-0044/Round4): the RECOVER key starts a new attempt -- requeue the running
     -- driver to the back of the queue. ONLY recover (not repair): repair falls through to the normal in-place
     -- repair below, which does NOT end the run (ADR-0017). Available regardless of the assist enable (a
@@ -4538,7 +4708,7 @@ function M.on_assist_key_down(kind)
     -- the run's detector being armed and not done, so a press while holding/staged or after finishing is inert.
     if kind == "recover" and M.state.quali_staged and M.state.phase == "qualifying"
         and M.state.detection and not M.state.detection.done then
-        quali_request_requeue()
+        quali.request_requeue()
         return
     end
     local enabled = assist_setting(kind)
@@ -4569,6 +4739,18 @@ end
 -- key is held AND the car is (near) stationary -- releasing or driving off cancels it. On completion
 -- the held kind is consumed (cleared) so it does not immediately re-fire while the key is still down.
 local function step_assist(dt_real)
+    -- A qualifying hold can engage while an assist key is still physically DOWN -- e.g. the repair key held
+    -- across the finish line, where the finish itself puts the driver into `done`. From that moment the
+    -- input filter swallows the key-UP as well, so on_assist_key_up never fires and assist_held stays
+    -- latched. Its countdown only requires a stationary car -- and a frozen car IS stationary -- so it would
+    -- run to completion and fire the assist, breaking the very hold we just engaged. Drop the latched hold
+    -- the moment the driver is held (bug quali-hold-reset-and-repaint-leak).
+    if hold.is_held() then
+        M.state.assist_held = nil
+        M.state.assist_notice = nil
+        clear_assist_arming()
+        return
+    end
     local held = M.state.assist_held
     if not held then
         clear_assist_arming()
@@ -5019,8 +5201,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- AI). step_detection / step_ai_detections below no-op until a driver launches (detector nil while
         -- holding), so a staged driver holds silently until its turn.
         if M.state.quali_staged then
-            step_quali_staged()
+            quali.step_staged()
         end
+        -- Keep the recover-key block in step with hold.is_held() (bug quali-hold-reset-and-repaint-leak).
+        -- Every transition syncs it already; this is the net that makes the predicate the single truth even
+        -- if a future queue path forgets to. Costs one boolean compare -- the engine call only fires on an
+        -- actual edge.
+        hold.sync()
         step_detection(dtSim)
         step_ai_detections(dtSim)
         -- Recover/repair work in qualifying exactly as in the race (ADR-0017): drive the held assist
@@ -5097,8 +5284,15 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- Arm the EV start-freeze throttle clamp over the frozen phases (staging + countdown), so it lifts on
     -- racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs. Skip it during an F1
     -- light-start countdown: that frees the car at the first light (ADR-0043), so the clamp must not re-arm.
+    --
+    -- A qualifying HOLD is a frozen phase too (bug quali-hold-reset-and-repaint-leak): controller.setFreeze
+    -- is a soft hold that an EV's instant 0-rpm torque creeps through, so without the clamp an electric car
+    -- can simply drive out of the hold under full throttle -- no key press needed. quali.launch_local already
+    -- disarms the clamp at GO (as begin_driving and f1_begin_lights do on their releases), which is what this
+    -- arm was always missing its other half of.
     if M.state.race and (M.state.phase == "staging"
-            or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))) then
+            or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))
+            or hold.is_held()) then
         push_freeze_hold()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
