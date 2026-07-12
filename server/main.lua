@@ -261,14 +261,19 @@ local CONFIG_CANDIDATE_PATHS = {
     "beamcomp.config.json",
 }
 
--- Normalized (trimmed, lowercased) admin names -> true, and whether the gate is on.
-local race_admins = {}
-local race_admin_gate_active = false
-
--- Whether player identity resolves to the client-reported BeamNG name instead of the BeamMP name
--- (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the guest-name fix applies
--- out of the box. Set false in beamcomp.config.json to fall back to BeamMP names everywhere.
-local use_client_name = true
+-- The plugin config, as read from beamcomp.config.json (ADR-0016). One namespace table rather than a
+-- local per setting: main.lua lives at LuaJIT's 200-local ceiling (see grid_store / f1), and a table
+-- costs one local no matter how many settings it grows.
+--   * `admins` / `admin_gate_active` -- normalized (trimmed, lowercased) admin names -> true, and
+--     whether the race-admin gate is on at all (no admins configured = everyone may start races).
+--   * `use_client_name` -- whether player identity resolves to the client-reported BeamNG name instead
+--     of the BeamMP name (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the
+--     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
+local cfg = {
+    admins = {},
+    admin_gate_active = false,
+    use_client_name = true,
+}
 
 -- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
 -- and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is per race --
@@ -279,7 +284,7 @@ local client_names = {}
 -- the option is on and one was reported, else the BeamMP name. The single chokepoint every name read
 -- goes through -- the option and the fallback live here only. nil only if BeamMP has no name for the id.
 local function resolve_identity(player_id)
-    if use_client_name then
+    if cfg.use_client_name then
         local name = client_names[player_id]
         if type(name) == "string" and name ~= "" then
             return name
@@ -391,9 +396,9 @@ end
 -- only a real parse error warns. The resolved path is logged so the runtime working directory is
 -- visible in the server console (recon TODO #4). Called from on_init.
 local function load_config()
-    race_admins = {}
-    race_admin_gate_active = false
-    use_client_name = true
+    cfg.admins = {}
+    cfg.admin_gate_active = false
+    cfg.use_client_name = true
 
     local config, path, err = read_config()
     if not config then
@@ -408,8 +413,8 @@ local function load_config()
     end
 
     -- Default on (ADR-0031): only an explicit false turns it off; a missing key stays on.
-    use_client_name = config.useClientName ~= false
-    log_info("beamcomp.cfg", "useClientName=" .. (use_client_name and "on" or "off"))
+    cfg.use_client_name = config.useClientName ~= false
+    log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
 
     if type(config.raceAdmins) ~= "table" then
         log_info("beamcomp.cfg", "config at " .. path
@@ -421,8 +426,8 @@ local function load_config()
     for _, name in ipairs(config.raceAdmins) do
         if type(name) == "string" then
             local normalized = normalize_name(name)
-            if normalized ~= "" and not race_admins[normalized] then
-                race_admins[normalized] = true
+            if normalized ~= "" and not cfg.admins[normalized] then
+                cfg.admins[normalized] = true
                 count = count + 1
             end
         end
@@ -434,7 +439,7 @@ local function load_config()
         return
     end
 
-    race_admin_gate_active = true
+    cfg.admin_gate_active = true
     log_info("beamcomp.cfg", "loaded config from " .. path .. "; "
         .. count .. " race admin(s), gate active")
 end
@@ -442,10 +447,10 @@ end
 -- Whether `player_name` may issue the gated race commands. With the gate inactive (no admins
 -- configured) everyone is allowed -- the opt-in default (ADR-0016).
 local function is_race_admin(player_name)
-    if not race_admin_gate_active then
+    if not cfg.admin_gate_active then
         return true
     end
-    return race_admins[normalize_name(player_name)] == true
+    return cfg.admins[normalize_name(player_name)] == true
 end
 
 -- Read and JSON-decode the grids file from the first candidate path that opens (ADR-0023). Returns
