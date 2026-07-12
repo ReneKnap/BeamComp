@@ -302,13 +302,22 @@ local GRIDS_CANDIDATE_PATHS = {
 -- grids[map][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
 -- presets[map][name] = <race-setup form JSON string> is the named-preset store (ADR-0037 amendment
 -- 2026-07-03), folded onto this same table -- see the preset block below.
-local grid_store = {grids = {}, defaults = {}, presets = {}}
-local grids_file_path = nil
--- Whether grid_store has been populated from disk in THIS Lua-state instance. A BeamMP file-watch
--- reload (recon gotcha 12) re-runs this chunk -- resetting grid_store + this flag -- which is exactly
--- what happens when the editor writes the grids file; lazy-loading on first access (ensure_grids_loaded)
--- repopulates the store after such a reload, so a saved default is not lost.
-local grids_loaded = false
+--
+-- The grid store's own two state fields ride here as well, mirroring the presets' `presets_path` /
+-- `presets_loaded` below and for the same reason (the 200/200 local ceiling):
+--   * `grids_path`   -- the grids file we loaded from; writes go back to it, else the first candidate.
+--   * `grids_loaded` -- whether the store has been populated from disk in THIS Lua-state instance. A
+--     BeamMP file-watch reload (recon gotcha 12) re-runs this chunk -- rebuilding this table and so
+--     clearing the flag -- which is exactly what happens when the editor writes the grids file;
+--     lazy-loading on first access (ensure_grids_loaded) repopulates the store after such a reload, so
+--     a saved default is not lost.
+local grid_store = {
+    grids = {},
+    defaults = {},
+    presets = {},
+    grids_path = nil,
+    grids_loaded = false,
+}
 
 -- Named race-setup presets (ADR-0037 amendment 2026-07-03). A preset is the setup panel's form JSON,
 -- stored map-scoped and opaque -- the server never interprets it (race-blind, ADR-0005), it stores and
@@ -468,7 +477,7 @@ local function load_grids()
     grid_store.defaults = {}
 
     local data, path, err = read_grids()
-    grids_file_path = path
+    grid_store.grids_path = path
     if not data then
         if err == "parse" then
             log_info("beamcomp.grid", "grids file at " .. tostring(path)
@@ -492,10 +501,10 @@ end
 -- robust to a file-watch reload that resets the in-memory store without re-firing onInit (ADR-0023):
 -- the next save/resolve/fetch repopulates from disk.
 local function ensure_grids_loaded()
-    if grids_loaded then
+    if grid_store.grids_loaded then
         return
     end
-    grids_loaded = true
+    grid_store.grids_loaded = true
     load_grids()
 end
 
@@ -545,8 +554,8 @@ local function write_grids()
     end
 
     local candidates = {}
-    if grids_file_path then
-        candidates[#candidates + 1] = grids_file_path
+    if grid_store.grids_path then
+        candidates[#candidates + 1] = grid_store.grids_path
     end
     for _, path in ipairs(GRIDS_CANDIDATE_PATHS) do
         candidates[#candidates + 1] = path
@@ -567,7 +576,7 @@ local function write_grids()
                 -- full) the live file is left untouched -- the very data loss this fix prevents.
                 os.remove(path)
                 if os.rename(tmp, path) then
-                    grids_file_path = path
+                    grid_store.grids_path = path
                     return true, path
                 end
                 log_info("beamcomp.grid", "could not commit grids write at " .. path)
