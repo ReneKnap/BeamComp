@@ -183,18 +183,23 @@ function M.cumulative_through(sections, sector)
     return total
 end
 
--- The motorsport record class for a just-completed sector `split`: "session" (purple) when it is the
--- fastest that sector by anyone (<= the field's known best, which excludes this fresh split), else
--- "personal" (green) when it matched/beat your own best for that sector, else "slower" (red) when it is
--- slower than your best for that sector. "normal" only when there is no reference yet -- the first time
--- you complete this sector (prev_personal_best nil), so nothing to compare against. `session_best` /
--- `prev_personal_best` may be nil (no data yet).
+-- The motorsport record class for a just-completed sector `split`, checked best-first: "session"
+-- (purple) when it is the fastest that sector by anyone (<= the field's known best, which excludes this
+-- fresh split) -- possible even on your first run through the sector; else "personal" (green) when it
+-- matched/beat your own best for that sector; else "slower" (red) when it is slower than your best. The
+-- session-best check runs before the first-run guard, so beating the field is purple even without a
+-- personal reference yet. "normal" only when there is nothing to compare against -- the split is not a
+-- number, or there is no session best to beat and no personal reference yet (your first time through
+-- this sector). `session_best` / `prev_personal_best` may be nil (no data yet).
 function M.record_class(split, prev_personal_best, session_best)
-    if type(split) ~= "number" or prev_personal_best == nil then
+    if type(split) ~= "number" then
         return "normal"
     end
     if type(session_best) == "number" and split <= session_best then
         return "session"
+    end
+    if prev_personal_best == nil then
+        return "normal"
     end
     if split <= prev_personal_best then
         return "personal"
