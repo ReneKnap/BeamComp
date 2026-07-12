@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-hold-r2/2026-07-12"
+local BUILD_MARKER = "payload-gate/2026-07-12"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -292,6 +292,23 @@ M.state = {
 local function arm_dashboard_refresh(wait)
     M.state.dash_refresh_pending = true
     M.state.dash_refresh_wait = wait or DASH_REFRESH_SETTLE
+end
+
+-- Outgoing payload sizes per message type, as a high-water mark (bug offroad-race-massive-network-
+-- payload-lag). BeamNG stops logging after 15,000 entries and BeamMP's own packet logging can exhaust
+-- that budget before a race even starts, so a per-send line would destroy the very data it is meant to
+-- produce: a type is logged only when it sets a NEW size peak. Peaks are deliberately never reset -- the
+-- lag appears "from one race to the next", so a type that keeps setting new peaks race after race is
+-- itself the finding (something accumulates). Sizes only, never payload contents.
+local netsize = {peak = {}}
+
+-- Note an outgoing message's encoded size; log it only if it is that type's largest so far.
+function netsize.note(message_type, size)
+    if size <= (netsize.peak[message_type] or 0) then
+        return
+    end
+    netsize.peak[message_type] = size
+    log("I", "beamcomp.net", string.format("payload peak: %s = %d B", message_type, size))
 end
 
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
@@ -3415,6 +3432,10 @@ function send_to_server(message_type, payload)
             .. tostring(encoded))
         return
     end
+    -- The envelope is already encoded here, so its size is free to take (bug offroad-race-massive-
+    -- network-payload-lag): this is the client->server measurement point -- it is what shows the
+    -- raceValidation weighing tens of KB, and what proves the ADR-0046 gate brought it down.
+    netsize.note(message_type, #encoded)
     local sent, err = pcall(TriggerServerEvent, EVENT_CHANNEL, encoded)
     if not sent then
         log("W", LOG_TAG, "TriggerServerEvent failed for '" .. message_type .. "': "

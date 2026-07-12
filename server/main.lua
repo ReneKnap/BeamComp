@@ -837,13 +837,45 @@ local function phase_elapsed()
     return now() - session.phase_started_at
 end
 
+-- Outgoing payload sizes per message type, as a high-water mark (bug offroad-race-massive-network-
+-- payload-lag). The decisive measurement: it says whether any standings/racePhase broadcast ever comes
+-- near the ~145 KB the client decompresses per checkpoint, or whether only raceStart is ever big.
+--
+-- Sparse by construction -- a type is logged only when it sets a NEW size peak, so a broadcast (one
+-- send_event per player with the same payload) collapses to a single line and a steady-state race falls
+-- silent. Peaks are deliberately never reset: the lag arrives "from one race to the next", so a type that
+-- keeps setting new peaks race after race is itself the finding (something accumulates).
+--
+-- Sizes only, never payload contents -- the server measures the LENGTH of the envelope it already ships
+-- and reads nothing inside it, so race-blindness (ADR-0005) holds. Hangs off a namespace table rather
+-- than top-level locals: main.lua sits at LuaJIT's 200-local ceiling (see grid_store / f1).
+local net = {peak = {}}
+
+-- Note an outgoing envelope's encoded size; log it only if it is that type's largest so far. The encode
+-- is pcall-guarded and its result discarded (BeamMP re-encodes the table for the wire) -- a measurement
+-- must never be the thing that breaks a send.
+function net.note_size(message_type, envelope)
+    local ok, encoded = pcall(Util.JsonEncode, envelope)
+    if not ok or type(encoded) ~= "string" then
+        return
+    end
+    local size = #encoded
+    if size <= (net.peak[message_type] or 0) then
+        return
+    end
+    net.peak[message_type] = size
+    log_info("beamcomp.net", string.format("payload peak: %s = %d B", message_type, size))
+end
+
 -- Send a typed event to one client as a { type, payload } envelope. BeamMP
 -- JSON-encodes the table; the client decodes it with the shared envelope module.
 local function send_event(player_id, message_type, payload)
-    local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, {
+    local envelope = {
         type = message_type,
         payload = payload,
-    })
+    }
+    net.note_size(message_type, envelope)
+    local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, envelope)
     if not ok then
         log_info("beamcomp.net", "client event '" .. message_type .. "' to id "
             .. player_id .. " failed: " .. tostring(err))
