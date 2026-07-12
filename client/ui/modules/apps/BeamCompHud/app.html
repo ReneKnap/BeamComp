@@ -860,6 +860,13 @@
       </div>
     </div>
     <div class="bc-tr">
+      <!-- Per-run checkpoint progress (ADR-0044/Round7): CP x/y shown only during the local driver's own
+           staged run, in the SAME wording + style as the race HUD's bc-lapcp-huge readout (above). Reuses the
+           live local detector's cpInLap/cpPerLap (populated during a staged run, ADR-0041), so quali and race
+           read identically; hidden between runs. -->
+      <div class="bc-lapcp-huge" ng-if="hud.qualiMine && hud.qualiMine.status === 'running' && hud.localEntry">
+        <span class="bc-cp-huge">CP {{hud.localEntry.cpInLap}}/{{hud.localEntry.cpPerLap}}</span>
+      </div>
       <div class="bc-panel bc-timepanel">
         <table class="bc-timeblock">
           <tr>

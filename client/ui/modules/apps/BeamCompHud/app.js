@@ -215,14 +215,22 @@ angular.module('beamng.apps')
     return 'Queued';
   }
 
-  // The time cell for a staged-quali board row (ADR-0044/Round6): a driver on their run shows their live
-  // run elapsed (the on-stage car's climbing time, so the board keeps moving through the finish grace),
-  // everyone else their best complete run time (or "--" before their first). Server-relayed numbers only.
+  // The time/progress cell for a staged-quali board row (ADR-0044/Round7): a driver WITH a complete run
+  // shows their best run time -- that is the grid-setting number. A driver WITHOUT one shows checkpoint
+  // progress instead of a live climbing time: on their run -> CP x/y (matching the race HUD + the right
+  // panel), otherwise the reached checkpoint count. Server-relayed numbers only.
   function qualiRowTime(r) {
-    if (r && r.status === 'running' && typeof r.live === 'number') {
-      return formatTime(r.live);
+    if (!r) {
+      return '--';
     }
-    return (r && typeof r.best === 'number') ? formatTime(r.best) : '--';
+    if (typeof r.best === 'number') {
+      return formatTime(r.best);
+    }
+    var cp = typeof r.cp === 'number' ? r.cp : 0;
+    if (r.status === 'running' && typeof r.cpTotal === 'number') {
+      return 'CP ' + cp + '/' + r.cpTotal;
+    }
+    return 'CP ' + cp;
   }
 
   // The local player's full entry (the one flagged isLocal), or null. Resolved from the full field
