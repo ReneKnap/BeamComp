@@ -210,6 +210,51 @@ local function resolve_race(payload)
     return race, locator, nil
 end
 
+-- ===== race-distribution policy (ADR-0039 / ADR-0046) ====================================
+-- Two switches govern how much of the race the host ships through the pre-flight handshake. Declared
+-- here, above both the builders (M.validate) and the consumer (resolve_race_for_prepare), so one block
+-- states the whole policy.
+
+-- ADR-0039 decision 6: with the file installed a client parses locally (no behavior change); a file-less
+-- client builds from the host's relayed definition. Flip this to true to make the relayed model the
+-- PRIMARY source (local parse becomes the fallback), once the 2-client perf/size check clears it.
+local PREFER_RELAYED_RACE_DATA = false
+
+-- ADR-0046: whether the host also ships the race's STATIC SCENERY (barriers/signs/arrows) as full prefab
+-- file text, so a file-less client can spawn it. Off by default -- it is the single biggest thing on the
+-- wire (measured: ~55 KB of a 59 KB raceValidation on 017-OffRoad) and on a server where everyone has the
+-- track installed it is decoded, relayed once per player inside raceStart, and then thrown away, every
+-- single race start (bug offroad-race-massive-network-payload-lag).
+--
+-- What a file-less client loses with this off is exactly the degradation ADR-0039 decision 5 sanctions:
+-- no barriers/signs. Its GEOMETRY still ships (raceData, always -- start positions + checkpoints), so it
+-- spawns on the exact grid, is scored identically and cannot shortcut the race; the cones still reach it
+-- too (host-spawned + BeamMP-synced, never relayed -- ADR-0020/0025). Turn this on if players race tracks
+-- they do not have installed and the scenery matters more than the payload.
+local DISTRIBUTE_PREFAB_CONTENT = false
+
+-- Ship the statics whenever the relayed model is PRIMARY: then every client -- not just a file-less one --
+-- builds its props from the relay, so withholding the content would strip the scenery from the whole
+-- field. Coupling the two switches here means the ADR-0039 decision-6 promotion stays a one-line change.
+local function ships_prefab_content()
+    return DISTRIBUTE_PREFAB_CONTENT or PREFER_RELAYED_RACE_DATA
+end
+
+-- The encoded size of a relayed blob, in bytes -- the measurement the payload fix rests on. Size only,
+-- never content. pcall-guarded and non-fatal (-1 = could not encode): a measurement must never be the
+-- thing that breaks a race start.
+local function encoded_size(value)
+    if value == nil then
+        return 0
+    end
+    local ok, encoded = pcall(jsonEncode, value)
+    if not ok or type(encoded) ~= "string" then
+        return -1
+    end
+    return #encoded
+end
+-- ===== end race-distribution policy ======================================================
+
 -- The host's serialized race definition for a file-less client (ADR-0039): only the normalized model a
 -- relayed M.prepare needs -- start positions, checkpoints, meta. routePoints and the local prop paths are
 -- omitted (the AI owner is always the host and parses locally; the prop content ships separately and the
@@ -231,10 +276,12 @@ local function build_race_data(race, locator)
 end
 
 -- The static-scenery content for each of this race's prefab files (ADR-0039), so a file-less client can
--- spawn the barriers/signs without the local files. Cones are not shipped -- the host spawns them and
--- BeamMP syncs them to everyone (ADR-0020/0025). Each entry keeps the file's basename so the consumer's
--- direction filter still selects the forward/reverse copy. A prefab that cannot be read/filtered is
--- skipped (best-effort: geometry is independent, so a missing barrier never blocks the race).
+-- spawn the barriers/signs without the local files. Built on every verdict (it is measured), but only
+-- SHIPPED when the distribution policy above allows it -- it is by far the heaviest thing on the wire
+-- (ADR-0046). Cones are not shipped -- the host spawns them and BeamMP syncs them to everyone
+-- (ADR-0020/0025). Each entry keeps the file's basename so the consumer's direction filter still selects
+-- the forward/reverse copy. A prefab that cannot be read/filtered is skipped (best-effort: geometry is
+-- independent, so a missing barrier never blocks the race).
 local function build_prefab_content(race)
     local files = (race.props and race.props.prefabFiles) or {}
     local content = {}
@@ -278,8 +325,9 @@ function M.validate(payload)
     -- aiDefaults.count to seed the AI slots when /race opted into AI without an explicit count. nil for
     -- non-aiRace content. The owner reads the same defaults locally via M.prepare for difficulty/vehicle.
     --
-    -- raceData + prefabContent serialize the race for distribution (ADR-0039): the server relays them
-    -- verbatim in raceStart so a client without the local race file can still build + spawn it.
+    -- raceData (+ prefabContent, when the policy above ships it) serialize the race for distribution
+    -- (ADR-0039/0046): the race-blind server relays them verbatim in raceStart so a client without the
+    -- local race file can still build + spawn it.
     -- Staged sprint quali activation (ADR-0044): the race-blind server cannot read meta.closed, so tell it
     -- whether an order=quali on this race is the rally staged sprint variant. Effective mode = the
     -- sprint|circuit override else meta.closed; a sprint means the staged single-car-from-P1 quali, a
@@ -295,20 +343,28 @@ function M.validate(payload)
         staged_quali = not closed
     end
 
+    -- Geometry always ships; the statics only when the relay is actually consumed (ADR-0046). They are
+    -- built either way -- local file reads, once per /race, on the host only -- so the size line below can
+    -- state what the gate is holding back. That keeps the trade-off in the log instead of in folklore: a
+    -- future "why does my friend see no barriers?" has a breadcrumb, and the payload measurement the fix
+    -- rests on stays reproducible (bug offroad-race-massive-network-payload-lag).
+    local race_data = build_race_data(race, locator)
+    local prefab_content = build_prefab_content(race)
+    local ships_statics = ships_prefab_content()
+    log("I", LOG_TAG, string.format(
+        "distribution '%s': raceData=%d B, prefabContent=%d B in %d prefab(s) -- statics %s",
+        tostring(locator.id), encoded_size(race_data), encoded_size(prefab_content),
+        #prefab_content, ships_statics and "shipped" or "withheld (ADR-0046)"))
+
     return {
         ok = true,
         raceId = locator.id,
         aiDefaults = race.meta and race.meta.aiDefaults,
-        raceData = build_race_data(race, locator),
-        prefabContent = build_prefab_content(race),
+        raceData = race_data,
+        prefabContent = ships_statics and prefab_content or nil,
         stagedQuali = staged_quali,
     }
 end
-
--- ADR-0039 decision 6: with the file installed a client parses locally (no behavior change); a file-less
--- client builds from the host's relayed definition. Flip this to true to make the relayed model the
--- PRIMARY source (local parse becomes the fallback), once the 2-client perf/size check clears it.
-local PREFER_RELAYED_RACE_DATA = false
 
 -- Reconstruct the parsed race model + locator from the host's relayed definition (ADR-0039). The host
 -- ships only the geometry, so the prop side the consumer owns is rebuilt here: the shipped statics are

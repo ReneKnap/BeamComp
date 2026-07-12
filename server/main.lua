@@ -2895,7 +2895,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
                 -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
                 -- race from these. Same for every slot; the host (which has the file) ignores them and
-                -- parses locally. nil when the issuer's client did not ship them (older client).
+                -- parses locally. Either is nil when the issuer's client did not ship it (an older
+                -- client); prefabContent is additionally nil whenever the issuer's distribution policy
+                -- withholds the scenery -- the default since ADR-0046, which is why the relay is normally
+                -- geometry only. A file-less client then races the exact course without the barriers.
                 raceData = race_data,
                 prefabContent = prefab_content,
                 -- Qualifying event (ADR-0041): present only for order=quali, carrying the session length so
