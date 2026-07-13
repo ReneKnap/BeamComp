@@ -491,6 +491,76 @@ local function build_route_nodes(route)
     return nodes
 end
 
+-- How far past an open route's finish line the AI's final drive target sits (metres). Far enough that
+-- the car crosses the line at speed and brakes only behind it, short enough to stay on plausibly
+-- raceable ground behind the finish.
+local OVERSHOOT_DISTANCE = 30.0
+
+-- `distance` metres past `last` along the prev->last direction, as {x, y, z}; nil when the two points
+-- (nearly) coincide and carry no direction.
+local function extrapolate_past(prev, last, distance)
+    local dx, dy, dz = last.x - prev.x, last.y - prev.y, last.z - prev.z
+    local length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length < 0.01 then
+        return nil
+    end
+    local scale = distance / length
+    return {x = last.x + dx * scale, y = last.y + dy * scale, z = last.z + dz * scale}
+end
+
+-- The overshoot target position for an open route: `distance` metres past the last node along the final
+-- segment's direction. Walks back past degenerate (coincident) nodes for a usable direction; nil when
+-- the route has fewer than 2 distinct positions (no overshoot, by design).
+local function overshoot_position(nodes, distance)
+    local last = nodes[#nodes]
+    for i = #nodes - 1, 1, -1 do
+        local position = extrapolate_past(nodes[i], last, distance)
+        if position then
+            return position
+        end
+    end
+    return nil
+end
+
+-- Append the open-route finish-overshoot waypoint (snap variant): extrapolate OVERSHOOT_DISTANCE past
+-- the finish along the final route segment, snap that ONE point to the navgraph, and append it once as
+-- the final drive target -- so the AI crosses the finish line at speed and brakes only behind it
+-- instead of stopping short of the last checkpoint's trigger radius. If the snap lands back on the
+-- current route end (the finish node), the distance is doubled and retried once; still no distinct
+-- node -> no overshoot (logged), i.e. the prior brake-on-the-line behaviour. NOTE: this extrapolates
+-- exactly ONE point BEHIND the finish -- it never interpolates between route nodes (see
+-- resolve_waypoint_names: interpolated snapping wrecks the route; tried, reverted).
+local function append_overshoot_waypoint(names, route)
+    if #names == 0 then
+        return
+    end
+    if type(map) ~= "table" or type(map.findClosestRoad) ~= "function" then
+        return
+    end
+    local nodes = build_route_nodes(route)
+    local distance = OVERSHOOT_DISTANCE
+    for _ = 1, 2 do
+        local position = overshoot_position(nodes, distance)
+        if not position then
+            log("I", LOG_TAG, "no finish overshoot: route has no usable final segment")
+            return
+        end
+        local ok, name = pcall(map.findClosestRoad, vec3(position.x, position.y, position.z))
+        if not ok or type(name) ~= "string" or name == "" then
+            log("W", LOG_TAG, "no finish overshoot: navgraph snap behind the finish failed")
+            return
+        end
+        if name ~= names[#names] then
+            names[#names + 1] = name
+            log("I", LOG_TAG, string.format(
+                "finish overshoot waypoint '%s' (%.0f m past the finish)", name, distance))
+            return
+        end
+        distance = distance * 2
+    end
+    log("I", LOG_TAG, "no distinct navgraph node behind the finish; AI will brake on the line")
+end
+
 -- The wpTargetList node-index sequence across `lap_count` laps. The custom graph has one node per route
 -- point (1..node_count); a lap drives them in order, every lap repeated in full. The car spawns ON node 1
 -- (the start line), and ai.driveUsingPath's getPointNodePath(ego.pos -> node 1) then returns a 1-node path
@@ -510,6 +580,26 @@ local function lay_out_node_indices(node_count, lap_count, closed)
         seq[#seq + 1] = 1
     end
     return seq
+end
+
+-- Append the open-route finish-overshoot node (direct variant): one synthetic custom-map node
+-- OVERSHOOT_DISTANCE past the finish along the final segment, radius inherited from the finish node,
+-- targeted exactly once after the last lap -- the same crossing-at-speed intent as
+-- append_overshoot_waypoint. Mutates `nodes` (the custom map gains the node and its N->N+1 link) and
+-- `index_sequence` (the one extra final target). Closed loops never come here -- their closing edge
+-- already carries the AI through the finish (lay_out_node_indices).
+local function append_overshoot_node(nodes, index_sequence)
+    if #nodes < 2 then
+        return
+    end
+    local position = overshoot_position(nodes, OVERSHOOT_DISTANCE)
+    if not position then
+        log("I", LOG_TAG, "no finish overshoot: route has no usable final segment")
+        return
+    end
+    position.r = nodes[#nodes].r
+    nodes[#nodes + 1] = position
+    index_sequence[#index_sequence + 1] = #nodes
 end
 
 local DEFAULT_NODE_RADIUS = 4.0  -- corridor half-width when a route point ships none
@@ -603,7 +693,10 @@ end
 -- network so the car still drives. The lap sequence is laid out over the lap count (full-lap repeat +
 -- closed-loop finish drive-through), then the drive command -- built from the resolved difficulty `params`
 -- -- is queued to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). `closed` (a
--- circuit) adds the closing edge + drive-through. pcall-guarded. A nil `params` uses the default preset.
+-- circuit) adds the closing edge + drive-through; an OPEN route instead gets one overshoot target
+-- ~OVERSHOOT_DISTANCE behind the finish (both variants) so the AI crosses the line at speed and brakes
+-- only behind it -- ai.driveUsingPath brakes to a stop ON its final target, which otherwise parks the car
+-- short of the last checkpoint's trigger radius. pcall-guarded. A nil `params` uses the default preset.
 -- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph was installed (the
 -- caller restores the real one at teardown via M.restore_map).
 function M.drive(cars, route, laps, params, closed)
@@ -619,6 +712,11 @@ function M.drive(cars, route, laps, params, closed)
     if params.route == "direct" then
         local nodes = build_route_nodes(route)
         local index_sequence = lay_out_node_indices(#nodes, lap_count, closed)
+        -- perLap counts the real route nodes; the overshoot node below is a drive aid, not a lap stop.
+        per_lap = #nodes
+        if not closed then
+            append_overshoot_node(nodes, index_sequence)
+        end
         if install_custom_race_map(nodes, closed) then
             command = drive_command_wptargets(index_sequence, params)
             source = "direct"
@@ -627,10 +725,13 @@ function M.drive(cars, route, laps, params, closed)
             command = drive_command_wptargets({}, params)
             source = "span"
         end
-        per_lap, total = #nodes, #index_sequence
+        total = #index_sequence
     else
         local lap_names = resolve_waypoint_names(route)
         local names = lay_out_lap_waypoints(lap_names, lap_count)
+        if not closed then
+            append_overshoot_waypoint(names, route)
+        end
         local quoted = {}
         for _, name in ipairs(names) do
             quoted[#quoted + 1] = string.format("%q", name)
