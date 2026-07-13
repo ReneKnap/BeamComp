@@ -235,7 +235,6 @@ local session = {
     pending_map = nil,       -- queued race's issuer-reported map, for grid resolution (ADR-0023)
     pending_race_id = nil,   -- queued race's canonical id, the default-grid lookup key (ADR-0023)
     pending_race_data = nil, -- queued race's serialized definition, relayed verbatim in raceStart (ADR-0039)
-    pending_prefab_content = nil, -- queued race's serialized statics content, relayed verbatim (ADR-0039)
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
@@ -261,14 +260,19 @@ local CONFIG_CANDIDATE_PATHS = {
     "beamcomp.config.json",
 }
 
--- Normalized (trimmed, lowercased) admin names -> true, and whether the gate is on.
-local race_admins = {}
-local race_admin_gate_active = false
-
--- Whether player identity resolves to the client-reported BeamNG name instead of the BeamMP name
--- (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the guest-name fix applies
--- out of the box. Set false in beamcomp.config.json to fall back to BeamMP names everywhere.
-local use_client_name = true
+-- The plugin config, as read from beamcomp.config.json (ADR-0016). One namespace table rather than a
+-- local per setting: main.lua lives at LuaJIT's 200-local ceiling (see grid_store / f1), and a table
+-- costs one local no matter how many settings it grows.
+--   * `admins` / `admin_gate_active` -- normalized (trimmed, lowercased) admin names -> true, and
+--     whether the race-admin gate is on at all (no admins configured = everyone may start races).
+--   * `use_client_name` -- whether player identity resolves to the client-reported BeamNG name instead
+--     of the BeamMP name (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the
+--     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
+local cfg = {
+    admins = {},
+    admin_gate_active = false,
+    use_client_name = true,
+}
 
 -- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
 -- and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is per race --
@@ -279,7 +283,7 @@ local client_names = {}
 -- the option is on and one was reported, else the BeamMP name. The single chokepoint every name read
 -- goes through -- the option and the fallback live here only. nil only if BeamMP has no name for the id.
 local function resolve_identity(player_id)
-    if use_client_name then
+    if cfg.use_client_name then
         local name = client_names[player_id]
         if type(name) == "string" and name ~= "" then
             return name
@@ -302,13 +306,22 @@ local GRIDS_CANDIDATE_PATHS = {
 -- grids[map][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
 -- presets[map][name] = <race-setup form JSON string> is the named-preset store (ADR-0037 amendment
 -- 2026-07-03), folded onto this same table -- see the preset block below.
-local grid_store = {grids = {}, defaults = {}, presets = {}}
-local grids_file_path = nil
--- Whether grid_store has been populated from disk in THIS Lua-state instance. A BeamMP file-watch
--- reload (recon gotcha 12) re-runs this chunk -- resetting grid_store + this flag -- which is exactly
--- what happens when the editor writes the grids file; lazy-loading on first access (ensure_grids_loaded)
--- repopulates the store after such a reload, so a saved default is not lost.
-local grids_loaded = false
+--
+-- The grid store's own two state fields ride here as well, mirroring the presets' `presets_path` /
+-- `presets_loaded` below and for the same reason (the 200/200 local ceiling):
+--   * `grids_path`   -- the grids file we loaded from; writes go back to it, else the first candidate.
+--   * `grids_loaded` -- whether the store has been populated from disk in THIS Lua-state instance. A
+--     BeamMP file-watch reload (recon gotcha 12) re-runs this chunk -- rebuilding this table and so
+--     clearing the flag -- which is exactly what happens when the editor writes the grids file;
+--     lazy-loading on first access (ensure_grids_loaded) repopulates the store after such a reload, so
+--     a saved default is not lost.
+local grid_store = {
+    grids = {},
+    defaults = {},
+    presets = {},
+    grids_path = nil,
+    grids_loaded = false,
+}
 
 -- Named race-setup presets (ADR-0037 amendment 2026-07-03). A preset is the setup panel's form JSON,
 -- stored map-scoped and opaque -- the server never interprets it (race-blind, ADR-0005), it stores and
@@ -382,9 +395,9 @@ end
 -- only a real parse error warns. The resolved path is logged so the runtime working directory is
 -- visible in the server console (recon TODO #4). Called from on_init.
 local function load_config()
-    race_admins = {}
-    race_admin_gate_active = false
-    use_client_name = true
+    cfg.admins = {}
+    cfg.admin_gate_active = false
+    cfg.use_client_name = true
 
     local config, path, err = read_config()
     if not config then
@@ -399,8 +412,8 @@ local function load_config()
     end
 
     -- Default on (ADR-0031): only an explicit false turns it off; a missing key stays on.
-    use_client_name = config.useClientName ~= false
-    log_info("beamcomp.cfg", "useClientName=" .. (use_client_name and "on" or "off"))
+    cfg.use_client_name = config.useClientName ~= false
+    log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
 
     if type(config.raceAdmins) ~= "table" then
         log_info("beamcomp.cfg", "config at " .. path
@@ -412,8 +425,8 @@ local function load_config()
     for _, name in ipairs(config.raceAdmins) do
         if type(name) == "string" then
             local normalized = normalize_name(name)
-            if normalized ~= "" and not race_admins[normalized] then
-                race_admins[normalized] = true
+            if normalized ~= "" and not cfg.admins[normalized] then
+                cfg.admins[normalized] = true
                 count = count + 1
             end
         end
@@ -425,7 +438,7 @@ local function load_config()
         return
     end
 
-    race_admin_gate_active = true
+    cfg.admin_gate_active = true
     log_info("beamcomp.cfg", "loaded config from " .. path .. "; "
         .. count .. " race admin(s), gate active")
 end
@@ -433,10 +446,10 @@ end
 -- Whether `player_name` may issue the gated race commands. With the gate inactive (no admins
 -- configured) everyone is allowed -- the opt-in default (ADR-0016).
 local function is_race_admin(player_name)
-    if not race_admin_gate_active then
+    if not cfg.admin_gate_active then
         return true
     end
-    return race_admins[normalize_name(player_name)] == true
+    return cfg.admins[normalize_name(player_name)] == true
 end
 
 -- Read and JSON-decode the grids file from the first candidate path that opens (ADR-0023). Returns
@@ -468,7 +481,7 @@ local function load_grids()
     grid_store.defaults = {}
 
     local data, path, err = read_grids()
-    grids_file_path = path
+    grid_store.grids_path = path
     if not data then
         if err == "parse" then
             log_info("beamcomp.grid", "grids file at " .. tostring(path)
@@ -492,10 +505,10 @@ end
 -- robust to a file-watch reload that resets the in-memory store without re-firing onInit (ADR-0023):
 -- the next save/resolve/fetch repopulates from disk.
 local function ensure_grids_loaded()
-    if grids_loaded then
+    if grid_store.grids_loaded then
         return
     end
-    grids_loaded = true
+    grid_store.grids_loaded = true
     load_grids()
 end
 
@@ -545,8 +558,8 @@ local function write_grids()
     end
 
     local candidates = {}
-    if grids_file_path then
-        candidates[#candidates + 1] = grids_file_path
+    if grid_store.grids_path then
+        candidates[#candidates + 1] = grid_store.grids_path
     end
     for _, path in ipairs(GRIDS_CANDIDATE_PATHS) do
         candidates[#candidates + 1] = path
@@ -567,7 +580,7 @@ local function write_grids()
                 -- full) the live file is left untouched -- the very data loss this fix prevents.
                 os.remove(path)
                 if os.rename(tmp, path) then
-                    grids_file_path = path
+                    grid_store.grids_path = path
                     return true, path
                 end
                 log_info("beamcomp.grid", "could not commit grids write at " .. path)
@@ -828,13 +841,45 @@ local function phase_elapsed()
     return now() - session.phase_started_at
 end
 
+-- Outgoing payload sizes per message type, as a high-water mark (bug offroad-race-massive-network-
+-- payload-lag). The decisive measurement: it says whether any standings/racePhase broadcast ever comes
+-- near the ~145 KB the client decompresses per checkpoint, or whether only raceStart is ever big.
+--
+-- Sparse by construction -- a type is logged only when it sets a NEW size peak, so a broadcast (one
+-- send_event per player with the same payload) collapses to a single line and a steady-state race falls
+-- silent. Peaks are deliberately never reset: the lag arrives "from one race to the next", so a type that
+-- keeps setting new peaks race after race is itself the finding (something accumulates).
+--
+-- Sizes only, never payload contents -- the server measures the LENGTH of the envelope it already ships
+-- and reads nothing inside it, so race-blindness (ADR-0005) holds. Hangs off a namespace table rather
+-- than top-level locals: main.lua sits at LuaJIT's 200-local ceiling (see grid_store / f1).
+local net = {peak = {}}
+
+-- Note an outgoing envelope's encoded size; log it only if it is that type's largest so far. The encode
+-- is pcall-guarded and its result discarded (BeamMP re-encodes the table for the wire) -- a measurement
+-- must never be the thing that breaks a send.
+function net.note_size(message_type, envelope)
+    local ok, encoded = pcall(Util.JsonEncode, envelope)
+    if not ok or type(encoded) ~= "string" then
+        return
+    end
+    local size = #encoded
+    if size <= (net.peak[message_type] or 0) then
+        return
+    end
+    net.peak[message_type] = size
+    log_info("beamcomp.net", string.format("payload peak: %s = %d B", message_type, size))
+end
+
 -- Send a typed event to one client as a { type, payload } envelope. BeamMP
 -- JSON-encodes the table; the client decodes it with the shared envelope module.
 local function send_event(player_id, message_type, payload)
-    local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, {
+    local envelope = {
         type = message_type,
         payload = payload,
-    })
+    }
+    net.note_size(message_type, envelope)
+    local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, envelope)
     if not ok then
         log_info("beamcomp.net", "client event '" .. message_type .. "' to id "
             .. player_id .. " failed: " .. tostring(err))
@@ -848,6 +893,137 @@ local function broadcast_event(message_type, payload)
         send_event(player_id, message_type, payload)
     end
 end
+
+-- ===== targeted track distribution (ADR-0046) ============================================
+-- A client that does not have the race installed still races it: the issuer serializes the track and the
+-- server relays it (ADR-0039). It used to ride the raceValidation + every player's raceStart -- tens of KB
+-- shipped to EVERYONE at the busiest instant of the session, and thrown away by everyone who has the track
+-- (they parse locally). Now it is pulled on demand instead:
+--
+--   race validated -> trackProbe (all but the issuer) -> trackNeed (only from clients that cannot resolve
+--   the race locally) -> trackFetch (to the issuer, which provably has the files) -> trackUpload -> cached
+--   here -> trackData (only to the clients that asked).
+--
+-- If everyone has the track, not one further byte is sent. The probe fires the moment the race passes
+-- validation -- before the spawning phase, and for a QUEUED race an entire race early -- so the content is
+-- there before it is needed rather than inside the race-start burst.
+--
+-- The blob is opaque: cached, relayed, never parsed. Race-blindness (ADR-0005) holds.
+local track = {}
+
+track.MSG_PROBE = "trackProbe"    -- server -> all but the issuer: "this race is coming; do you need it?"
+track.MSG_NEED = "trackNeed"      -- client -> server: "I cannot resolve that race locally, send it"
+track.MSG_FETCH = "trackFetch"    -- server -> issuer: "serialize that race's scenery for me"
+track.MSG_UPLOAD = "trackUpload"  -- issuer -> server: the serialized scenery
+track.MSG_DATA = "trackData"      -- server -> a needing client: the serialized scenery
+
+track.content = {}   -- raceId -> the opaque prefab-content blob, cached for this server's lifetime
+track.waiting = {}   -- raceId -> {player_id -> true}: who asked while no blob was cached yet
+track.probed = {}    -- raceId -> true: the races the SERVER itself announced; only these are ever served
+track.fetching = {}  -- raceId -> true: an upload we have asked the CURRENT issuer for (one per race)
+track.owner_id = nil -- the last validated race's issuer: the one client known to hold the files
+
+-- Announce a validated race to everyone but its issuer, so a client without the files can pull them now
+-- rather than at the start. Records the issuer as the client to fetch from -- it just parsed this race for
+-- its pre-flight verdict (ADR-0019), so it demonstrably has the content.
+function track.probe(race_id, owner_id)
+    if type(race_id) ~= "string" or race_id == "" then
+        return
+    end
+    -- A DIFFERENT issuer voids every request we still have outstanding: those were addressed to the old
+    -- one, which may well be gone. Only on a change, though -- the same admin queuing a second race must
+    -- not invalidate the upload that the *running* race's clients are still waiting on.
+    if track.owner_id ~= owner_id then
+        track.fetching = {}
+    end
+    track.owner_id = owner_id
+    track.probed[race_id] = true
+    for player_id in pairs(MP.GetPlayers()) do
+        if player_id ~= owner_id then
+            send_event(player_id, track.MSG_PROBE, {raceId = race_id})
+        end
+    end
+end
+
+-- A client reports it cannot build this race locally. Serve it from the cache, or ask the issuer once and
+-- park the client until the upload lands.
+function track.handle_need(player_id, payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    local race_id = payload.raceId
+
+    -- Only ever service a race the server itself announced. Without this, any client could name an
+    -- arbitrary string and have us order the ISSUER's client to resolve and parse it -- unbounded work on
+    -- someone else's machine, driven from the network, once per made-up id. Everything legitimate is
+    -- covered: a probe answer echoes an id we sent, and the race-start backstop's id was probed in
+    -- commit_validated_race, which is the only way into a race at all.
+    if not track.probed[race_id] then
+        log_info("beamcomp.track", "ignored track request for an unannounced race from id "
+            .. tostring(player_id))
+        return
+    end
+
+    local cached = track.content[race_id]
+    if cached then
+        send_event(player_id, track.MSG_DATA, {raceId = race_id, prefabContent = cached})
+        return
+    end
+
+    local waiting = track.waiting[race_id]
+    if not waiting then
+        waiting = {}
+        track.waiting[race_id] = waiting
+    end
+    waiting[player_id] = true
+
+    if track.fetching[race_id] then
+        return  -- already asked; this client rides the same upload
+    end
+    if not track.owner_id then
+        log_info("beamcomp.track", "no issuer to fetch '" .. race_id .. "' from")
+        return
+    end
+    track.fetching[race_id] = true
+    send_event(track.owner_id, track.MSG_FETCH, {raceId = race_id})
+end
+
+-- The issuer's serialized scenery. Accepted ONLY from the client we asked and ONLY for a race we actually
+-- asked it about: this content is written to disk and spawned as scene objects on every receiver, so an
+-- unguarded upload would let any client poison the cache and spawn arbitrary objects on everyone else (the
+-- same owner discipline as the ADR-0019 handshake). Cached opaquely, then fanned out to whoever waited.
+-- The request is cleared before caching, so a second upload for the same race can never overwrite it.
+function track.handle_upload(player_id, payload)
+    if type(payload) ~= "table" or type(payload.raceId) ~= "string" then
+        return
+    end
+    if player_id ~= track.owner_id or not track.fetching[payload.raceId] then
+        log_info("beamcomp.track", "dropped unsolicited track upload from id " .. tostring(player_id))
+        return
+    end
+
+    local race_id = payload.raceId
+    track.fetching[race_id] = nil
+    -- An empty list is a legitimate answer (a race with no prefabs, or one the issuer could not read):
+    -- cache it too, so the waiting clients are released instead of hanging on a fetch that never repeats.
+    local content = type(payload.prefabContent) == "table" and payload.prefabContent or {}
+    track.content[race_id] = content
+
+    local waiting = track.waiting[race_id]
+    track.waiting[race_id] = nil
+    if not waiting then
+        return
+    end
+
+    local served = 0
+    for waiting_id in pairs(waiting) do
+        send_event(waiting_id, track.MSG_DATA, {raceId = race_id, prefabContent = content})
+        served = served + 1
+    end
+    log_info("beamcomp.track", string.format(
+        "track '%s': %d prefab(s) cached, served to %d client(s)", race_id, #content, served))
+end
+-- ===== end targeted track distribution ===================================================
 
 -- Send a chat line to every connected player. Like broadcast_event, BeamMP has no single broadcast,
 -- so loop the player table (server API note, section 7).
@@ -2674,7 +2850,6 @@ local function reset_to_lobby()
     session.pending_map = nil
     session.pending_race_id = nil
     session.pending_race_data = nil
-    session.pending_prefab_content = nil
     session.cleanup_warned = false
     session.spawn_pending = nil
     session.spawn_ready_count = 0
@@ -2728,7 +2903,7 @@ end
 -- race file, ADR-0013/0018). `owner_id` is the player that issued /race; exactly that player's
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
-local function start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
+local function start_race(race_name, owner_id, overrides, map, race_id, race_data)
     -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
@@ -2781,7 +2956,6 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     session.pending_map = nil
     session.pending_race_id = nil
     session.pending_race_data = nil
-    session.pending_prefab_content = nil
     session.cleanup_warned = false
 
     -- Seed the spawn-ready gate: await one spawnReady ack per rostered player before leaving the
@@ -2883,12 +3057,16 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- with car/maxhp/maxpwr only). nil for a non-random car -- the client ignores them then.
                 randomTrim = overrides.randomTrim,
                 noBigCars = overrides.noBigCars,
-                -- The issuer-serialized race definition + statics content (ADR-0039), relayed verbatim and
-                -- never interpreted (ADR-0005): a client without the local race file builds + spawns the
-                -- race from these. Same for every slot; the host (which has the file) ignores them and
-                -- parses locally. nil when the issuer's client did not ship them (older client).
+                -- The issuer-serialized race GEOMETRY (ADR-0039), relayed verbatim and never interpreted
+                -- (ADR-0005): a client without the local race file builds the grid + checkpoints from this,
+                -- so it is scored identically and cannot cut the course. Same for every slot; the host
+                -- (which has the file) ignores it and parses locally. nil from an older client.
+                --
+                -- The SCENERY no longer rides here (ADR-0046). It is tens of KB, it was duplicated into
+                -- every player's raceStart, and everyone who has the track threw it away. It is now pulled
+                -- on demand (trackProbe/trackNeed/trackData), before the start, only by clients that lack
+                -- the files -- so this message stays lean and most races ship none of it at all.
                 raceData = race_data,
-                prefabContent = prefab_content,
                 -- Qualifying event (ADR-0041): present only for order=quali, carrying the session length so
                 -- the client builds an unbounded-lap quali plan + shows the quali clock. nil = normal race.
                 quali = session.quali and {duration = session.quali.duration} or nil,
@@ -2922,15 +3100,13 @@ local function advance_from_finished()
         local map = session.pending_map
         local race_id = session.pending_race_id
         local race_data = session.pending_race_data
-        local prefab_content = session.pending_prefab_content
         session.pending_race = nil
         session.pending_owner = nil
         session.pending_overrides = nil
         session.pending_map = nil
         session.pending_race_id = nil
         session.pending_race_data = nil
-        session.pending_prefab_content = nil
-        start_race(pending, owner, overrides, map, race_id, race_data, prefab_content)
+            start_race(pending, owner, overrides, map, race_id, race_data)
         return
     end
     reset_to_lobby()
@@ -4055,9 +4231,15 @@ end
 -- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
 -- phase is re-checked here, not at request time, since the race may have ended while the check was in
 -- flight: from lobby/finished start now; from an active phase queue + run the brief abort window.
-local function commit_validated_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
+local function commit_validated_race(race_name, owner_id, overrides, map, race_id, race_data)
+    -- Prefetch the track for anyone who lacks it (ADR-0046). Fired here, at the earliest moment the race
+    -- is known to be going ahead: a client can pull the scenery during the spawning phase instead of
+    -- receiving it inside its raceStart -- and when this race is QUEUED behind a running one (below), an
+    -- entire race early. Costs nothing on a server where everyone has the track: nobody answers.
+    track.probe(race_id, owner_id)
+
     if session.phase == PHASE.lobby or session.phase == PHASE.finished then
-        start_race(race_name, owner_id, overrides, map, race_id, race_data, prefab_content)
+        start_race(race_name, owner_id, overrides, map, race_id, race_data)
         MP.SendChatMessage(owner_id, "BeamComp: starting race '" .. race_name .. "'")
         return
     end
@@ -4068,7 +4250,6 @@ local function commit_validated_race(race_name, owner_id, overrides, map, race_i
     session.pending_map = map
     session.pending_race_id = race_id
     session.pending_race_data = race_data
-    session.pending_prefab_content = prefab_content
     enter_phase(PHASE.finished, PHASE_DURATIONS.abort_window)
     MP.SendChatMessage(owner_id, "BeamComp: restarting with race '" .. race_name .. "'")
 end
@@ -4105,9 +4286,7 @@ local function handle_race_validation(player_id, payload)
         -- blob and relayed verbatim into raceStart so a file-less client can build the race. The server
         -- never parses or inspects it -- race-blindness holds (ADR-0005). nil from an older client.
         local race_data = type(payload.raceData) == "table" and payload.raceData or nil
-        local prefab_content = type(payload.prefabContent) == "table" and payload.prefabContent or nil
-        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id,
-            race_data, prefab_content)
+        commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id, race_data)
     else
         local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
         MP.SendChatMessage(pending.owner_id, "BeamComp: " .. reason)
@@ -5345,6 +5524,10 @@ local function handle_client_event(player_id, data)
         handle_vehicle_list(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_VALIDATION then
         handle_race_validation(player_id, decoded.payload)
+    elseif decoded.type == track.MSG_NEED then
+        track.handle_need(player_id, decoded.payload)
+    elseif decoded.type == track.MSG_UPLOAD then
+        track.handle_upload(player_id, decoded.payload)
     elseif decoded.type == MSG_SPAWN_READY then
         handle_spawn_ready(player_id, decoded.payload)
     elseif decoded.type == MSG_CLIENT_INFO then
