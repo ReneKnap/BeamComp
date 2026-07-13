@@ -1692,10 +1692,15 @@ quali.STAGE_COUNTDOWN = 8.0 -- start count at the ramp (8 -> GO), then the drive
 -- Clearance countdown AFTER a driver launches and BEFORE the next is teleported onto the ramp, so the next
 -- never spawns into the one just driving off. Round 4: the next stages only once BOTH this gap has passed
 -- AND the launched driver has physically cleared the ramp (the >=15 m gate the client reports, quali.MSG_CLEARED).
+-- Round 10: the gap doubles as a SETTLE timer -- when the clearing driver's run ends early (recover, finish,
+-- forced requeue), the gap restarts from the requeue moment, covering the network round-trip of the teleport
+-- back to the holding slot before anyone is staged onto the ramp.
 quali.STAGE_GAP = 5.0
--- Fallback so a stuck/AFK driver who never clears the ramp cannot stall the whole field: proceed anyway this
--- long after the launch even without the clear report (Round 4). The client 15 m gate normally fires first.
--- Stays well above STAGE_GAP (5 s) so the raised gap never collides with this stuck-driver fallback.
+-- Fallback so a stuck/AFK driver who never clears the ramp cannot stall the whole field: this long after the
+-- launch without a clear report the driver is FORCE-REQUEUED back to its holding slot (Round 10; players and
+-- AI alike). The requeue restarts the gap as a settle timer, so the next driver still stages no earlier than
+-- STAGE_GAP after the ramp actually emptied -- the cleared-AND-gap release gate is never bypassed. The client
+-- 15 m gate normally fires first. Stays well above STAGE_GAP (5 s) so the two timers never collide.
 quali.STAGE_CLEAR_TIMEOUT = 20.0
 
 -- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
@@ -1759,9 +1764,10 @@ function quali.begin(duration, staged)
         queue = nil,        -- turn order: ids waiting for their ramp turn (seeded by start_session)
         staging_id = nil,   -- the id counting down at the ramp (before GO), or nil
         staged_at = nil,    -- now() when staging_id was released (its count ends STAGE_COUNTDOWN later)
-        clearing_id = nil,  -- the id that launched but has not yet cleared the ramp (blocks the next), or nil
-        launched_at = nil,  -- now() when clearing_id launched (GO); the clearance gap runs from here
-        cleared = false,    -- true once clearing_id reported it is >=15 m clear of the ramp (Round 4 gate)
+        clearing_id = nil,  -- the id that launched but has not yet freed the ramp (blocks the next), or nil
+        launched_at = nil,  -- now() when clearing_id launched (GO); restarted by a requeue (Round-10 settle)
+        cleared = false,    -- true once clearing_id reported >=15 m clear -- or left the track via a
+                            -- requeue, which purpose-serves the distance condition (Round 10)
         status = nil,       -- per-id "queued|staged|running|done" for the HUD (seeded by start_session)
         best = nil,         -- per-identity best complete run time in seconds (ADR-0031)
     }
@@ -2120,7 +2126,8 @@ function quali.broadcast_queue()
     end
     table.sort(rows, function(a, b) return (a.slot or 0) < (b.slot or 0) end)
     -- `waiting` (Round 4): a driver has launched but not yet cleared the ramp, so the next stage is held --
-    -- the HUD shows "Waiting for driver to start". The staged driver's own count is not "waiting".
+    -- the HUD shows "Waiting for driver to start". The staged driver's own count is not "waiting". Also true
+    -- through a Round-10 settle (the clearing driver was requeued; the ramp frees when the settle gap ends).
     broadcast_event(quali.MSG_QUEUE, {rows = rows, waiting = (q.clearing_id ~= nil) or nil})
 end
 
@@ -2185,25 +2192,31 @@ function quali.reset_progress(id)
 end
 
 -- Requeue a driver whose run ended (ADR-0044/Round4): reset their record so the next run scores from zero,
--- free the ramp/clearing state if they held it, then either append them to the back of the turn queue
--- (another attempt, returning to their own fixed holding slot) or mark them done. The window is the ONLY
--- thing that ends a driver's session: while it is open EVERY driver -- player or AI (ADR-0044/Round9) --
--- goes back into the rotation; a run that ends after it closed marks done + freeze-in-place.
+-- release any ramp state they held (a held clearing gate becomes a settle timer, Round 10), then either
+-- append them to the back of the turn queue (another attempt, returning to their own fixed holding slot)
+-- or mark them done. The window is the ONLY thing that ends a driver's session: while it is open EVERY
+-- driver -- player or AI (ADR-0044/Round9) -- goes back into the rotation; a run that ends after it closed
+-- marks done + freeze-in-place.
 function quali.requeue(id)
     local q = session.quali
     if not q or not q.staged then
         return
     end
     quali.reset_progress(id)
-    -- Free the ramp / clearing gate if this driver held it (a reset while counting or clearing).
+    -- Free the ramp count if this driver held it (a requeue while still counting at the ramp).
     if q.staging_id == id then
         q.staging_id = nil
         q.staged_at = nil
     end
+    -- If this driver held the clearing gate, do NOT free it outright (Round 10): the car stays physically
+    -- on/near the ramp until the hold teleport lands, a network round-trip away. Convert the gate into a
+    -- settle timer instead -- the distance condition is purpose-served (the driver is off the track), the
+    -- gap restarts from the requeue moment -- so advance_staged stages the next driver no earlier than
+    -- STAGE_GAP from now. clearing_id stays set until the settle expires, which keeps release_next held
+    -- and the queue broadcast's `waiting` flag honest.
     if q.clearing_id == id then
-        q.clearing_id = nil
-        q.launched_at = nil
-        q.cleared = false
+        q.cleared = true
+        q.launched_at = now()
     end
     local filtered = {}
     for _, qid in ipairs(q.queue or {}) do
@@ -2306,10 +2319,11 @@ end
 
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
 -- the staged driver counts for STAGE_COUNTDOWN, then launches (-> clearing_id); the next driver is not staged
--- until the launcher has BOTH cleared the ramp (the client >=15 m report, or the STAGE_CLEAR_TIMEOUT fallback)
--- AND the STAGE_GAP clearance has passed. The waiting field stays put on their fixed slots (no roll-forward).
--- When the window expires, stop releasing and arm a finish-your-run grace, then classify. Circuit uses
--- quali.advance_qualifying instead.
+-- until the launcher has BOTH cleared the ramp (the client >=15 m report) AND the STAGE_GAP clearance has
+-- passed -- a strict AND with no bypass (Round 10). A launcher that never clears within STAGE_CLEAR_TIMEOUT
+-- is force-requeued (players and AI alike), which restarts the gap as a settle timer instead of releasing.
+-- The waiting field stays put on their fixed slots (no roll-forward). When the window expires, stop releasing
+-- and arm a finish-your-run grace, then classify. Circuit uses quali.advance_qualifying instead.
 function quali.advance_staged()
     local q = session.quali
     if not q then
@@ -2336,19 +2350,24 @@ function quali.advance_staged()
         changed = true
     end
 
-    -- The launched driver has cleared the ramp: both the >=15 m gate (q.cleared, client-reported) and the
-    -- clearance gap have passed -- OR the stuck-driver timeout fires. Free the ramp for the next.
+    -- The ramp frees ONLY when both the >=15 m gate (q.cleared -- client-reported, or purpose-served by a
+    -- requeue) AND the clearance gap have passed: the strict AND gate (Round 10), no bypass. A driver stuck
+    -- at the ramp (no clear report within STAGE_CLEAR_TIMEOUT) is force-requeued back to its holding slot
+    -- instead of being staged past; quali.requeue converts this gate into a settle timer (cleared=true,
+    -- launched_at=now), so the release still waits the full gap for the return teleport to land. requeue
+    -- broadcasts the queue itself (no changed flag here), and it keeps clearing_id set, so the release
+    -- check below cannot fire in this same tick.
     if q.clearing_id then
-        local gate_ok = q.cleared and t >= (q.launched_at or 0) + quali.STAGE_GAP
-        local timeout = t >= (q.launched_at or 0) + quali.STAGE_CLEAR_TIMEOUT
-        if gate_ok or timeout then
-            if timeout and not q.cleared then
-                log_info("beamcomp.race", "staged quali: ramp clear timeout -- proceeding (driver stuck at ramp?)")
-            end
+        if q.cleared and t >= (q.launched_at or 0) + quali.STAGE_GAP then
             q.clearing_id = nil
             q.launched_at = nil
             q.cleared = false
             changed = true
+        elseif not q.cleared and t >= (q.launched_at or 0) + quali.STAGE_CLEAR_TIMEOUT then
+            log_info("beamcomp.race", string.format(
+                "staged quali: ramp clear timeout -- forcing requeue of stuck driver %s",
+                tostring(q.clearing_id)))
+            quali.requeue(q.clearing_id)
         end
     end
 
