@@ -2186,9 +2186,10 @@ end
 
 -- Requeue a driver whose run ended (ADR-0044/Round4): reset their record so the next run scores from zero,
 -- free the ramp/clearing state if they held it, then either append them to the back of the turn queue
--- (another attempt while the window is open, returning to their own fixed holding slot) or mark them done.
--- terminal=true forces done -- AI take a single staged run. A window that has already closed also marks done.
-function quali.requeue(id, terminal)
+-- (another attempt, returning to their own fixed holding slot) or mark them done. The window is the ONLY
+-- thing that ends a driver's session: while it is open EVERY driver -- player or AI (ADR-0044/Round9) --
+-- goes back into the rotation; a run that ends after it closed marks done + freeze-in-place.
+function quali.requeue(id)
     local q = session.quali
     if not q or not q.staged then
         return
@@ -2212,7 +2213,9 @@ function quali.requeue(id, terminal)
     end
     q.queue = filtered
     local window_open = session.phase == PHASE.qualifying and phase_elapsed() < q.duration
-    if terminal or not window_open then
+    if not window_open then
+        -- The run ended after the window closed: this driver is finished for the session. They stay where
+        -- they rolled out (no teleport) -- the pre-race re-grid puts the whole field back on the grid anyway.
         q.status[id] = "done"
         quali.hold_driver(id, true)  -- stop + freeze in place
     else
@@ -2227,7 +2230,8 @@ end
 
 -- A driver completed a staged Start->Ziel run (ADR-0044): fold their run time into the per-identity best
 -- (fastest complete run stands), then requeue them. Called from handle_checkpoint_report's final branch
--- while this is a staged qualifying session. AI take a single run -> requeued as terminal (done).
+-- while this is a staged qualifying session. AI requeue exactly like players (ADR-0044/Round9): back to
+-- their own holding slot, back of the turn queue, another run for as long as the window is open.
 function quali.finish_run(id)
     local q = session.quali
     if not q or not q.staged then
@@ -2250,7 +2254,7 @@ function quali.finish_run(id)
             log_info("beamcomp.race", string.format("staged quali: %s run %.2fs (best)", identity, time))
         end
     end
-    quali.requeue(id, is_ai_id(id))
+    quali.requeue(id)
 end
 
 -- A player hit RECOVER mid-run (client->server qualiReset, ADR-0044/Round4): start a new attempt -- requeue
@@ -2264,7 +2268,7 @@ function quali.handle_reset(player_id, payload)
     if not (session.progress and session.progress[player_id]) then
         return
     end
-    quali.requeue(player_id, false)
+    quali.requeue(player_id)
     log_info("beamcomp.race", "player " .. tostring(player_id) .. " recover -> requeued (staged quali)")
 end
 
