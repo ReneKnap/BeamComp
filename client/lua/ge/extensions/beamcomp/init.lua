@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-spawn-no-nudge-split-height/2026-07-14"
+local BUILD_MARKER = "grid-spawn-anchor-lift-r2/2026-07-14"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -5518,9 +5518,9 @@ end
 -- Knobs (beamcomp_grid_set):
 --   offsetForward  -- shift the whole grid forward/back along the travel axis (m)
 --   offsetLateral  -- shift the whole grid left/right (m)
---   offsetHeight   -- lift the segment base above the inherited chain height (m); chains into the tail.
---                     Auto-seeded from the ground when a breakpoint is created, so a split re-anchors
---                     the grounding window on climbing terrain -- this knob is fine-tuning on top.
+--   offsetHeight   -- lift each pose of the segment this far ABOVE the ground (m), applied AFTER the
+--                     surface snap at spawn and in the preview (+1 = hovers exactly 1 m). Per segment;
+--                     does not chain into later segments.
 --   rowGap         -- spacing between positions front-to-back (m)
 --   colGap         -- spacing between positions left-to-right (m)
 --   headingDeg     -- rotate the whole grid about vertical (deg)
@@ -5532,7 +5532,10 @@ end
 -- Segments (ADR-0023 amendment): beamcomp_grid_breakpoint(slot) selects (or creates, seeded from the
 -- covering segment) the segment starting at `slot` -- the knobs above then edit that segment, which
 -- stacks behind the previous one; beamcomp_grid_removebreak() drops the active breakpoint. Slot 0 is the
--- base segment. A grid with no breakpoints is exactly today's single-block behaviour.
+-- base segment. A NEW breakpoint auto-seeds an internal pre-grounding height anchor from the terrain
+-- (chains into the tail, re-centers the ground-cast window on climbing terrain); the anchor is not a
+-- knob -- re-create the breakpoint to re-seed it. A grid with no breakpoints is exactly today's
+-- single-block behaviour.
 
 -- GE console command (intentionally global): start a fresh grid from the track's generated layout.
 function beamcomp_grid_new(race_name)

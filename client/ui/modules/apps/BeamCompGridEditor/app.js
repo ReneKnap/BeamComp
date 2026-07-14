@@ -16,12 +16,14 @@ angular.module('beamng.apps')
   // ("auto") and is derived from the field at spawn. Both carry `auto: true` so whichever is unpinned
   // reads "auto". The boolean `mirror` param is not in this list -- it renders as its own On/Off toggle
   // (the first Layout row, see app.html + scope.setMirror), not a numeric stepper. offsetHeight is the
-  // per-segment height lift above the inherited chain z (auto-seeded when a breakpoint is created; blank
-  // on a grid saved before the field existed, which GE treats as 0).
+  // segment's POST-grounding lift: GE adds it after the surface snap at spawn and in the preview, so
+  // +1 hovers the cars exactly 1 m above the ground; per segment, it does not chain into later
+  // segments (blank on an older saved grid, which GE treats as 0). The internal split height anchor
+  // (anchorHeight, auto-seeded on breakpoint creation) is deliberately NOT a knob.
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)' },
     { key: 'offsetLateral', label: 'Offset lateral (m)' },
-    { key: 'offsetHeight', label: 'Offset height (m)' },
+    { key: 'offsetHeight', label: 'Height lift (m)' },
     { key: 'headingDeg', label: 'Heading (deg)' },
     { key: 'rowGap', label: 'Row gap (m)' },
     { key: 'colGap', label: 'Col gap (m)' },

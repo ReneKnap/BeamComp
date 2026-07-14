@@ -162,9 +162,9 @@ function M.ground_z(x, y, hint_z)
     return terrain_ground_z(x, y)
 end
 
--- Wide-window surface probe for the EDITOR's grid-split height seed (ADR-0023 amendment). Unlike
--- ground_z -- whose fixed UP_MARGIN window is a spawn-side contract (the cast must start UNDER a tunnel
--- ceiling, ADR-0034) -- this also searches far ABOVE the hint, for the exact case the seed exists for:
+-- Wide-window surface probe for the EDITOR's grid-split height-anchor seed (ADR-0023 amendment).
+-- Unlike ground_z -- whose fixed UP_MARGIN window is a spawn-side contract (the cast must start UNDER a
+-- tunnel ceiling, ADR-0034) -- this also searches far ABOVE the hint, for the exact case the seed exists for:
 -- terrain that climbed more than UP_MARGIN over the chain z, where the normal cast starts inside the
 -- hill and misses. Casts at escalating start heights (nearest window first, so a surface close to the
 -- hint wins over a high overpass), then falls back to terrain height (z-independent), refined by one
@@ -202,9 +202,12 @@ end
 
 -- Ground a list of poses HEIGHT-ONLY, in place-order -- the grid spawn pass (ADR-0034 amendment): each
 -- pose drops to the surface with NO wall displacement, so the spawned field keeps the authored X/Y of
--- every slot, exactly what the editor preview shows. Entries that are not {pos = {...}} tables pass
--- through unchanged (defensive at the call boundary, like resolve). Returns a new list; the input list
--- and its pose tables are not mutated.
+-- every slot, exactly what the editor preview shows. A pose's `lift` (the offsetHeight knob's
+-- POST-grounding lift, ADR-0023 amendment) is then added on top -- equally on the authored-z degrade
+-- path when no surface answers -- so +1 m spawns the car exactly 1 m above where it would otherwise
+-- sit. Grid poses carry `lift`; recover targets never do. Entries that are not {pos = {...}} tables
+-- pass through unchanged (defensive at the call boundary, like resolve). Returns a new list; the input
+-- list and its pose tables are not mutated.
 function M.ground_all(poses)
     if type(poses) ~= "table" then
         return poses
@@ -213,7 +216,12 @@ function M.ground_all(poses)
     for index = 1, #poses do
         local pose = poses[index]
         if type(pose) == "table" and type(pose.pos) == "table" then
-            grounded[index] = M.ground_pose(pose)
+            local dropped = M.ground_pose(pose)
+            local lift = tonumber(pose.lift)
+            if lift and lift ~= 0 then
+                dropped.pos.z = dropped.pos.z + lift
+            end
+            grounded[index] = dropped
         else
             grounded[index] = pose
         end

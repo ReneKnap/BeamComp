@@ -15,8 +15,10 @@
 -- is the base param set, and a breakpoint at a chosen slot adds a further segment (seeded from the covering
 -- segment's params) that lays out behind the previous one (grid.poses_segmented). M.state.segment is the
 -- active segment the knobs edit; the breakpoint selector (M.select_segment / M.remove_segment) chooses it.
--- A fresh breakpoint auto-seeds its offsetHeight from the real surface at its first slot
--- (seed_segment_height), so splitting alone re-anchors the grounding window on climbing terrain.
+-- A fresh breakpoint auto-seeds its internal anchorHeight from the real surface at its first slot
+-- (seed_segment_anchor), so splitting alone re-anchors the grounding window on climbing terrain; the
+-- anchor is deliberately NOT a knob -- re-creating the breakpoint re-seeds it. The offsetHeight knob is
+-- a separate POST-grounding lift applied after the preview/spawn ground snap (see recompute).
 -- A grid with only segment 0 is exactly today's single-block behaviour.
 
 local M = {}
@@ -47,6 +49,9 @@ local MAX_BREAKPOINT_SLOT = MAX_PREVIEW_COUNT
 -- heading are unrestricted; gaps are non-negative; rows and columns are positive integers. rows and
 -- columns are two ways to express the same width and are mutually exclusive (see M.set): pinning one axis
 -- drops the other, which then becomes the dynamic axis derived from the field at spawn (grid.poses).
+-- offsetHeight is the POST-grounding lift (added after the ground snap at spawn and preview). The
+-- internal anchorHeight (the auto-seeded split anchor) is deliberately absent here: it has no editing
+-- surface, so M.set rejects it -- re-create the breakpoint to re-seed it.
 local KNOBS = {
     offsetForward = {},
     offsetLateral = {},
@@ -119,24 +124,28 @@ local function recompute()
     -- Ground each pose to the surface HEIGHT ONLY (placement.ground_pose): Z follows the terrain so the
     -- preview matches where cars land, with NO lateral wall-nudge -- and since the grid spawn grounds
     -- height-only too (placement.ground_all, ADR-0034 amendment), preview and spawn are the same pass.
-    -- Copy back only Z: ground_pose returns a fresh {pos, rot, forward} table that would
-    -- drop the segment tag and faceDir. These pose tables are freshly built here, so mutating them is safe.
+    -- The pose's `lift` (the offsetHeight knob's POST-grounding lift) is added after the snap in the
+    -- same order as the spawn pass, so a +1 m knob shows pillars hovering exactly 1 m. Copy back only
+    -- Z: ground_pose returns a fresh {pos, rot, forward} table that would drop the segment tag and
+    -- faceDir. These pose tables are freshly built here, so mutating them is safe.
     for _, pose in ipairs(poses) do
-        pose.pos.z = placement.ground_pose(pose).pos.z
+        pose.pos.z = placement.ground_pose(pose).pos.z + (tonumber(pose.lift) or 0)
     end
     M.state.poses = poses
 end
 
--- Auto-seed a NEW breakpoint segment's offsetHeight from the real surface at its first slot (ADR-0023
--- amendment): measure the ground under the pose the pure chain puts there and set the delta that lifts
--- the segment base onto it. This is what makes SPLITTING a grid re-anchor the grounding window on
--- climbing terrain by itself -- the knob is only fine-tuning on top. Uses the wide editor probe
+-- Auto-seed a NEW breakpoint segment's internal anchorHeight from the real surface at its first slot
+-- (ADR-0023 amendment): measure the ground under the pose the pure chain puts there and set the delta
+-- that lifts the segment base onto it -- the split point becomes the segment's new height zero. This is
+-- what makes SPLITTING a grid re-anchor the grounding window on climbing terrain by itself. The anchor
+-- is pre-grounding and internal (no knob; re-creating the breakpoint is the way to re-seed it) --
+-- distinct from the offsetHeight knob's post-grounding lift. Uses the wide editor probe
 -- (placement.probe_ground_z) because the motivating case is ground far above the inherited chain z,
 -- outside the spawn window. Editor-only; the spawn side stays pure param application. Must be called
--- AFTER the segment (offsetHeight 0) is inserted, so the chain pose reflects the inherited height.
--- Degrade-don't-crash: any failure (no ground, engine API missing) leaves the seed at 0, logged, and
+-- AFTER the segment (anchorHeight 0) is inserted, so the chain pose reflects the inherited height.
+-- Degrade-don't-crash: any failure (no ground, engine API missing) leaves the anchor at 0, logged, and
 -- never surfaces an error into the editor flow.
-local function seed_segment_height(new_segment)
+local function seed_segment_anchor(new_segment)
     local seeded_delta = nil
     pcall(function()
         local anchor = M.state.anchors[M.state.direction]
@@ -155,17 +164,17 @@ local function seed_segment_height(new_segment)
         if not ground then
             return
         end
-        -- Centimetre rounding: a clean knob value for the panel; the grounding window this seed exists
-        -- to re-anchor is metres wide, so the lost precision is irrelevant.
+        -- Centimetre rounding keeps the stored value clean; the grounding window this anchor exists
+        -- to re-center is metres wide, so the lost precision is irrelevant.
         seeded_delta = math.floor((ground - chain_z) * 100 + 0.5) / 100
     end)
     if seeded_delta then
-        new_segment.params.offsetHeight = seeded_delta
-        log("I", LOG_TAG, string.format("breakpoint at slot %d: offsetHeight auto-seeded to %+.2f m",
+        new_segment.params.anchorHeight = seeded_delta
+        log("I", LOG_TAG, string.format("breakpoint at slot %d: height anchor auto-seeded to %+.2f m",
             new_segment.startSlot, seeded_delta))
     else
-        log("W", LOG_TAG, string.format("breakpoint at slot %d: no ground found for the height seed"
-            .. " -- offsetHeight stays 0 (tune the knob manually)", new_segment.startSlot))
+        log("W", LOG_TAG, string.format("breakpoint at slot %d: no ground found for the height anchor"
+            .. " -- anchor stays 0 (re-create the breakpoint to retry)", new_segment.startSlot))
     end
 end
 
@@ -319,8 +328,8 @@ end
 -- (ADR-0023 amendment). Slot 0 (or below) is always the base segment. If a segment already starts at the
 -- slot it is activated; otherwise a new segment is created, SEEDED from the params of the segment that
 -- currently covers the slot (so it starts as a copy you then tune), inserted in slot order, and its
--- offsetHeight auto-seeded from the ground at its first slot (seed_segment_height -- creation only, a
--- re-select never re-seeds). Returns true + the applied start slot, or nil + a reason.
+-- internal anchorHeight auto-seeded from the ground at its first slot (seed_segment_anchor -- creation
+-- only, a re-select never re-seeds). Returns true + the applied start slot, or nil + a reason.
 function M.select_segment(start_slot)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
@@ -358,17 +367,20 @@ function M.select_segment(start_slot)
     -- Seed a fresh breakpoint from the covering segment so it inherits the layout (columns/rowGap/colGap/
     -- headingDeg/mirror), but zero its position offsets so it CONTINUES the previous segment seamlessly out
     -- of the box: offsetForward is then a pure additional gap the admin dials in (0 = seamless).
-    -- offsetHeight is zeroed like the others (the covering segment's delta is already in the inherited
-    -- chain z -- copying it would apply it twice) and then auto-seeded from the real surface below. Only
-    -- breakpoint segments are zeroed here; segment 0 keeps its own offsetForward (the setback from the line).
+    -- The internal anchorHeight is zeroed like the chain offsets (the covering segment's anchor is
+    -- already in the inherited chain z -- copying it would apply it twice) and then auto-seeded from the
+    -- real surface below. The offsetHeight LIFT is inherited as-is like the layout knobs: it does not
+    -- chain, so keeping the covering segment's hover means the split does not visibly move the field.
+    -- Only breakpoint segments are zeroed here; segment 0 keeps its own offsetForward (the setback from
+    -- the line).
     local seeded = copy_params(segments[prev_index].params)
     seeded.offsetForward = 0
     seeded.offsetLateral = 0
-    seeded.offsetHeight = 0
+    seeded.anchorHeight = 0
     local new_segment = {startSlot = number, params = seeded}
     table.insert(segments, prev_index + 1, new_segment)
     M.state.segment = prev_index + 1
-    seed_segment_height(new_segment)
+    seed_segment_anchor(new_segment)
     recompute()
     return true, number
 end
