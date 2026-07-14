@@ -472,11 +472,14 @@ function M.prepare(payload)
     -- a reverse race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
     local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
     local grid_params = grid_params_for(payload.gridParams, direction)
-    -- Drop every pose onto the real surface and clear of walls before anyone spawns on it (ADR-0034):
-    -- grid.poses is pure math at the start-line Z, so on undulating tracks the rear rows would bury or
-    -- float. front-anchoring (vehicles.lua) preserves Z, so grounding here flows through every placement
-    -- path (fresh/fixed/substitute spawn, keep+teleport, regrid, restage, recover-before-CP1). The block
-    -- is expanded into its ordered segment list (ADR-0023 amendment) and laid out via poses_segmented, so
+    -- Drop every pose onto the real surface before anyone spawns on it (ADR-0034): grid.poses is pure
+    -- math at the chain Z, so on undulating tracks the rear rows would bury or float. front-anchoring
+    -- (vehicles.lua) preserves Z, so grounding here flows through every placement path (fresh/fixed/
+    -- substitute spawn, keep+teleport, regrid, restage, recover-before-CP1). HEIGHT-ONLY on purpose
+    -- (ADR-0034 amendment): the wall-nudge misfired on steep slopes (its horizontal ray hits the rising
+    -- ground itself and shoved a holding slot onto the staged-quali ramp), so the grid keeps the authored
+    -- X/Y exactly as the editor preview shows them; only the recover assist still nudges. The block is
+    -- expanded into its ordered segment list (ADR-0023 amendment) and laid out via poses_segmented, so
     -- the spawned field matches the editor's stacked preview exactly; a plain single-param block (or nil)
     -- expands to one segment and reproduces today's layout bit-for-bit.
     -- Rally staged sprint quali (ADR-0044/Round4): P1 is a dedicated, initially-EMPTY start ramp. Lay out
@@ -486,7 +489,7 @@ function M.prepare(payload)
     -- holding poses re-indexed (slot k -> gridPoses[k+1]), so spawn / AI / regrid keep their usual mapping.
     local staged_quali = (mode == "sprint") and (type(payload.quali) == "table")
     local layout_count = staged_quali and (count + 1) or count
-    local poses = placement.resolve_all(grid.poses_segmented(base_pose.pos, base_pose.rot, layout_count,
+    local poses = placement.ground_all(grid.poses_segmented(base_pose.pos, base_pose.rot, layout_count,
         grid.block_to_segments(grid_params), gate_normal))
     local ramp_pose = nil
     if staged_quali then
