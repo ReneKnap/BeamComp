@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-sector-bar-r2/2026-07-15"
+local BUILD_MARKER = "quali-sector-bar-r3/2026-07-15"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -3553,6 +3553,22 @@ end
 -- emission seam for a passage -- keep it the one place a passage is reported. The report carries
 -- `seq` (the plan ordinal, the server's ordering key), `lap`, the display `index`/`name`, the time,
 -- and `count` (total scored crossings) so the race-blind server (ADR-0005) tracks progress and the
+-- The session sector reference (the field's best time per sector) for the qualifying record
+-- colouring -- ONE derivation for the crossing-time freeze, the bar re-evaluation and the readout
+-- (feature quali-sector-progress-bar, Round 3). Staged sprint: the server-relayed field bests
+-- (`sectorBests`, folded per scored crossing, ADR-0044). Circuit: derived from the live standings
+-- splits (ADR-0015; the raw broadcast entries carry .splits/.run_up). Both sources update only on a
+-- server broadcast, so a value read synchronously at crossing time can never contain that crossing
+-- itself. nil when no reference exists yet. On the quali namespace table -- init.lua sits at 186/200
+-- top-level locals.
+function quali.sector_session_reference(cps)
+    if M.state.quali_staged then
+        local relayed = M.state.quali_queue and M.state.quali_queue.sectorBests
+        return (type(relayed) == "table") and relayed or nil
+    end
+    return sectors.session_reference(M.state.standings, cps)
+end
+
 -- final crossing without parsing the race (ADR-0011, ADR-0013).
 local function on_checkpoint_reached(event, count)
     log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) lap %d reached @ %.2fs (seq %d)",
@@ -3579,11 +3595,14 @@ local function on_checkpoint_reached(event, count)
         end
     end
     -- Qualifying live sector delta (feature: quali-live-sector-delta): record this crossing's just-completed
-    -- sector (split time, per-sector personal best, lap cumulative) for the HUD readout. Circuit quali only
-    -- (sector_track is nil otherwise); lt.run_up bases lap 1's first sector on the start/finish line so it
-    -- reads clean line-to-line.
+    -- sector (split time, per-sector personal best, lap cumulative) for the HUD readout; lt.run_up bases
+    -- lap 1's first sector on the start/finish line so it reads clean line-to-line. The current session
+    -- sector reference rides along to be FROZEN as this sector's pre-crossing field best (Round 3): read
+    -- synchronously before the report below is sent, it cannot contain this crossing -- so the first-ever
+    -- time in a sector classifies "normal", never purple/green against its own relayed-back value.
     if M.state.phase == "qualifying" and M.state.sector_track then
-        sectors.on_crossing(M.state.sector_track, event.seq, event.time, lt and lt.run_up or nil)
+        sectors.on_crossing(M.state.sector_track, event.seq, event.time, lt and lt.run_up or nil,
+            quali.sector_session_reference(M.state.sector_track.cps))
     end
     -- `bestLap` rides the existing report as an additive field: the server stores the latest per
     -- player and relays it in the standings (ADR-0022) so the results card can show every player's
@@ -4375,18 +4394,12 @@ local function build_hud_snapshot()
     local sector_track = M.state.sector_track
     local sector_cps = (race and race.checkpoints) and #race.checkpoints or 0
     if phase == "qualifying" and sector_track and sector_cps >= 1 then
-        -- Session reference (the field's best per sector), shared by the readout and the bar. The circuit
-        -- derives it from the live standings splits (ADR-0015, partial laps included). The staged sprint
-        -- reads the server-relayed field bests (`sectorBests`, folded per scored crossing -- ADR-0044
-        -- Round 13); the old per-row bestSplits derivation only knew COMPLETE runs, too stale to degrade
-        -- a purple live.
-        local session_ref
-        if M.state.quali_staged then
-            local relayed = M.state.quali_queue and M.state.quali_queue.sectorBests
-            session_ref = (type(relayed) == "table") and relayed or nil
-        else
-            session_ref = sectors.session_reference(entries, sector_cps)
-        end
+        -- Session reference (the field's best per sector), shared by the readout and the bar -- the same
+        -- derivation the crossing-time freeze uses (Round 3). Circuit: live standings splits (ADR-0015,
+        -- partial laps included). Staged: the server-relayed field bests (`sectorBests`, folded per scored
+        -- crossing -- ADR-0044 Round 13); the old per-row bestSplits derivation only knew COMPLETE runs,
+        -- too stale to degrade a purple live.
+        local session_ref = quali.sector_session_reference(sector_cps)
         -- The bar shows in both variants whenever the quali HUD is up: grey before the first crossing,
         -- and between staged runs it keeps the last run's states until the next launch wipes them
         -- (decision 3/4). run_states re-classifies against session_ref on every push (degradation).
@@ -4415,7 +4428,11 @@ local function build_hud_snapshot()
                 personal_splits = local_entry and local_entry.splits or nil
                 personal_run_up = local_entry and local_entry.run_up or nil
             end
-            local session_best = session_ref and session_ref[last.sector] or nil
+            -- The readout classifies on the SAME frozen/effective reference as the bar (Round 3): the
+            -- live field best applies only when strictly faster than this split, else the value frozen
+            -- at crossing time -- the readout must never show purple where the bar is white.
+            local session_best = sectors.effective_session_best(last.split,
+                last.prev_session_best, session_ref and session_ref[last.sector] or nil)
             -- Cumulative delta vs your fastest run: this run's time through the sector minus that run's.
             local best_sections = sectors.personal_reference(personal_splits, personal_run_up, sector_cps)
             local best_cumulative = best_sections
