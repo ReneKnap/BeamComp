@@ -1774,6 +1774,10 @@ function quali.begin(duration, staged)
                             -- most checkpoints any run reached + the smallest run-relative time to that
                             -- count. Board + ranking measure timeless drivers on this, not the live
                             -- record, which every requeue resets (seeded by start_session, like best)
+        sector_best = nil,  -- per-sector field best split across ALL drivers and runs (Round 13):
+                            -- [k] = the fastest splits[k]-splits[k-1] any scored crossing produced,
+                            -- relayed as `sectorBests` on the queue snapshot so the staged HUD's
+                            -- record colouring degrades live (seeded by start_session, like best_cp)
     }
 end
 
@@ -2080,7 +2084,8 @@ end
 -- Broadcast the staged-quali holding queue for the HUD (ADR-0044): every participant's slot, identity,
 -- status (queued|staged|running|done), the classification `position` (Round 7: the best-run-then-checkpoint
 -- rank, so the live board mirrors the grid it sets), the waiting-line `queuePos` (drives "you're next"),
--- best complete run time, checkpoint progress (cp/cpTotal), the best run's splits, and the ai flag. Each
+-- best complete run time, checkpoint progress (cp/cpTotal), the best run's splits, and the ai flag --
+-- plus the field-wide per-sector best splits as one top-level `sectorBests` field (Round 13). Each
 -- client picks its own row by slot. Reported numbers only -- race-blind (ADR-0005).
 function quali.broadcast_queue()
     if not quali.is_staged() or not session.progress then
@@ -2139,7 +2144,15 @@ function quali.broadcast_queue()
     -- `waiting` (Round 4): a driver has launched but not yet cleared the ramp, so the next stage is held --
     -- the HUD shows "Waiting for driver to start". The staged driver's own count is not "waiting". Also true
     -- through a Round-10 settle (the clearing driver was requeued; the ramp frees when the settle gap ends).
-    broadcast_event(quali.MSG_QUEUE, {rows = rows, waiting = (q.clearing_id ~= nil) or nil})
+    -- `sectorBests` (Round 13): the field-wide per-sector best splits, ONE top-level field (not per row) --
+    -- the staged HUD's session reference for the record colouring of the bar + readout. This broadcast
+    -- already fires on every scored crossing (handle_checkpoint_report / requeue), so an improvement
+    -- reaches every client on the report that set it -- live degradation needs no extra cadence.
+    broadcast_event(quali.MSG_QUEUE, {
+        rows = rows,
+        waiting = (q.clearing_id ~= nil) or nil,
+        sectorBests = q.sector_best,
+    })
 end
 
 -- Seed the turn queue at the staging -> qualifying seam and stage the first driver at the ramp
@@ -2180,6 +2193,12 @@ function quali.start_session()
     -- only: a circuit quali never seeds it -- there the live record is never reset mid-session, so it
     -- already is the max and ranks the timeless drivers directly (Round 12).
     q.best_cp = {}
+    -- Field-wide best split per sector across all drivers and runs (Round 13): folded per scored
+    -- crossing (quali.note_sector_best) and relayed as ONE top-level queue-snapshot field
+    -- (sectorBests), so every client's record colouring -- bar + readout -- degrades live the moment
+    -- anyone beats a sector. Staged only, like best_cp: the circuit derives its session reference
+    -- client-side from the live standings splits (ADR-0015) and never allocates this.
+    q.sector_best = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
@@ -2241,6 +2260,30 @@ function quali.note_cp_progress(id)
     if not best or record.completed > best.cp
             or (record.completed == best.cp and time < best.time) then
         q.best_cp[identity] = {cp = record.completed, time = time}
+    end
+end
+
+-- Fold one scored crossing into the field-wide per-sector best splits (Round 13). Called per checkpoint
+-- report under the staged gate, like note_cp_progress, so EVERY scored crossing counts -- aborted runs
+-- included. The sector split is the difference of consecutive run-relative cumulative splits
+-- (splits[k] - splits[k-1], ADR-0015 semantics; k = 1 bases on 0 -- the staged run starts at the ramp,
+-- no run-up). Crossings arrive in seq order, so the array stays dense (sector k is never folded before
+-- 1..k-1). Race-blind (ADR-0005): a min of two client-reported numbers, the q.best pattern.
+function quali.note_sector_best(id)
+    local q = session.quali
+    local record = session.progress and session.progress[id]
+    if not q or not q.sector_best or not record or record.completed <= 0 then
+        return
+    end
+    local k = record.completed
+    local cumulative = record.splits and record.splits[k]
+    local previous = (k == 1) and 0 or (record.splits and record.splits[k - 1])
+    if type(cumulative) ~= "number" or type(previous) ~= "number" then
+        return
+    end
+    local split = cumulative - previous
+    if not q.sector_best[k] or split < q.sector_best[k] then
+        q.sector_best[k] = split
     end
 end
 
@@ -4998,12 +5041,14 @@ local function handle_checkpoint_report(player_id, payload)
         index and string.format(" (cp %d)", index) or "",
         time, final and " (final)" or ""))
 
-    -- Staged sprint quali (Round 11): fold this scored crossing into the driver's max progress pair
-    -- BEFORE the queue-board broadcast below reads it. Every scored crossing counts -- final ones too, and
-    -- those of a run later aborted by a recover/forced requeue (the fold is per crossing, so an abort can
-    -- never lose banked progress). Circuit quali / normal race: gated off.
+    -- Staged sprint quali (Round 11): fold this scored crossing into the driver's max progress pair --
+    -- and the field-wide per-sector best splits (Round 13) -- BEFORE the queue-board broadcast below
+    -- reads them. Every scored crossing counts -- final ones too, and those of a run later aborted by a
+    -- recover/forced requeue (the fold is per crossing, so an abort can never lose banked progress).
+    -- Circuit quali / normal race: gated off.
     if quali.is_staged() and session.phase == PHASE.qualifying then
         quali.note_cp_progress(subject_id)
+        quali.note_sector_best(subject_id)
     end
     broadcast_standings()
     -- Staged sprint quali (Round 6): refresh the holding-queue board on every crossing, so the live-timing
