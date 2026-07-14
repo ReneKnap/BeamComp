@@ -25,7 +25,12 @@
 -- breakpoint slot with its own full param set, laid out BEHIND the previous one. M.poses_segmented runs the
 -- stacking as a KINEMATIC FRAME CHAIN: each segment lays out in a running frame and passes the next segment
 -- the frame at its own end, so a segment's forward continuation (seamless at offsetForward 0), its lateral
--- offset, and its heading rotation all carry into the whole tail behind it (headings compose cumulatively).
+-- offset, its height anchor (anchorHeight, metres above the inherited chain z -- editor-seeded on a grid
+-- split so the split re-anchors the grounding window on climbing terrain), and its heading rotation all
+-- carry into the whole tail behind it (headings compose cumulatively). Distinct from the anchor, the
+-- offsetHeight KNOB is a per-segment POST-grounding lift: it rides on each pose as `lift` and is added
+-- by the ground passes (spawn + editor preview) AFTER the surface snap -- it does NOT chain and never
+-- moves the chain z or the ground-cast window.
 -- A single-segment list reproduces M.poses (today's layout) bit-for-bit. block_to_segments /
 -- segments_to_block convert between the stored block and the segment list.
 
@@ -39,10 +44,12 @@ local M = {}
 local DEFAULT_COLUMNS = 2
 local DEFAULT_OFFSET_FORWARD = 15.0  -- metres the whole grid trails behind the line (ADR-0022)
 local DEFAULT_OFFSET_LATERAL = 0.0   -- metres the whole grid shifts along the right axis
+local DEFAULT_ANCHOR_HEIGHT = 0.0    -- metres the segment base lifts above the inherited chain z (chains)
+local DEFAULT_OFFSET_HEIGHT = 0.0    -- metres each pose lifts above the grounded surface (no chaining)
 local DEFAULT_HEADING_DEG = 0.0      -- extra rotation about vertical applied to layout + headings
 local DEFAULT_ROW_GAP = 8.0          -- longitudinal gap between rows (metres)
 local DEFAULT_COL_GAP = 4.0          -- lateral gap between adjacent columns (metres)
-local DEFAULT_MIRROR = false         -- lateral seiten-flip: off reproduces the historical pole-left layout
+local DEFAULT_MIRROR = false         -- lateral side flip: off reproduces the historical pole-left layout
 
 -- The editor's default preview field size and the rows clamp/fallback. With the columns-pinned default a
 -- slot's pose is count-independent (slot k -> a fixed row/column from k alone), so the editor's 8-car
@@ -187,6 +194,16 @@ local function resolved_params(params)
     return {
         offset_forward = params.offsetForward or DEFAULT_OFFSET_FORWARD,
         offset_lateral = params.offsetLateral or DEFAULT_OFFSET_LATERAL,
+        -- Internal pre-grounding height ANCHOR (ADR-0023 amendment): metres the segment base lifts
+        -- above the inherited chain z, auto-seeded by the editor when a breakpoint is created so a grid
+        -- split re-centers the ground-cast window on climbing terrain. Chains into following segments.
+        -- Deliberately NOT a knob (no UI surface); re-creating the breakpoint re-seeds it. The 0 default
+        -- keeps a param set without the field bit-for-bit at today's flat-chain poses.
+        anchor_height = params.anchorHeight or DEFAULT_ANCHOR_HEIGHT,
+        -- The height KNOB (ADR-0023 amendment): a POST-grounding lift, metres above the surface. Pure
+        -- math here only writes it onto each pose as `lift`; the ground passes (spawn ground_all,
+        -- editor preview) add it AFTER their surface snap. Does NOT chain, never moves the cast window.
+        offset_height = params.offsetHeight or DEFAULT_OFFSET_HEIGHT,
         heading_deg = params.headingDeg or DEFAULT_HEADING_DEG,
         row_gap = params.rowGap or DEFAULT_ROW_GAP,
         col_gap = params.colGap or DEFAULT_COL_GAP,
@@ -204,6 +221,7 @@ function M.default_params()
     return {
         offsetForward = DEFAULT_OFFSET_FORWARD,
         offsetLateral = DEFAULT_OFFSET_LATERAL,
+        offsetHeight = DEFAULT_OFFSET_HEIGHT,
         headingDeg = DEFAULT_HEADING_DEG,
         rowGap = DEFAULT_ROW_GAP,
         colGap = DEFAULT_COL_GAP,
@@ -278,6 +296,11 @@ local function compute_segment(frame, count, params)
     local column_setback = p.row_gap / columns
 
     local origin = frame.origin
+    -- The segment's base height: the inherited chain z lifted by this segment's anchorHeight. Applied to
+    -- every pose AND to next_frame below, so the anchor carries the whole tail with it -- the same
+    -- chain the lateral offset and heading rotation ride (ADR-0023 amendment). At the 0 default this is
+    -- exactly origin.z, reproducing the historical flat chain bit-for-bit.
+    local base_z = origin.z + p.anchor_height
     local poses = {}
     for slot = 0, count - 1 do
         local column = slot % columns
@@ -293,7 +316,7 @@ local function compute_segment(frame, count, params)
             pos = {
                 x = origin.x + right.x * lateral - forward.x * setback,
                 y = origin.y + right.y * lateral - forward.y * setback,
-                z = origin.z,
+                z = base_z,
             },
             rot = {x = rot.x, y = rot.y, z = rot.z, w = rot.w},
             -- The travel axis the car should face, from the gate normal (+ chained headings); nil when no
@@ -303,6 +326,11 @@ local function compute_segment(frame, count, params)
             -- the fallback case) -- draw-only, used by the editor's orientation line. Distinct from
             -- `forward` above, which stays nil without a gate normal to preserve placement semantics.
             faceDir = forward,
+            -- The segment's POST-grounding height lift (the offsetHeight knob, ADR-0023 amendment).
+            -- Deliberately NOT part of pos.z: the frame chain and the ground-cast hint must not see it.
+            -- The ground passes (spawn ground_all, editor preview) add it AFTER their surface snap, so
+            -- +1 m hovers the car/pillar exactly 1 m above where it would otherwise sit.
+            lift = p.offset_height,
         }
     end
 
@@ -313,12 +341,14 @@ local function compute_segment(frame, count, params)
     local continuation = slot_setback(count, p, columns, column_setback)
     -- Advance the frame to that continuation point for the next segment: forward by the continuation and
     -- laterally by this segment's offsetLateral (so lateral chains to the tail), carrying the heading-rotated
-    -- forward/facing/rot (so heading chains cumulatively). z stays level; grounding happens downstream.
+    -- forward/facing/rot (so heading chains cumulatively). z carries the anchorHeight-lifted base, so the
+    -- anchor chains into the tail too (the post-grounding `lift` does not -- it stays per segment);
+    -- per-pose grounding still happens downstream.
     local next_frame = {
         origin = {
             x = origin.x + right.x * p.offset_lateral - forward.x * continuation,
             y = origin.y + right.y * p.offset_lateral - forward.y * continuation,
-            z = origin.z,
+            z = base_z,
         },
         forward = forward,
         facing = facing,
