@@ -531,8 +531,9 @@
     }
     /* Qualifying sector progress bar (feature quali-sector-progress-bar): one slim line = the current
        lap (circuit) / run (staged), one equal-width segment per sector, coloured by record class --
-       grey until driven. Fixed bottom-centered overlay like the sector readout; pointer-events:none so
-       it never eats clicks; leaves with the quali HUD (ng-if="hud.sectorBar"). */
+       grey until driven, WHITE once driven without any reference time (round 2: progress must be
+       visible before reference times exist). Fixed bottom-centered overlay like the sector readout;
+       pointer-events:none so it never eats clicks; leaves with the quali HUD (ng-if="hud.sectorBar"). */
     .beamcomp-hud .bc-quali-bar {
       /* Distance from the bottom of the viewport -- the single knob to re-tune in-game (the
          --bc-quali-sector-top pattern). */
@@ -541,7 +542,7 @@
       bottom: var(--bc-quali-bar-bottom);
       left: 50%;
       transform: translateX(-50%);
-      width: 44%;
+      width: 26%; /* round 2: 44% read as too long -- "~40% shorter" */
       display: flex;
       pointer-events: none;
       z-index: 900;
@@ -551,11 +552,16 @@
       height: 7px;
       border-radius: 2px;
       margin-right: 3px; /* the visible sector separator */
-      background: rgba(255, 255, 255, 0.28); /* bc-rec-normal: not driven / no reference */
+      background: rgba(255, 255, 255, 0.28); /* bc-rec-none: not driven this lap/run */
       box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
     }
     .beamcomp-hud .bc-qbar-seg:last-child {
       margin-right: 0;
+    }
+    /* Driven but nothing to compare against (record class "normal") -- white, clearly distinct from
+       the undriven grey. Bar only; the readout's "normal" is already its white default text. */
+    .beamcomp-hud .bc-qbar-seg.bc-rec-normal {
+      background: rgba(255, 255, 255, 0.92);
     }
     .beamcomp-hud .bc-qbar-seg.bc-rec-session {
       background: #b06bff;
@@ -883,7 +889,8 @@
     </div>
     <!-- Sector progress bar (feature quali-sector-progress-bar): the current lap, one segment per
          sector, record-coloured and live re-evaluated (a purple falls back once someone beats it).
-         Grey = not driven this lap / no reference. Resets as the new lap's first sector completes. -->
+         Grey = not driven this lap; white = driven, no reference yet (round 2). Resets as the new
+         lap's first sector completes. -->
     <div class="bc-quali-bar" ng-if="hud.sectorBar">
       <div class="bc-qbar-seg" ng-repeat="c in hud.sectorBar.states track by $index"
            ng-class="'bc-rec-' + c"></div>
@@ -954,7 +961,8 @@
     </div>
     <!-- Sector progress bar (feature quali-sector-progress-bar): the current run, one segment per
          sector, record-coloured and live re-evaluated against the server-relayed field bests
-         (sectorBests). Between runs the last run's states stay up until the next launch (decision 4). -->
+         (sectorBests). Grey = not driven this run; white = driven, no reference yet (round 2).
+         Between runs the last run's states stay up until the next launch (decision 4). -->
     <div class="bc-quali-bar" ng-if="hud.sectorBar">
       <div class="bc-qbar-seg" ng-repeat="c in hud.sectorBar.states track by $index"
            ng-class="'bc-rec-' + c"></div>
