@@ -15,14 +15,16 @@
 -- is the base param set, and a breakpoint at a chosen slot adds a further segment (seeded from the covering
 -- segment's params) that lays out behind the previous one (grid.poses_segmented). M.state.segment is the
 -- active segment the knobs edit; the breakpoint selector (M.select_segment / M.remove_segment) chooses it.
+-- A fresh breakpoint auto-seeds its offsetHeight from the real surface at its first slot
+-- (seed_segment_height), so splitting alone re-anchors the grounding window on climbing terrain.
 -- A grid with only segment 0 is exactly today's single-block behaviour.
 
 local M = {}
 
 local grid = require("beamcomp/race/grid")
 -- Grounds each preview pose to terrain HEIGHT (see recompute) so the pillars follow the surface the way
--- spawned cars do. The full ground+wall-clear pass (placement.resolve_all) stays off in the editor so
--- tuning never nudges pillars sideways -- height-only keeps the layout exactly as the admin dialed it.
+-- spawned cars do. Height-only is now the REAL spawn semantics too (placement.ground_all, ADR-0034
+-- amendment) -- what the admin dials in here is exactly what spawns, X/Y untouched on both sides.
 local placement = require("beamcomp/race/placement")
 local start = require("beamcomp/race/start")
 local maps = require("beamcomp/race/maps")
@@ -48,6 +50,7 @@ local MAX_BREAKPOINT_SLOT = MAX_PREVIEW_COUNT
 local KNOBS = {
     offsetForward = {},
     offsetLateral = {},
+    offsetHeight = {},
     headingDeg = {},
     rowGap = {min = 0},
     colGap = {min = 0},
@@ -113,15 +116,57 @@ local function recompute()
     -- and faceDir, which init.lua reads to highlight the active segment and draw the orientation line.
     local poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot,
         M.state.preview_count, segments, anchor.gate_normal)
-    -- Ground each pose to the surface HEIGHT ONLY (placement.ground_pose, NOT resolve_all/clear_pose):
-    -- Z follows the terrain so the preview matches where cars land, but with NO lateral wall-nudge -- the
-    -- layout stays exactly what the admin is tuning (ADR-0034 exposes ground_pose apart from the wall
-    -- snap for this). Copy back only Z: ground_pose returns a fresh {pos, rot, forward} table that would
+    -- Ground each pose to the surface HEIGHT ONLY (placement.ground_pose): Z follows the terrain so the
+    -- preview matches where cars land, with NO lateral wall-nudge -- and since the grid spawn grounds
+    -- height-only too (placement.ground_all, ADR-0034 amendment), preview and spawn are the same pass.
+    -- Copy back only Z: ground_pose returns a fresh {pos, rot, forward} table that would
     -- drop the segment tag and faceDir. These pose tables are freshly built here, so mutating them is safe.
     for _, pose in ipairs(poses) do
         pose.pos.z = placement.ground_pose(pose).pos.z
     end
     M.state.poses = poses
+end
+
+-- Auto-seed a NEW breakpoint segment's offsetHeight from the real surface at its first slot (ADR-0023
+-- amendment): measure the ground under the pose the pure chain puts there and set the delta that lifts
+-- the segment base onto it. This is what makes SPLITTING a grid re-anchor the grounding window on
+-- climbing terrain by itself -- the knob is only fine-tuning on top. Uses the wide editor probe
+-- (placement.probe_ground_z) because the motivating case is ground far above the inherited chain z,
+-- outside the spawn window. Editor-only; the spawn side stays pure param application. Must be called
+-- AFTER the segment (offsetHeight 0) is inserted, so the chain pose reflects the inherited height.
+-- Degrade-don't-crash: any failure (no ground, engine API missing) leaves the seed at 0, logged, and
+-- never surfaces an error into the editor flow.
+local function seed_segment_height(new_segment)
+    local seeded_delta = nil
+    pcall(function()
+        local anchor = M.state.anchors[M.state.direction]
+        -- Lay the chain out PURE (grid.poses_segmented, not the preview -- recompute overwrites z with
+        -- the grounded height) far enough to include the new segment's first slot, and read the
+        -- un-grounded chain pose there.
+        local count = math.max(M.state.preview_count, new_segment.startSlot + 1)
+        local poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot, count,
+            active_segments(), anchor.gate_normal)
+        local first_pose = poses[new_segment.startSlot + 1]
+        if not first_pose then
+            return
+        end
+        local chain_z = first_pose.pos.z
+        local ground = placement.probe_ground_z(first_pose.pos.x, first_pose.pos.y, chain_z)
+        if not ground then
+            return
+        end
+        -- Centimetre rounding: a clean knob value for the panel; the grounding window this seed exists
+        -- to re-anchor is metres wide, so the lost precision is irrelevant.
+        seeded_delta = math.floor((ground - chain_z) * 100 + 0.5) / 100
+    end)
+    if seeded_delta then
+        new_segment.params.offsetHeight = seeded_delta
+        log("I", LOG_TAG, string.format("breakpoint at slot %d: offsetHeight auto-seeded to %+.2f m",
+            new_segment.startSlot, seeded_delta))
+    else
+        log("W", LOG_TAG, string.format("breakpoint at slot %d: no ground found for the height seed"
+            .. " -- offsetHeight stays 0 (tune the knob manually)", new_segment.startSlot))
+    end
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given STORED blocks
@@ -273,8 +318,9 @@ end
 -- Select (or create) the segment that starts at `start_slot`, making it the active one the knobs edit
 -- (ADR-0023 amendment). Slot 0 (or below) is always the base segment. If a segment already starts at the
 -- slot it is activated; otherwise a new segment is created, SEEDED from the params of the segment that
--- currently covers the slot (so it starts as a copy you then tune) and inserted in slot order. Returns
--- true + the applied start slot, or nil + a reason.
+-- currently covers the slot (so it starts as a copy you then tune), inserted in slot order, and its
+-- offsetHeight auto-seeded from the ground at its first slot (seed_segment_height -- creation only, a
+-- re-select never re-seeds). Returns true + the applied start slot, or nil + a reason.
 function M.select_segment(start_slot)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
@@ -311,16 +357,18 @@ function M.select_segment(start_slot)
     end
     -- Seed a fresh breakpoint from the covering segment so it inherits the layout (columns/rowGap/colGap/
     -- headingDeg/mirror), but zero its position offsets so it CONTINUES the previous segment seamlessly out
-    -- of the box: offsetForward is then a pure additional gap the admin dials in (0 = seamless). Only
+    -- of the box: offsetForward is then a pure additional gap the admin dials in (0 = seamless).
+    -- offsetHeight is zeroed like the others (the covering segment's delta is already in the inherited
+    -- chain z -- copying it would apply it twice) and then auto-seeded from the real surface below. Only
     -- breakpoint segments are zeroed here; segment 0 keeps its own offsetForward (the setback from the line).
     local seeded = copy_params(segments[prev_index].params)
     seeded.offsetForward = 0
     seeded.offsetLateral = 0
-    table.insert(segments, prev_index + 1, {
-        startSlot = number,
-        params = seeded,
-    })
+    seeded.offsetHeight = 0
+    local new_segment = {startSlot = number, params = seeded}
+    table.insert(segments, prev_index + 1, new_segment)
     M.state.segment = prev_index + 1
+    seed_segment_height(new_segment)
     recompute()
     return true, number
 end

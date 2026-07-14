@@ -10,15 +10,18 @@
 // list, ng-click): native <select> does not open in the BeamNG CEF overlay.
 angular.module('beamng.apps')
 .directive('beamCompGridEditor', [function () {
-  // The seven NUMERIC tunable knobs (ADR-0023) in display order. Each continuous knob has a fine (0.05)
+  // The eight NUMERIC tunable knobs (ADR-0023) in display order. Each continuous knob has a fine (0.05)
   // and a coarse (1.0) stepper pair; integer knobs (rows/columns) step by 1 only. rows and columns are
   // mutually exclusive width pins: pinning one drops the other (GE clears it), which then shows blank
   // ("auto") and is derived from the field at spawn. Both carry `auto: true` so whichever is unpinned
   // reads "auto". The boolean `mirror` param is not in this list -- it renders as its own On/Off toggle
-  // (the first Layout row, see app.html + scope.setMirror), not a numeric stepper.
+  // (the first Layout row, see app.html + scope.setMirror), not a numeric stepper. offsetHeight is the
+  // per-segment height lift above the inherited chain z (auto-seeded when a breakpoint is created; blank
+  // on a grid saved before the field existed, which GE treats as 0).
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)' },
     { key: 'offsetLateral', label: 'Offset lateral (m)' },
+    { key: 'offsetHeight', label: 'Offset height (m)' },
     { key: 'headingDeg', label: 'Heading (deg)' },
     { key: 'rowGap', label: 'Row gap (m)' },
     { key: 'colGap', label: 'Col gap (m)' },
