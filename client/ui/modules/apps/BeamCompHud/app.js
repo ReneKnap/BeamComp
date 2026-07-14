@@ -152,8 +152,9 @@ angular.module('beamng.apps')
   }
 
   // Qualifying board (ADR-0041): the live classification during the qualifying session, ranked by best
-  // lap (fastest on pole); drivers with no valid time fall to the back in their current order. Display
-  // only -- the server sets the actual grid from the same metric when qualifying ends.
+  // lap (fastest on pole); drivers with no valid lap fall to the back in their live standings order --
+  // most checkpoints first, the same order the server's classification uses for them since Round 12.
+  // Display only -- the server sets the actual grid from the same metrics when qualifying ends.
   function qualiBoard(entries) {
     var list = (entries || []).slice();
     list.sort(function (a, b) {
@@ -217,8 +218,9 @@ angular.module('beamng.apps')
 
   // The time/progress cell for a staged-quali board row (ADR-0044/Round7): a driver WITH a complete run
   // shows their best run time -- that is the grid-setting number. A driver WITHOUT one shows checkpoint
-  // progress instead of a live climbing time: on their run -> CP x/y (matching the race HUD + the right
-  // panel), otherwise the reached checkpoint count. Server-relayed numbers only.
+  // progress instead of a live climbing time: always CP x/y (Round 12 -- every row, not just the running
+  // driver, so the reached count reads against the run's total). CP x fallback while cpTotal is still
+  // unknown (before the session's first crossing). Server-relayed numbers only.
   function qualiRowTime(r) {
     if (!r) {
       return '--';
@@ -227,8 +229,27 @@ angular.module('beamng.apps')
       return formatTime(r.best);
     }
     var cp = typeof r.cp === 'number' ? r.cp : 0;
-    if (r.status === 'running' && typeof r.cpTotal === 'number') {
+    if (typeof r.cpTotal === 'number') {
       return 'CP ' + cp + '/' + r.cpTotal;
+    }
+    return 'CP ' + cp;
+  }
+
+  // The time/progress cell for a circuit-quali board row (Round 12, mirroring the staged board): a driver
+  // WITH a complete lap shows their best lap -- the grid-setting number, as before. A driver still on
+  // lap 1 shows CP x/y instead of '--', where y is ONE lap's checkpoint count (hud.qualiCpsPerLap,
+  // client-local knowledge -- the server-relayed count is the whole unbounded quali plan, laps * cps).
+  // CP x fallback when the per-lap count is unavailable.
+  function qualiLapCell(e, cpsPerLap) {
+    if (!e) {
+      return '--';
+    }
+    if (typeof e.bestLap === 'number') {
+      return formatTime(e.bestLap);
+    }
+    var cp = typeof e.checkpoint === 'number' ? e.checkpoint : 0;
+    if (typeof cpsPerLap === 'number' && cpsPerLap > 0) {
+      return 'CP ' + cp + '/' + cpsPerLap;
     }
     return 'CP ' + cp;
   }
@@ -301,9 +322,11 @@ angular.module('beamng.apps')
       scope.formatStaging = formatStaging;
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
-      // Staged sprint quali status line (ADR-0044) + board row time (ADR-0044/Round6).
+      // Staged sprint quali status line (ADR-0044) + board row time (ADR-0044/Round6) + the circuit
+      // board's lap-or-CP cell (Round 12).
       scope.qualiStatusText = qualiStatusText;
       scope.qualiRowTime = qualiRowTime;
+      scope.qualiLapCell = qualiLapCell;
 
       // UI-presence heartbeat (self-healing HUD: race/hud.lua + the init.lua watchdog). Tell GE this app
       // is alive on link and once a second after. If GE stops hearing it while a race wants the HUD up --

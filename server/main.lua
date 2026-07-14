@@ -1770,6 +1770,10 @@ function quali.begin(duration, staged)
                             -- requeue, which purpose-serves the distance condition (Round 10)
         status = nil,       -- per-id "queued|staged|running|done" for the HUD (seeded by start_session)
         best = nil,         -- per-identity best complete run time in seconds (ADR-0031)
+        best_cp = nil,      -- per-identity max progress pair {cp, time} across ALL runs (Round 11): the
+                            -- most checkpoints any run reached + the smallest run-relative time to that
+                            -- count. Board + ranking measure timeless drivers on this, not the live
+                            -- record, which every requeue resets (seeded by start_session, like best)
     }
 end
 
@@ -1779,11 +1783,13 @@ end
 
 -- The qualifying classification as a ranked list of {identity, pace, ai} (ADR-0041). Pace = the
 -- client-reported best_lap (circuit); a staged sprint (ADR-0044) uses the best complete Start->Ziel run.
--- Faster pace ranks ahead. A driver with no complete run ranks behind every timed driver; among those
--- timeless drivers a staged quali orders by checkpoint count (Round 7: most checkpoints -> earliest time at
--- that checkpoint -> slot, the build_standings live tie-break), while a circuit quali keeps slot order. This
--- is the single seam the live board, the results card and the race grid all read, so they classify timeless
--- drivers identically. Pure over build_standings -- race-blind (ADR-0005).
+-- Faster pace ranks ahead. A driver with no complete run/lap ranks behind every timed driver; those
+-- timeless drivers order by checkpoint count (Round 7: most checkpoints -> earliest time at that
+-- checkpoint -> slot). A staged sprint measures that on the MAX across all runs (Round 11 -- the live
+-- record resets on every requeue); a circuit reads the live record, which nothing resets mid-session, so
+-- live IS the max there (Round 12 -- previously the circuit fell back to slot order). This is the single
+-- seam the live board, the results card and the race grid all read, so they classify timeless drivers
+-- identically. Pure over build_standings + the quali table -- race-blind (ADR-0005).
 function quali.ranking()
     local timed, untimed = {}, {}
     local staged = quali.is_staged()
@@ -1803,15 +1809,19 @@ function quali.ranking()
             if pace then
                 timed[#timed + 1] = {identity = entry.name, pace = pace, slot = entry.slot or 0, ai = entry.ai}
             else
-                -- Carry the checkpoint count + the time at that checkpoint (the live progress record, which a
-                -- staged run resets between attempts) so a staged quali can rank timeless drivers by how far
-                -- they got. cp/cp_time only ever order the staged untimed list; the circuit branch ignores them.
+                -- Carry the checkpoint progress that ranks timeless drivers by how far they got. Staged:
+                -- the MAX across all runs (Round 11: best_cp, live-record fallback), not the live record
+                -- alone, which every requeue resets -- a driver who reached CP 7 in an earlier run keeps
+                -- ranking on 7. Circuit: best_cp is never seeded, so max_cp_of passes the live record
+                -- through -- which nothing resets mid-session, so it already is the max (Round 12).
+                local cp, cp_time = quali.max_cp_of(entry.name,
+                    entry.completed or 0, entry.total_time or 0)
                 untimed[#untimed + 1] = {
                     identity = entry.name,
                     slot = entry.slot or 0,
                     ai = entry.ai,
-                    cp = entry.completed or 0,
-                    cp_time = entry.total_time or 0,
+                    cp = cp,
+                    cp_time = cp_time,
                 }
             end
         end
@@ -1822,21 +1832,20 @@ function quali.ranking()
         end
         return a.slot < b.slot       -- stable tiebreak on the provisional slot
     end)
-    if staged then
-        -- Round 7: rank timeless drivers by how far they got -- most checkpoints first, then earliest to reach
-        -- that checkpoint, then slot -- the same tie-break build_standings uses for the live in-race order.
-        table.sort(untimed, function(a, b)
-            if a.cp ~= b.cp then
-                return a.cp > b.cp
-            end
-            if a.cp_time ~= b.cp_time then
-                return a.cp_time < b.cp_time
-            end
-            return a.slot < b.slot
-        end)
-    else
-        table.sort(untimed, function(a, b) return a.slot < b.slot end)
-    end
+    -- Rank timeless drivers by how far they got -- most checkpoints first, then earliest to reach that
+    -- checkpoint, then slot -- the same tie-break build_standings uses for the live in-race order.
+    -- Staged since Round 7 (on the max across runs, Round 11); the circuit joined in Round 12 (its live
+    -- board tail was already CP-ordered via build_standings position -- the classification, results card
+    -- and race grid now match it instead of falling back to slot order).
+    table.sort(untimed, function(a, b)
+        if a.cp ~= b.cp then
+            return a.cp > b.cp
+        end
+        if a.cp_time ~= b.cp_time then
+            return a.cp_time < b.cp_time
+        end
+        return a.slot < b.slot
+    end)
     local ranked = {}
     for _, item in ipairs(timed) do ranked[#ranked + 1] = item end
     for _, item in ipairs(untimed) do ranked[#ranked + 1] = item end
@@ -2113,10 +2122,12 @@ function quali.broadcast_queue()
             position = position[identity],
             queuePos = queue_pos[id],
             best = q.best and q.best[identity] or nil,
-            -- Checkpoint progress (Round 7): the reached count + the run total, so the board shows CP x/y for a
-            -- driver on their run and the reached count otherwise, and ranks timeless drivers by it. Straight
-            -- from session.progress (the sanctioned quali/standings data) -- no geometry read, race-blind (ADR-0005).
-            cp = record.completed or 0,
+            -- Checkpoint progress (Round 7; since Round 11 the MAX across all runs): the board always shows
+            -- a timeless driver's best reached count -- max(current run, best so far) -- so a requeue never
+            -- drops the row back to CP 0. The driver's own live run progress stays on the right-panel
+            -- readout (broadcast_standings), untouched. Still only client-reported numbers already stored
+            -- on the progress record / quali table -- no geometry read, race-blind (ADR-0005).
+            cp = quali.max_cp_of(identity, record.completed or 0, record.total_time or 0),
             cpTotal = record.count or known_count,
             -- The best complete run's cumulative crossing splits (Round 6), for the staged HUD sector
             -- readout's personal + session references. nil until this identity has finished a run.
@@ -2163,6 +2174,12 @@ function quali.start_session()
     -- so the staged HUD can show the same live sector readout as the circuit quali (its reference is the
     -- best run, not the per-run splits, which reset_progress wipes on each requeue). Keyed like q.best.
     q.best_splits = {}
+    -- Max checkpoint progress per identity across all runs (Round 11): {cp, time} pairs folded per scored
+    -- crossing (quali.note_cp_progress). The board + ranking measure timeless drivers on this, so a
+    -- requeue -- which wipes the live record -- can never regress what a driver already reached. Staged
+    -- only: a circuit quali never seeds it -- there the live record is never reset mid-session, so it
+    -- already is the max and ranks the timeless drivers directly (Round 12).
+    q.best_cp = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
@@ -2173,8 +2190,9 @@ function quali.start_session()
 end
 
 -- Reset one driver's progress record to a fresh baseline for their next staged run (ADR-0044): completed 0,
--- no count/splits/best/finished. Keeps slot/name/ai. The best complete run time is captured on the quali
--- table (session.quali.best) before this is called, so the reset never loses it.
+-- no count/splits/best/finished. Keeps slot/name/ai. The best complete run time (q.best, captured before
+-- this is called) and the max checkpoint progress (q.best_cp, folded per crossing) live on the quali
+-- table, so the reset never loses them.
 function quali.reset_progress(id)
     local record = session.progress and session.progress[id]
     if not record then
@@ -2189,6 +2207,41 @@ function quali.reset_progress(id)
     record.lap = 1
     record.best_lap = nil
     record.run_up = nil
+end
+
+-- The measured checkpoint progress for a timeless driver (Round 11): the lexicographic max of the stored
+-- best_cp pair and the caller's live values -- more checkpoints win; at an equal count the smaller
+-- run-relative time (the fastest way to that count) wins. Falls back to the live values when no pair is
+-- stored (first run, or a circuit quali, which never seeds best_cp). Because note_cp_progress folds every
+-- scored crossing, the stored pair is always >= the live record -- so this IS max(current run, best so far).
+function quali.max_cp_of(identity, live_cp, live_time)
+    local q = session.quali
+    local best = q and q.best_cp and q.best_cp[identity]
+    if best and (best.cp > live_cp or (best.cp == live_cp and best.time < live_time)) then
+        return best.cp, best.time
+    end
+    return live_cp, live_time
+end
+
+-- Fold one scored crossing into the driver's max progress pair (Round 11). Called per checkpoint report
+-- during a staged qualifying, so EVERY scored crossing counts -- including those of a run later aborted
+-- by a recover/forced requeue, which wipes only the live record, never this pair. Lexicographic update:
+-- more checkpoints replace the pair; the same count with a smaller run-relative time improves it (the
+-- run-relative total is comparable across runs because reset_progress zeroes it per run). Keyed by
+-- identity like q.best, so it survives requeues and matches the ranking side (ADR-0031/0036).
+function quali.note_cp_progress(id)
+    local q = session.quali
+    local record = session.progress and session.progress[id]
+    if not q or not q.best_cp or not record or record.completed <= 0 then
+        return
+    end
+    local identity = quali.identity_of(id)
+    local time = record.total_time or 0
+    local best = q.best_cp[identity]
+    if not best or record.completed > best.cp
+            or (record.completed == best.cp and time < best.time) then
+        q.best_cp[identity] = {cp = record.completed, time = time}
+    end
 end
 
 -- Requeue a driver whose run ended (ADR-0044/Round4): reset their record so the next run scores from zero,
@@ -4945,6 +4998,13 @@ local function handle_checkpoint_report(player_id, payload)
         index and string.format(" (cp %d)", index) or "",
         time, final and " (final)" or ""))
 
+    -- Staged sprint quali (Round 11): fold this scored crossing into the driver's max progress pair
+    -- BEFORE the queue-board broadcast below reads it. Every scored crossing counts -- final ones too, and
+    -- those of a run later aborted by a recover/forced requeue (the fold is per crossing, so an abort can
+    -- never lose banked progress). Circuit quali / normal race: gated off.
+    if quali.is_staged() and session.phase == PHASE.qualifying then
+        quali.note_cp_progress(subject_id)
+    end
     broadcast_standings()
     -- Staged sprint quali (Round 6): refresh the holding-queue board on every crossing, so the live-timing
     -- table shows the running driver's progress in real time -- including through the finish-your-run grace,
