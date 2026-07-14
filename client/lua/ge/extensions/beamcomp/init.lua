@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-spawn-anchor-lift-r2/2026-07-14"
+local BUILD_MARKER = "staged-quali-max-cp-r2/2026-07-14"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -4467,6 +4467,12 @@ local function build_hud_snapshot()
         -- qualiResultsRemaining (the freeze eats the lead's first seconds; the rest is the visible settle).
         qualiSettleActive = (phase == "qualiResults" and M.state.quali_settle) and true or false,
         quali = M.state.quali,
+        -- One lap's checkpoint count for the quali boards' "CP x/y" cells (Round 12): client-local
+        -- knowledge, because the server-relayed per-row `count` is the whole traversal plan -- on the
+        -- unbounded circuit quali plan that is laps * cps, useless as the per-lap denominator. Every
+        -- client resolves the same race, so every board shows the same y. nil outside qualifying.
+        qualiCpsPerLap = (phase == "qualifying" and race and race.checkpoints
+            and #race.checkpoints > 0) and #race.checkpoints or nil,
         -- Rally staged sprint quali (ADR-0044): flag the staged view + carry the holding queue and the local
         -- driver's own row (status/position/best), resolved from the broadcast queue snapshot by slot. nil /
         -- false outside a staged qualifying phase, so the app falls back to the circuit best-lap board.

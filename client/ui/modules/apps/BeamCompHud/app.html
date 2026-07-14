@@ -796,7 +796,9 @@
                 ng-class="{'bc-local': e.isLocal, 'bc-ai': e.ai}">
               <td class="bc-pos">P{{$index + 1}}</td>
               <td class="bc-name">{{e.name}}</td>
-              <td class="bc-int">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
+              <!-- Best lap once one is complete; until then checkpoint progress CP x/y of the current
+                   lap (Round 12), mirroring the staged board's timeless rows. -->
+              <td class="bc-int">{{qualiLapCell(e, hud.qualiCpsPerLap)}}</td>
             </tr>
           </table>
         </div>
