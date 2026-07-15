@@ -801,6 +801,15 @@ angular.module('beamng.apps')
         return (e && (e.carLabel || e.car)) || 'select car…';
       };
 
+      // Toggle the expandable roster list. A scope METHOD, not an inline `rosterOpen = !rosterOpen` on
+      // the button: the Edit button lives under an ng-if (own child scope), where an inline primitive
+      // write would shadow rosterOpen onto that child scope -- the sibling list reads the directive
+      // scope's rosterOpen (still false) and never renders. A method resolves rosterOpen on the
+      // directive scope through the closure regardless of the calling child scope.
+      scope.toggleRoster = function () {
+        scope.rosterOpen = !scope.rosterOpen;
+      };
+
       // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
       scope.createRoster = function () {
         var spec = rosterRollSpec();

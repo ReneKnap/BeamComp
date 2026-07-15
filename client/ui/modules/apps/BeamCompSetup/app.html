@@ -278,7 +278,7 @@
               title="Roll a fresh named roster (names + cars); pressing again re-rolls everything">
               {{form.aiRoster.length ? 'Re-create' : 'Create'}}</button>
             <button type="button" class="bc-refresh" ng-if="form.aiRoster.length"
-              ng-click="rosterOpen = !rosterOpen">{{rosterOpen ? 'Hide' : 'Edit…'}}</button>
+              ng-click="toggleRoster()">{{rosterOpen ? 'Hide' : 'Edit…'}}</button>
           </span>
         </div>
         <div class="bc-roster-hint" ng-if="!form.aiRoster.length">No AI will spawn -- press Create to field the AI roster.</div>
