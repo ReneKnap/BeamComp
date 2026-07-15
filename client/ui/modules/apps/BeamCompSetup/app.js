@@ -842,18 +842,23 @@ angular.module('beamng.apps')
         spec.count = count - roster.length;
         spec.mode = 'extend';
         spec.exclude = rosterNames();
+        // Keep the new entries' colours distinct from the kept ones too (ADR-0047 round 3).
+        spec.excludeColors = rosterColors();
         geLuaArg('roll_ai_roster', JSON.stringify(spec));
       };
 
       scope.$on('BeamCompAiRoster', function (event, payload) {
         scope.$evalAsync(function () {
           var entries = ((payload && payload.entries) || []).map(function (e) {
-            return { name: e.name, car: e.car, carLabel: e.carLabel };
+            return { name: e.name, car: e.car, carLabel: e.carLabel, color: e.color };
           });
           if (payload && payload.mode === 'extend') {
             scope.form.aiRoster = (scope.form.aiRoster || []).concat(entries);
           } else {
             scope.form.aiRoster = entries;
+            // Auto-expand the list on a fresh Create so the generated AI are visible at once (ADR-0047
+            // round 3); the Hide toggle still collapses it. Not on extend -- the list is already open.
+            scope.rosterOpen = true;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
           scope.rosterHint = '';
