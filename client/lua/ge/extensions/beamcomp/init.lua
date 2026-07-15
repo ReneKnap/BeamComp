@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ai-roster-r2/2026-07-15"
+local BUILD_MARKER = "ai-roster-r3/2026-07-15"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2406,6 +2406,9 @@ local function push_setup_data(include_deprecated)
     guihooks.trigger("BeamCompSetupData", {
         races = racelist.options(map, include_deprecated),
         cars = carlist.options().models,
+        -- The static AI colour palette (ADR-0047 round 3) for the roster swatch picker; same list the
+        -- GE roster draw uses, so swatches and auto-assigned colours share one source.
+        aiPalette = ai.palette(),
     })
     M.state.grid_list_target = "setup"
     send_to_server("gridListReq", {map = map})
@@ -2524,8 +2527,10 @@ function M.roll_ai_roster(json)
         return
     end
     local count = math.max(1, math.min(16, math.floor(tonumber(request.count) or 1)))
+    -- excludeColors keeps an extend distinct from the kept entries' colours (ADR-0047 round 3); nil on a
+    -- fresh create (nothing to exclude).
     local entries = ai.roll_roster_entries(count, request.exclude, request.ai, request.policy,
-        M.state.ai_pool)
+        M.state.ai_pool, request.excludeColors)
     guihooks.trigger("BeamCompAiRoster", {
         mode = request.mode == "extend" and "extend" or "create",
         entries = entries,
@@ -2549,6 +2554,11 @@ function M.reroll_ai_name(json)
         reply.car = drawn.preferred
         reply.carLabel = ai.car_label(drawn.preferred)
     end
+    -- A drawn pool name's preferred colour ALWAYS rides along (ADR-0047 round 3): colour is unrestricted,
+    -- so unlike the car there is no compliance gate.
+    if drawn.preferredColor then
+        reply.color = drawn.preferredColor
+    end
     guihooks.trigger("BeamCompAiRosterName", reply)
 end
 
@@ -2566,9 +2576,10 @@ function M.reroll_ai_car(json)
     guihooks.trigger("BeamCompAiRosterCar", {index = index, car = car, carLabel = ai.car_label(car)})
 end
 
--- Save one roster name to the global custom pool (UI -> GE -> server, ADR-0047): payload {name, car?}.
--- Relayed verbatim to the admin-gated aiPoolSave; the server echoes the updated pool (aiPoolData), which
--- refreshes M.state.ai_pool. Public as beamcomp_init.save_ai_pool_name.
+-- Save one roster name to the global custom pool (UI -> GE -> server, ADR-0047): payload
+-- {name, car?, color?}. Round 3: the one Save button stores name + current car (concrete only) + current
+-- colour together. Relayed verbatim to the admin-gated aiPoolSave; the server echoes the updated pool
+-- (aiPoolData), which refreshes M.state.ai_pool. Public as beamcomp_init.save_ai_pool_name.
 function M.save_ai_pool_name(json)
     local ok, decoded = pcall(jsonDecode, json)
     if not ok or type(decoded) ~= "table"
@@ -2576,7 +2587,7 @@ function M.save_ai_pool_name(json)
         log("W", RACE_LOG_TAG, "save_ai_pool_name: bad payload")
         return
     end
-    send_to_server("aiPoolSave", {name = decoded.name, car = decoded.car})
+    send_to_server("aiPoolSave", {name = decoded.name, car = decoded.car, color = decoded.color})
 end
 
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on

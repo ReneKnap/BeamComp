@@ -236,7 +236,7 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [] };
+      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [] };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
@@ -335,6 +335,9 @@ angular.module('beamng.apps')
         scope.$evalAsync(function () {
           scope.data.races = (payload && payload.races) || [];
           scope.data.cars = (payload && payload.cars) || [];
+          // The AI roster colour palette (ADR-0047 round 3): the swatch picker + the JS-side colour reroll
+          // draw from this. Static, pushed with the setup data so it is present on link and after restore.
+          scope.data.aiPalette = (payload && payload.aiPalette) || scope.data.aiPalette || [];
           rebuildRaceCarOpts();
           // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
           // harmless (labelFor falls back) and re-fetched on the next model change.
@@ -767,6 +770,10 @@ angular.module('beamng.apps')
       function rosterNames() {
         return (scope.form.aiRoster || []).map(function (e) { return e.name; });
       }
+      function rosterColors() {
+        return (scope.form.aiRoster || []).map(function (e) { return e.color; })
+          .filter(function (c) { return !!c; });
+      }
 
       // The roll request's shared slice: the AI car mode + axes and the player policy, mirroring what
       // the race payload would relay (buildRosterPolicy) so panel rolls and spawn cannot drift.
@@ -870,6 +877,8 @@ angular.module('beamng.apps')
             e.car = payload.car;
             e.carLabel = payload.carLabel;
           }
+          // A drawn pool name's preferred colour always applies (ADR-0047 round 3, no compliance gate).
+          if (payload.color) { e.color = payload.color; }
         });
       });
 
@@ -932,6 +941,29 @@ angular.module('beamng.apps')
           }
         }
         return value || 'stock';
+      };
+
+      // Colour is an opaque, unrestricted token from the client-known palette, so the swatch pick and the
+      // reroll are pure JS (no GE round-trip, unlike the car which needs the vehiclespecs chain). The
+      // '#'-prefixed CSS value for a swatch / the row's current colour.
+      scope.rosterSwatchStyle = function (hex) {
+        return { 'background-color': '#' + hex };
+      };
+      scope.pickRosterColor = function (e, hex) {
+        e.color = hex;
+      };
+      // Reroll one entry's colour: a random palette colour distinct from the current one when possible.
+      // A manual override, so -- like the car reroll -- it deliberately ignores any preferred colour.
+      scope.rerollRosterColor = function (e) {
+        var palette = scope.data.aiPalette || [];
+        if (!palette.length) { return; }
+        var pick = palette[Math.floor(Math.random() * palette.length)];
+        if (palette.length > 1) {
+          while (pick === e.color) {
+            pick = palette[Math.floor(Math.random() * palette.length)];
+          }
+        }
+        e.color = pick;
       };
 
       // Names are identity keys server-side, so the panel rejects duplicates (and blanks) on blur by

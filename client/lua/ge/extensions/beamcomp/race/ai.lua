@@ -303,7 +303,10 @@ function M.spawn(ai_slots, grid_poses, config, content_defaults, policy, host_ca
             -- (ADR-0042); it takes precedence inside resolve_ai_vehicle. nil fields = the normal chain.
             local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index,
                 slot_info, host_car)
-            local veh, reason = vehicles.spawn_at(pose, model, vehicle_config)
+            -- The roster's per-AI primary-paint colour (ADR-0047), an opaque hex string relayed per slot;
+            -- nil = stock paint (chat path / no roster). Paint is applied inside spawn_at, pcall-guarded --
+            -- a paint failure degrades to stock and never blocks the spawn.
+            local veh, reason = vehicles.spawn_at(pose, model, vehicle_config, slot_info.color)
             if veh then
                 cars[#cars + 1] = {
                     id = slot_info.id,
@@ -869,11 +872,46 @@ local NAME_POOL = {
     "VibesOnlyVic", "WreckItWes", "XenonXavier", "BoxThisLapBen",
 }
 
+-- Built-in colour palette for the named-AI roster (ADR-0047, round 3): ~18 bold, well-distinguishable
+-- opaque hex strings (lowercase, no leading #). Each AI is painted in one of these as its PRIMARY paint
+-- layer at spawn. Drawn without replacement per roster (>= 16 lets a full 16-AI field stay distinct); the
+-- panel renders each as a swatch. The value is an opaque token -- the server never interprets it
+-- (ADR-0005), it only relays it per slot; the client maps hex -> RGBA at spawn (race/vehicles). White,
+-- near-black and silver are included as realistic car colours alongside the vivid hues.
+local COLOR_PALETTE = {
+    "e6194b", "f58231", "ffe119", "bfef45", "3cb44b", "469990",
+    "42d4f4", "4363d8", "000075", "911eb4", "f032e6", "ff1493",
+    "9a6324", "800000", "808000", "ffffff", "202020", "a0a0a0",
+}
+
+-- The colour palette, for the panel's swatch picker (ADR-0047). Same list the roster draw uses, so the
+-- swatches and the auto-assigned colours come from one source and never drift.
+function M.palette()
+    return COLOR_PALETTE
+end
+
+-- Draw one palette colour not in `used` (a set of hex -> true), or -- when every palette colour is
+-- already used (more AI than palette entries) -- any random palette colour so an entry always gets one.
+-- Owner/panel-local, so math.random is fine (no cross-client determinism, like the name/car draws).
+local function draw_color(used)
+    local free = {}
+    for _, hex in ipairs(COLOR_PALETTE) do
+        if not used[hex] then
+            free[#free + 1] = hex
+        end
+    end
+    if #free > 0 then
+        return free[math.random(#free)]
+    end
+    return COLOR_PALETTE[math.random(#COLOR_PALETTE)]
+end
+
 -- Draw `count` roster names without replacement (ADR-0047): custom pool entries (which may carry a
--- preferred car) plus the built-ins, minus `exclude` (the panel's existing roster names, exact match).
--- Custom names take pool priority only in candidate ORDER; the draw itself is uniform over all remaining
--- candidates. Pool exhaustion (impossible in practice: 64+ names vs. max 16 AI) degrades to "AI <k>"
--- fallback names + a log instead of failing the roll. Returns a list of {name, preferred?}.
+-- preferred car and/or preferred colour) plus the built-ins, minus `exclude` (the panel's existing roster
+-- names, exact match). Custom names take pool priority only in candidate ORDER; the draw itself is uniform
+-- over all remaining candidates. Pool exhaustion (impossible in practice: 64+ names vs. max 16 AI)
+-- degrades to "AI <k>" fallback names + a log instead of failing the roll. Returns a list of
+-- {name, preferred?, preferredColor?}.
 function M.draw_roster_names(count, exclude, custom_pool)
     local taken = {}
     if type(exclude) == "table" then
@@ -886,7 +924,9 @@ function M.draw_roster_names(count, exclude, custom_pool)
         for _, entry in ipairs(custom_pool) do
             if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= ""
                     and not taken[entry.name] then
-                candidates[#candidates + 1] = {name = entry.name, preferred = entry.car}
+                candidates[#candidates + 1] = {
+                    name = entry.name, preferred = entry.car, preferredColor = entry.color,
+                }
                 taken[entry.name] = true
             end
         end
@@ -994,13 +1034,22 @@ function M.car_label(token)
 end
 
 -- Roll `count` full roster entries for the panel (ADR-0047): draw unique names (built-ins + the custom
--- pool, minus `exclude`), then per entry either apply the name's preferred car -- when the row's car
--- would be rolled at all (preferred_applies) and the token passes the active restrictions
--- (preferred_car_compliant) -- or roll a car through the spawn chain (roll_roster_car). Returns a list of
--- {name, car, carLabel} ready for the panel.
-function M.roll_roster_entries(count, exclude, config, policy, custom_pool)
+-- pool, minus `exclude`), then per entry resolve the car and the colour. Car: the name's preferred car
+-- when the row's car would be rolled at all (preferred_applies) and it passes the active restrictions
+-- (preferred_car_compliant), else a car rolled through the spawn chain (roll_roster_car). Colour: the
+-- name's preferred colour ALWAYS when it carries one (colour is unrestricted -- no compliance, ADR-0047
+-- round 3), else a palette colour drawn without replacement across this batch AND `exclude_colors` (the
+-- panel's existing roster colours, so an extend stays distinct from the kept entries). Returns a list of
+-- {name, car, carLabel, color} ready for the panel.
+function M.roll_roster_entries(count, exclude, config, policy, custom_pool, exclude_colors)
     config = type(config) == "table" and config or {}
     policy = type(policy) == "table" and policy or {}
+    local used = {}
+    if type(exclude_colors) == "table" then
+        for _, hex in ipairs(exclude_colors) do
+            used[hex] = true
+        end
+    end
     local entries = {}
     for k, drawn in ipairs(M.draw_roster_names(count, exclude, custom_pool)) do
         local car
@@ -1010,7 +1059,9 @@ function M.roll_roster_entries(count, exclude, config, policy, custom_pool)
         else
             car = M.roll_roster_car(config, policy, k)
         end
-        entries[k] = {name = drawn.name, car = car, carLabel = M.car_label(car)}
+        local color = drawn.preferredColor or draw_color(used)
+        used[color] = true
+        entries[k] = {name = drawn.name, car = car, carLabel = M.car_label(car), color = color}
     end
     return entries
 end

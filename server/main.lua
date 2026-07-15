@@ -1217,6 +1217,16 @@ function grid_store.ai_roster_car(id)
     return entry and entry.car or nil
 end
 
+-- The roster's per-AI primary-paint colour for an AI id (ADR-0047, round 3), or nil (chat path / no
+-- roster). An opaque hex string -- never interpreted here (race-blind, ADR-0005); it rides a per-slot
+-- ai_entry.color field to the owner, who maps it to a paint layer at spawn. Orthogonal to the car: it is
+-- set on EVERY roster AI, including inside a class-drop tournament (the class wins the car, the roster
+-- still colours it).
+function grid_store.ai_roster_color(id)
+    local entry = grid_store.ai_roster_entry(id)
+    return entry and entry.color or nil
+end
+
 -- Sanitize the panel's roster for the session (ADR-0047): keep entry order (entry k backs "ai:<k>") and
 -- disambiguate names DETERMINISTICALLY -- roster names are identity keys, so a collision with a connected
 -- player's identity or an earlier roster entry (the UI prevents both, this is the defensive net) gets a
@@ -1246,6 +1256,8 @@ function grid_store.sanitize_ai_roster(raw)
             roster[k] = {
                 name = name,
                 car = (type(entry.car) == "string" and entry.car ~= "") and entry.car or nil,
+                -- Opaque per-AI paint colour (ADR-0047 round 3); relayed verbatim, never interpreted.
+                color = (type(entry.color) == "string" and entry.color ~= "") and entry.color or nil,
             }
         end
     end
@@ -2020,6 +2032,9 @@ function quali.regrid()
                 slot = entry.slot,
                 label = entry.name,
                 car = (session.tournament == nil) and grid_store.ai_roster_car(entry.id) or nil,
+                -- Colour rides the fresh re-spawn too (ADR-0047 round 3), ALWAYS -- unlike the car it is
+                -- not suppressed under a tournament (roster colours the class car).
+                color = grid_store.ai_roster_color(entry.id),
             }
         end
     end
@@ -3231,6 +3246,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
             else
                 ai_entry.car = grid_store.ai_roster_car(entry.id)
             end
+            -- The roster's per-AI paint colour (ADR-0047 round 3) is ALWAYS set -- orthogonal to the car,
+            -- so it applies even in a tournament (class wins the car, roster still colours it). Opaque,
+            -- owner-only, nil without a roster. The owner maps it to a primary paint layer at spawn.
+            ai_entry.color = grid_store.ai_roster_color(entry.id)
             ai_slots[#ai_slots + 1] = ai_entry
         end
     end
@@ -5541,9 +5560,11 @@ function grid_store.send_ai_pool(player_id)
 end
 
 -- Save one custom AI name to the global pool (ADR-0047), sent by the panel. Admin-gated like presetSave.
--- Add-only: an unknown name appends, a known name updates its preferred car (set or cleared by the
--- payload -- names themselves are never removed; there is no delete by decision). Payload: {name, car?},
--- both opaque strings (race-blind, ADR-0005). Echoes the updated pool.
+-- Add-only: an unknown name appends, a known name updates its preferred setup (name kept, car + colour set
+-- or cleared by the payload -- names themselves are never removed; there is no delete by decision).
+-- Payload: {name, car?, color?}, all opaque strings (race-blind, ADR-0005). The one Save button (round 3)
+-- stores name + current car (only when concrete, not the host sentinel) + current colour together, so a
+-- saved name comes back with that car AND colour. Echoes the updated pool.
 function grid_store.handle_ai_pool_save(player_id, payload)
     local player_name = player_name_of(player_id)
     if not player_name or not is_race_admin(player_name) then
@@ -5555,6 +5576,7 @@ function grid_store.handle_ai_pool_save(player_id, payload)
         return
     end
     local car = (type(payload.car) == "string" and payload.car ~= "") and payload.car or nil
+    local color = (type(payload.color) == "string" and payload.color ~= "") and payload.color or nil
 
     grid_store.ensure_presets_loaded()
     local entry
@@ -5568,18 +5590,20 @@ function grid_store.handle_ai_pool_save(player_id, payload)
     end
     if entry then
         entry.car = car
+        entry.color = color
     elseif #grid_store.ai_pool >= grid_store.AI_POOL_MAX then
         MP.SendChatMessage(player_id, "BeamComp: AI name pool is full")
         return
     else
-        grid_store.ai_pool[#grid_store.ai_pool + 1] = {name = payload.name, car = car}
+        grid_store.ai_pool[#grid_store.ai_pool + 1] = {name = payload.name, car = car, color = color}
     end
 
     if grid_store.write_presets() then
         MP.SendChatMessage(player_id, "BeamComp: saved AI name '" .. payload.name .. "'"
             .. (car and " with preferred car" or ""))
-        log_info("beamcomp.aipool", string.format("saved AI name '%s'%s by %s",
-            payload.name, car and (" (car " .. car .. ")") or "", player_name))
+        log_info("beamcomp.aipool", string.format("saved AI name '%s'%s%s by %s",
+            payload.name, car and (" (car " .. car .. ")") or "",
+            color and (" (colour " .. color .. ")") or "", player_name))
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write presets file")
     end
@@ -5709,6 +5733,8 @@ local function sanitize_overrides(raw)
                     roster[#roster + 1] = {
                         name = entry.name,
                         car = (type(entry.car) == "string" and entry.car ~= "") and entry.car or nil,
+                        color = (type(entry.color) == "string" and entry.color ~= "")
+                            and entry.color or nil,
                     }
                 end
             end

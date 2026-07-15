@@ -72,6 +72,11 @@
       padding: 2px 6px; margin: 4px 0; }
     .bc-roster-hint { font-size: 12px; opacity: 0.75; font-style: italic; margin: 2px 0 6px; }
     .bc-roster-actions { display: flex; gap: 6px; flex: 1 1 auto; justify-content: flex-end; }
+    /* AI colour swatches (ADR-0047 round 3): a wrapping row of fixed-palette colour buttons. */
+    .bc-swatches { display: flex; flex-wrap: wrap; gap: 3px; flex: 1 1 auto; min-width: 0; }
+    .bc-swatch { width: 16px; height: 16px; padding: 0; border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 3px; cursor: pointer; }
+    .bc-swatch.sel { border: 2px solid #fff; box-shadow: 0 0 3px rgba(255,255,255,0.8); }
   </style>
 
   <div class="bc-toolbar">
