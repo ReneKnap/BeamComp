@@ -67,6 +67,11 @@
     .bc-cancel { background: #5a2d2d; color: #f0d0d0; }
     .bc-end { background: #1565c0; color: #fff; }
     .bc-cancel[disabled], .bc-end[disabled] { background: #444; color: #999; cursor: default; }
+    /* AI roster (ADR-0047): a bordered card per entry plus the hint line under the Create row. */
+    .bc-roster-entry { border: 1px solid rgba(255,255,255,0.12); border-radius: 3px;
+      padding: 2px 6px; margin: 4px 0; }
+    .bc-roster-hint { font-size: 12px; opacity: 0.75; font-style: italic; margin: 2px 0 6px; }
+    .bc-roster-actions { display: flex; gap: 6px; flex: 1 1 auto; justify-content: flex-end; }
   </style>
 
   <div class="bc-toolbar">
@@ -233,7 +238,10 @@
       <div ng-if="form.aiEnabled">
         <label class="bc-row">
           <span>Count</span>
-          <input type="number" min="1" max="16" ng-model="form.aiCount">
+          <!-- With an existing roster the count applies on blur/Enter (the panel's number-field
+               convention): fewer AI drop tail entries, more AI roll new ones in (ADR-0047). -->
+          <input type="number" min="1" max="16" ng-model="form.aiCount"
+            ng-blur="applyRosterCount()" ng-keydown="$event.keyCode === 13 && applyRosterCount()">
         </label>
         <div class="bc-row">
           <span>Preset</span>
@@ -260,6 +268,63 @@
         <div ng-if="form.aiCar === 'random'">
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiRandomTrim"><span>Random trim variant</span></label>
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiNoBigCars"><span>Exclude big vehicles</span></label>
+        </div>
+        <!-- Named AI roster (ADR-0047): Create rolls names + concrete cars GE-side; the expandable list
+             edits them per entry. THE gate -- without a roster the panel spawns no AI. -->
+        <div class="bc-row">
+          <span>Roster</span>
+          <span class="bc-roster-actions">
+            <button type="button" class="bc-refresh" ng-click="createRoster()"
+              title="Roll a fresh named roster (names + cars); pressing again re-rolls everything">
+              {{form.aiRoster.length ? 'Re-create' : 'Create'}}</button>
+            <button type="button" class="bc-refresh" ng-if="form.aiRoster.length"
+              ng-click="rosterOpen = !rosterOpen">{{rosterOpen ? 'Hide' : 'Edit…'}}</button>
+          </span>
+        </div>
+        <div class="bc-roster-hint" ng-if="!form.aiRoster.length">No AI will spawn -- press Create to field the AI roster.</div>
+        <div class="bc-roster-hint" ng-if="rosterHint">{{rosterHint}}</div>
+        <div ng-if="rosterOpen && form.aiRoster.length">
+          <div class="bc-roster-entry" ng-repeat="e in form.aiRoster">
+            <div class="bc-row">
+              <span>#{{$index + 1}} Name</span>
+              <input type="text" ng-model="e.name"
+                ng-focus="rosterNameFocus($index)" ng-blur="rosterNameBlur($index)">
+              <button type="button" class="bc-preset" ng-click="rerollRosterName($index)"
+                title="Draw a new name from the pool">Roll</button>
+            </div>
+            <div class="bc-row">
+              <span>Car</span>
+              <div class="bc-dd">
+                <button type="button" class="bc-dd-head" ng-click="toggle('rosterCar' + $index)">{{rosterCarLabel(e)}}</button>
+                <div class="bc-dd-list" ng-if="open === 'rosterCar' + $index">
+                  <div class="bc-dd-opt" ng-repeat="o in opts.rosterCar" ng-class="{sel: o.v === rosterModelOf(e)}"
+                    ng-click="pickRosterCar(e, o.v)">{{o.label}}</div>
+                </div>
+              </div>
+              <button type="button" class="bc-preset" ng-click="rerollRosterCar($index)"
+                title="Reroll this AI's car under the current settings">Roll</button>
+            </div>
+            <div class="bc-row" ng-if="rosterModelOf(e) && rosterModelOf(e) !== 'host'">
+              <span>Config</span>
+              <div class="bc-dd">
+                <button type="button" class="bc-dd-head" ng-click="toggle('rosterCfg' + $index)">{{rosterConfigLabel(e)}}</button>
+                <div class="bc-dd-list" ng-if="open === 'rosterCfg' + $index">
+                  <div class="bc-dd-opt" ng-repeat="o in rosterConfigOpts(e)" ng-class="{sel: o.v === rosterConfigOf(e)}"
+                    ng-click="pickRosterConfig(e, o.v)">{{o.label}}</div>
+                </div>
+              </div>
+            </div>
+            <div class="bc-row">
+              <span>Pool</span>
+              <span class="bc-roster-actions">
+                <button type="button" class="bc-preset" ng-click="savePoolName($index, false)"
+                  title="Save this name to the permanent name pool">Save name</button>
+                <button type="button" class="bc-preset" ng-disabled="!canSaveWithCar(e)"
+                  ng-click="savePoolName($index, true)"
+                  title="Save the name with this car as its preferred car (wins future rolls)">Save + car</button>
+              </span>
+            </div>
+          </div>
         </div>
         <!-- Separate the AI-car / random-pool cluster above from the advanced tuning cluster below. -->
         <div class="bc-subdivider"></div>
