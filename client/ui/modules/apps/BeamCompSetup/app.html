@@ -319,14 +319,23 @@
                 </div>
               </div>
             </div>
+            <!-- Paint colour (ADR-0047 round 3): fixed-palette swatches + a reroll, no free colour picker.
+                 The AI's car spawns in this colour as its primary paint. -->
+            <div class="bc-row">
+              <span>Colour</span>
+              <span class="bc-swatches">
+                <button type="button" class="bc-swatch" ng-repeat="hex in data.aiPalette"
+                  ng-class="{sel: hex === e.color}" ng-style="rosterSwatchStyle(hex)"
+                  ng-click="pickRosterColor(e, hex)" title="{{hex}}"></button>
+              </span>
+              <button type="button" class="bc-preset" ng-click="rerollRosterColor(e)"
+                title="Reroll this AI's colour">Roll</button>
+            </div>
             <div class="bc-row">
               <span>Pool</span>
               <span class="bc-roster-actions">
-                <button type="button" class="bc-preset" ng-click="savePoolName($index, false)"
-                  title="Save this name to the permanent name pool">Save name</button>
-                <button type="button" class="bc-preset" ng-disabled="!canSaveWithCar(e)"
-                  ng-click="savePoolName($index, true)"
-                  title="Save the name with this car as its preferred car (wins future rolls)">Save + car</button>
+                <button type="button" class="bc-preset" ng-click="savePoolName($index)"
+                  title="Save this name to the permanent pool with its current car + colour as its preferred setup">Save</button>
               </span>
             </div>
           </div>

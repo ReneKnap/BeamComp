@@ -989,21 +989,20 @@ angular.module('beamng.apps')
         delete rosterPrev[i];
       };
 
-      // Save a row's (edited) name to the permanent pool (ADR-0047, add-only, server-persisted);
-      // optionally with the row's current car as the name's preferred car. The host sentinel is not
-      // saveable as a preferred car (it points at whoever hosts, not a concrete car).
-      scope.canSaveWithCar = function (e) {
-        return !!(e && e.car && e.car !== 'host');
-      };
-      scope.savePoolName = function (i, withCar) {
+      // Save a row's (edited) name to the permanent pool (ADR-0047, add-only, server-persisted). Round 3:
+      // ONE Save button stores the name together with its current car (only when concrete -- the host
+      // sentinel points at whoever hosts, not a car) and its current colour, so the saved name comes back
+      // with that car AND colour. The button is always enabled (name + colour can always be saved).
+      scope.savePoolName = function (i) {
         var e = scope.form.aiRoster[i];
         var name = e && (e.name || '').trim();
         if (!name) { return; }
         var payload = { name: name };
-        if (withCar && scope.canSaveWithCar(e)) { payload.car = e.car; }
+        if (e.car && e.car !== 'host') { payload.car = e.car; }
+        if (e.color) { payload.color = e.color; }
         geLuaArg('save_ai_pool_name', JSON.stringify(payload));
         scope.rosterHint = 'Saving "' + name + '" to the name pool'
-          + (payload.car ? ' with preferred car…' : '…');
+          + (payload.car ? ' with its car + colour…' : ' with its colour…');
       };
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
