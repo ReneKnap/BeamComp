@@ -249,6 +249,7 @@ local session = {
     tournament = nil,         -- active class-drop tournament {classes, order, standings, race_count, winner, ended} or nil (ADR-0042); session-scoped, survives reset_to_lobby like championship
     quali = nil,              -- active quali-then-race event {duration, lap_grace_deadline, done} or nil (ADR-0041); per-event, cleared by reset_to_lobby (unlike last_order/championship)
     owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
+    ai_roster = nil,          -- named AI roster for the active race (ADR-0047): [k] = {name, car?} for AI id "ai:<k>", sanitized from the panel's overrides.ai.roster; nil on the chat path (classic "AI <k>" labels). Per-race, cleared by reset_to_lobby
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race, /raceend and
@@ -1077,12 +1078,14 @@ end
 -- the back. Shared by order=last (previous finish) and order=championship (points table). An empty ranking
 -- leaves every id in the back group, i.e. plain entry order.
 local function place_by_identity(ids, ranking, rev)
-    -- An id's ranking identity: AI ids are strings "ai:<k>" that carry the display name "AI <k>" in the
-    -- standings (mirrors AI_ID_PREFIX / make_slot_entry), so the championship can rank AI alongside players;
-    -- real player ids are numbers resolved via resolve_identity (ADR-0031).
+    -- An id's ranking identity: AI ids are strings "ai:<k>" whose display name -- the roster name or
+    -- "AI <k>" (ADR-0047) -- keys them in the standings, so the championship/last-order/quali rankings can
+    -- match AI alongside players; real player ids are numbers resolved via resolve_identity (ADR-0031).
+    -- grid_store.ai_display_name is defined further down (next to the AI helpers) but exists by the time
+    -- this runs -- place_by_identity is only called during race operations.
     local function identity_of(id)
         if type(id) == "string" then
-            return "AI " .. id:sub(4)
+            return grid_store.ai_display_name(id)
         end
         return resolve_identity(id)
     end
@@ -1166,11 +1169,83 @@ local function ai_id_list(ai_count)
     return ids
 end
 
--- One slot record for an id at a 0-based slot. AI ids (ADR-0036) carry the "AI <k>" display name and the
--- ai flag; real players carry their connected name. Keeps build_slots free of the player/AI branch.
+-- The roster entry for an AI id (ADR-0047): entry k of session.ai_roster backs "ai:<k>". nil without a
+-- roster (the chat path) or for an unknown/foreign id. Attached to grid_store like the preset helpers,
+-- NOT a new top-level local (200-local ceiling); grid_store is in scope from line ~318, so the earlier
+-- place_by_identity can call these at runtime even though they are defined here, next to the AI helpers.
+function grid_store.ai_roster_entry(id)
+    local index = tonumber(tostring(id):sub(#AI_ID_PREFIX + 1))
+    if not index or not session.ai_roster then
+        return nil
+    end
+    return session.ai_roster[index]
+end
+
+-- The display name for a synthetic AI id (ADR-0047): the admin-authored roster name when the panel
+-- shipped one, else the classic "AI <k>". The SINGLE resolver behind every AI name read
+-- (place_by_identity, make_slot_entry, quali.identity_of, tour.identity_of) -- the name doubles as the
+-- identity KEY for quali bests, championship points, tournament classes and order=last, so all sites
+-- must agree. Without a roster this is byte-identical to the former inline "AI <k>" derivations.
+function grid_store.ai_display_name(id)
+    local entry = grid_store.ai_roster_entry(id)
+    if entry and type(entry.name) == "string" and entry.name ~= "" then
+        return entry.name
+    end
+    return "AI " .. tostring(id):sub(#AI_ID_PREFIX + 1)
+end
+
+-- The roster's pre-picked car token for an AI id (ADR-0047), or nil (chat path / no roster / entry
+-- without a car). An opaque string ("model[:config]" or the "host" sentinel) -- never interpreted here
+-- (race-blind, ADR-0005); it rides the per-slot ai_entry.car seam the class-drop tournament established.
+function grid_store.ai_roster_car(id)
+    local entry = grid_store.ai_roster_entry(id)
+    return entry and entry.car or nil
+end
+
+-- Sanitize the panel's roster for the session (ADR-0047): keep entry order (entry k backs "ai:<k>") and
+-- disambiguate names DETERMINISTICALLY -- roster names are identity keys, so a collision with a connected
+-- player's identity or an earlier roster entry (the UI prevents both, this is the defensive net) gets a
+-- " (2)" / " (3)" ... suffix instead of mixing keys. Returns the sanitized array, or nil for no/empty
+-- roster (the chat path -- every downstream read then falls back to "AI <k>").
+function grid_store.sanitize_ai_roster(raw)
+    if type(raw) ~= "table" or #raw == 0 then
+        return nil
+    end
+    local taken = {}
+    for id in pairs(MP.GetPlayers()) do
+        local identity = resolve_identity(id)
+        if identity then
+            taken[identity] = true
+        end
+    end
+    local roster = {}
+    for k, entry in ipairs(raw) do
+        if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" then
+            local name = entry.name
+            local suffix = 2
+            while taken[name] do
+                name = entry.name .. " (" .. suffix .. ")"
+                suffix = suffix + 1
+            end
+            taken[name] = true
+            roster[k] = {
+                name = name,
+                car = (type(entry.car) == "string" and entry.car ~= "") and entry.car or nil,
+            }
+        end
+    end
+    if next(roster) == nil then
+        return nil
+    end
+    return roster
+end
+
+-- One slot record for an id at a 0-based slot. AI ids (ADR-0036) carry their display name -- the roster
+-- name when the panel shipped one, else "AI <k>" (ADR-0047) -- and the ai flag; real players carry their
+-- connected name. Keeps build_slots free of the player/AI branch.
 local function make_slot_entry(id, slot, players)
     if is_ai_id(id) then
-        return {id = id, slot = slot, name = "AI " .. id:sub(#AI_ID_PREFIX + 1), ai = true}
+        return {id = id, slot = slot, name = grid_store.ai_display_name(id), ai = true}
     end
     return {id = id, slot = slot, name = players[id]}
 end
@@ -1732,12 +1807,13 @@ function quali.is_staged()
     return session.quali ~= nil and session.quali.staged == true
 end
 
--- The standings identity for a participant id (ADR-0031/0036): AI ids carry "AI <k>", players resolve to
--- the canonical client name (falling back to the seeded record name / raw id). Keys session.quali.best
--- consistently with build_standings entry.name, so the staged ranking + re-grid line up (ADR-0044).
+-- The standings identity for a participant id (ADR-0031/0036): AI ids carry their display name -- the
+-- roster name or "AI <k>" (ADR-0047) -- players resolve to the canonical client name (falling back to the
+-- seeded record name / raw id). Keys session.quali.best consistently with build_standings entry.name, so
+-- the staged ranking + re-grid line up (ADR-0044).
 function quali.identity_of(id)
     if is_ai_id(id) then
-        return "AI " .. tostring(id):sub(#AI_ID_PREFIX + 1)
+        return grid_store.ai_display_name(id)
     end
     local record = session.progress and session.progress[id]
     return resolve_identity(id) or (record and record.name) or tostring(id)
@@ -1919,7 +1995,17 @@ function quali.regrid()
     local ai_regrid = {}
     for _, entry in ipairs(slots) do
         if is_ai_id(entry.id) then
-            ai_regrid[#ai_regrid + 1] = {id = entry.id, slot = entry.slot, label = entry.name}
+            -- The roster's pre-picked car (ADR-0047) rides along: the owner RE-SPAWNS fresh AI on the
+            -- quali grid, so without the token it would re-roll the car and break the one-truth roster.
+            -- Suppressed while a tournament runs (the class car wins there, ADR-0042; checked via
+            -- session.tournament -- the tour table is declared later in the file) and nil without a
+            -- roster, keeping the aiConfig chain byte-identical.
+            ai_regrid[#ai_regrid + 1] = {
+                id = entry.id,
+                slot = entry.slot,
+                label = entry.name,
+                car = (session.tournament == nil) and grid_store.ai_roster_car(entry.id) or nil,
+            }
         end
     end
     for _, entry in ipairs(slots) do
@@ -2556,12 +2642,13 @@ function tour.is_active()
     return session.tournament ~= nil
 end
 
--- The standings identity for a participant id: AI ids "ai:<k>" carry the display name "AI <k>" (ADR-0036),
--- real player ids resolve to the canonical client name (ADR-0031). Matches build_standings/make_slot_entry,
--- so a driver's class keys consistently across the spawn relay and the award fold.
+-- The standings identity for a participant id: AI ids "ai:<k>" carry their display name -- the roster
+-- name or "AI <k>" (ADR-0036/0047) -- real player ids resolve to the canonical client name (ADR-0031).
+-- Matches build_standings/make_slot_entry, so a driver's class keys consistently across the spawn relay
+-- and the award fold.
 function tour.identity_of(id)
     if is_ai_id(id) then
-        return "AI " .. id:sub(#AI_ID_PREFIX + 1)
+        return grid_store.ai_display_name(id)
     end
     return resolve_identity(id)
 end
@@ -2989,6 +3076,9 @@ local function reset_to_lobby()
     session.spawn_ready_count = 0
     session.identities = nil
     session.owner_id = nil
+    -- session.ai_roster (ADR-0047) is per-race: the panel re-sends the roster with every start, so a
+    -- stale one must never name the next race's AI (e.g. a follow-up typed /race without a roster).
+    session.ai_roster = nil
     -- session.quali (ADR-0041) is per-event, so unlike last_order/championship it is cleared here -- a
     -- qualifying belongs to one race event and must not bleed into the next.
     session.quali = nil
@@ -3066,6 +3156,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     else
         quali.clear()
     end
+    -- The panel's named AI roster (ADR-0047): entry k names + pre-picks the car of AI id "ai:<k>". Stored
+    -- on the session BEFORE build_slots so make_slot_entry and every identity read resolve the roster
+    -- names; nil without a roster (the typed-chat path) keeps the classic "AI <k>" labels byte-identical.
+    session.ai_roster = grid_store.sanitize_ai_roster(overrides.ai and overrides.ai.roster)
     -- The requested AI opponents become synthetic participant slots (ADR-0036), so the roster, grid
     -- layout, and standings include them like any participant; the owner spawns + drives them. They mix
     -- into a random order and sort by reported pwr; otherwise they take the back of the grid.
@@ -3111,12 +3205,16 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
             local ai_entry = {slot = entry.slot, id = entry.id, label = entry.name}
             -- In a class-drop tournament each AI drives the car/cap of its current class (ADR-0042); the
             -- owner resolves a cap to a compliant car exactly as it does for the player policy (ADR-0036).
-            -- Absent (no tournament) the AI vehicle falls back to the uniform aiConfig chain unchanged.
+            -- Absent (no tournament) the roster's pre-picked car (ADR-0047) rides the SAME per-slot field
+            -- -- highest precedence in the owner's resolve_ai_vehicle, so the panel-shown car IS the
+            -- spawned car (one-truth); nil (chat path / no roster) keeps the uniform aiConfig chain.
             if tour.is_active() then
                 local vp = tour.policy_for(entry.id)
                 ai_entry.car = vp.car
                 ai_entry.maxhp = vp.maxhp
                 ai_entry.maxpwr = vp.maxpwr
+            else
+                ai_entry.car = grid_store.ai_roster_car(entry.id)
             end
             ai_slots[#ai_slots + 1] = ai_entry
         end
@@ -5522,6 +5620,27 @@ local function sanitize_overrides(raw)
         end
         if type(raw.ai.noBigCars) == "boolean" then
             ai.noBigCars = raw.ai.noBigCars
+        end
+        -- Named AI roster (ADR-0047): opaque {name, car?} entries relayed race-blind (ADR-0005). The
+        -- Create gate makes the roster the source of truth, so the AI count follows its length; entries
+        -- past MAX_AI drop. Absent on the typed-chat path (parse_race_args never builds a roster).
+        if type(raw.ai.roster) == "table" then
+            local roster = {}
+            for _, entry in ipairs(raw.ai.roster) do
+                if #roster >= MAX_AI then
+                    break
+                end
+                if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" then
+                    roster[#roster + 1] = {
+                        name = entry.name,
+                        car = (type(entry.car) == "string" and entry.car ~= "") and entry.car or nil,
+                    }
+                end
+            end
+            if #roster > 0 then
+                ai.roster = roster
+                ai.count = #roster
+            end
         end
         overrides.ai = ai
     end
