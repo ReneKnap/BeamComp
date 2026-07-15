@@ -17,11 +17,12 @@
 --   * the bottom progress bar: every sector of the current lap/run in the same colours, re-evaluated
 --     per HUD push so a purple degrades live (M.run_states).
 -- The session best per sector comes from the standings broadcast `splits` (ADR-0015) on a circuit; a
--- staged sprint reads the server-relayed field bests (`sectorBests`, ADR-0044) instead. Both fold
--- every crossing -- including the own one, once relayed back -- so classification anchors on the
--- references frozen AT crossing time and only lets the live field best in when it is strictly faster
--- (round 3, effective_session_best): the first-ever time in a sector is plain white, never a record
--- against itself. No persistence (all session-live).
+-- staged sprint reads the server-relayed field bests (`sectorBests` + `sectorCounts`, ADR-0044)
+-- instead. Both fold every crossing -- including the own one, once relayed back -- so classification
+-- anchors on the references frozen AT crossing time; the live field best applies when strictly
+-- faster (round 3), and once a SECOND scoring of the sector exists a still-fastest no-reference
+-- split upgrades to purple live (round 4) -- but the first-ever time alone stays plain white, never
+-- a record against itself (effective_session_best). No persistence (all session-live).
 
 local M = {}
 
@@ -179,14 +180,17 @@ end
 -- (feature quali-sector-progress-bar; previously only completed laps counted). The per-crossing
 -- subtraction reproduces laps_from_splits' sections exactly: crossing i closes sector ((i-1) % cps)+1,
 -- based on the previous crossing (run_up/0 for the very first, ADR-0022's clean lap-1). `entries` is
--- the standings list, each entry carrying `.splits` and `.run_up`. Returns a 1-based array where [s]
--- is the minimum sector-s time over every driver and lap (nil for sectors nobody has completed), or
--- nil when nobody has crossed anything yet.
+-- the standings list, each entry carrying `.splits` and `.run_up`. Returns TWO values (r4): a 1-based
+-- array where [s] is the minimum sector-s time over every driver and lap (nil for sectors nobody has
+-- completed; the whole array nil when nobody has crossed anything yet), and the companion counter
+-- array where [s] is how many valid crossings folded into sector s -- the circuit-side twin of the
+-- staged `sectorCounts` relay, feeding the white->purple upgrade branch (effective_session_best).
 function M.session_reference(entries, cps)
     if type(cps) ~= "number" or cps < 1 then
         return nil
     end
     local best = {}
+    local counts = {}
     local has_any = false
     for _, entry in ipairs(entries or {}) do
         local splits = entry.splits
@@ -201,6 +205,7 @@ function M.session_reference(entries, cps)
                 end
                 local s = ((i - 1) % cps) + 1
                 local value = cumulative - previous
+                counts[s] = (counts[s] or 0) + 1
                 if best[s] == nil or value < best[s] then
                     best[s] = value
                     has_any = true
@@ -208,7 +213,7 @@ function M.session_reference(entries, cps)
             end
         end
     end
-    return has_any and best or nil
+    return has_any and best or nil, counts
 end
 
 -- Cumulative time through `sector` of a per-section array (sum of sections 1..sector), or nil when any
@@ -255,16 +260,28 @@ function M.record_class(split, prev_personal_best, session_best)
     return "slower"
 end
 
--- The session reference a stored split is re-evaluated against on a HUD push (round 3): the CURRENT
--- field best counts only when it STRICTLY beats the stored split -- someone genuinely undercut it,
--- so the purple falls. Anything else (the own value relayed back, or an exact tie) keeps the
--- reference frozen at crossing time, so a class can never be won or lost against the split itself.
--- This is the one seam the bar (run_states) and the centred readout share, per the round-3 contract:
--- the readout must never show purple where the bar is white.
-function M.effective_session_best(split, prev_session_best, session_best_now)
-    if type(session_best_now) == "number" and type(split) == "number"
-            and session_best_now < split then
+-- The session reference a stored split is re-evaluated against on a HUD push (round 3, upgrade
+-- branch round 4). Three branches, first match wins:
+--   1. The CURRENT field best STRICTLY beats the stored split -- someone genuinely undercut it, so
+--      the purple falls (and a no-reference sector goes back to white via record_class).
+--   2. At least one FURTHER scoring of this sector exists (`session_count_now >= 2` -- the stored
+--      split's own fold is one of them) and nobody is strictly faster -- the split IS the field
+--      best against real competition, so it upgrades to purple live (an exact tie counts as still
+--      fastest, consistent with 3.2). A solo first-ever time stays white: its own relay makes
+--      count 1, so the round-3 self-purple bug cannot return by construction.
+--   3. Otherwise the reference frozen at crossing time stands, so a class can never be won or lost
+--      against the split itself.
+-- This is the one seam the bar (run_states) and the centred readout share, per the round-3
+-- contract: the readout must never show purple where the bar is white.
+function M.effective_session_best(split, prev_session_best, session_best_now, session_count_now)
+    if type(split) ~= "number" then
+        return prev_session_best
+    end
+    if type(session_best_now) == "number" and session_best_now < split then
         return session_best_now
+    end
+    if type(session_count_now) == "number" and session_count_now >= 2 then
+        return split
     end
     return prev_session_best
 end
@@ -273,12 +290,12 @@ end
 -- quali-sector-progress-bar): a dense 1..cps array of class strings -- "none" for sectors not driven
 -- this lap/run (grey segment), else record_class re-evaluated NOW while both references stay
 -- anchored at crossing time: the personal best as frozen then, and the session best through
--- effective_session_best (round 3) -- the live field best applies only when strictly faster, so the
--- own relayed-back split can never turn itself purple, while a rival genuinely undercutting the
--- sector still degrades it live. A DRIVEN sector without any reference keeps record_class's
--- "normal" (white segment, round 2) -- visibly distinct from undriven grey. nil on a degenerate
--- tracker.
-function M.run_states(state, session_reference)
+-- effective_session_best (round 3, upgrade branch round 4) -- the live field best applies when
+-- strictly faster (degradation), a second scoring of the sector upgrades a still-fastest white to
+-- purple (`session_counts`, round 4), and the own relayed-back split alone can never turn itself
+-- purple. A DRIVEN sector without any comparison keeps record_class's "normal" (white segment,
+-- round 2) -- visibly distinct from undriven grey. nil on a degenerate tracker.
+function M.run_states(state, session_reference, session_counts)
     if not state or not state.cps or state.cps < 1 then
         return nil
     end
@@ -288,7 +305,8 @@ function M.run_states(state, session_reference)
         local crossed = run[s]
         if crossed then
             local session_best = M.effective_session_best(crossed.split,
-                crossed.prev_session_best, session_reference and session_reference[s] or nil)
+                crossed.prev_session_best, session_reference and session_reference[s] or nil,
+                session_counts and session_counts[s] or nil)
             states[s] = M.record_class(crossed.split, crossed.prev_personal_best, session_best)
         else
             states[s] = "none"

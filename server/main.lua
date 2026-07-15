@@ -1778,6 +1778,11 @@ function quali.begin(duration, staged)
                             -- [k] = the fastest splits[k]-splits[k-1] any scored crossing produced,
                             -- relayed as `sectorBests` on the queue snapshot so the staged HUD's
                             -- record colouring degrades live (seeded by start_session, like best_cp)
+        sector_count = nil, -- per-sector count of scored crossings across ALL drivers and runs
+                            -- (Round 13/r4): [k] = how many splits ever folded into sector_best[k],
+                            -- relayed as `sectorCounts` so a no-reference (white) sector upgrades to
+                            -- purple once a second scoring exists (seeded by start_session, same
+                            -- fold seam and lifecycle as sector_best)
     }
 end
 
@@ -2148,10 +2153,13 @@ function quali.broadcast_queue()
     -- the staged HUD's session reference for the record colouring of the bar + readout. This broadcast
     -- already fires on every scored crossing (handle_checkpoint_report / requeue), so an improvement
     -- reaches every client on the report that set it -- live degradation needs no extra cadence.
+    -- `sectorCounts` (r4): the companion crossing counter per sector, same fold seam -- lets a client
+    -- upgrade a no-reference (white) sector to purple once a second scoring of that sector exists.
     broadcast_event(quali.MSG_QUEUE, {
         rows = rows,
         waiting = (q.clearing_id ~= nil) or nil,
         sectorBests = q.sector_best,
+        sectorCounts = q.sector_count,
     })
 end
 
@@ -2199,6 +2207,9 @@ function quali.start_session()
     -- anyone beats a sector. Staged only, like best_cp: the circuit derives its session reference
     -- client-side from the live standings splits (ADR-0015) and never allocates this.
     q.sector_best = {}
+    -- Companion crossing counter per sector (r4), same fold seam: `sectorCounts` lets the client
+    -- upgrade a no-reference (white) sector to purple once at least one FURTHER scoring exists.
+    q.sector_count = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
@@ -2263,12 +2274,13 @@ function quali.note_cp_progress(id)
     end
 end
 
--- Fold one scored crossing into the field-wide per-sector best splits (Round 13). Called per checkpoint
--- report under the staged gate, like note_cp_progress, so EVERY scored crossing counts -- aborted runs
--- included. The sector split is the difference of consecutive run-relative cumulative splits
--- (splits[k] - splits[k-1], ADR-0015 semantics; k = 1 bases on 0 -- the staged run starts at the ramp,
--- no run-up). Crossings arrive in seq order, so the array stays dense (sector k is never folded before
--- 1..k-1). Race-blind (ADR-0005): a min of two client-reported numbers, the q.best pattern.
+-- Fold one scored crossing into the field-wide per-sector best splits (Round 13) and bump the
+-- sector's crossing counter (r4). Called per checkpoint report under the staged gate, like
+-- note_cp_progress, so EVERY scored crossing counts -- aborted runs included. The sector split is
+-- the difference of consecutive run-relative cumulative splits (splits[k] - splits[k-1], ADR-0015
+-- semantics; k = 1 bases on 0 -- the staged run starts at the ramp, no run-up). Crossings arrive in
+-- seq order, so both arrays stay dense (sector k is never folded before 1..k-1). Race-blind
+-- (ADR-0005): a min + a count of client-reported numbers, the q.best pattern.
 function quali.note_sector_best(id)
     local q = session.quali
     local record = session.progress and session.progress[id]
@@ -2284,6 +2296,9 @@ function quali.note_sector_best(id)
     local split = cumulative - previous
     if not q.sector_best[k] or split < q.sector_best[k] then
         q.sector_best[k] = split
+    end
+    if q.sector_count then
+        q.sector_count[k] = (q.sector_count[k] or 0) + 1
     end
 end
 
