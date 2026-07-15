@@ -10,13 +10,26 @@
 -- overlay's per-lap sections exactly (splits[k] - splits[k-1]; ADR-0015/0030) -- same source, same
 -- subtraction. The tracker also keeps the current lap's cumulative time and a per-sector personal best.
 -- The HUD reads these to show, on each crossing:
---   * a cumulative delta vs your FASTEST LAP (personal_reference sections), and
+--   * a cumulative delta vs your FASTEST LAP (personal_reference sections),
 --   * the just-completed sector's split time + a per-segment delta vs your PER-SECTOR personal best,
---     record-coloured purple (session best across the field) / green (your personal best) / normal.
--- The session best per sector comes from the standings broadcast `splits` (ADR-0015), so every client
--- derives the same numbers with no server change and no persistence (all session-live).
+--     record-coloured purple (session best across the field) / green (your personal best) / yellow
+--     (slower, <= OFF_THRESHOLD x your best) / red ("off", beyond it) / grey (no reference), and
+--   * the bottom progress bar: every sector of the current lap/run in the same colours, re-evaluated
+--     per HUD push so a purple degrades live (M.run_states).
+-- The session best per sector comes from the standings broadcast `splits` (ADR-0015) on a circuit; a
+-- staged sprint reads the server-relayed field bests (`sectorBests` + `sectorCounts`, ADR-0044)
+-- instead. Both fold every crossing -- including the own one, once relayed back -- so classification
+-- anchors on the references frozen AT crossing time; the live field best applies when strictly
+-- faster (round 3), and once a SECOND scoring of the sector exists a still-fastest no-reference
+-- split upgrades to purple live (round 4) -- but the first-ever time alone stays plain white, never
+-- a record against itself (effective_session_best). No persistence (all session-live).
 
 local M = {}
+
+-- Record-class threshold (feature quali-sector-progress-bar): a split MORE than 16 % over the
+-- driver's per-sector personal best classifies "off" (red) instead of "slower" (yellow). Exactly
+-- 1.16 x PB is still "slower".
+M.OFF_THRESHOLD = 1.16
 
 -- Per-lap section arrays from a cumulative splits array (ADR-0015/0030): lap l section s =
 -- splits[(l-1)*cps + s] - splits[(l-1)*cps + s - 1], total = splits[l*cps] - splits[(l-1)*cps]. Only
@@ -69,6 +82,9 @@ function M.new(cps)
         seq = 0,              -- monotonic count of completed sectors this session
         personal_best = {},   -- [sector] = the fastest split seen for that sector across the session
         last = nil,           -- the just-completed sector, see M.on_crossing, or nil
+        run = {},             -- [sector] = {split, prev_personal_best} of the CURRENT lap/run (feature
+                              -- quali-sector-progress-bar): the reference frozen at crossing time, so
+                              -- M.run_states can re-classify live against a moving session best
     }
 end
 
@@ -85,6 +101,7 @@ function M.reset_run(state)
     state.lap_start = nil
     state.seq = 0
     state.last = nil
+    state.run = {}
 end
 
 -- Record a scored crossing at 0-based plan ordinal `crossing_seq` and detector time `time`. Computes
@@ -93,10 +110,15 @@ end
 --   split                -- its time (this crossing's elapsed minus the previous crossing's),
 --   lap_cumulative       -- the current lap's elapsed through this crossing (line-relative, clean),
 --   prev_personal_best   -- the fastest split for this sector BEFORE this crossing (nil the first time),
+--   prev_session_best    -- the field's best for this sector BEFORE this crossing (round 3): frozen
+--                           from `session_reference` (the caller's current view), which cannot yet
+--                           contain THIS split -- the crossing is recorded synchronously before its
+--                           report is even sent, so no relay/row round-trip can leak it in. nil when
+--                           nobody (own earlier laps/runs included) has set a time for this sector.
 -- and folds `split` into the running per-sector personal best. `run_up` (circuit; ADR-0022) is used
 -- only as the base for the very first crossing, so lap 1's first sector reads clean line-to-line (lap
 -- 1's real start is the start/finish line, behind the grid). No-op on a degenerate tracker / bad time.
-function M.on_crossing(state, crossing_seq, time, run_up)
+function M.on_crossing(state, crossing_seq, time, run_up, session_reference)
     if not state or not state.cps or state.cps < 1 or type(time) ~= "number" then
         return
     end
@@ -110,20 +132,30 @@ function M.on_crossing(state, crossing_seq, time, run_up)
     end
     local sector = (crossing_seq % state.cps) + 1
     -- Sector 1 opens a new lap, so its base is the lap start (the previous CP0 crossing, or run_up/0 for
-    -- lap 1); later sectors keep that lap start for the cumulative time.
+    -- lap 1); later sectors keep that lap start for the cumulative time. The per-lap sector statuses
+    -- (the progress bar) reset with it -- the previous lap stays visible until the new lap's first
+    -- sector completes (feature quali-sector-progress-bar, decision 3/4).
     if sector == 1 then
         state.lap_start = base
+        state.run = {}
     end
     local split = time - base
     local prev_pb = state.personal_best[sector]
     if prev_pb == nil or split < prev_pb then
         state.personal_best[sector] = split
     end
+    local prev_sb = session_reference and session_reference[sector] or nil
+    if type(prev_sb) ~= "number" then
+        prev_sb = nil
+    end
+    state.run = state.run or {}  -- tolerate a tracker that survived a hot reload of an older shape
+    state.run[sector] = {split = split, prev_personal_best = prev_pb, prev_session_best = prev_sb}
     state.last = {
         sector = sector,
         split = split,
         lap_cumulative = time - (state.lap_start or base),
         prev_personal_best = prev_pb,
+        prev_session_best = prev_sb,
     }
     state.seq = state.seq + 1
     state.prev_time = time
@@ -143,28 +175,45 @@ function M.personal_reference(splits, run_up, cps)
 end
 
 -- The session-best reference sectors: the fastest time seen for each sector index across ALL drivers'
--- completed laps this session (ADR-0015 broadcast splits). `entries` is the standings list, each entry
--- carrying `.splits` and `.run_up`. Returns a 1-based array where [s] is the minimum sector-s time over
--- every driver and lap (nil for sectors nobody has completed), or nil when the field has no completed
--- lap at all.
+-- crossings this session (ADR-0015 broadcast splits). Folded per crossing -- partial laps included --
+-- so a rival bettering a sector mid-lap degrades a purple the moment their crossing is broadcast
+-- (feature quali-sector-progress-bar; previously only completed laps counted). The per-crossing
+-- subtraction reproduces laps_from_splits' sections exactly: crossing i closes sector ((i-1) % cps)+1,
+-- based on the previous crossing (run_up/0 for the very first, ADR-0022's clean lap-1). `entries` is
+-- the standings list, each entry carrying `.splits` and `.run_up`. Returns TWO values (r4): a 1-based
+-- array where [s] is the minimum sector-s time over every driver and lap (nil for sectors nobody has
+-- completed; the whole array nil when nobody has crossed anything yet), and the companion counter
+-- array where [s] is how many valid crossings folded into sector s -- the circuit-side twin of the
+-- staged `sectorCounts` relay, feeding the white->purple upgrade branch (effective_session_best).
 function M.session_reference(entries, cps)
     if type(cps) ~= "number" or cps < 1 then
         return nil
     end
     local best = {}
+    local counts = {}
     local has_any = false
     for _, entry in ipairs(entries or {}) do
-        for _, lap in ipairs(laps_from_splits(entry.splits, cps, entry.run_up)) do
-            for s = 1, cps do
-                local value = lap.sections[s]
-                if type(value) == "number" and (best[s] == nil or value < best[s]) then
+        local splits = entry.splits
+        if type(splits) == "table" then
+            for i = 1, #splits do
+                local previous = (i == 1)
+                    and (type(entry.run_up) == "number" and entry.run_up or 0)
+                    or splits[i - 1]
+                local cumulative = splits[i]
+                if type(cumulative) ~= "number" or type(previous) ~= "number" then
+                    break  -- broken cumulative chain; later diffs would be garbage
+                end
+                local s = ((i - 1) % cps) + 1
+                local value = cumulative - previous
+                counts[s] = (counts[s] or 0) + 1
+                if best[s] == nil or value < best[s] then
                     best[s] = value
                     has_any = true
                 end
             end
         end
     end
-    return has_any and best or nil
+    return has_any and best or nil, counts
 end
 
 -- Cumulative time through `sector` of a per-section array (sum of sections 1..sector), or nil when any
@@ -186,11 +235,12 @@ end
 -- The motorsport record class for a just-completed sector `split`, checked best-first: "session"
 -- (purple) when it is the fastest that sector by anyone (<= the field's known best, which excludes this
 -- fresh split) -- possible even on your first run through the sector; else "personal" (green) when it
--- matched/beat your own best for that sector; else "slower" (red) when it is slower than your best. The
--- session-best check runs before the first-run guard, so beating the field is purple even without a
--- personal reference yet. "normal" only when there is nothing to compare against -- the split is not a
--- number, or there is no session best to beat and no personal reference yet (your first time through
--- this sector). `session_best` / `prev_personal_best` may be nil (no data yet).
+-- matched/beat your own best for that sector; else "slower" (yellow) when it is at most
+-- OFF_THRESHOLD x your best; else "off" (red, clearly off the pace). The session-best check runs
+-- before the first-run guard, so beating the field is purple even without a personal reference yet.
+-- "normal" only when there is nothing to compare against -- the split is not a number, or there is no
+-- session best to beat and no personal reference yet (your first time through this sector).
+-- `session_best` / `prev_personal_best` may be nil (no data yet).
 function M.record_class(split, prev_personal_best, session_best)
     if type(split) ~= "number" then
         return "normal"
@@ -204,7 +254,65 @@ function M.record_class(split, prev_personal_best, session_best)
     if split <= prev_personal_best then
         return "personal"
     end
+    if split > prev_personal_best * M.OFF_THRESHOLD then
+        return "off"
+    end
     return "slower"
+end
+
+-- The session reference a stored split is re-evaluated against on a HUD push (round 3, upgrade
+-- branch round 4). Three branches, first match wins:
+--   1. The CURRENT field best STRICTLY beats the stored split -- someone genuinely undercut it, so
+--      the purple falls (and a no-reference sector goes back to white via record_class).
+--   2. At least one FURTHER scoring of this sector exists (`session_count_now >= 2` -- the stored
+--      split's own fold is one of them) and nobody is strictly faster -- the split IS the field
+--      best against real competition, so it upgrades to purple live (an exact tie counts as still
+--      fastest, consistent with 3.2). A solo first-ever time stays white: its own relay makes
+--      count 1, so the round-3 self-purple bug cannot return by construction.
+--   3. Otherwise the reference frozen at crossing time stands, so a class can never be won or lost
+--      against the split itself.
+-- This is the one seam the bar (run_states) and the centred readout share, per the round-3
+-- contract: the readout must never show purple where the bar is white.
+function M.effective_session_best(split, prev_session_best, session_best_now, session_count_now)
+    if type(split) ~= "number" then
+        return prev_session_best
+    end
+    if type(session_best_now) == "number" and session_best_now < split then
+        return session_best_now
+    end
+    if type(session_count_now) == "number" and session_count_now >= 2 then
+        return split
+    end
+    return prev_session_best
+end
+
+-- The record class of every sector of the current lap/run, for the bottom progress bar (feature
+-- quali-sector-progress-bar): a dense 1..cps array of class strings -- "none" for sectors not driven
+-- this lap/run (grey segment), else record_class re-evaluated NOW while both references stay
+-- anchored at crossing time: the personal best as frozen then, and the session best through
+-- effective_session_best (round 3, upgrade branch round 4) -- the live field best applies when
+-- strictly faster (degradation), a second scoring of the sector upgrades a still-fastest white to
+-- purple (`session_counts`, round 4), and the own relayed-back split alone can never turn itself
+-- purple. A DRIVEN sector without any comparison keeps record_class's "normal" (white segment,
+-- round 2) -- visibly distinct from undriven grey. nil on a degenerate tracker.
+function M.run_states(state, session_reference, session_counts)
+    if not state or not state.cps or state.cps < 1 then
+        return nil
+    end
+    local run = state.run or {}
+    local states = {}
+    for s = 1, state.cps do
+        local crossed = run[s]
+        if crossed then
+            local session_best = M.effective_session_best(crossed.split,
+                crossed.prev_session_best, session_reference and session_reference[s] or nil,
+                session_counts and session_counts[s] or nil)
+            states[s] = M.record_class(crossed.split, crossed.prev_personal_best, session_best)
+        else
+            states[s] = "none"
+        end
+    end
+    return states
 end
 
 return M

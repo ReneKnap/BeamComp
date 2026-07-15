@@ -513,9 +513,10 @@
       margin-left: 6px;
       font-size: 0.85em;
     }
-    /* Motorsport record colours for the split time + per-segment delta: purple = session best (fastest that
-       sector by anyone), green = your personal best, red = slower than your personal best; default white only
-       when there is no reference yet (first time through the sector). */
+    /* Motorsport record colours, ONE scheme for the split readout and the sector progress bar (feature
+       quali-sector-progress-bar): purple = session best (fastest that sector by anyone), green = your
+       personal best, yellow = slower but within 16% of your best, red = "off" (beyond it); default white
+       (readout) / grey (bar) when there is no reference yet. */
     .beamcomp-hud .bc-rec-session {
       color: #b06bff;
     }
@@ -523,7 +524,56 @@
       color: #3fd96b;
     }
     .beamcomp-hud .bc-rec-slower {
+      color: #f2c744;
+    }
+    .beamcomp-hud .bc-rec-off {
       color: #d9534f;
+    }
+    /* Qualifying sector progress bar (feature quali-sector-progress-bar): one slim line = the current
+       lap (circuit) / run (staged), one equal-width segment per sector, coloured by record class --
+       grey until driven, WHITE once driven without any reference time (round 2: progress must be
+       visible before reference times exist). Fixed bottom-centered overlay like the sector readout;
+       pointer-events:none so it never eats clicks; leaves with the quali HUD (ng-if="hud.sectorBar"). */
+    .beamcomp-hud .bc-quali-bar {
+      /* Distance from the bottom of the viewport -- the single knob to re-tune in-game (the
+         --bc-quali-sector-top pattern). */
+      --bc-quali-bar-bottom: 7%;
+      position: fixed;
+      bottom: var(--bc-quali-bar-bottom);
+      left: 50%;
+      transform: translateX(-50%);
+      width: 26%; /* round 2: 44% read as too long -- "~40% shorter" */
+      display: flex;
+      pointer-events: none;
+      z-index: 900;
+    }
+    .beamcomp-hud .bc-qbar-seg {
+      flex: 1;
+      height: 7px;
+      border-radius: 2px;
+      margin-right: 3px; /* the visible sector separator */
+      background: rgba(255, 255, 255, 0.28); /* bc-rec-none: not driven this lap/run */
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+    }
+    .beamcomp-hud .bc-qbar-seg:last-child {
+      margin-right: 0;
+    }
+    /* Driven but nothing to compare against (record class "normal") -- white, clearly distinct from
+       the undriven grey. Bar only; the readout's "normal" is already its white default text. */
+    .beamcomp-hud .bc-qbar-seg.bc-rec-normal {
+      background: rgba(255, 255, 255, 0.92);
+    }
+    .beamcomp-hud .bc-qbar-seg.bc-rec-session {
+      background: #b06bff;
+    }
+    .beamcomp-hud .bc-qbar-seg.bc-rec-personal {
+      background: #3fd96b;
+    }
+    .beamcomp-hud .bc-qbar-seg.bc-rec-slower {
+      background: #f2c744;
+    }
+    .beamcomp-hud .bc-qbar-seg.bc-rec-off {
+      background: #d9534f;
     }
     /* Minimized quali-results bar (ADR-0041): a small centered pill that restores the card. */
     .beamcomp-hud .bc-quali-restore {
@@ -835,7 +885,15 @@
       <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
            ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
       <div class="bc-qd-seg"
-           ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
+           ng-class="'bc-rec-' + hud.sector.record"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
+    </div>
+    <!-- Sector progress bar (feature quali-sector-progress-bar): the current lap, one segment per
+         sector, record-coloured and live re-evaluated (a purple falls back once someone beats it).
+         Grey = not driven this lap; white = driven, no reference yet (round 2). Resets as the new
+         lap's first sector completes. -->
+    <div class="bc-quali-bar" ng-if="hud.sectorBar">
+      <div class="bc-qbar-seg" ng-repeat="c in hud.sectorBar.states track by $index"
+           ng-class="'bc-rec-' + c"></div>
     </div>
   </div>
   <!-- Staged sprint quali (ADR-0044/Round4): the rally staggered single-car ramp view. Left: window clock (or
@@ -899,7 +957,15 @@
       <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
            ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">RUN</span>{{formatDelta(hud.sector.cumulative)}}</div>
       <div class="bc-qd-seg"
-           ng-class="{'bc-rec-session': hud.sector.record === 'session', 'bc-rec-personal': hud.sector.record === 'personal', 'bc-rec-slower': hud.sector.record === 'slower'}"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
+           ng-class="'bc-rec-' + hud.sector.record"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
+    </div>
+    <!-- Sector progress bar (feature quali-sector-progress-bar): the current run, one segment per
+         sector, record-coloured and live re-evaluated against the server-relayed field bests
+         (sectorBests). Grey = not driven this run; white = driven, no reference yet (round 2).
+         Between runs the last run's states stay up until the next launch (decision 4). -->
+    <div class="bc-quali-bar" ng-if="hud.sectorBar">
+      <div class="bc-qbar-seg" ng-repeat="c in hud.sectorBar.states track by $index"
+           ng-class="'bc-rec-' + c"></div>
     </div>
   </div>
   <!-- Qualifying results (ADR-0041): the classification that sets the race grid, shown during the pause
