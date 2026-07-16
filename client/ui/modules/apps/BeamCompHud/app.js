@@ -46,13 +46,18 @@ angular.module('beamng.apps')
     return (s >= 0 ? '+' : '') + s.toFixed(2) + 's';
   }
 
-  // Live-standings interval cell: the time gap to the row's reference (the selected mode -- self,
-  // car ahead, or leader), prefixed with the checkpoint gap when the two are more than one completed
-  // checkpoint apart -> "+2 CP (+12.3)" (the frozen shared-crossing time gap, ADR-0015, is then
-  // misleadingly small, so the CP gap leads). Both are signed: a reference ahead reads negative. At
-  // <=1 CP apart it is just the time.
+  // Live-standings interval cell. A DNF driver shows a "DNF (CP x/y)" status label (mirrors the
+  // provisional/results cards). Otherwise: the time gap to the row's reference (the selected mode --
+  // self, car ahead, or leader), prefixed with the checkpoint gap when the two are at least one
+  // completed checkpoint apart -> "+1 CP (+12.3)" (the frozen shared-crossing time gap, ADR-0015, is
+  // then misleadingly small, so the CP gap leads). Both are signed: a reference ahead reads negative.
+  // At the same checkpoint it is just the time. A finisher keeps its frozen end-gap here (the check
+  // marker sits on the name cell instead).
   function formatInterval(e) {
-    if (typeof e.cpInterval === 'number' && Math.abs(e.cpInterval) >= 2) {
+    if (e.dnf) {
+      return 'DNF (CP ' + e.checkpoint + '/' + e.count + ')';
+    }
+    if (typeof e.cpInterval === 'number' && Math.abs(e.cpInterval) >= 1) {
       var cp = (e.cpInterval < 0 ? '-' : '+') + Math.abs(e.cpInterval) + ' CP';
       return typeof e.interval === 'number' ? cp + ' (' + formatDelta(e.interval) + ')' : cp;
     }
@@ -60,10 +65,10 @@ angular.module('beamng.apps')
   }
 
   // Provisional-card gap cell: the time gap to the leader, prefixed with the checkpoint gap when the row
-  // is more than one completed checkpoint behind the leader -> "+2 CP (+12.3)". P1 (no leader gap) and
-  // <=1 CP behind fall back to the plain leader time.
+  // is at least one completed checkpoint behind the leader -> "+1 CP (+12.3)". P1 (no leader gap) and
+  // same-checkpoint rows fall back to the plain leader time.
   function formatLeaderGap(e) {
-    if (typeof e.cpGap === 'number' && Math.abs(e.cpGap) >= 2) {
+    if (typeof e.cpGap === 'number' && Math.abs(e.cpGap) >= 1) {
       var cp = (e.cpGap < 0 ? '-' : '+') + Math.abs(e.cpGap) + ' CP';
       return typeof e.gap === 'number' ? cp + ' (' + formatDelta(e.gap) + ')' : cp;
     }

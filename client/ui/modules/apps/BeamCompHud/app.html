@@ -286,8 +286,9 @@
       text-align: right;
     }
     .beamcomp-hud .bc-int {
-      /* Wide enough for the combined "+2 CP (+12.3)" interval (table-layout:fixed pins the column). */
-      width: 8.5em;
+      /* Wide enough for the widest cell content -- the live-standings "DNF (CP 10/12)" status label
+         and the combined "+1 CP (+12.3)" interval (table-layout:fixed pins the column). */
+      width: 9em;
       font-variant-numeric: tabular-nums;
       text-align: right;
       opacity: 0.85;
@@ -779,7 +780,7 @@
             <tr ng-repeat="e in hud.liveEntries"
                 ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai, 'bc-flash': e.flash}">
               <td class="bc-pos">P{{e.position}}</td>
-              <td class="bc-name">{{e.name}}<span class="bc-react-tag" ng-if="e.reaction != null">{{formatReaction(e.reaction)}}</span><span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
+              <td class="bc-name"><span class="bc-fin-mark" ng-if="e.finished">&#10003; </span>{{e.name}}<span class="bc-react-tag" ng-if="e.reaction != null">{{formatReaction(e.reaction)}}</span><span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
               <td class="bc-int">{{formatInterval(e)}}</td>
             </tr>
           </table>
