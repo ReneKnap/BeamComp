@@ -890,6 +890,32 @@ function M.palette()
     return COLOR_PALETTE
 end
 
+-- The pool NAME list for the panel's name picker (ADR-0047 amendment R2): the server-persisted custom
+-- names first (the admin's own), then the built-in nicknames, deduplicated (a custom re-save of a built-in
+-- name shows once). The R2 editor picks a roster name from this dropdown instead of free typing; the custom
+-- pool arrives via aiPoolData, so before it lands only the built-ins show. `custom_pool` is M.state.ai_pool
+-- ({name, car?, color?} entries) or nil.
+function M.pool_names(custom_pool)
+    local names = {}
+    local seen = {}
+    if type(custom_pool) == "table" then
+        for _, entry in ipairs(custom_pool) do
+            if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= ""
+                    and not seen[entry.name] then
+                names[#names + 1] = entry.name
+                seen[entry.name] = true
+            end
+        end
+    end
+    for _, name in ipairs(NAME_POOL) do
+        if not seen[name] then
+            names[#names + 1] = name
+            seen[name] = true
+        end
+    end
+    return names
+end
+
 -- Draw one palette colour not in `used` (a set of hex -> true), or -- when every palette colour is
 -- already used (more AI than palette entries) -- any random palette colour so an entry always gets one.
 -- Owner/panel-local, so math.random is fine (no cross-client determinism, like the name/car draws).
@@ -949,12 +975,14 @@ function M.draw_roster_names(count, exclude, custom_pool)
     return drawn
 end
 
--- Whether a pool name's PREFERRED CAR participates in a roster roll (ADR-0047 decision 4): it replaces a
--- ROLLED car ("they always get it, even on random"), but an explicit concrete admin choice -- a fixed
--- aicar=<model> or aicar=host -- stays authoritative for every entry.
+-- Whether a pool name's PREFERRED CAR participates in a roster roll (ADR-0047 amendment R2): it replaces
+-- a car ONLY in the "default" AI-car mode (aicar unset/empty). aicar=random now IGNORES the preferred car
+-- and rolls a fresh random one (the R2 flip -- default = each AI's preferred, random = surprise field); an
+-- explicit concrete admin choice -- a fixed aicar=<model> or aicar=host -- stays authoritative as before.
+-- Colour is orthogonal and stays always-applied (round-3), so this gate is the CAR precedence only.
 function M.preferred_applies(config)
     local car = type(config) == "table" and config.car or nil
-    return car == nil or car == "" or car == "random"
+    return car == nil or car == ""
 end
 
 -- Whether a preferred-car token passes the ACTIVE vehicle restrictions, with the same filter set the
