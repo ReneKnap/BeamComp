@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "live-standings-dnf+track-name-fit/2026-07-16"
+local BUILD_MARKER = "ai-roster-editor-r3/2026-07-17"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2410,6 +2410,10 @@ local function push_setup_data(include_deprecated)
         -- GE roster draw uses, so swatches and auto-assigned colours share one source.
         aiPalette = ai.palette(),
     })
+    -- The pool NAME list for the panel's roster name picker (ADR-0047 amendment R2): built-ins now, plus
+    -- any custom names already cached; refreshed when aiPoolData lands (below). The panel picks names from
+    -- this instead of free typing.
+    guihooks.trigger("BeamCompAiPool", {names = ai.pool_names(M.state.ai_pool)})
     M.state.grid_list_target = "setup"
     send_to_server("gridListReq", {map = map})
     -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
@@ -2914,12 +2918,13 @@ local HANDLERS = {
     gridList = handle_grid_list,
     presetData = handle_preset_data,
     presetList = handle_preset_list,
-    -- The global custom AI name pool for the roster rolls (ADR-0047): cached GE-side only -- the panel
-    -- never needs the raw pool, it just triggers rolls. Inline closure, not a new top-level local
-    -- (init.lua sits near the 200-local ceiling).
+    -- The global custom AI name pool for the roster rolls (ADR-0047): cached GE-side for the rolls, and its
+    -- NAME list is pushed to the panel's name picker (ADR-0047 amendment R2) so a just-saved name appears in
+    -- the dropdown. Inline closure, not a new top-level local (init.lua sits near the 200-local ceiling).
     aiPoolData = function(payload)
         M.state.ai_pool = (type(payload) == "table" and type(payload.entries) == "table")
             and payload.entries or {}
+        guihooks.trigger("BeamCompAiPool", {names = ai.pool_names(M.state.ai_pool)})
     end,
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,

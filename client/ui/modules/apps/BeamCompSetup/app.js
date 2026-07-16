@@ -236,7 +236,7 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [] };
+      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [] };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
@@ -245,7 +245,7 @@ angular.module('beamng.apps')
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
         rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
-      scope.rosterHint = '';     // transient roster feedback line (duplicate name, pool save, ...)
+      scope.rosterHint = '';     // transient roster feedback line (pool save, ...)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
@@ -343,6 +343,14 @@ angular.module('beamng.apps')
           // harmless (labelFor falls back) and re-fetched on the next model change.
           rebuildGridOpts();
           rebuildConfigOpts();
+        });
+      });
+
+      // The AI roster name pool (ADR-0047 amendment R2): GE pushes the pickable names (custom + built-ins)
+      // with the setup data and again after a pool save, so the per-AI name dropdown reflects the pool.
+      scope.$on('BeamCompAiPool', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.data.aiPoolNames = (payload && payload.names) || scope.data.aiPoolNames || [];
         });
       });
 
@@ -765,8 +773,6 @@ angular.module('beamng.apps')
       // resolution chain the spawn uses), the list edits it per entry, and buildOverrides sends AI only
       // when a roster exists. Rolls are async: the GE replies via the BeamCompAiRoster* events below.
 
-      var rosterPrev = {};  // per-index pre-edit name, for the duplicate/empty revert on blur
-
       function rosterNames() {
         return (scope.form.aiRoster || []).map(function (e) { return e.name; });
       }
@@ -804,8 +810,14 @@ angular.module('beamng.apps')
         var parts = String(e.car).split(':');
         return parts.length > 1 ? parts.slice(1).join(':') : '';
       };
+      // The car field shows the MODEL only (ADR-0047 amendment, change D): the config has its own field, so
+      // the old "Model - Config" (from e.carLabel) was redundant. Derived straight from the entry's model
+      // token via modelLabel, independent of e.carLabel (other paths still set it, but nothing renders it now).
       scope.rosterCarLabel = function (e) {
-        return (e && (e.carLabel || e.car)) || 'select car…';
+        var model = scope.rosterModelOf(e);
+        if (!model) { return 'select car…'; }
+        if (model === 'host') { return "host's car"; }
+        return modelLabel(model);
       };
 
       // Toggle the expandable roster list. A scope METHOD, not an inline `rosterOpen = !rosterOpen` on
@@ -815,6 +827,50 @@ angular.module('beamng.apps')
       // directive scope through the closure regardless of the calling child scope.
       scope.toggleRoster = function () {
         scope.rosterOpen = !scope.rosterOpen;
+      };
+
+      // ----- Compact all-AI editor (ADR-0047 amendment R2) --------------------------------------------
+      // Every AI is listed at once; each row expands its own Car/Type/Colour panel. The per-entry open flag
+      // is an OBJECT property (e._open) -- an object-property write across a scope boundary is safe (unlike a
+      // primitive scope write, which would shadow onto an ng-repeat child scope: the round-2 trap). The
+      // dropdown-picks below stay scope methods that mutate the passed entry object.
+
+      // Expand / collapse one AI's edit panel. e._open is an object property, so this write is safe from an
+      // ng-repeat child; closing any open dropdown keeps the panel tidy.
+      scope.toggleRosterEntry = function (e) {
+        if (!e) { return; }
+        e._open = !e._open;
+        scope.open = null;
+      };
+
+      // The pool names pickable for one entry's name dropdown: the pushed pool (custom + built-ins) minus the
+      // names already taken by OTHER entries, so a pick can never collide (names are identity keys). The
+      // entry's own current name stays listed (shown selected).
+      scope.rosterNameOpts = function (e) {
+        var taken = {};
+        (scope.form.aiRoster || []).forEach(function (other) {
+          if (other !== e && other.name) { taken[other.name] = true; }
+        });
+        return (scope.data.aiPoolNames || []).filter(function (name) { return !taken[name]; });
+      };
+      // Pick a roster name from the pool (object-property write). Options already exclude names taken by
+      // other entries, so no duplicate is possible.
+      scope.pickRosterName = function (e, name) {
+        scope.open = null;
+        if (e) { e.name = name; }
+      };
+
+      // The DATA index of an entry in form.aiRoster. The list is displayed alphabetically (orderBy in the
+      // ng-repeat, R3) so the repeat's $index is the sorted position, NOT the data slot -- but the roll/save
+      // GE calls and the "#n" slot label need the real array index (it maps to spawn/grid slots), so they go
+      // through this instead of $index.
+      scope.rosterIndexOf = function (e) {
+        return (scope.form.aiRoster || []).indexOf(e);
+      };
+      // orderBy key for the alphabetical DISPLAY sort (R3): case-insensitive by name. Display only -- orderBy
+      // returns a sorted view, the underlying form.aiRoster order (and the sent roster) is untouched.
+      scope.nameSortKey = function (e) {
+        return (e && e.name ? e.name : '').toLowerCase();
       };
 
       // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
@@ -867,7 +923,10 @@ angular.module('beamng.apps')
 
       // Re-draw one entry's name from the pool (unique against the rest). If the drawn name carries a
       // preferred car that applies under the current settings, the GE sends the car along (decision 4).
-      scope.rerollRosterName = function (i) {
+      // Takes the entry object (the list is sorted for display, so $index is not the data slot).
+      scope.rerollRosterName = function (e) {
+        var i = scope.rosterIndexOf(e);
+        if (i < 0) { return; }
         var spec = rosterRollSpec();
         spec.index = i;
         spec.exclude = rosterNames();
@@ -888,8 +947,11 @@ angular.module('beamng.apps')
       });
 
       // Re-roll one entry's car through the spawn chain. A manual override by intent, so the GE bypasses
-      // the name's preferred car here (it would pin the button to a single result).
-      scope.rerollRosterCar = function (i) {
+      // the name's preferred car here (it would pin the button to a single result). Takes the entry object
+      // (the list is sorted for display, so $index is not the data slot).
+      scope.rerollRosterCar = function (e) {
+        var i = scope.rosterIndexOf(e);
+        if (i < 0) { return; }
         var spec = rosterRollSpec();
         spec.index = i;
         geLuaArg('reroll_ai_car', JSON.stringify(spec));
@@ -935,6 +997,21 @@ angular.module('beamng.apps')
           return { v: c.config, label: c.name };
         }));
       };
+      // Reroll one entry's config/type (ADR-0047 amendment R2): a manual per-field roll, so it is a fresh
+      // random pick from this model's known configs (incl. stock), distinct from the current when possible.
+      // Pure JS on the loaded config list -- the model is fixed, so no compliance/GE round-trip is needed.
+      scope.rerollRosterConfig = function (e) {
+        var opts = scope.rosterConfigOpts(e);
+        if (!opts.length) { return; }
+        var current = scope.rosterConfigOf(e);
+        var pick = opts[Math.floor(Math.random() * opts.length)].v;
+        if (opts.length > 1) {
+          while (pick === current) {
+            pick = opts[Math.floor(Math.random() * opts.length)].v;
+          }
+        }
+        scope.pickRosterConfig(e, pick);
+      };
       // The display name of a roster entry's config, resolved from the same options the dropdown shows
       // (mirrors classConfigLabel) -- 'stock' for none, the raw key as fallback.
       scope.rosterConfigLabel = function (e) {
@@ -955,7 +1032,7 @@ angular.module('beamng.apps')
         return { 'background-color': '#' + hex };
       };
       scope.pickRosterColor = function (e, hex) {
-        e.color = hex;
+        if (e) { e.color = hex; }
       };
       // Reroll one entry's colour: a random palette colour distinct from the current one when possible.
       // A manual override, so -- like the car reroll -- it deliberately ignores any preferred colour.
@@ -971,35 +1048,11 @@ angular.module('beamng.apps')
         e.color = pick;
       };
 
-      // Names are identity keys server-side, so the panel rejects duplicates (and blanks) on blur by
-      // reverting to the pre-edit value with a hint -- the server additionally disambiguates defensively.
-      scope.rosterNameFocus = function (i) {
-        rosterPrev[i] = scope.form.aiRoster[i].name;
-      };
-      scope.rosterNameBlur = function (i) {
-        var e = scope.form.aiRoster[i];
-        var name = (e.name || '').trim();
-        var isDuplicate = name && (scope.form.aiRoster || []).some(function (other, j) {
-          return j !== i && other.name === name;
-        });
-        if (!name || isDuplicate) {
-          e.name = rosterPrev[i] !== undefined ? rosterPrev[i] : e.name;
-          scope.rosterHint = isDuplicate
-            ? 'Duplicate name rejected -- roster names must be unique.'
-            : 'Empty name rejected.';
-        } else {
-          e.name = name;
-          scope.rosterHint = '';
-        }
-        delete rosterPrev[i];
-      };
-
-      // Save a row's (edited) name to the permanent pool (ADR-0047, add-only, server-persisted). Round 3:
-      // ONE Save button stores the name together with its current car (only when concrete -- the host
-      // sentinel points at whoever hosts, not a car) and its current colour, so the saved name comes back
-      // with that car AND colour. The button is always enabled (name + colour can always be saved).
-      scope.savePoolName = function (i) {
-        var e = scope.form.aiRoster[i];
+      // Save an entry's name to the permanent pool (ADR-0047, add-only, server-persisted): stores the name
+      // with its current car (only when concrete -- the host sentinel points at whoever hosts, not a car)
+      // and its current colour, so the saved name comes back with that car AND colour. Takes the entry
+      // object (the list is sorted for display, so $index is not the data slot).
+      scope.savePoolName = function (e) {
         var name = e && (e.name || '').trim();
         if (!name) { return; }
         var payload = { name: name };
@@ -1008,6 +1061,14 @@ angular.module('beamng.apps')
         geLuaArg('save_ai_pool_name', JSON.stringify(payload));
         scope.rosterHint = 'Saving "' + name + '" to the name pool'
           + (payload.car ? ' with its car + colour…' : ' with its colour…');
+      };
+      // Save & Done (R3): the single Change-panel close button persists the AI's current car/type/colour as
+      // its pool name's preferred (savePoolName) AND collapses the panel. Closing the panel now ALWAYS saves
+      // -- there is no close-without-save path (user decision). e._open is an object-property write.
+      scope.saveAndDoneRosterEntry = function (e) {
+        if (!e) { return; }
+        scope.savePoolName(e);
+        e._open = false;
       };
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
