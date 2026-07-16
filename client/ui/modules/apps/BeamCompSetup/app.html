@@ -34,6 +34,18 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    /* Long dropdown labels (bcSetupFit): the directive wraps each label in .bc-fit-clip > .bc-fit-text.
+       The clip is a block that fills the cell content box (so it stops before the head's 22px chevron
+       padding) and hides overflow; the inline-block text is shrunk to fit and, if still too wide, given a
+       calm ping-pong marquee driven by the per-cell --bc-fit-shift / --bc-fit-dur the directive sets. */
+    .bc-fit-clip { display: block; width: 100%; overflow: hidden; }
+    .bc-fit-text { display: inline-block; white-space: nowrap; vertical-align: bottom; }
+    .bc-fit-text.bc-fit-scroll { will-change: transform;
+      animation: bc-fit-marquee var(--bc-fit-dur, 6s) ease-in-out infinite alternate; }
+    @keyframes bc-fit-marquee {
+      0%, 12% { transform: translateX(0); }
+      88%, 100% { transform: translateX(var(--bc-fit-shift, 0px)); }
+    }
     .bc-actions { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 10px;
       border-top: 1px solid rgba(255,255,255,0.12); }
     .bc-actions button { flex: 1 1 auto; padding: 6px 0; border: none; border-radius: 3px;
@@ -92,9 +104,9 @@
       <div class="bc-row">
         <span>Race</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('race')">{{labelFor('race')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('race')">{{labelFor('race')}}</button>
           <div class="bc-dd-list" ng-if="open === 'race'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
               ng-click="pick('race', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -102,9 +114,9 @@
       <div class="bc-row">
         <span>Mode</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('mode')">{{labelFor('mode')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('mode')">{{labelFor('mode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'mode'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.mode" ng-class="{sel: o.v === form.mode}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.mode" ng-class="{sel: o.v === form.mode}"
               ng-click="pick('mode', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -123,9 +135,9 @@
       <div class="bc-row">
         <span>Car (all)</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('carModel')">{{labelFor('carModel')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carModel')">{{labelFor('carModel')}}</button>
           <div class="bc-dd-list" ng-if="open === 'carModel'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.carModel" ng-class="{sel: o.v === form.carModel}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.carModel" ng-class="{sel: o.v === form.carModel}"
               ng-click="pick('carModel', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -133,9 +145,9 @@
       <div class="bc-row" ng-if="form.carModel && form.carModel !== 'random'">
         <span>Config</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('carConfig')">{{labelFor('carConfig')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carConfig')">{{labelFor('carConfig')}}</button>
           <div class="bc-dd-list" ng-if="open === 'carConfig'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.carConfig" ng-class="{sel: o.v === form.carConfig}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.carConfig" ng-class="{sel: o.v === form.carConfig}"
               ng-click="pick('carConfig', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -174,9 +186,9 @@
              so the per-race picker is disabled and the race request omits order= (see prepareRace) -- the
              server then applies the active format's order. -->
         <div class="bc-dd" ng-if="!championship.active && !tournament.active">
-          <button type="button" class="bc-dd-head" ng-click="toggle('orderMode')">{{labelFor('orderMode')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('orderMode')">{{labelFor('orderMode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'orderMode'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.orderMode" ng-class="{sel: o.v === form.orderMode}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.orderMode" ng-class="{sel: o.v === form.orderMode}"
               ng-click="pick('orderMode', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -200,9 +212,9 @@
       <div class="bc-row">
         <span>Grid</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('grid')">{{labelFor('grid')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('grid')">{{labelFor('grid')}}</button>
           <div class="bc-dd-list" ng-if="open === 'grid'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.grid" ng-class="{sel: o.v === form.grid}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.grid" ng-class="{sel: o.v === form.grid}"
               ng-click="pick('grid', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -251,9 +263,9 @@
         <div class="bc-row">
           <span>Preset</span>
           <div class="bc-dd">
-            <button type="button" class="bc-dd-head" ng-click="toggle('aiPreset')">{{labelFor('aiPreset')}}</button>
+            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiPreset')">{{labelFor('aiPreset')}}</button>
             <div class="bc-dd-list" ng-if="open === 'aiPreset'">
-              <div class="bc-dd-opt" ng-repeat="o in opts.aiPreset" ng-class="{sel: o.v === form.aiPreset}"
+              <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.aiPreset" ng-class="{sel: o.v === form.aiPreset}"
                 ng-click="pick('aiPreset', o.v)">{{o.label}}</div>
             </div>
           </div>
@@ -261,9 +273,9 @@
         <div class="bc-row">
           <span>AI car</span>
           <div class="bc-dd">
-            <button type="button" class="bc-dd-head" ng-click="toggle('aiCar')">{{labelFor('aiCar')}}</button>
+            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiCar')">{{labelFor('aiCar')}}</button>
             <div class="bc-dd-list" ng-if="open === 'aiCar'">
-              <div class="bc-dd-opt" ng-repeat="o in opts.aiCar" ng-class="{sel: o.v === form.aiCar}"
+              <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.aiCar" ng-class="{sel: o.v === form.aiCar}"
                 ng-click="pick('aiCar', o.v)">{{o.label}}</div>
             </div>
           </div>
@@ -300,9 +312,9 @@
             <div class="bc-row">
               <span>Car</span>
               <div class="bc-dd">
-                <button type="button" class="bc-dd-head" ng-click="toggle('rosterCar' + $index)">{{rosterCarLabel(e)}}</button>
+                <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCar' + $index)">{{rosterCarLabel(e)}}</button>
                 <div class="bc-dd-list" ng-if="open === 'rosterCar' + $index">
-                  <div class="bc-dd-opt" ng-repeat="o in opts.rosterCar" ng-class="{sel: o.v === rosterModelOf(e)}"
+                  <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.rosterCar" ng-class="{sel: o.v === rosterModelOf(e)}"
                     ng-click="pickRosterCar(e, o.v)">{{o.label}}</div>
                 </div>
               </div>
@@ -312,9 +324,9 @@
             <div class="bc-row" ng-if="rosterModelOf(e) && rosterModelOf(e) !== 'host'">
               <span>Config</span>
               <div class="bc-dd">
-                <button type="button" class="bc-dd-head" ng-click="toggle('rosterCfg' + $index)">{{rosterConfigLabel(e)}}</button>
+                <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCfg' + $index)">{{rosterConfigLabel(e)}}</button>
                 <div class="bc-dd-list" ng-if="open === 'rosterCfg' + $index">
-                  <div class="bc-dd-opt" ng-repeat="o in rosterConfigOpts(e)" ng-class="{sel: o.v === rosterConfigOf(e)}"
+                  <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in rosterConfigOpts(e)" ng-class="{sel: o.v === rosterConfigOf(e)}"
                     ng-click="pickRosterConfig(e, o.v)">{{o.label}}</div>
                 </div>
               </div>
@@ -347,9 +359,9 @@
           <div class="bc-row">
             <span>Route</span>
             <div class="bc-dd">
-              <button type="button" class="bc-dd-head" ng-click="toggle('aiRoute')">{{labelFor('aiRoute')}}</button>
+              <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiRoute')">{{labelFor('aiRoute')}}</button>
               <div class="bc-dd-list" ng-if="open === 'aiRoute'">
-                <div class="bc-dd-opt" ng-repeat="o in opts.aiRoute" ng-class="{sel: o.v === form.aiRoute}"
+                <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.aiRoute" ng-class="{sel: o.v === form.aiRoute}"
                   ng-click="pick('aiRoute', o.v)">{{o.label}}</div>
               </div>
             </div>
@@ -374,11 +386,11 @@
       <div class="bc-row">
         <span>Saved</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('preset')">{{presetLabel()}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('preset')">{{presetLabel()}}</button>
           <div class="bc-dd-list" ng-if="open === 'preset'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
               ng-click="pickPreset(o.v)">{{o.label}}</div>
-            <div class="bc-dd-opt" ng-if="!opts.preset.length">no saved presets</div>
+            <div class="bc-dd-opt" bc-setup-fit ng-if="!opts.preset.length">no saved presets</div>
           </div>
         </div>
       </div>
@@ -397,9 +409,9 @@
       <div class="bc-row">
         <span>Mode</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('tourMode')">{{labelFor('tourMode')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourMode')">{{labelFor('tourMode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'tourMode'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.tourMode" ng-class="{sel: o.v === form.tourMode}"
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.tourMode" ng-class="{sel: o.v === form.tourMode}"
               ng-click="pickTourMode(o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -415,9 +427,9 @@
         <div class="bc-row">
           <span>Points</span>
           <div class="bc-dd">
-            <button type="button" class="bc-dd-head" ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
+            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
             <div class="bc-dd-list" ng-if="open === 'champPreset'">
-              <div class="bc-dd-opt" ng-repeat="o in opts.champPreset" ng-class="{sel: o.v === form.champPreset}"
+              <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.champPreset" ng-class="{sel: o.v === form.champPreset}"
                 ng-click="pickChamp('champPreset', o.v)">{{o.label}}</div>
             </div>
           </div>
@@ -425,9 +437,9 @@
         <div class="bc-row">
           <span>Grid order</span>
           <div class="bc-dd">
-            <button type="button" class="bc-dd-head" ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
+            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
             <div class="bc-dd-list" ng-if="open === 'champOrder'">
-              <div class="bc-dd-opt" ng-repeat="o in opts.champOrder" ng-class="{sel: o.v === form.champOrder}"
+              <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.champOrder" ng-class="{sel: o.v === form.champOrder}"
                 ng-click="pickChamp('champOrder', o.v)">{{o.label}}</div>
             </div>
           </div>
@@ -470,9 +482,9 @@
           <div class="bc-row" ng-if="cls.kind === 'car'">
             <span>Car</span>
             <div class="bc-dd">
-              <button type="button" class="bc-dd-head" ng-click="toggle('tourCar' + $index)">{{classCarLabel(cls)}}</button>
+              <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourCar' + $index)">{{classCarLabel(cls)}}</button>
               <div class="bc-dd-list" ng-if="open === 'tourCar' + $index">
-                <div class="bc-dd-opt" ng-repeat="o in opts.carModel" ng-class="{sel: o.v === cls.car}"
+                <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.carModel" ng-class="{sel: o.v === cls.car}"
                   ng-click="pickClassCar(cls, o.v)">{{o.label}}</div>
               </div>
             </div>
@@ -480,9 +492,9 @@
           <div class="bc-row" ng-if="cls.kind === 'car'">
             <span>Config</span>
             <div class="bc-dd">
-              <button type="button" class="bc-dd-head" ng-click="toggle('tourCfg' + $index)">{{classConfigLabel(cls)}}</button>
+              <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourCfg' + $index)">{{classConfigLabel(cls)}}</button>
               <div class="bc-dd-list" ng-if="open === 'tourCfg' + $index">
-                <div class="bc-dd-opt" ng-repeat="o in classConfigOpts(cls)" ng-class="{sel: o.v === cls.config}"
+                <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in classConfigOpts(cls)" ng-class="{sel: o.v === cls.config}"
                   ng-click="pickClassConfig(cls, o.v)">{{o.label}}</div>
               </div>
             </div>
@@ -504,9 +516,9 @@
         <div class="bc-row">
           <span>Grid order</span>
           <div class="bc-dd">
-            <button type="button" class="bc-dd-head" ng-click="toggle('tourOrder')">{{labelFor('tourOrder')}}</button>
+            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourOrder')">{{labelFor('tourOrder')}}</button>
             <div class="bc-dd-list" ng-if="open === 'tourOrder'">
-              <div class="bc-dd-opt" ng-repeat="o in opts.tourOrder" ng-class="{sel: o.v === form.tourOrder}"
+              <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.tourOrder" ng-class="{sel: o.v === form.tourOrder}"
                 ng-click="pickTour('tourOrder', o.v)">{{o.label}}</div>
             </div>
           </div>

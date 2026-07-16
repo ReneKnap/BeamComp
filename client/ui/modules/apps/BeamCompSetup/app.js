@@ -1030,3 +1030,108 @@ angular.module('beamng.apps')
     },
   };
 }]);
+
+// Long dropdown-label fit: shrink-to-fit, then a calm marquee. Attribute directive placed (via the class
+// -> attr in app.html) on every .bc-dd-head (the closed selected value) and .bc-dd-opt (each open option),
+// which today clip long labels with an ellipsis. It wraps the label in an overflow-clipping box that
+// RESPECTS the head's right chevron padding (so a scrolling label never slides under the ::after chevron),
+// then, when the label is wider than its cell, first shrinks the font toward a floor so "only a little too
+// long" names fit whole, and -- only if it STILL overflows -- runs a slow left/right CSS marquee. Pure CEF,
+// no external assets. Measures once on link (after paint) and again whenever the label text changes, so an
+// idle dropdown costs nothing.
+//
+// The name is app-unique on purpose: BeamCompSetup + BeamCompGridEditor share the 'beamng.apps' Angular
+// module, so a shared directive name would double-fire (and could reach other apps' markup). BeamCompGridEditor
+// carries the same logic under bcGridFit; the two apps share no code by design (kept in ES5 to match the
+// surrounding CEF/AngularJS file).
+angular.module('beamng.apps').directive('bcSetupFit', [function () {
+  var FLOOR_PX = 10.5;   // shrink floor (from the 13px base, ~19% smaller); past this we scroll instead
+  var SPEED = 32;        // marquee pace, px/s -- calm; the duration scales with the hidden distance
+  var MIN_DUR = 3;       // s -- keep a short overflow from scrolling twitchy-fast
+  var END_GAP = 6;       // px of trailing room so the last glyph is not flush at the scrolled end
+
+  return {
+    restrict: 'A',
+    link: function (scope, element) {
+      // Wrap the label: <cell> -> <cell><span.bc-fit-clip><span.bc-fit-text>{{label}}</span></span>.
+      // Moving the interpolated text node(s) into .bc-fit-text keeps the {{}} binding live -- the
+      // interpolation watcher updates the node by reference regardless of its new parent (verified with a
+      // jsdom + AngularJS harness). .bc-fit-clip fills the cell content box and hides overflow; the
+      // inline-block .bc-fit-text is what we measure, shrink and translate.
+      var cell = element[0];
+      var text = document.createElement('span');
+      text.className = 'bc-fit-text';
+      while (cell.firstChild) {
+        text.appendChild(cell.firstChild);
+      }
+      var clip = document.createElement('span');
+      clip.className = 'bc-fit-clip';
+      clip.appendChild(text);
+      cell.appendChild(clip);
+
+      function measure() {
+        // Reset to the natural size so every re-measure starts from a clean slate.
+        text.classList.remove('bc-fit-scroll');
+        text.style.fontSize = '';
+        text.style.letterSpacing = '';
+        text.style.removeProperty('--bc-fit-shift');
+        text.style.removeProperty('--bc-fit-dur');
+        var avail = clip.clientWidth;
+        if (!avail) {
+          return;                              // not laid out yet
+        }
+        var full = text.scrollWidth;
+        if (full <= avail + 1) {
+          return;                              // fits as-is
+        }
+        // Shrink stage: scale the font toward fitting, clamped to the floor, with a hair of tracking.
+        var base = parseFloat(window.getComputedStyle(text).fontSize) || 13;
+        var target = Math.max(FLOOR_PX, base * avail / full);
+        if (target < base - 0.1) {
+          text.style.fontSize = target.toFixed(2) + 'px';
+          text.style.letterSpacing = '-0.2px';
+          full = text.scrollWidth;
+        }
+        // Marquee stage: still wider than the cell after the floor -> scroll it.
+        if (full > avail + 1) {
+          var shift = Math.round(full - avail + END_GAP);
+          text.style.setProperty('--bc-fit-shift', '-' + shift + 'px');
+          text.style.setProperty('--bc-fit-dur', Math.max(MIN_DUR, shift / SPEED).toFixed(2) + 's');
+          text.classList.add('bc-fit-scroll');
+        }
+      }
+
+      // Measure after paint (the label is interpolated post-link) and again on any label change. rAF
+      // coalesces bursts; the observer fires only on a real text change, so idle dropdowns cost nothing.
+      var pending = null;
+      function schedule() {
+        if (pending !== null) {
+          return;
+        }
+        if (window.requestAnimationFrame) {
+          pending = window.requestAnimationFrame(function () { pending = null; measure(); });
+        } else {
+          pending = window.setTimeout(function () { pending = null; measure(); }, 16);
+        }
+      }
+      var observer = null;
+      if (typeof MutationObserver !== 'undefined') {
+        observer = new MutationObserver(schedule);
+        observer.observe(text, { childList: true, characterData: true, subtree: true });
+      }
+      schedule();
+      scope.$on('$destroy', function () {
+        if (observer) {
+          observer.disconnect();
+        }
+        if (pending !== null) {
+          if (window.cancelAnimationFrame) {
+            window.cancelAnimationFrame(pending);
+          } else {
+            window.clearTimeout(pending);
+          }
+        }
+      });
+    },
+  };
+}]);
