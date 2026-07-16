@@ -245,6 +245,13 @@ angular.module('beamng.apps')
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
         rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
+      // Compact roster editor (ADR-0047 amendment): one AI is edited at a time. These three are
+      // directive-scope UI state ONLY -- never on scope.form, so nothing new rides the sent payload or the
+      // stored form -- and are written solely through scope methods (never an inline primitive from an
+      // ng-if/ng-repeat child, which would shadow onto the child scope -- the round-2 roster bug).
+      scope.rosterSel = 0;            // index of the AI shown in the editor card
+      scope.carOverrideOpen = false;  // reveal the manual car/config dropdowns (default: show the preferred car)
+      scope.colorOpen = false;        // expand the colour palette (default: collapsed to the current swatch)
       scope.rosterHint = '';     // transient roster feedback line (duplicate name, pool save, ...)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
@@ -804,8 +811,14 @@ angular.module('beamng.apps')
         var parts = String(e.car).split(':');
         return parts.length > 1 ? parts.slice(1).join(':') : '';
       };
+      // The car field shows the MODEL only (ADR-0047 amendment, change D): the config has its own field, so
+      // the old "Model - Config" (from e.carLabel) was redundant. Derived straight from the entry's model
+      // token via modelLabel, independent of e.carLabel (other paths still set it, but nothing renders it now).
       scope.rosterCarLabel = function (e) {
-        return (e && (e.carLabel || e.car)) || 'select car…';
+        var model = scope.rosterModelOf(e);
+        if (!model) { return 'select car…'; }
+        if (model === 'host') { return "host's car"; }
+        return modelLabel(model);
       };
 
       // Toggle the expandable roster list. A scope METHOD, not an inline `rosterOpen = !rosterOpen` on
@@ -815,6 +828,39 @@ angular.module('beamng.apps')
       // directive scope through the closure regardless of the calling child scope.
       scope.toggleRoster = function () {
         scope.rosterOpen = !scope.rosterOpen;
+      };
+
+      // ----- Compact editor: select one AI, collapse its car/colour panels (ADR-0047 amendment) --------
+      // Same scope-method discipline as toggleRoster: every write to rosterSel/carOverrideOpen/colorOpen
+      // runs here on the directive scope through the closure, never as an inline primitive assignment from
+      // an ng-if/ng-repeat child (which would shadow the state onto the child scope and never take effect).
+
+      // The roster entry currently shown in the editor card. A read helper for the template bindings; the
+      // card renders only under `rosterOpen && form.aiRoster.length` with rosterSel clamped in range, so the
+      // callers always see a real entry.
+      scope.curEntry = function () {
+        return (scope.form.aiRoster || [])[scope.rosterSel];
+      };
+      // The AI-selector dropdown head: "#<n> <name>" of the selected entry.
+      scope.rosterSelLabel = function () {
+        var e = scope.curEntry();
+        return e ? '#' + (scope.rosterSel + 1) + ' ' + (e.name || '') : 'select AI…';
+      };
+      // Switch the edited AI; collapse its per-AI car/colour panels so each AI opens in the compact state.
+      scope.selectRosterEntry = function (i) {
+        scope.rosterSel = i;
+        scope.open = null;
+        scope.carOverrideOpen = false;
+        scope.colorOpen = false;
+      };
+      // Preferred-car toggle (change B): collapsed (default) shows the chosen car (model only) and hides the
+      // car/config dropdowns; expanded reveals them for a manual pick. Pure UI -- e.car stays the data model.
+      scope.toggleCarOverride = function () {
+        scope.carOverrideOpen = !scope.carOverrideOpen;
+      };
+      // Colour field (change C): collapsed shows the current swatch; expanded reveals the palette.
+      scope.toggleColor = function () {
+        scope.colorOpen = !scope.colorOpen;
       };
 
       // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
@@ -836,6 +882,7 @@ angular.module('beamng.apps')
         if (!roster.length || roster.length === count) { return; }
         if (count < roster.length) {
           roster.splice(count);
+          scope.rosterSel = Math.min(scope.rosterSel, count - 1);  // keep the editor selection in range
           return;
         }
         var spec = rosterRollSpec();
@@ -859,8 +906,14 @@ angular.module('beamng.apps')
             // Auto-expand the list on a fresh Create so the generated AI are visible at once (ADR-0047
             // round 3); the Hide toggle still collapses it. Not on extend -- the list is already open.
             scope.rosterOpen = true;
+            // Compact editor (ADR-0047 amendment): a fresh roster opens on the first AI, collapsed.
+            scope.rosterSel = 0;
+            scope.carOverrideOpen = false;
+            scope.colorOpen = false;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
+          // Keep the editor selection in range after an extend grew (or a create replaced) the roster.
+          scope.rosterSel = Math.max(0, Math.min(scope.rosterSel, scope.form.aiRoster.length - 1));
           scope.rosterHint = '';
         });
       });
@@ -955,7 +1008,8 @@ angular.module('beamng.apps')
         return { 'background-color': '#' + hex };
       };
       scope.pickRosterColor = function (e, hex) {
-        e.color = hex;
+        if (e) { e.color = hex; }
+        scope.colorOpen = false;  // picking collapses the palette again (ADR-0047 amendment, change C)
       };
       // Reroll one entry's colour: a random palette colour distinct from the current one when possible.
       // A manual override, so -- like the car reroll -- it deliberately ignores any preferred colour.
