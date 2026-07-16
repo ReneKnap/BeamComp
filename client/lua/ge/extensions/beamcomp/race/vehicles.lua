@@ -311,12 +311,43 @@ local function spawn_vehicle_at(pose, spec)
     return veh
 end
 
--- Spawn one vehicle at a grid pose with a chosen model[:config] and stock paint, returning the new
--- vehicle (or nil + reason). The public seam over the internal spawn_vehicle_at so the AI module
--- (race/ai, ADR-0036) spawns host-owned AI cars through the exact front-anchored / grid-oriented path a
--- player car uses, and BeamMP propagates them the same way ('Os:'). Owned by the spawning client.
-function M.spawn_at(pose, model, config)
-    return spawn_vehicle_at(pose, {model = model, config = config})
+-- Build a PRIMARY vehicle paint layer from an opaque roster colour token (ADR-0047, round 3): a hex
+-- string "rrggbb" (optionally #-prefixed) -> createVehiclePaint({r, g, b, 1}). Only the primary layer is
+-- built; the caller leaves paint2/paint3 nil so those stay stock. Returns the paint object, or nil for a
+-- nil/blank/invalid colour or when the paint API is unavailable -- the spawn then uses stock paint. Fully
+-- guarded: a paint failure must never block an AI spawn (degrade to stock + log). A bad hex is logged; a
+-- simply-absent createVehiclePaint API degrades silently (nothing to paint with).
+local function paint_from_color(color)
+    if type(color) ~= "string" or color == "" then
+        return nil
+    end
+    local hex = color:gsub("^#", "")
+    if not hex:match("^%x%x%x%x%x%x$") then
+        log("W", LOG_TAG, "invalid roster colour '" .. color .. "'; spawning stock paint")
+        return nil
+    end
+    if type(createVehiclePaint) ~= "function" then
+        return nil
+    end
+    local r = tonumber(hex:sub(1, 2), 16) / 255
+    local g = tonumber(hex:sub(3, 4), 16) / 255
+    local b = tonumber(hex:sub(5, 6), 16) / 255
+    local ok, paint = pcall(createVehiclePaint, {r, g, b, 1})
+    if not ok or not paint then
+        log("W", LOG_TAG, "createVehiclePaint failed for '" .. color .. "'; spawning stock paint")
+        return nil
+    end
+    return paint
+end
+
+-- Spawn one vehicle at a grid pose with a chosen model[:config], returning the new vehicle (or nil +
+-- reason). The public seam over the internal spawn_vehicle_at so the AI module (race/ai, ADR-0036) spawns
+-- host-owned AI cars through the exact front-anchored / grid-oriented path a player car uses, and BeamMP
+-- propagates them the same way ('Os:'). Owned by the spawning client. `color` (ADR-0047) is an optional
+-- opaque roster colour applied as the PRIMARY paint layer only (paint2/paint3 stay stock); nil = stock
+-- paint, byte-identical to the pre-colour behaviour.
+function M.spawn_at(pose, model, config, color)
+    return spawn_vehicle_at(pose, {model = model, config = config, paint = paint_from_color(color)})
 end
 
 -- Return the car the player is currently in, iff it is a real owned car worth keeping for the race

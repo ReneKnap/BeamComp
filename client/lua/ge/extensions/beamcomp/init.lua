@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-sector-bar-r4/2026-07-15"
+local BUILD_MARKER = "ai-roster-r3/2026-07-15"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -262,6 +262,7 @@ M.state = {
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
+    ai_pool = nil,            -- server-persisted custom AI name-pool entries {name, car?} for the roster rolls (ADR-0047); fetched with the setup dataset, or nil until the first aiPoolData lands
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
@@ -2405,11 +2406,17 @@ local function push_setup_data(include_deprecated)
     guihooks.trigger("BeamCompSetupData", {
         races = racelist.options(map, include_deprecated),
         cars = carlist.options().models,
+        -- The static AI colour palette (ADR-0047 round 3) for the roster swatch picker; same list the
+        -- GE roster draw uses, so swatches and auto-assigned colours share one source.
+        aiPalette = ai.palette(),
     })
     M.state.grid_list_target = "setup"
     send_to_server("gridListReq", {map = map})
     -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
     send_to_server("presetListReq", {map = map})
+    -- Fetch the global custom AI name pool (ADR-0047) so roster rolls include the saved names; the
+    -- aiPoolData reply lands in M.state.ai_pool (rolls before it arrives just use the built-ins).
+    send_to_server("aiPoolReq", {})
 end
 
 -- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
@@ -2505,6 +2512,82 @@ function M.request_presets()
         return
     end
     send_to_server("presetListReq", {map = map})
+end
+
+-- Roll a full or additional named-AI roster for the setup panel (UI -> GE, ADR-0047). Payload JSON:
+-- {count, mode = "create"|"extend", exclude = [names], ai = {car?, randomTrim, noBigCars},
+-- policy = {car?, maxhp?, maxpwr?, maxkg?, minkg?, randomTrim?, noBigCars?}}. Names draw from the
+-- built-in pool + the server-persisted custom pool (M.state.ai_pool) without replacement; each entry's
+-- car resolves through the SAME chain the spawn uses (race/ai.lua), so the shown car IS the spawned car.
+-- Result pushed via BeamCompAiRoster. Public as beamcomp_init.roll_ai_roster.
+function M.roll_ai_roster(json)
+    local ok, request = pcall(jsonDecode, json)
+    if not ok or type(request) ~= "table" then
+        log("W", RACE_LOG_TAG, "roll_ai_roster: bad payload")
+        return
+    end
+    local count = math.max(1, math.min(16, math.floor(tonumber(request.count) or 1)))
+    -- excludeColors keeps an extend distinct from the kept entries' colours (ADR-0047 round 3); nil on a
+    -- fresh create (nothing to exclude).
+    local entries = ai.roll_roster_entries(count, request.exclude, request.ai, request.policy,
+        M.state.ai_pool, request.excludeColors)
+    guihooks.trigger("BeamCompAiRoster", {
+        mode = request.mode == "extend" and "extend" or "create",
+        entries = entries,
+    })
+end
+
+-- Re-draw one roster entry's name (UI -> GE, ADR-0047): payload {index, exclude, ai, policy}. When the
+-- drawn name carries a preferred car that applies (aiCar rolled, restrictions pass), the car rides the
+-- reply too -- decision 4's "they always get it". Result pushed via BeamCompAiRosterName. Public as
+-- beamcomp_init.reroll_ai_name.
+function M.reroll_ai_name(json)
+    local ok, request = pcall(jsonDecode, json)
+    if not ok or type(request) ~= "table" or tonumber(request.index) == nil then
+        log("W", RACE_LOG_TAG, "reroll_ai_name: bad payload")
+        return
+    end
+    local drawn = ai.draw_roster_names(1, request.exclude, M.state.ai_pool)[1]
+    local reply = {index = tonumber(request.index), name = drawn.name}
+    if drawn.preferred and ai.preferred_applies(request.ai)
+            and ai.preferred_car_compliant(drawn.preferred, request.ai, request.policy) then
+        reply.car = drawn.preferred
+        reply.carLabel = ai.car_label(drawn.preferred)
+    end
+    -- A drawn pool name's preferred colour ALWAYS rides along (ADR-0047 round 3): colour is unrestricted,
+    -- so unlike the car there is no compliance gate.
+    if drawn.preferredColor then
+        reply.color = drawn.preferredColor
+    end
+    guihooks.trigger("BeamCompAiRosterName", reply)
+end
+
+-- Re-roll one roster entry's car (UI -> GE, ADR-0047): payload {index, ai, policy}. An explicit re-roll
+-- is a manual override, so it deliberately bypasses the name's preferred car (which would pin the button
+-- to one result). Result pushed via BeamCompAiRosterCar. Public as beamcomp_init.reroll_ai_car.
+function M.reroll_ai_car(json)
+    local ok, request = pcall(jsonDecode, json)
+    if not ok or type(request) ~= "table" or tonumber(request.index) == nil then
+        log("W", RACE_LOG_TAG, "reroll_ai_car: bad payload")
+        return
+    end
+    local index = tonumber(request.index)
+    local car = ai.roll_roster_car(request.ai, request.policy, index + 1)
+    guihooks.trigger("BeamCompAiRosterCar", {index = index, car = car, carLabel = ai.car_label(car)})
+end
+
+-- Save one roster name to the global custom pool (UI -> GE -> server, ADR-0047): payload
+-- {name, car?, color?}. Round 3: the one Save button stores name + current car (concrete only) + current
+-- colour together. Relayed verbatim to the admin-gated aiPoolSave; the server echoes the updated pool
+-- (aiPoolData), which refreshes M.state.ai_pool. Public as beamcomp_init.save_ai_pool_name.
+function M.save_ai_pool_name(json)
+    local ok, decoded = pcall(jsonDecode, json)
+    if not ok or type(decoded) ~= "table"
+        or type(decoded.name) ~= "string" or decoded.name == "" then
+        log("W", RACE_LOG_TAG, "save_ai_pool_name: bad payload")
+        return
+    end
+    send_to_server("aiPoolSave", {name = decoded.name, car = decoded.car, color = decoded.color})
 end
 
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on
@@ -2831,6 +2914,13 @@ local HANDLERS = {
     gridList = handle_grid_list,
     presetData = handle_preset_data,
     presetList = handle_preset_list,
+    -- The global custom AI name pool for the roster rolls (ADR-0047): cached GE-side only -- the panel
+    -- never needs the raw pool, it just triggers rolls. Inline closure, not a new top-level local
+    -- (init.lua sits near the 200-local ceiling).
+    aiPoolData = function(payload)
+        M.state.ai_pool = (type(payload) == "table" and type(payload.entries) == "table")
+            and payload.entries or {}
+    end,
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,
     setupOpen = handle_setup_open,

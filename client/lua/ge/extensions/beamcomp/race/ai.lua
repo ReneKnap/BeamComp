@@ -202,10 +202,17 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
     content_defaults = type(content_defaults) == "table" and content_defaults or {}
     slot_policy = type(slot_policy) == "table" and slot_policy or {}
 
-    -- A per-AI class policy (ADR-0042) wins over everything else: in a class-drop tournament each AI must
-    -- drive the car/cap of its OWN class, not the shared aicar=. A fixed car spawns it; a cap finds a
-    -- compliant car; an empty or unsatisfiable spec falls through to the normal chain so the AI still races.
-    if slot_policy.car then
+    -- A per-AI slot policy wins over everything else: in a class-drop tournament each AI must drive the
+    -- car/cap of its OWN class (ADR-0042), and outside one the named roster's pre-picked car rides the
+    -- same field (ADR-0047). A fixed car spawns it; the roster's "host" sentinel resolves to the owner's
+    -- actual race car exactly like aicar=host; a cap finds a compliant car; an empty or unsatisfiable
+    -- spec falls through to the normal chain so the AI still races.
+    if slot_policy.car == "host" then
+        if type(host_car) == "table" and host_car.model then
+            return host_car.model, host_car.config
+        end
+        log("W", LOG_TAG, "roster car 'host': no resolved host car; falling back to the AI-car chain")
+    elseif slot_policy.car then
         local model, vehicle_config = split_car_token(slot_policy.car)
         if model then
             return model, vehicle_config
@@ -296,7 +303,10 @@ function M.spawn(ai_slots, grid_poses, config, content_defaults, policy, host_ca
             -- (ADR-0042); it takes precedence inside resolve_ai_vehicle. nil fields = the normal chain.
             local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index,
                 slot_info, host_car)
-            local veh, reason = vehicles.spawn_at(pose, model, vehicle_config)
+            -- The roster's per-AI primary-paint colour (ADR-0047), an opaque hex string relayed per slot;
+            -- nil = stock paint (chat path / no roster). Paint is applied inside spawn_at, pcall-guarded --
+            -- a paint failure degrades to stock and never blocks the spawn.
+            local veh, reason = vehicles.spawn_at(pose, model, vehicle_config, slot_info.color)
             if veh then
                 cars[#cars + 1] = {
                     id = slot_info.id,
@@ -836,6 +846,224 @@ function M.server_id_of(veh)
         return nil
     end
     return server_id
+end
+
+-- ===== Named AI roster (ADR-0047) =====
+
+-- Built-in nickname pool for the named-AI roster: 64 tongue-in-cheek English racing gamer tags (no real
+-- people or brands). Custom names saved by admins live in the server-persisted pool and mix in via the
+-- custom_pool argument of the draw helpers; only those custom entries can carry a preferred car.
+local NAME_POOL = {
+    "BrakeChecker99", "SundayDriver", "CrashTestDummy", "CaptainOversteer",
+    "LiftOffLenny", "ApexPredator", "GravelMagnet", "WallHugger",
+    "LastLapLarry", "TurboTortoise", "NitroNoodle", "HandbrakeHank",
+    "OversteerOtto", "UndersteerUncle", "PitLanePete", "RedMistRandy",
+    "SlipstreamSally", "TrackLimitTed", "DNFDenny", "BackmarkerBob",
+    "ChicaneCharlie", "DriftKingDave", "FuelSaverFred", "GridGoblin",
+    "HairpinHarry", "KerbstoneKevin", "LockupLuke", "MirrorMissingMike",
+    "NoBrakesNed", "OilPatchOllie", "PhotoFinishPhil", "QualifyingQuinn",
+    "RumbleStripRick", "SandTrapSam", "TailgateTina", "TorqueSteerTom",
+    "VMaxVinnie", "WheelspinWalt", "YellowFlagYuri", "ZigzagZack",
+    "AeroLessAndy", "BargeBoardBarry", "CoastingCarl", "DiveBombDylan",
+    "EarlyApexEddie", "FlatOutFinn", "GhostBraker", "HotLapHugo",
+    "InsideLineIzzy", "JumpStartJack", "KamikazeKarl", "LateBrakeLewis",
+    "MidfieldMarty", "NoGripNigel", "OptimisticOwen", "PanicBrakePaul",
+    "RageQuitRoy", "SpinCycleStan", "ThrottleTherapy", "UnsafeReleaseUli",
+    "VibesOnlyVic", "WreckItWes", "XenonXavier", "BoxThisLapBen",
+}
+
+-- Built-in colour palette for the named-AI roster (ADR-0047, round 3): ~18 bold, well-distinguishable
+-- opaque hex strings (lowercase, no leading #). Each AI is painted in one of these as its PRIMARY paint
+-- layer at spawn. Drawn without replacement per roster (>= 16 lets a full 16-AI field stay distinct); the
+-- panel renders each as a swatch. The value is an opaque token -- the server never interprets it
+-- (ADR-0005), it only relays it per slot; the client maps hex -> RGBA at spawn (race/vehicles). White,
+-- near-black and silver are included as realistic car colours alongside the vivid hues.
+local COLOR_PALETTE = {
+    "e6194b", "f58231", "ffe119", "bfef45", "3cb44b", "469990",
+    "42d4f4", "4363d8", "000075", "911eb4", "f032e6", "ff1493",
+    "9a6324", "800000", "808000", "ffffff", "202020", "a0a0a0",
+}
+
+-- The colour palette, for the panel's swatch picker (ADR-0047). Same list the roster draw uses, so the
+-- swatches and the auto-assigned colours come from one source and never drift.
+function M.palette()
+    return COLOR_PALETTE
+end
+
+-- Draw one palette colour not in `used` (a set of hex -> true), or -- when every palette colour is
+-- already used (more AI than palette entries) -- any random palette colour so an entry always gets one.
+-- Owner/panel-local, so math.random is fine (no cross-client determinism, like the name/car draws).
+local function draw_color(used)
+    local free = {}
+    for _, hex in ipairs(COLOR_PALETTE) do
+        if not used[hex] then
+            free[#free + 1] = hex
+        end
+    end
+    if #free > 0 then
+        return free[math.random(#free)]
+    end
+    return COLOR_PALETTE[math.random(#COLOR_PALETTE)]
+end
+
+-- Draw `count` roster names without replacement (ADR-0047): custom pool entries (which may carry a
+-- preferred car and/or preferred colour) plus the built-ins, minus `exclude` (the panel's existing roster
+-- names, exact match). Custom names take pool priority only in candidate ORDER; the draw itself is uniform
+-- over all remaining candidates. Pool exhaustion (impossible in practice: 64+ names vs. max 16 AI)
+-- degrades to "AI <k>" fallback names + a log instead of failing the roll. Returns a list of
+-- {name, preferred?, preferredColor?}.
+function M.draw_roster_names(count, exclude, custom_pool)
+    local taken = {}
+    if type(exclude) == "table" then
+        for _, name in ipairs(exclude) do
+            taken[name] = true
+        end
+    end
+    local candidates = {}
+    if type(custom_pool) == "table" then
+        for _, entry in ipairs(custom_pool) do
+            if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= ""
+                    and not taken[entry.name] then
+                candidates[#candidates + 1] = {
+                    name = entry.name, preferred = entry.car, preferredColor = entry.color,
+                }
+                taken[entry.name] = true
+            end
+        end
+    end
+    for _, name in ipairs(NAME_POOL) do
+        if not taken[name] then
+            candidates[#candidates + 1] = {name = name}
+            taken[name] = true
+        end
+    end
+    local drawn = {}
+    for k = 1, count do
+        if #candidates > 0 then
+            drawn[k] = table.remove(candidates, math.random(#candidates))
+        else
+            log("W", LOG_TAG, "roster name pool exhausted; falling back to 'AI " .. k .. "'")
+            drawn[k] = {name = "AI " .. k}
+        end
+    end
+    return drawn
+end
+
+-- Whether a pool name's PREFERRED CAR participates in a roster roll (ADR-0047 decision 4): it replaces a
+-- ROLLED car ("they always get it, even on random"), but an explicit concrete admin choice -- a fixed
+-- aicar=<model> or aicar=host -- stays authoritative for every entry.
+function M.preferred_applies(config)
+    local car = type(config) == "table" and config.car or nil
+    return car == nil or car == "" or car == "random"
+end
+
+-- Whether a preferred-car token passes the ACTIVE vehicle restrictions, with the same filter set the
+-- random roll for this row would compose (ADR-0047 / ADR-0032): the player policy caps -- unless a fixed
+-- player car dropped them (the random_ai_vehicle gate) -- plus the AI big-car ceiling. No active filter
+-- means compliant. A "model:config" token checks that config's own power/weight; a model-only (stock)
+-- token uses the representative "any compliant trim" rule (random_stock_compliant's rule -- model-level
+-- metadata is unreliable pre-spawn). Unreadable specs under a set cap are non-compliant
+-- (vehiclespecs.is_compliant), so the caller then treats the preferred car like a discarded random
+-- candidate and keeps rolling.
+function M.preferred_car_compliant(token, config, policy)
+    config = type(config) == "table" and config or {}
+    policy = type(policy) == "table" and policy or {}
+    local model, vehicle_config = split_car_token(token)
+    if not model or model == "host" then
+        return false
+    end
+    local fixed_player_car = policy.car ~= nil and policy.car ~= "random"
+    local cap_active = not fixed_player_car
+        and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg)
+    local max_power = cap_active and policy.maxhp or nil
+    local max_pwr = cap_active and policy.maxpwr or nil
+    local range = cap_active and vehiclespecs.weight_range(policy.minkg, policy.maxkg) or nil
+    local max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil
+    if not (max_power or max_pwr or range or max_weight) then
+        return true
+    end
+    if vehicle_config then
+        local power = vehiclespecs.config_power(model, vehicle_config)
+        local weight = vehiclespecs.config_weight(model, vehicle_config)
+        return vehiclespecs.is_compliant(power, weight, max_power, max_pwr, max_weight, range)
+    end
+    for _, entry in ipairs(vehiclespecs.list_configs(model)) do
+        if vehiclespecs.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, range) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Roll one roster car token for the panel (ADR-0047): the SAME resolution chain as the spawn
+-- (resolve_ai_vehicle) minus the spawn-only inputs -- content defaults come from the parsed race (not
+-- available at panel time) and the host car resolves at spawn, so aicar=host stays the opaque "host"
+-- sentinel. Because the rolled token then rides the per-slot ai_entry.car with highest precedence, the
+-- panel-shown car IS the spawned car by construction (one-truth). `index` is 1-based (varies content
+-- cycling if defaults ever apply). Returns "model[:config]" or "host".
+function M.roll_roster_car(config, policy, index)
+    config = type(config) == "table" and config or {}
+    if config.car == "host" then
+        return "host"
+    end
+    local model, vehicle_config = resolve_ai_vehicle(config, nil, policy, index or 1, nil, nil)
+    return vehicle_config and (model .. ":" .. vehicle_config) or model
+end
+
+-- A human label for a roster car token (ADR-0047): the model's display name (vehiclespecs.model_label)
+-- plus the config's in-game name when the token carries one; "host's car" for the host sentinel. Display
+-- only -- the opaque token stays the value everywhere.
+function M.car_label(token)
+    if token == "host" then
+        return "host's car"
+    end
+    local model, vehicle_config = split_car_token(token)
+    if not model then
+        return tostring(token or "?")
+    end
+    local label = vehiclespecs.model_label(model)
+    if not vehicle_config then
+        return label
+    end
+    for _, entry in ipairs(vehiclespecs.list_configs(model)) do
+        if entry.config == vehicle_config then
+            return label .. " - " .. entry.name
+        end
+    end
+    return label .. " - " .. vehicle_config
+end
+
+-- Roll `count` full roster entries for the panel (ADR-0047): draw unique names (built-ins + the custom
+-- pool, minus `exclude`), then per entry resolve the car and the colour. Car: the name's preferred car
+-- when the row's car would be rolled at all (preferred_applies) and it passes the active restrictions
+-- (preferred_car_compliant), else a car rolled through the spawn chain (roll_roster_car). Colour: the
+-- name's preferred colour ALWAYS when it carries one (colour is unrestricted -- no compliance, ADR-0047
+-- round 3), else a palette colour drawn without replacement across this batch AND `exclude_colors` (the
+-- panel's existing roster colours, so an extend stays distinct from the kept entries). Returns a list of
+-- {name, car, carLabel, color} ready for the panel.
+function M.roll_roster_entries(count, exclude, config, policy, custom_pool, exclude_colors)
+    config = type(config) == "table" and config or {}
+    policy = type(policy) == "table" and policy or {}
+    local used = {}
+    if type(exclude_colors) == "table" then
+        for _, hex in ipairs(exclude_colors) do
+            used[hex] = true
+        end
+    end
+    local entries = {}
+    for k, drawn in ipairs(M.draw_roster_names(count, exclude, custom_pool)) do
+        local car
+        if drawn.preferred and M.preferred_applies(config)
+                and M.preferred_car_compliant(drawn.preferred, config, policy) then
+            car = drawn.preferred
+        else
+            car = M.roll_roster_car(config, policy, k)
+        end
+        local color = drawn.preferredColor or draw_color(used)
+        used[color] = true
+        entries[k] = {name = drawn.name, car = car, carLabel = M.car_label(car), color = color}
+    end
+    return entries
 end
 
 -- The owner's aiMap entries (ADR-0036): each AI car's label + its BeamMP server id, for the relay that

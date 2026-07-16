@@ -74,6 +74,10 @@ angular.module('beamng.apps')
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
+      // Named AI roster (ADR-0047): [{name, car, carLabel}] created via the Create button. THE gate for
+      // panel-spawned AI -- buildOverrides sends `ai` only when this is non-empty. Session-restored with
+      // the form; excluded from saved presets (PRESET_EXCLUDE_KEYS).
+      aiRoster: [],
       // Composable random-AI axes (aiCar='random'): stock vs random trim, and exclude big/heavy vehicles.
       // Both default ON (sensible-defaults, like the curated race settings): a random compliant trim plus a
       // curb-weight ceiling that keeps oversized/heavy vehicles out. Existing saved presets keep their stored
@@ -87,10 +91,12 @@ angular.module('beamng.apps')
 
   // The championship / class-drop keys are EXCLUDED from a saved preset (ADR-0037 amendment): they are
   // activated live via championshipCmd/tournamentCmd, so baking them into a preset would mislead (a loaded
-  // tourMode would not auto-start anything). Everything else in the form -- including the selected race --
-  // is saved. Must stay in sync with freshForm's tournament fields.
+  // tourMode would not auto-start anything). The AI roster is excluded too (ADR-0047): presets are
+  // reusable templates, the roster is session state -- only the name pool persists (server-side).
+  // Everything else in the form -- including the selected race -- is saved. Must stay in sync with
+  // freshForm's tournament + roster fields.
   var PRESET_EXCLUDE_KEYS = ['champPreset', 'champOrder', 'champQualiMinutes',
-    'tourMode', 'tourClasses', 'tourOrder'];
+    'tourMode', 'tourClasses', 'tourOrder', 'aiRoster'];
 
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
   // the JSON's double quotes pass through; backslashes and single quotes are escaped). Inert when bngApi
@@ -118,6 +124,34 @@ angular.module('beamng.apps')
     }
     var n = Number(value);
     return isNaN(n) ? undefined : n;
+  }
+
+  // Copy the form's set vehicle caps (hp / hp-per-kg / weight range) onto a target object, blanks
+  // omitted. Shared by buildOverrides (the race payload) and buildRosterPolicy (the roster rolls), so
+  // the two can never relay different caps.
+  function capsInto(form, target) {
+    if (num(form.maxhp) !== undefined) { target.maxhp = num(form.maxhp); }
+    if (num(form.maxpwr) !== undefined) { target.maxpwr = num(form.maxpwr); }
+    if (num(form.maxkg) !== undefined) { target.maxkg = num(form.maxkg); }
+    if (num(form.minkg) !== undefined) { target.minkg = num(form.minkg); }
+  }
+
+  // The player vehicle-policy slice the GE roster roll expects (ADR-0047): mirrors buildOverrides'
+  // car/caps relay exactly, so a rolled roster car obeys precisely what the race would send (fixed car
+  // wins and drops the caps; car=random composes them; the restriction toggle gates the caps).
+  function buildRosterPolicy(form) {
+    var policy = {};
+    if (form.carModel === 'random') {
+      policy.car = 'random';
+      policy.randomTrim = !!form.carRandomTrim;
+      policy.noBigCars = !!form.carNoBigCars;
+      if (form.restrictVehicles) { capsInto(form, policy); }
+    } else if (form.carModel) {
+      policy.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
+    } else if (form.restrictVehicles) {
+      capsInto(form, policy);
+    }
+    return policy;
   }
 
   // Build the overrides object in the exact shape parse_race_args produces server-side (ADR-0037), so the
@@ -155,15 +189,9 @@ angular.module('beamng.apps')
     // composes with the caps (the client draws from the cap-compliant pool), so relay them too. Otherwise the
     // optional power/weight caps apply on their own. The "Vehicle restrictions" toggle gates whether the caps
     // apply, so an unchecked restriction sends nothing even if a stale value lingers in a field.
-    function relayCaps() {
-      if (num(form.maxhp) !== undefined) { o.maxhp = num(form.maxhp); }
-      if (num(form.maxpwr) !== undefined) { o.maxpwr = num(form.maxpwr); }
-      if (num(form.maxkg) !== undefined) { o.maxkg = num(form.maxkg); }
-      if (num(form.minkg) !== undefined) { o.minkg = num(form.minkg); }
-    }
     if (form.carModel === 'random') {
       o.car = 'random';
-      if (form.restrictVehicles) { relayCaps(); }
+      if (form.restrictVehicles) { capsInto(form, o); }
       // The two composable axes, explicit booleans (like the AI axes): randomTrim false = stock/default trim,
       // true = a random compliant trim; noBigCars true excludes big/heavy vehicles (curb-weight ceiling).
       o.randomTrim = !!form.carRandomTrim;
@@ -171,11 +199,18 @@ angular.module('beamng.apps')
     } else if (form.carModel) {
       o.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
     } else if (form.restrictVehicles) {
-      relayCaps();
+      capsInto(form, o);
     }
 
-    if (form.aiEnabled) {
-      var ai = { count: num(form.aiCount) || 1, explicit: true };
+    // AI roster gate (ADR-0047): the panel fields AI only from a created roster -- aiEnabled + count alone
+    // send NO `ai` at all, so no AI spawns. The typed /race chat path is unaffected. The roster length IS
+    // the AI count; each entry's pre-picked {name, car} rides opaquely to the server (race-blind) and the
+    // car lands on the per-slot spawn policy. ai.car stays relayed as the chain fallback for an entry
+    // without a car token.
+    var roster = form.aiRoster || [];
+    if (form.aiEnabled && roster.length) {
+      var ai = { count: roster.length, explicit: true };
+      ai.roster = roster.map(function (e) { return { name: e.name, car: e.car }; });
       if (form.aiPreset) { ai.preset = form.aiPreset; }
       if (form.aiCar) { ai.car = form.aiCar; }
       // Composable random-AI axes (resolved client-side in race/ai.lua): sent explicitly as booleans so the
@@ -201,13 +236,16 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [] };
+      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [] };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
       scope.presetName = '';       // the name field for Save (ADR-0037 amendment)
       scope.selectedPreset = '';   // the saved preset chosen in the dropdown, for Load / Delete
-      scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [], preset: [] }, STATIC_OPTS);
+      scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
+        rosterCar: [], preset: [] }, STATIC_OPTS);
+      scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
+      scope.rosterHint = '';     // transient roster feedback line (duplicate name, pool save, ...)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
@@ -229,6 +267,9 @@ angular.module('beamng.apps')
         scope.opts.carModel = [{ v: '', label: 'keep own' }, { v: 'random', label: 'random' }].concat(cars);
         scope.opts.aiCar = [{ v: '', label: 'default' }, { v: 'random', label: 'random' },
           { v: 'host', label: 'same as host' }].concat(cars);
+        // Roster rows pick a CONCRETE car (ADR-0047), so no ''/random sentinels here -- only the host
+        // sentinel (resolved at spawn) plus the installed models.
+        scope.opts.rosterCar = [{ v: 'host', label: "host's car" }].concat(cars);
       }
       function rebuildGridOpts() {
         scope.opts.grid = [{ v: '', label: 'default' }].concat(
@@ -276,6 +317,14 @@ angular.module('beamng.apps')
             geLuaArg('request_car_configs', c.car);
           }
         });
+        // Same for the restored roster entries' cars (ADR-0047), so each row's config dropdown has its
+        // options without re-picking the model. UX only -- the stored token spawns regardless.
+        (scope.form.aiRoster || []).forEach(function (e) {
+          var model = (e.car && e.car !== 'host') ? String(e.car).split(':')[0] : '';
+          if (model) {
+            geLuaArg('request_car_configs', model);
+          }
+        });
       }
 
       // GE pushes the dynamic lists on open AND on every refresh (the include-deprecated toggle, the Refresh
@@ -286,6 +335,9 @@ angular.module('beamng.apps')
         scope.$evalAsync(function () {
           scope.data.races = (payload && payload.races) || [];
           scope.data.cars = (payload && payload.cars) || [];
+          // The AI roster colour palette (ADR-0047 round 3): the swatch picker + the JS-side colour reroll
+          // draw from this. Static, pushed with the setup data so it is present on link and after restore.
+          scope.data.aiPalette = (payload && payload.aiPalette) || scope.data.aiPalette || [];
           rebuildRaceCarOpts();
           // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
           // harmless (labelFor falls back) and re-fetched on the next model change.
@@ -706,6 +758,256 @@ angular.module('beamng.apps')
       // Full stop -- used by Mode=off (pickTourMode).
       scope.tournamentReset = function () {
         geLuaArg('tournament_cmd', JSON.stringify({ action: 'reset' }));
+      };
+
+      // ----- Named AI roster (ADR-0047) -----------------------------------------------------------
+      // The Create button rolls a named roster GE-side (names from the pool, cars through the SAME
+      // resolution chain the spawn uses), the list edits it per entry, and buildOverrides sends AI only
+      // when a roster exists. Rolls are async: the GE replies via the BeamCompAiRoster* events below.
+
+      var rosterPrev = {};  // per-index pre-edit name, for the duplicate/empty revert on blur
+
+      function rosterNames() {
+        return (scope.form.aiRoster || []).map(function (e) { return e.name; });
+      }
+      function rosterColors() {
+        return (scope.form.aiRoster || []).map(function (e) { return e.color; })
+          .filter(function (c) { return !!c; });
+      }
+
+      // The roll request's shared slice: the AI car mode + axes and the player policy, mirroring what
+      // the race payload would relay (buildRosterPolicy) so panel rolls and spawn cannot drift.
+      function rosterRollSpec() {
+        var spec = { ai: { randomTrim: !!scope.form.aiRandomTrim, noBigCars: !!scope.form.aiNoBigCars } };
+        if (scope.form.aiCar) { spec.ai.car = scope.form.aiCar; }
+        spec.policy = buildRosterPolicy(scope.form);
+        return spec;
+      }
+
+      // Clamp the count field into the panel's AI range and write it back, so a blank or wild value
+      // never sizes a roll.
+      function clampAiCount() {
+        var count = Math.floor(num(scope.form.aiCount) || 0);
+        count = Math.max(1, Math.min(16, count || 4));
+        scope.form.aiCount = count;
+        return count;
+      }
+
+      // The model key of a roster entry's car token ('host' for the host sentinel, '' when unset).
+      scope.rosterModelOf = function (e) {
+        if (!e || !e.car) { return ''; }
+        return e.car === 'host' ? 'host' : String(e.car).split(':')[0];
+      };
+      // The config key of a roster entry's car token ('' for stock/host/unset).
+      scope.rosterConfigOf = function (e) {
+        if (!e || !e.car || e.car === 'host') { return ''; }
+        var parts = String(e.car).split(':');
+        return parts.length > 1 ? parts.slice(1).join(':') : '';
+      };
+      scope.rosterCarLabel = function (e) {
+        return (e && (e.carLabel || e.car)) || 'select car…';
+      };
+
+      // Toggle the expandable roster list. A scope METHOD, not an inline `rosterOpen = !rosterOpen` on
+      // the button: the Edit button lives under an ng-if (own child scope), where an inline primitive
+      // write would shadow rosterOpen onto that child scope -- the sibling list reads the directive
+      // scope's rosterOpen (still false) and never renders. A method resolves rosterOpen on the
+      // directive scope through the closure regardless of the calling child scope.
+      scope.toggleRoster = function () {
+        scope.rosterOpen = !scope.rosterOpen;
+      };
+
+      // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
+      scope.createRoster = function () {
+        var spec = rosterRollSpec();
+        spec.count = clampAiCount();
+        spec.mode = 'create';
+        spec.exclude = [];
+        geLuaArg('roll_ai_roster', JSON.stringify(spec));
+      };
+
+      // Count changed with an existing roster (applied on blur/Enter, the panel's number-field
+      // convention): fewer -> tail entries drop; more -> new entries are rolled in, names unique against
+      // the kept ones. Existing entries stay untouched (decision 7). Without a roster the count only
+      // sizes the next Create.
+      scope.applyRosterCount = function () {
+        var count = clampAiCount();
+        var roster = scope.form.aiRoster || [];
+        if (!roster.length || roster.length === count) { return; }
+        if (count < roster.length) {
+          roster.splice(count);
+          return;
+        }
+        var spec = rosterRollSpec();
+        spec.count = count - roster.length;
+        spec.mode = 'extend';
+        spec.exclude = rosterNames();
+        // Keep the new entries' colours distinct from the kept ones too (ADR-0047 round 3).
+        spec.excludeColors = rosterColors();
+        geLuaArg('roll_ai_roster', JSON.stringify(spec));
+      };
+
+      scope.$on('BeamCompAiRoster', function (event, payload) {
+        scope.$evalAsync(function () {
+          var entries = ((payload && payload.entries) || []).map(function (e) {
+            return { name: e.name, car: e.car, carLabel: e.carLabel, color: e.color };
+          });
+          if (payload && payload.mode === 'extend') {
+            scope.form.aiRoster = (scope.form.aiRoster || []).concat(entries);
+          } else {
+            scope.form.aiRoster = entries;
+            // Auto-expand the list on a fresh Create so the generated AI are visible at once (ADR-0047
+            // round 3); the Hide toggle still collapses it. Not on extend -- the list is already open.
+            scope.rosterOpen = true;
+          }
+          scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
+          scope.rosterHint = '';
+        });
+      });
+
+      // Re-draw one entry's name from the pool (unique against the rest). If the drawn name carries a
+      // preferred car that applies under the current settings, the GE sends the car along (decision 4).
+      scope.rerollRosterName = function (i) {
+        var spec = rosterRollSpec();
+        spec.index = i;
+        spec.exclude = rosterNames();
+        geLuaArg('reroll_ai_name', JSON.stringify(spec));
+      };
+      scope.$on('BeamCompAiRosterName', function (event, payload) {
+        scope.$evalAsync(function () {
+          var e = payload && (scope.form.aiRoster || [])[payload.index];
+          if (!e) { return; }
+          e.name = payload.name;
+          if (payload.car) {
+            e.car = payload.car;
+            e.carLabel = payload.carLabel;
+          }
+          // A drawn pool name's preferred colour always applies (ADR-0047 round 3, no compliance gate).
+          if (payload.color) { e.color = payload.color; }
+        });
+      });
+
+      // Re-roll one entry's car through the spawn chain. A manual override by intent, so the GE bypasses
+      // the name's preferred car here (it would pin the button to a single result).
+      scope.rerollRosterCar = function (i) {
+        var spec = rosterRollSpec();
+        spec.index = i;
+        geLuaArg('reroll_ai_car', JSON.stringify(spec));
+      };
+      scope.$on('BeamCompAiRosterCar', function (event, payload) {
+        scope.$evalAsync(function () {
+          var e = payload && (scope.form.aiRoster || [])[payload.index];
+          if (!e || !payload.car) { return; }
+          e.car = payload.car;
+          e.carLabel = payload.carLabel;
+        });
+      });
+
+      // Manual car pick per row (the tourClasses per-row dropdown pattern: pass the entry object -- the
+      // option list is a NESTED ng-repeat, so $index there is the option index).
+      scope.pickRosterCar = function (e, model) {
+        scope.open = null;
+        if (model === 'host') {
+          e.car = 'host';
+          e.carLabel = "host's car";
+          return;
+        }
+        e.car = model;
+        e.carLabel = modelLabel(model);
+        if (model) { geLuaArg('request_car_configs', model); }
+      };
+      scope.pickRosterConfig = function (e, config) {
+        scope.open = null;
+        var model = scope.rosterModelOf(e);
+        if (!model || model === 'host') { return; }
+        e.car = config ? (model + ':' + config) : model;
+        var configName = '';
+        (scope.configsByModel[model] || []).some(function (c) {
+          if (c.config === config) { configName = c.name; return true; }
+          return false;
+        });
+        e.carLabel = modelLabel(model) + (config ? ' - ' + (configName || config) : '');
+      };
+      scope.rosterConfigOpts = function (e) {
+        var model = scope.rosterModelOf(e);
+        var list = (model && model !== 'host' && scope.configsByModel[model]) || [];
+        return [{ v: '', label: 'stock' }].concat(list.map(function (c) {
+          return { v: c.config, label: c.name };
+        }));
+      };
+      // The display name of a roster entry's config, resolved from the same options the dropdown shows
+      // (mirrors classConfigLabel) -- 'stock' for none, the raw key as fallback.
+      scope.rosterConfigLabel = function (e) {
+        var value = scope.rosterConfigOf(e);
+        var list = scope.rosterConfigOpts(e);
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].v === value) {
+            return list[i].label;
+          }
+        }
+        return value || 'stock';
+      };
+
+      // Colour is an opaque, unrestricted token from the client-known palette, so the swatch pick and the
+      // reroll are pure JS (no GE round-trip, unlike the car which needs the vehiclespecs chain). The
+      // '#'-prefixed CSS value for a swatch / the row's current colour.
+      scope.rosterSwatchStyle = function (hex) {
+        return { 'background-color': '#' + hex };
+      };
+      scope.pickRosterColor = function (e, hex) {
+        e.color = hex;
+      };
+      // Reroll one entry's colour: a random palette colour distinct from the current one when possible.
+      // A manual override, so -- like the car reroll -- it deliberately ignores any preferred colour.
+      scope.rerollRosterColor = function (e) {
+        var palette = scope.data.aiPalette || [];
+        if (!palette.length) { return; }
+        var pick = palette[Math.floor(Math.random() * palette.length)];
+        if (palette.length > 1) {
+          while (pick === e.color) {
+            pick = palette[Math.floor(Math.random() * palette.length)];
+          }
+        }
+        e.color = pick;
+      };
+
+      // Names are identity keys server-side, so the panel rejects duplicates (and blanks) on blur by
+      // reverting to the pre-edit value with a hint -- the server additionally disambiguates defensively.
+      scope.rosterNameFocus = function (i) {
+        rosterPrev[i] = scope.form.aiRoster[i].name;
+      };
+      scope.rosterNameBlur = function (i) {
+        var e = scope.form.aiRoster[i];
+        var name = (e.name || '').trim();
+        var isDuplicate = name && (scope.form.aiRoster || []).some(function (other, j) {
+          return j !== i && other.name === name;
+        });
+        if (!name || isDuplicate) {
+          e.name = rosterPrev[i] !== undefined ? rosterPrev[i] : e.name;
+          scope.rosterHint = isDuplicate
+            ? 'Duplicate name rejected -- roster names must be unique.'
+            : 'Empty name rejected.';
+        } else {
+          e.name = name;
+          scope.rosterHint = '';
+        }
+        delete rosterPrev[i];
+      };
+
+      // Save a row's (edited) name to the permanent pool (ADR-0047, add-only, server-persisted). Round 3:
+      // ONE Save button stores the name together with its current car (only when concrete -- the host
+      // sentinel points at whoever hosts, not a car) and its current colour, so the saved name comes back
+      // with that car AND colour. The button is always enabled (name + colour can always be saved).
+      scope.savePoolName = function (i) {
+        var e = scope.form.aiRoster[i];
+        var name = e && (e.name || '').trim();
+        if (!name) { return; }
+        var payload = { name: name };
+        if (e.car && e.car !== 'host') { payload.car = e.car; }
+        if (e.color) { payload.color = e.color; }
+        geLuaArg('save_ai_pool_name', JSON.stringify(payload));
+        scope.rosterHint = 'Saving "' + name + '" to the name pool'
+          + (payload.car ? ' with its car + colour…' : ' with its colour…');
       };
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
