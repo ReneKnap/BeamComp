@@ -860,6 +860,19 @@ angular.module('beamng.apps')
         if (e) { e.name = name; }
       };
 
+      // The DATA index of an entry in form.aiRoster. The list is displayed alphabetically (orderBy in the
+      // ng-repeat, R3) so the repeat's $index is the sorted position, NOT the data slot -- but the roll/save
+      // GE calls and the "#n" slot label need the real array index (it maps to spawn/grid slots), so they go
+      // through this instead of $index.
+      scope.rosterIndexOf = function (e) {
+        return (scope.form.aiRoster || []).indexOf(e);
+      };
+      // orderBy key for the alphabetical DISPLAY sort (R3): case-insensitive by name. Display only -- orderBy
+      // returns a sorted view, the underlying form.aiRoster order (and the sent roster) is untouched.
+      scope.nameSortKey = function (e) {
+        return (e && e.name ? e.name : '').toLowerCase();
+      };
+
       // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
       scope.createRoster = function () {
         var spec = rosterRollSpec();
@@ -910,7 +923,10 @@ angular.module('beamng.apps')
 
       // Re-draw one entry's name from the pool (unique against the rest). If the drawn name carries a
       // preferred car that applies under the current settings, the GE sends the car along (decision 4).
-      scope.rerollRosterName = function (i) {
+      // Takes the entry object (the list is sorted for display, so $index is not the data slot).
+      scope.rerollRosterName = function (e) {
+        var i = scope.rosterIndexOf(e);
+        if (i < 0) { return; }
         var spec = rosterRollSpec();
         spec.index = i;
         spec.exclude = rosterNames();
@@ -931,8 +947,11 @@ angular.module('beamng.apps')
       });
 
       // Re-roll one entry's car through the spawn chain. A manual override by intent, so the GE bypasses
-      // the name's preferred car here (it would pin the button to a single result).
-      scope.rerollRosterCar = function (i) {
+      // the name's preferred car here (it would pin the button to a single result). Takes the entry object
+      // (the list is sorted for display, so $index is not the data slot).
+      scope.rerollRosterCar = function (e) {
+        var i = scope.rosterIndexOf(e);
+        if (i < 0) { return; }
         var spec = rosterRollSpec();
         spec.index = i;
         geLuaArg('reroll_ai_car', JSON.stringify(spec));
@@ -1029,12 +1048,11 @@ angular.module('beamng.apps')
         e.color = pick;
       };
 
-      // Save a row's (edited) name to the permanent pool (ADR-0047, add-only, server-persisted). Round 3:
-      // ONE Save button stores the name together with its current car (only when concrete -- the host
-      // sentinel points at whoever hosts, not a car) and its current colour, so the saved name comes back
-      // with that car AND colour. The button is always enabled (name + colour can always be saved).
-      scope.savePoolName = function (i) {
-        var e = scope.form.aiRoster[i];
+      // Save an entry's name to the permanent pool (ADR-0047, add-only, server-persisted): stores the name
+      // with its current car (only when concrete -- the host sentinel points at whoever hosts, not a car)
+      // and its current colour, so the saved name comes back with that car AND colour. Takes the entry
+      // object (the list is sorted for display, so $index is not the data slot).
+      scope.savePoolName = function (e) {
         var name = e && (e.name || '').trim();
         if (!name) { return; }
         var payload = { name: name };
@@ -1043,6 +1061,14 @@ angular.module('beamng.apps')
         geLuaArg('save_ai_pool_name', JSON.stringify(payload));
         scope.rosterHint = 'Saving "' + name + '" to the name pool'
           + (payload.car ? ' with its car + colour…' : ' with its colour…');
+      };
+      // Save & Done (R3): the single Change-panel close button persists the AI's current car/type/colour as
+      // its pool name's preferred (savePoolName) AND collapses the panel. Closing the panel now ALWAYS saves
+      // -- there is no close-without-save path (user decision). e._open is an object-property write.
+      scope.saveAndDoneRosterEntry = function (e) {
+        if (!e) { return; }
+        scope.savePoolName(e);
+        e._open = false;
       };
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
