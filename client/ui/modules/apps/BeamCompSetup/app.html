@@ -89,13 +89,13 @@
     .bc-swatch { width: 16px; height: 16px; padding: 0; border: 1px solid rgba(255,255,255,0.25);
       border-radius: 3px; cursor: pointer; }
     .bc-swatch.sel { border: 2px solid #fff; box-shadow: 0 0 3px rgba(255,255,255,0.8); }
-    /* AI roster compact editor (ADR-0047 amendment): the collapsed preferred-car summary line (model only,
-       optional muted config detail) and the collapsed colour chip. The summary span beats the .bc-row label
-       width (0,1,1) with a compound selector so it fills the row and ellipsis-clips. */
+    /* AI roster compact editor (ADR-0047 amendment): the read-only summary line (model, muted config detail,
+       inline colour swatch). The summary span beats the .bc-row label width (0,1,1) with a compound selector
+       so it fills the row and ellipsis-clips. The inline swatch previews the entry's colour in the summary. */
     .bc-row > span.bc-roster-carshown { flex: 1 1 auto; min-width: 0; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
     .bc-roster-cardetail { opacity: 0.7; }
-    .bc-swatch-cur { width: 24px; height: 16px; }
+    .bc-swatch-inline { display: inline-block; vertical-align: middle; width: 14px; height: 14px; }
   </style>
 
   <div class="bc-toolbar">
@@ -308,85 +308,79 @@
         <div class="bc-roster-hint" ng-if="!form.aiRoster.length">No AI will spawn -- press Create to field the AI roster.</div>
         <div class="bc-roster-hint" ng-if="rosterHint">{{rosterHint}}</div>
         <div ng-if="rosterOpen && form.aiRoster.length">
-          <!-- Compact editor (ADR-0047 amendment): a dropdown picks ONE AI (#n + name); only that AI's card
-               shows. selectRosterEntry writes rosterSel through a scope method (never an inline primitive from
-               this ng-if/ng-repeat child, which would shadow it) and resets the per-AI collapse state. -->
-          <div class="bc-row">
-            <span>Edit AI</span>
-            <div class="bc-dd">
-              <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterSel')">{{rosterSelLabel()}}</button>
-              <div class="bc-dd-list" ng-if="open === 'rosterSel'">
-                <div class="bc-dd-opt" bc-setup-fit ng-repeat="e in form.aiRoster" ng-class="{sel: $index === rosterSel}"
-                  ng-click="selectRosterEntry($index)">#{{$index + 1}} {{e.name}}</div>
-              </div>
-            </div>
-          </div>
-          <div class="bc-roster-entry">
+          <!-- Compact all-AI editor (ADR-0047 amendment R2): every AI is listed; each expands its own
+               Car/Type/Colour panel via e._open. e._open is an OBJECT property, so the write is safe from
+               this ng-repeat child scope (the round-2 trap is a *primitive* scope write). The name is PICKED
+               from the pool dropdown (no free typing) or rolled; picks/rolls mutate the entry object. -->
+          <div class="bc-roster-entry" ng-repeat="e in form.aiRoster">
             <div class="bc-row">
-              <span>Name</span>
-              <input type="text" ng-model="form.aiRoster[rosterSel].name"
-                ng-focus="rosterNameFocus(rosterSel)" ng-blur="rosterNameBlur(rosterSel)">
-              <button type="button" class="bc-preset" ng-click="rerollRosterName(rosterSel)"
-                title="Draw a new name from the pool">Roll</button>
-            </div>
-            <!-- Preferred car (change B): collapsed by default -- the chosen car (model only, change D) is
-                 shown and the car/config dropdowns hide behind Change; expanded reveals them + the car Roll.
-                 Pure UI state (carOverrideOpen via a scope method); e.car stays the data model. -->
-            <div class="bc-row" ng-if="!carOverrideOpen">
-              <span>Car</span>
-              <span class="bc-roster-carshown">{{rosterCarLabel(curEntry())}}<span class="bc-roster-cardetail"
-                ng-if="rosterConfigOf(curEntry())"> &middot; {{rosterConfigLabel(curEntry())}}</span></span>
-              <button type="button" class="bc-preset" ng-click="toggleCarOverride()"
-                title="Pick this AI's car and config by hand">Change…</button>
-            </div>
-            <div class="bc-row" ng-if="carOverrideOpen">
-              <span>Car</span>
+              <span>#{{$index + 1}} Name</span>
               <div class="bc-dd">
-                <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCar' + rosterSel)">{{rosterCarLabel(curEntry())}}</button>
-                <div class="bc-dd-list" ng-if="open === 'rosterCar' + rosterSel">
-                  <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.rosterCar" ng-class="{sel: o.v === rosterModelOf(curEntry())}"
-                    ng-click="pickRosterCar(curEntry(), o.v)">{{o.label}}</div>
+                <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterName' + $index)">{{e.name || 'pick name…'}}</button>
+                <div class="bc-dd-list" ng-if="open === 'rosterName' + $index">
+                  <div class="bc-dd-opt" bc-setup-fit ng-repeat="nm in rosterNameOpts(e)" ng-class="{sel: nm === e.name}"
+                    ng-click="pickRosterName(e, nm)">{{nm}}</div>
                 </div>
               </div>
-              <button type="button" class="bc-preset" ng-click="rerollRosterCar(rosterSel)"
-                title="Reroll this AI's car under the current settings">Roll</button>
-              <button type="button" class="bc-preset" ng-click="toggleCarOverride()"
-                title="Collapse to the chosen car">Done</button>
+              <button type="button" class="bc-preset" ng-click="rerollRosterName($index)"
+                title="Draw a random name from the pool">Roll</button>
             </div>
-            <div class="bc-row" ng-if="carOverrideOpen && rosterModelOf(curEntry()) && rosterModelOf(curEntry()) !== 'host'">
-              <span>Config</span>
-              <div class="bc-dd">
-                <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCfg' + rosterSel)">{{rosterConfigLabel(curEntry())}}</button>
-                <div class="bc-dd-list" ng-if="open === 'rosterCfg' + rosterSel">
-                  <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in rosterConfigOpts(curEntry())" ng-class="{sel: o.v === rosterConfigOf(curEntry())}"
-                    ng-click="pickRosterConfig(curEntry(), o.v)">{{o.label}}</div>
+            <!-- Read-only summary: the car model (change D: model only), a muted config-type detail, and an
+                 inline colour swatch; Change opens the edit panel. -->
+            <div class="bc-row" ng-if="!e._open">
+              <span>Car</span>
+              <span class="bc-roster-carshown">{{rosterCarLabel(e)}}<span class="bc-roster-cardetail"
+                ng-if="rosterConfigOf(e)"> &middot; {{rosterConfigLabel(e)}}</span> <span class="bc-swatch bc-swatch-inline"
+                ng-style="rosterSwatchStyle(e.color)" title="{{e.color}}"></span></span>
+              <button type="button" class="bc-preset" ng-click="toggleRosterEntry(e)"
+                title="Edit this AI's car, type and colour">Change…</button>
+            </div>
+            <!-- Expanded edit panel: Car / Type / Colour, each with its own dropdown/palette + a Roll, then
+                 Save (store as this name's preferred) + Done (collapse). -->
+            <div ng-if="e._open">
+              <div class="bc-row">
+                <span>Car</span>
+                <div class="bc-dd">
+                  <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCar' + $index)">{{rosterCarLabel(e)}}</button>
+                  <div class="bc-dd-list" ng-if="open === 'rosterCar' + $index">
+                    <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.rosterCar" ng-class="{sel: o.v === rosterModelOf(e)}"
+                      ng-click="pickRosterCar(e, o.v)">{{o.label}}</div>
+                  </div>
                 </div>
+                <button type="button" class="bc-preset" ng-click="rerollRosterCar($index)"
+                  title="Roll a random car under the current settings">Roll</button>
               </div>
-            </div>
-            <!-- Paint colour (ADR-0047 round 3, compact change C): a single current-colour chip that expands
-                 the fixed palette on click; picking collapses it (toggleColor / pickRosterColor set colorOpen
-                 via scope methods -- no ng-if child primitive write). The reroll stays visible. -->
-            <div class="bc-row">
-              <span>Colour</span>
-              <button type="button" class="bc-swatch bc-swatch-cur" ng-style="rosterSwatchStyle(curEntry().color)"
-                ng-click="toggleColor()" title="{{curEntry().color}}"></button>
-              <button type="button" class="bc-preset" ng-click="rerollRosterColor(curEntry())"
-                title="Reroll this AI's colour">Roll</button>
-            </div>
-            <div class="bc-row" ng-if="colorOpen">
-              <span></span>
-              <span class="bc-swatches">
-                <button type="button" class="bc-swatch" ng-repeat="hex in data.aiPalette"
-                  ng-class="{sel: hex === curEntry().color}" ng-style="rosterSwatchStyle(hex)"
-                  ng-click="pickRosterColor(curEntry(), hex)" title="{{hex}}"></button>
-              </span>
-            </div>
-            <div class="bc-row">
-              <span>Pool</span>
-              <span class="bc-roster-actions">
-                <button type="button" class="bc-preset" ng-click="savePoolName(rosterSel)"
-                  title="Save this name to the permanent pool with its current car + colour as its preferred setup">Save</button>
-              </span>
+              <div class="bc-row" ng-if="rosterModelOf(e) && rosterModelOf(e) !== 'host'">
+                <span>Type</span>
+                <div class="bc-dd">
+                  <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCfg' + $index)">{{rosterConfigLabel(e)}}</button>
+                  <div class="bc-dd-list" ng-if="open === 'rosterCfg' + $index">
+                    <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in rosterConfigOpts(e)" ng-class="{sel: o.v === rosterConfigOf(e)}"
+                      ng-click="pickRosterConfig(e, o.v)">{{o.label}}</div>
+                  </div>
+                </div>
+                <button type="button" class="bc-preset" ng-click="rerollRosterConfig(e)"
+                  title="Roll a random type for this car">Roll</button>
+              </div>
+              <div class="bc-row">
+                <span>Colour</span>
+                <span class="bc-swatches">
+                  <button type="button" class="bc-swatch" ng-repeat="hex in data.aiPalette"
+                    ng-class="{sel: hex === e.color}" ng-style="rosterSwatchStyle(hex)"
+                    ng-click="pickRosterColor(e, hex)" title="{{hex}}"></button>
+                </span>
+                <button type="button" class="bc-preset" ng-click="rerollRosterColor(e)"
+                  title="Roll a random colour">Roll</button>
+              </div>
+              <div class="bc-row">
+                <span>Pool</span>
+                <span class="bc-roster-actions">
+                  <button type="button" class="bc-preset" ng-click="savePoolName($index)"
+                    title="Save this name's current car + colour to the pool as its preferred setup">Save</button>
+                  <button type="button" class="bc-preset" ng-click="toggleRosterEntry(e)"
+                    title="Collapse this AI">Done</button>
+                </span>
+              </div>
             </div>
           </div>
         </div>

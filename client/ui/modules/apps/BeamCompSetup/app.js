@@ -236,7 +236,7 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [] };
+      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [] };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
@@ -245,14 +245,7 @@ angular.module('beamng.apps')
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
         rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
-      // Compact roster editor (ADR-0047 amendment): one AI is edited at a time. These three are
-      // directive-scope UI state ONLY -- never on scope.form, so nothing new rides the sent payload or the
-      // stored form -- and are written solely through scope methods (never an inline primitive from an
-      // ng-if/ng-repeat child, which would shadow onto the child scope -- the round-2 roster bug).
-      scope.rosterSel = 0;            // index of the AI shown in the editor card
-      scope.carOverrideOpen = false;  // reveal the manual car/config dropdowns (default: show the preferred car)
-      scope.colorOpen = false;        // expand the colour palette (default: collapsed to the current swatch)
-      scope.rosterHint = '';     // transient roster feedback line (duplicate name, pool save, ...)
+      scope.rosterHint = '';     // transient roster feedback line (pool save, ...)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
@@ -350,6 +343,14 @@ angular.module('beamng.apps')
           // harmless (labelFor falls back) and re-fetched on the next model change.
           rebuildGridOpts();
           rebuildConfigOpts();
+        });
+      });
+
+      // The AI roster name pool (ADR-0047 amendment R2): GE pushes the pickable names (custom + built-ins)
+      // with the setup data and again after a pool save, so the per-AI name dropdown reflects the pool.
+      scope.$on('BeamCompAiPool', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.data.aiPoolNames = (payload && payload.names) || scope.data.aiPoolNames || [];
         });
       });
 
@@ -772,8 +773,6 @@ angular.module('beamng.apps')
       // resolution chain the spawn uses), the list edits it per entry, and buildOverrides sends AI only
       // when a roster exists. Rolls are async: the GE replies via the BeamCompAiRoster* events below.
 
-      var rosterPrev = {};  // per-index pre-edit name, for the duplicate/empty revert on blur
-
       function rosterNames() {
         return (scope.form.aiRoster || []).map(function (e) { return e.name; });
       }
@@ -830,37 +829,35 @@ angular.module('beamng.apps')
         scope.rosterOpen = !scope.rosterOpen;
       };
 
-      // ----- Compact editor: select one AI, collapse its car/colour panels (ADR-0047 amendment) --------
-      // Same scope-method discipline as toggleRoster: every write to rosterSel/carOverrideOpen/colorOpen
-      // runs here on the directive scope through the closure, never as an inline primitive assignment from
-      // an ng-if/ng-repeat child (which would shadow the state onto the child scope and never take effect).
+      // ----- Compact all-AI editor (ADR-0047 amendment R2) --------------------------------------------
+      // Every AI is listed at once; each row expands its own Car/Type/Colour panel. The per-entry open flag
+      // is an OBJECT property (e._open) -- an object-property write across a scope boundary is safe (unlike a
+      // primitive scope write, which would shadow onto an ng-repeat child scope: the round-2 trap). The
+      // dropdown-picks below stay scope methods that mutate the passed entry object.
 
-      // The roster entry currently shown in the editor card. A read helper for the template bindings; the
-      // card renders only under `rosterOpen && form.aiRoster.length` with rosterSel clamped in range, so the
-      // callers always see a real entry.
-      scope.curEntry = function () {
-        return (scope.form.aiRoster || [])[scope.rosterSel];
-      };
-      // The AI-selector dropdown head: "#<n> <name>" of the selected entry.
-      scope.rosterSelLabel = function () {
-        var e = scope.curEntry();
-        return e ? '#' + (scope.rosterSel + 1) + ' ' + (e.name || '') : 'select AI…';
-      };
-      // Switch the edited AI; collapse its per-AI car/colour panels so each AI opens in the compact state.
-      scope.selectRosterEntry = function (i) {
-        scope.rosterSel = i;
+      // Expand / collapse one AI's edit panel. e._open is an object property, so this write is safe from an
+      // ng-repeat child; closing any open dropdown keeps the panel tidy.
+      scope.toggleRosterEntry = function (e) {
+        if (!e) { return; }
+        e._open = !e._open;
         scope.open = null;
-        scope.carOverrideOpen = false;
-        scope.colorOpen = false;
       };
-      // Preferred-car toggle (change B): collapsed (default) shows the chosen car (model only) and hides the
-      // car/config dropdowns; expanded reveals them for a manual pick. Pure UI -- e.car stays the data model.
-      scope.toggleCarOverride = function () {
-        scope.carOverrideOpen = !scope.carOverrideOpen;
+
+      // The pool names pickable for one entry's name dropdown: the pushed pool (custom + built-ins) minus the
+      // names already taken by OTHER entries, so a pick can never collide (names are identity keys). The
+      // entry's own current name stays listed (shown selected).
+      scope.rosterNameOpts = function (e) {
+        var taken = {};
+        (scope.form.aiRoster || []).forEach(function (other) {
+          if (other !== e && other.name) { taken[other.name] = true; }
+        });
+        return (scope.data.aiPoolNames || []).filter(function (name) { return !taken[name]; });
       };
-      // Colour field (change C): collapsed shows the current swatch; expanded reveals the palette.
-      scope.toggleColor = function () {
-        scope.colorOpen = !scope.colorOpen;
+      // Pick a roster name from the pool (object-property write). Options already exclude names taken by
+      // other entries, so no duplicate is possible.
+      scope.pickRosterName = function (e, name) {
+        scope.open = null;
+        if (e) { e.name = name; }
       };
 
       // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
@@ -882,7 +879,6 @@ angular.module('beamng.apps')
         if (!roster.length || roster.length === count) { return; }
         if (count < roster.length) {
           roster.splice(count);
-          scope.rosterSel = Math.min(scope.rosterSel, count - 1);  // keep the editor selection in range
           return;
         }
         var spec = rosterRollSpec();
@@ -906,14 +902,8 @@ angular.module('beamng.apps')
             // Auto-expand the list on a fresh Create so the generated AI are visible at once (ADR-0047
             // round 3); the Hide toggle still collapses it. Not on extend -- the list is already open.
             scope.rosterOpen = true;
-            // Compact editor (ADR-0047 amendment): a fresh roster opens on the first AI, collapsed.
-            scope.rosterSel = 0;
-            scope.carOverrideOpen = false;
-            scope.colorOpen = false;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
-          // Keep the editor selection in range after an extend grew (or a create replaced) the roster.
-          scope.rosterSel = Math.max(0, Math.min(scope.rosterSel, scope.form.aiRoster.length - 1));
           scope.rosterHint = '';
         });
       });
@@ -988,6 +978,21 @@ angular.module('beamng.apps')
           return { v: c.config, label: c.name };
         }));
       };
+      // Reroll one entry's config/type (ADR-0047 amendment R2): a manual per-field roll, so it is a fresh
+      // random pick from this model's known configs (incl. stock), distinct from the current when possible.
+      // Pure JS on the loaded config list -- the model is fixed, so no compliance/GE round-trip is needed.
+      scope.rerollRosterConfig = function (e) {
+        var opts = scope.rosterConfigOpts(e);
+        if (!opts.length) { return; }
+        var current = scope.rosterConfigOf(e);
+        var pick = opts[Math.floor(Math.random() * opts.length)].v;
+        if (opts.length > 1) {
+          while (pick === current) {
+            pick = opts[Math.floor(Math.random() * opts.length)].v;
+          }
+        }
+        scope.pickRosterConfig(e, pick);
+      };
       // The display name of a roster entry's config, resolved from the same options the dropdown shows
       // (mirrors classConfigLabel) -- 'stock' for none, the raw key as fallback.
       scope.rosterConfigLabel = function (e) {
@@ -1009,7 +1014,6 @@ angular.module('beamng.apps')
       };
       scope.pickRosterColor = function (e, hex) {
         if (e) { e.color = hex; }
-        scope.colorOpen = false;  // picking collapses the palette again (ADR-0047 amendment, change C)
       };
       // Reroll one entry's colour: a random palette colour distinct from the current one when possible.
       // A manual override, so -- like the car reroll -- it deliberately ignores any preferred colour.
@@ -1023,29 +1027,6 @@ angular.module('beamng.apps')
           }
         }
         e.color = pick;
-      };
-
-      // Names are identity keys server-side, so the panel rejects duplicates (and blanks) on blur by
-      // reverting to the pre-edit value with a hint -- the server additionally disambiguates defensively.
-      scope.rosterNameFocus = function (i) {
-        rosterPrev[i] = scope.form.aiRoster[i].name;
-      };
-      scope.rosterNameBlur = function (i) {
-        var e = scope.form.aiRoster[i];
-        var name = (e.name || '').trim();
-        var isDuplicate = name && (scope.form.aiRoster || []).some(function (other, j) {
-          return j !== i && other.name === name;
-        });
-        if (!name || isDuplicate) {
-          e.name = rosterPrev[i] !== undefined ? rosterPrev[i] : e.name;
-          scope.rosterHint = isDuplicate
-            ? 'Duplicate name rejected -- roster names must be unique.'
-            : 'Empty name rejected.';
-        } else {
-          e.name = name;
-          scope.rosterHint = '';
-        }
-        delete rosterPrev[i];
       };
 
       // Save a row's (edited) name to the permanent pool (ADR-0047, add-only, server-persisted). Round 3:
