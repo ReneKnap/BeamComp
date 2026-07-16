@@ -39,6 +39,18 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    /* Long dropdown labels (bcGridFit): the directive wraps each label in .bc-fit-clip > .bc-fit-text.
+       The clip is a block that fills the cell content box (so it stops before the head's 22px chevron
+       padding) and hides overflow; the inline-block text is shrunk to fit and, if still too wide, given a
+       calm ping-pong marquee driven by the per-cell --bc-fit-shift / --bc-fit-dur the directive sets. */
+    .bc-fit-clip { display: block; width: 100%; overflow: hidden; }
+    .bc-fit-text { display: inline-block; white-space: nowrap; vertical-align: bottom; }
+    .bc-fit-text.bc-fit-scroll { will-change: transform;
+      animation: bc-fit-marquee var(--bc-fit-dur, 6s) ease-in-out infinite alternate; }
+    @keyframes bc-fit-marquee {
+      0%, 12% { transform: translateX(0); }
+      88%, 100% { transform: translateX(var(--bc-fit-shift, 0px)); }
+    }
     /* flex:1 1 auto lets the segmented control fill a flex .bc-row (the Mirror toggle); it is inert in
        the Direction section where .bc-seg is a block-level child of a non-flex .bc-section. */
     .bc-seg { display: flex; flex: 1 1 auto; min-width: 0; gap: 6px; }
@@ -72,9 +84,9 @@
       <div class="bc-row">
         <span>Race</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('race')">{{labelFor('race', 'select…')}}</button>
+          <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('race')">{{labelFor('race', 'select…')}}</button>
           <div class="bc-dd-list" ng-if="open === 'race'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
+            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
               ng-click="pick('race', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -86,9 +98,9 @@
       <div class="bc-row">
         <span>Saved grid</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('loadName')">{{labelFor('loadName', 'none saved')}}</button>
+          <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('loadName')">{{labelFor('loadName', 'none saved')}}</button>
           <div class="bc-dd-list" ng-if="open === 'loadName'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.loadName" ng-class="{sel: o.v === form.loadName}"
+            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.loadName" ng-class="{sel: o.v === form.loadName}"
               ng-click="pick('loadName', o.v)">{{o.label}}</div>
           </div>
         </div>
@@ -192,9 +204,9 @@
       <div class="bc-row">
         <span>For race</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" ng-click="toggle('assignRace')">{{labelFor('assignRace', 'select…')}}</button>
+          <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('assignRace')">{{labelFor('assignRace', 'select…')}}</button>
           <div class="bc-dd-list" ng-if="open === 'assignRace'">
-            <div class="bc-dd-opt" ng-repeat="o in opts.assignRace" ng-class="{sel: o.v === form.assignRace}"
+            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.assignRace" ng-class="{sel: o.v === form.assignRace}"
               ng-click="pick('assignRace', o.v)">{{o.label}}</div>
           </div>
         </div>
