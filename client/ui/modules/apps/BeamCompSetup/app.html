@@ -409,36 +409,9 @@
       </div>
     </div>
 
-    <!-- Presets (ADR-0037 amendment): save the current setup under a name, or load/delete a saved one.
-         The last standard section, directly above the Tournament block. Tournament/championship fields are
-         NOT saved in a preset. -->
-    <div class="bc-section">
-      <div class="bc-section-title">Presets</div>
-      <div class="bc-row">
-        <span>Name</span>
-        <input type="text" ng-model="presetName" placeholder="preset name">
-      </div>
-      <div class="bc-row">
-        <span>Saved</span>
-        <div class="bc-dd">
-          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('preset')">{{presetLabel()}}</button>
-          <div class="bc-dd-list" ng-if="open === 'preset'">
-            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
-              ng-click="pickPreset(o.v)">{{o.label}}</div>
-            <div class="bc-dd-opt" bc-setup-fit ng-if="!opts.preset.length">no saved presets</div>
-          </div>
-        </div>
-      </div>
-      <div class="bc-row bc-preset-actions">
-        <button class="bc-refresh" ng-disabled="!presetName.trim()" ng-click="savePreset()">Save</button>
-        <button class="bc-refresh" ng-disabled="!selectedPreset" ng-click="loadPreset()">Load</button>
-        <button class="bc-refresh bc-champ-reset" ng-disabled="!selectedPreset" ng-click="deletePreset()">Delete</button>
-      </div>
-    </div>
-
     <!-- Tournament (ADR-0042): one of two mutually-exclusive multi-race formats -- the points championship
          (ADR-0040) or the class-drop handicap. The mode selector reflects the active format; mutations are
-         admin-gated server-side. -->
+         admin-gated server-side. Sits directly above the Presets section (the panel's last section). -->
     <div class="bc-section">
       <div class="bc-section-title">Tournament</div>
       <div class="bc-row">
@@ -563,6 +536,33 @@
         <div class="bc-row bc-champ-actions" ng-if="tournament.active">
           <button class="bc-refresh bc-champ-reset" ng-click="tournamentRestart()">Reset progress</button>
         </div>
+      </div>
+    </div>
+
+    <!-- Presets (ADR-0037 amendment): save the current setup under a name, or load/delete a saved one.
+         The panel's LAST section, below the Tournament block. The whole form is saved -- the race, the
+         multi-race format + its settings, and the full AI setup incl. the roster (nothing is excluded). -->
+    <div class="bc-section">
+      <div class="bc-section-title">Presets</div>
+      <div class="bc-row">
+        <span>Name</span>
+        <input type="text" ng-model="presetName" placeholder="preset name">
+      </div>
+      <div class="bc-row">
+        <span>Saved</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('preset')">{{presetLabel()}}</button>
+          <div class="bc-dd-list" ng-if="open === 'preset'">
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
+              ng-click="pickPreset(o.v)">{{o.label}}</div>
+            <div class="bc-dd-opt" bc-setup-fit ng-if="!opts.preset.length">no saved presets</div>
+          </div>
+        </div>
+      </div>
+      <div class="bc-row bc-preset-actions">
+        <button class="bc-refresh" ng-disabled="!presetName.trim()" ng-click="savePreset()">Save</button>
+        <button class="bc-refresh" ng-disabled="!selectedPreset" ng-click="loadPreset()">Load</button>
+        <button class="bc-refresh bc-champ-reset" ng-disabled="!selectedPreset" ng-click="deletePreset()">Delete</button>
       </div>
     </div>
 
