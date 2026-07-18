@@ -89,14 +89,16 @@ angular.module('beamng.apps')
     };
   }
 
-  // The championship / class-drop keys are EXCLUDED from a saved preset (ADR-0037 amendment): they are
-  // activated live via championshipCmd/tournamentCmd, so baking them into a preset would mislead (a loaded
-  // tourMode would not auto-start anything). The AI roster is excluded too (ADR-0047): presets are
-  // reusable templates, the roster is session state -- only the name pool persists (server-side).
-  // Everything else in the form -- including the selected race -- is saved. Must stay in sync with
-  // freshForm's tournament + roster fields.
-  var PRESET_EXCLUDE_KEYS = ['champPreset', 'champOrder', 'champQualiMinutes',
-    'tourMode', 'tourClasses', 'tourOrder', 'aiRoster'];
+  // A saved preset now PERSISTS the multi-race-format choice AND its settings (ADR-0037 amendment
+  // 2026-07-18, reversing the 2026-07-03 exclusion): tourMode plus the selected format's fields
+  // (championship: champPreset/champOrder/champQualiMinutes; class-drop: tourClasses/tourOrder) round-trip
+  // like the rest of the form. Load is PRE-FILL ONLY -- applyStoredForm sets scope.form directly, never
+  // firing championshipCmd/tournamentCmd, so a loaded format is informational until the admin acts; the
+  // live .active state stays server-driven. That pre-fill-only load is what makes persisting them safe.
+  // The AI roster stays excluded (ADR-0047): presets are reusable templates, the roster is session state --
+  // only the name pool persists (server-side). Everything else in the form -- including the selected race --
+  // is saved.
+  var PRESET_EXCLUDE_KEYS = ['aiRoster'];
 
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
   // the JSON's double quotes pass through; backslashes and single quotes are escaped). Inert when bngApi
@@ -286,7 +288,10 @@ angular.module('beamng.apps')
       // Apply a stored form JSON string (the session-restore blob OR a loaded preset) over a fresh form,
       // then re-sync the option lists and prefetch the configs the restored cars need. Shared by
       // BeamCompSetupForm and BeamCompSetupPresetData so a loaded preset restores EXACTLY like the session
-      // form (ADR-0037 amendment). A preset omits the tournament fields, so those stay at freshForm defaults.
+      // form (ADR-0037 amendment). The merge over freshForm is a plain assignment -- it sets the format
+      // fields (tourMode/champ*/tour*) but never fires championshipCmd/tournamentCmd, so a loaded preset
+      // pre-fills the format without auto-starting it (ADR-0037 amendment 2026-07-18). An OLDER preset that
+      // predates format persistence simply lacks those keys, so they fall back to freshForm defaults.
       function applyStoredForm(formJson) {
         if (!formJson) {
           return;
@@ -363,7 +368,9 @@ angular.module('beamng.apps')
       });
 
       // Apply a loaded preset's form (ADR-0037 amendment): the same restore path as the session form, so a
-      // loaded preset behaves identically. The preset omits the tournament fields -- they stay at defaults.
+      // loaded preset behaves identically -- pre-filling the format selector + settings without auto-starting
+      // (applyStoredForm never fires a championship/tournament command). Old presets predating format
+      // persistence lack those keys and fall back to freshForm defaults (tourMode 'off').
       scope.$on('BeamCompSetupPresetData', function (event, payload) {
         scope.$evalAsync(function () {
           applyStoredForm(payload && payload.form);
@@ -478,9 +485,10 @@ angular.module('beamng.apps')
       };
 
       // Presets (ADR-0037 amendment): save the current form under a name, or load / delete a saved one.
-      // Save strips the tournament/championship keys (activated live, not via a preset) and sends the rest
-      // -- including the selected race -- as an opaque JSON blob GE relays to the server with the map. The
-      // server echoes the updated name list (BeamCompSetupPresets), so the dropdown reflects server truth.
+      // Save strips only the AI roster (session state, ADR-0047) and sends the rest -- including the selected
+      // race AND the multi-race-format choice + its settings (ADR-0037 amendment 2026-07-18) -- as an opaque
+      // JSON blob GE relays to the server with the map. The server echoes the updated name list
+      // (BeamCompSetupPresets), so the dropdown reflects server truth.
       scope.presetLabel = function () {
         return scope.selectedPreset || 'select preset…';
       };
