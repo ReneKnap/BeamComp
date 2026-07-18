@@ -101,6 +101,20 @@ angular.module('beamng.apps')
   // server-driven. Kept as a (currently empty) list so a future must-exclude field has an obvious home.
   var PRESET_EXCLUDE_KEYS = [];
 
+  // Reduce a roster to only its meaningful, persistable fields. Once the roster list has RENDERED, Angular's
+  // ng-repeat stamps a tracking id ($$hashKey) onto every entry, and the per-AI editor sets a transient
+  // _open flag -- neither belongs in stored/transported data. This is the R2-load bug (bug preset-multirace-
+  // roster-not-created): the R2 harness set aiRoster directly (never rendered, so no $$hashKey) and passed,
+  // but the live panel renders the roster before Save, baking a $$hashKey into the preset blob; on load that
+  // FOREIGN tracking id rides back into the reopened panel's ng-repeat and breaks the roster's re-creation.
+  // Persist/restore the clean shape {name, car, carLabel, color} so a loaded roster gets fresh Angular
+  // tracking, and _open never reopens editors against the default-collapsed rule.
+  function cleanRoster(roster) {
+    return (roster || []).map(function (e) {
+      return { name: e.name, car: e.car, carLabel: e.carLabel, color: e.color };
+    });
+  }
+
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
   // the JSON's double quotes pass through; backslashes and single quotes are escaped). Inert when bngApi
   // is unavailable (see header) -- the panel simply cannot submit, never throws.
@@ -306,6 +320,10 @@ angular.module('beamng.apps')
           return;
         }
         scope.form = angular.extend(freshForm(), parsed);
+        // Drop any Angular ng-repeat tracking id ($$hashKey) / editor flag (_open) a preset saved before the
+        // fix baked into its roster entries, so the restored roster renders with fresh tracking instead of a
+        // foreign id (bug preset-multirace-roster-not-created). New presets are already clean (savePreset).
+        scope.form.aiRoster = cleanRoster(scope.form.aiRoster);
         // Auto-reveal the vehicle-restriction fields when a restored form or loaded preset carries any cap
         // value, so a saved restriction is never silently hidden-but-inactive (and older presets that predate
         // the restrictVehicles flag still show their caps).
@@ -506,7 +524,12 @@ angular.module('beamng.apps')
         }
         var formCopy = angular.extend({}, scope.form);
         PRESET_EXCLUDE_KEYS.forEach(function (k) { delete formCopy[k]; });
-        geLuaArg('save_preset', JSON.stringify({ name: name, form: JSON.stringify(formCopy) }));
+        // Strip Angular's ng-repeat internals from the roster before it is stored/transported (see
+        // cleanRoster). angular.toJson (not JSON.stringify) drops any remaining $$-prefixed keys elsewhere
+        // too -- e.g. the tournament class rows once they have rendered -- so no tracking ids leak into the
+        // opaque preset blob.
+        formCopy.aiRoster = cleanRoster(formCopy.aiRoster);
+        geLuaArg('save_preset', JSON.stringify({ name: name, form: angular.toJson(formCopy) }));
       };
       scope.loadPreset = function () {
         if (scope.selectedPreset) {
