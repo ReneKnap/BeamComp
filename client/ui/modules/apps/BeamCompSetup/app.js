@@ -76,7 +76,8 @@ angular.module('beamng.apps')
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
       // Named AI roster (ADR-0047): [{name, car, carLabel}] created via the Create button. THE gate for
       // panel-spawned AI -- buildOverrides sends `ai` only when this is non-empty. Session-restored with
-      // the form; excluded from saved presets (PRESET_EXCLUDE_KEYS).
+      // the form AND saved in a preset (ADR-0047 amendment 2026-07-18): a loaded non-empty roster restores
+      // the "created" state (pre-fill only -- restoring the roster never rolls or spawns).
       aiRoster: [],
       // Composable random-AI axes (aiCar='random'): stock vs random trim, and exclude big/heavy vehicles.
       // Both default ON (sensible-defaults, like the curated race settings): a random compliant trim plus a
@@ -89,14 +90,30 @@ angular.module('beamng.apps')
     };
   }
 
-  // The championship / class-drop keys are EXCLUDED from a saved preset (ADR-0037 amendment): they are
-  // activated live via championshipCmd/tournamentCmd, so baking them into a preset would mislead (a loaded
-  // tourMode would not auto-start anything). The AI roster is excluded too (ADR-0047): presets are
-  // reusable templates, the roster is session state -- only the name pool persists (server-side).
-  // Everything else in the form -- including the selected race -- is saved. Must stay in sync with
-  // freshForm's tournament + roster fields.
-  var PRESET_EXCLUDE_KEYS = ['champPreset', 'champOrder', 'champQualiMinutes',
-    'tourMode', 'tourClasses', 'tourOrder', 'aiRoster'];
+  // A saved preset persists the ENTIRE form -- nothing is excluded anymore (ADR-0037 amendment 2026-07-18,
+  // R2). This covers the multi-race-format choice + its settings (tourMode, champPreset/champOrder/
+  // champQualiMinutes, tourClasses/tourOrder) AND the full AI setup including the named roster
+  // (aiRoster = [{name, car, carLabel, color, ...}]; the ai* scalars were already saved). Load is
+  // PRE-FILL ONLY -- applyStoredForm sets scope.form directly (angular.extend), so it restores the format
+  // fields and the roster verbatim WITHOUT firing any live command (championshipCmd/tournamentCmd) or roll/
+  // spawn: a loaded non-empty roster is simply in the "created" state (ADR-0047: buildOverrides gates `ai`
+  // on a non-empty roster) and spawns at race start like any created roster. The live .active state stays
+  // server-driven. Kept as a (currently empty) list so a future must-exclude field has an obvious home.
+  var PRESET_EXCLUDE_KEYS = [];
+
+  // Reduce a roster to only its meaningful, persistable fields. Once the roster list has RENDERED, Angular's
+  // ng-repeat stamps a tracking id ($$hashKey) onto every entry, and the per-AI editor sets a transient
+  // _open flag -- neither belongs in stored/transported data. This is the R2-load bug (bug preset-multirace-
+  // roster-not-created): the R2 harness set aiRoster directly (never rendered, so no $$hashKey) and passed,
+  // but the live panel renders the roster before Save, baking a $$hashKey into the preset blob; on load that
+  // FOREIGN tracking id rides back into the reopened panel's ng-repeat and breaks the roster's re-creation.
+  // Persist/restore the clean shape {name, car, carLabel, color} so a loaded roster gets fresh Angular
+  // tracking, and _open never reopens editors against the default-collapsed rule.
+  function cleanRoster(roster) {
+    return (roster || []).map(function (e) {
+      return { name: e.name, car: e.car, carLabel: e.carLabel, color: e.color };
+    });
+  }
 
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
   // the JSON's double quotes pass through; backslashes and single quotes are escaped). Inert when bngApi
@@ -286,7 +303,12 @@ angular.module('beamng.apps')
       // Apply a stored form JSON string (the session-restore blob OR a loaded preset) over a fresh form,
       // then re-sync the option lists and prefetch the configs the restored cars need. Shared by
       // BeamCompSetupForm and BeamCompSetupPresetData so a loaded preset restores EXACTLY like the session
-      // form (ADR-0037 amendment). A preset omits the tournament fields, so those stay at freshForm defaults.
+      // form (ADR-0037 amendment). The merge over freshForm is a plain assignment -- it sets the format
+      // fields (tourMode/champ*/tour*) and the AI roster verbatim but never fires championshipCmd/
+      // tournamentCmd or a roster roll/spawn, so a loaded preset pre-fills everything (the format AND the
+      // "created" roster) without auto-starting or spawning it (ADR-0037/0047 amendments 2026-07-18). An
+      // OLDER preset that predates this simply lacks those keys, so they fall back to freshForm defaults
+      // (tourMode 'off', empty roster).
       function applyStoredForm(formJson) {
         if (!formJson) {
           return;
@@ -298,6 +320,10 @@ angular.module('beamng.apps')
           return;
         }
         scope.form = angular.extend(freshForm(), parsed);
+        // Drop any Angular ng-repeat tracking id ($$hashKey) / editor flag (_open) a preset saved before the
+        // fix baked into its roster entries, so the restored roster renders with fresh tracking instead of a
+        // foreign id (bug preset-multirace-roster-not-created). New presets are already clean (savePreset).
+        scope.form.aiRoster = cleanRoster(scope.form.aiRoster);
         // Auto-reveal the vehicle-restriction fields when a restored form or loaded preset carries any cap
         // value, so a saved restriction is never silently hidden-but-inactive (and older presets that predate
         // the restrictVehicles flag still show their caps).
@@ -363,7 +389,9 @@ angular.module('beamng.apps')
       });
 
       // Apply a loaded preset's form (ADR-0037 amendment): the same restore path as the session form, so a
-      // loaded preset behaves identically. The preset omits the tournament fields -- they stay at defaults.
+      // loaded preset behaves identically -- pre-filling the format selector + settings without auto-starting
+      // (applyStoredForm never fires a championship/tournament command). Old presets predating format
+      // persistence lack those keys and fall back to freshForm defaults (tourMode 'off').
       scope.$on('BeamCompSetupPresetData', function (event, payload) {
         scope.$evalAsync(function () {
           applyStoredForm(payload && payload.form);
@@ -478,9 +506,10 @@ angular.module('beamng.apps')
       };
 
       // Presets (ADR-0037 amendment): save the current form under a name, or load / delete a saved one.
-      // Save strips the tournament/championship keys (activated live, not via a preset) and sends the rest
-      // -- including the selected race -- as an opaque JSON blob GE relays to the server with the map. The
-      // server echoes the updated name list (BeamCompSetupPresets), so the dropdown reflects server truth.
+      // Save sends the WHOLE form -- the selected race, the multi-race-format choice + its settings, and the
+      // full AI setup incl. the named roster (ADR-0037/0047 amendments 2026-07-18; PRESET_EXCLUDE_KEYS is
+      // now empty) -- as an opaque JSON blob GE relays to the server with the map. The server echoes the
+      // updated name list (BeamCompSetupPresets), so the dropdown reflects server truth.
       scope.presetLabel = function () {
         return scope.selectedPreset || 'select preset…';
       };
@@ -495,7 +524,12 @@ angular.module('beamng.apps')
         }
         var formCopy = angular.extend({}, scope.form);
         PRESET_EXCLUDE_KEYS.forEach(function (k) { delete formCopy[k]; });
-        geLuaArg('save_preset', JSON.stringify({ name: name, form: JSON.stringify(formCopy) }));
+        // Strip Angular's ng-repeat internals from the roster before it is stored/transported (see
+        // cleanRoster). angular.toJson (not JSON.stringify) drops any remaining $$-prefixed keys elsewhere
+        // too -- e.g. the tournament class rows once they have rendered -- so no tracking ids leak into the
+        // opaque preset blob.
+        formCopy.aiRoster = cleanRoster(formCopy.aiRoster);
+        geLuaArg('save_preset', JSON.stringify({ name: name, form: angular.toJson(formCopy) }));
       };
       scope.loadPreset = function () {
         if (scope.selectedPreset) {
