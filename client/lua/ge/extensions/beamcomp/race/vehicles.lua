@@ -312,11 +312,16 @@ local function spawn_vehicle_at(pose, spec)
 end
 
 -- Build a PRIMARY vehicle paint layer from an opaque roster colour token (ADR-0047, round 3): a hex
--- string "rrggbb" (optionally #-prefixed) -> createVehiclePaint({r, g, b, 1}). Only the primary layer is
--- built; the caller leaves paint2/paint3 nil so those stay stock. Returns the paint object, or nil for a
--- nil/blank/invalid colour or when the paint API is unavailable -- the spawn then uses stock paint. Fully
--- guarded: a paint failure must never block an AI spawn (degrade to stock + log). A bad hex is logged; a
--- simply-absent createVehiclePaint API degrades silently (nothing to paint with).
+-- string "rrggbb" (optionally #-prefixed) -> createVehiclePaint({x = r, y = g, z = b, w = 1}). Only the
+-- primary layer is built; the caller leaves paint2/paint3 nil so those stay stock. Returns the paint
+-- object, or nil for a nil/blank/invalid colour or when the paint API is unavailable -- the spawn then
+-- uses stock paint. Fully guarded: a paint failure must never block an AI spawn (degrade to stock + log).
+-- A bad hex is logged; a simply-absent createVehiclePaint API degrades silently (nothing to paint with).
+--
+-- The colour MUST be field-addressable ({x, y, z, w}), NOT an array {r, g, b, 1}: engine createVehiclePaint
+-- (ge_utils.lua) reads color.x/.y/.z/.w and silently falls back to WHITE when color.x is nil, so an array
+-- token would paint every AI white. This mirrors the proven player-paint path, which passes veh.color (a
+-- field-addressable engine colour) into the same createVehiclePaint.
 local function paint_from_color(color)
     if type(color) ~= "string" or color == "" then
         return nil
@@ -332,7 +337,7 @@ local function paint_from_color(color)
     local r = tonumber(hex:sub(1, 2), 16) / 255
     local g = tonumber(hex:sub(3, 4), 16) / 255
     local b = tonumber(hex:sub(5, 6), 16) / 255
-    local ok, paint = pcall(createVehiclePaint, {r, g, b, 1})
+    local ok, paint = pcall(createVehiclePaint, {x = r, y = g, z = b, w = 1})
     if not ok or not paint then
         log("W", LOG_TAG, "createVehiclePaint failed for '" .. color .. "'; spawning stock paint")
         return nil

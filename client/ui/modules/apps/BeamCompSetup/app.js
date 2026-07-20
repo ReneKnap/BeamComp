@@ -221,13 +221,14 @@ angular.module('beamng.apps')
 
     // AI roster gate (ADR-0047): the panel fields AI only from a created roster -- aiEnabled + count alone
     // send NO `ai` at all, so no AI spawns. The typed /race chat path is unaffected. The roster length IS
-    // the AI count; each entry's pre-picked {name, car} rides opaquely to the server (race-blind) and the
-    // car lands on the per-slot spawn policy. ai.car stays relayed as the chain fallback for an entry
-    // without a car token.
+    // the AI count; each entry's pre-picked {name, car, color} rides opaquely to the server (race-blind) --
+    // the car lands on the per-slot spawn policy and the colour (round 3) becomes the AI's PRIMARY paint
+    // layer at spawn (nil = stock). ai.car stays relayed as the chain fallback for an entry without a car
+    // token.
     var roster = form.aiRoster || [];
     if (form.aiEnabled && roster.length) {
       var ai = { count: roster.length, explicit: true };
-      ai.roster = roster.map(function (e) { return { name: e.name, car: e.car }; });
+      ai.roster = roster.map(function (e) { return { name: e.name, car: e.car, color: e.color }; });
       if (form.aiPreset) { ai.preset = form.aiPreset; }
       if (form.aiCar) { ai.car = form.aiCar; }
       // Composable random-AI axes (resolved client-side in race/ai.lua): sent explicitly as booleans so the
