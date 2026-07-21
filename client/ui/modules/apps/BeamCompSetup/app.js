@@ -263,7 +263,6 @@ angular.module('beamng.apps')
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
         rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
-      scope.rosterHint = '';     // transient roster feedback line (pool save, ...)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
@@ -964,7 +963,6 @@ angular.module('beamng.apps')
             scope.rosterOpen = true;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
-          scope.rosterHint = '';
         });
       });
 
