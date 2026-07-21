@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ai-color-primary-paint/2026-07-20"
+local BUILD_MARKER = "file-ai-drivers/2026-07-21"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2410,10 +2410,10 @@ local function push_setup_data(include_deprecated)
         -- GE roster draw uses, so swatches and auto-assigned colours share one source.
         aiPalette = ai.palette(),
     })
-    -- The pool NAME list for the panel's roster name picker (ADR-0047 amendment R2): built-ins now, plus
-    -- any custom names already cached; refreshed when aiPoolData lands (below). The panel picks names from
-    -- this instead of free typing.
-    guihooks.trigger("BeamCompAiPool", {names = ai.pool_names(M.state.ai_pool)})
+    -- The driver NAME list for the panel's roster name picker (ADR-0048): sourced from the mod-bundled
+    -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
+    -- The panel picks names from this instead of free typing.
+    guihooks.trigger("BeamCompAiPool", {names = ai.pool_names()})
     M.state.grid_list_target = "setup"
     send_to_server("gridListReq", {map = map})
     -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
@@ -2518,11 +2518,11 @@ function M.request_presets()
     send_to_server("presetListReq", {map = map})
 end
 
--- Roll a full or additional named-AI roster for the setup panel (UI -> GE, ADR-0047). Payload JSON:
+-- Roll a full or additional named-AI roster for the setup panel (UI -> GE, ADR-0047/0048). Payload JSON:
 -- {count, mode = "create"|"extend", exclude = [names], ai = {car?, randomTrim, noBigCars},
 -- policy = {car?, maxhp?, maxpwr?, maxkg?, minkg?, randomTrim?, noBigCars?}}. Names draw from the
--- built-in pool + the server-persisted custom pool (M.state.ai_pool) without replacement; each entry's
--- car resolves through the SAME chain the spawn uses (race/ai.lua), so the shown car IS the spawned car.
+-- mod-bundled driver file (the single pool source, ADR-0048) without replacement; each entry's car
+-- resolves through the SAME chain the spawn uses (race/ai.lua), so the shown car IS the spawned car.
 -- Result pushed via BeamCompAiRoster. Public as beamcomp_init.roll_ai_roster.
 function M.roll_ai_roster(json)
     local ok, request = pcall(jsonDecode, json)
@@ -2534,7 +2534,7 @@ function M.roll_ai_roster(json)
     -- excludeColors keeps an extend distinct from the kept entries' colours (ADR-0047 round 3); nil on a
     -- fresh create (nothing to exclude).
     local entries = ai.roll_roster_entries(count, request.exclude, request.ai, request.policy,
-        M.state.ai_pool, request.excludeColors)
+        request.excludeColors)
     guihooks.trigger("BeamCompAiRoster", {
         mode = request.mode == "extend" and "extend" or "create",
         entries = entries,
@@ -2551,7 +2551,7 @@ function M.reroll_ai_name(json)
         log("W", RACE_LOG_TAG, "reroll_ai_name: bad payload")
         return
     end
-    local drawn = ai.draw_roster_names(1, request.exclude, M.state.ai_pool)[1]
+    local drawn = ai.draw_roster_names(1, request.exclude)[1]
     local reply = {index = tonumber(request.index), name = drawn.name}
     if drawn.preferred and ai.preferred_applies(request.ai)
             and ai.preferred_car_compliant(drawn.preferred, request.ai, request.policy) then
