@@ -1083,26 +1083,11 @@ angular.module('beamng.apps')
         e.color = pick;
       };
 
-      // Save an entry's name to the permanent pool (ADR-0047, add-only, server-persisted): stores the name
-      // with its current car (only when concrete -- the host sentinel points at whoever hosts, not a car)
-      // and its current colour, so the saved name comes back with that car AND colour. Takes the entry
-      // object (the list is sorted for display, so $index is not the data slot).
-      scope.savePoolName = function (e) {
-        var name = e && (e.name || '').trim();
-        if (!name) { return; }
-        var payload = { name: name };
-        if (e.car && e.car !== 'host') { payload.car = e.car; }
-        if (e.color) { payload.color = e.color; }
-        geLuaArg('save_ai_pool_name', JSON.stringify(payload));
-        scope.rosterHint = 'Saving "' + name + '" to the name pool'
-          + (payload.car ? ' with its car + colour…' : ' with its colour…');
-      };
-      // Save & Done (R3): the single Change-panel close button persists the AI's current car/type/colour as
-      // its pool name's preferred (savePoolName) AND collapses the panel. Closing the panel now ALWAYS saves
-      // -- there is no close-without-save path (user decision). e._open is an object-property write.
-      scope.saveAndDoneRosterEntry = function (e) {
+      // Done (ADR-0048): the Change-panel's close button just collapses the per-entry editor. The pool is a
+      // dev-authored, ship-fixed file now -- there is no save-to-pool path (the transient car/type/colour
+      // edits apply to this race only and never write back). e._open is an object-property write.
+      scope.doneRosterEntry = function (e) {
         if (!e) { return; }
-        scope.savePoolName(e);
         e._open = false;
       };
 

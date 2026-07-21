@@ -262,7 +262,6 @@ M.state = {
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
-    ai_pool = nil,            -- server-persisted custom AI name-pool entries {name, car?} for the roster rolls (ADR-0047); fetched with the setup dataset, or nil until the first aiPoolData lands
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
@@ -2418,9 +2417,6 @@ local function push_setup_data(include_deprecated)
     send_to_server("gridListReq", {map = map})
     -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
     send_to_server("presetListReq", {map = map})
-    -- Fetch the global custom AI name pool (ADR-0047) so roster rolls include the saved names; the
-    -- aiPoolData reply lands in M.state.ai_pool (rolls before it arrives just use the built-ins).
-    send_to_server("aiPoolReq", {})
 end
 
 -- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
@@ -2578,20 +2574,6 @@ function M.reroll_ai_car(json)
     local index = tonumber(request.index)
     local car = ai.roll_roster_car(request.ai, request.policy, index + 1)
     guihooks.trigger("BeamCompAiRosterCar", {index = index, car = car, carLabel = ai.car_label(car)})
-end
-
--- Save one roster name to the global custom pool (UI -> GE -> server, ADR-0047): payload
--- {name, car?, color?}. Round 3: the one Save button stores name + current car (concrete only) + current
--- colour together. Relayed verbatim to the admin-gated aiPoolSave; the server echoes the updated pool
--- (aiPoolData), which refreshes M.state.ai_pool. Public as beamcomp_init.save_ai_pool_name.
-function M.save_ai_pool_name(json)
-    local ok, decoded = pcall(jsonDecode, json)
-    if not ok or type(decoded) ~= "table"
-        or type(decoded.name) ~= "string" or decoded.name == "" then
-        log("W", RACE_LOG_TAG, "save_ai_pool_name: bad payload")
-        return
-    end
-    send_to_server("aiPoolSave", {name = decoded.name, car = decoded.car, color = decoded.color})
 end
 
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on
@@ -2918,14 +2900,6 @@ local HANDLERS = {
     gridList = handle_grid_list,
     presetData = handle_preset_data,
     presetList = handle_preset_list,
-    -- The global custom AI name pool for the roster rolls (ADR-0047): cached GE-side for the rolls, and its
-    -- NAME list is pushed to the panel's name picker (ADR-0047 amendment R2) so a just-saved name appears in
-    -- the dropdown. Inline closure, not a new top-level local (init.lua sits near the 200-local ceiling).
-    aiPoolData = function(payload)
-        M.state.ai_pool = (type(payload) == "table" and type(payload.entries) == "table")
-            and payload.entries or {}
-        guihooks.trigger("BeamCompAiPool", {names = ai.pool_names(M.state.ai_pool)})
-    end,
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,
     setupOpen = handle_setup_open,
