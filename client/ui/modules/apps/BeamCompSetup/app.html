@@ -305,7 +305,6 @@
           </span>
         </div>
         <div class="bc-roster-hint" ng-if="!form.aiRoster.length">No AI will spawn -- press Create to field the AI roster.</div>
-        <div class="bc-roster-hint" ng-if="rosterHint">{{rosterHint}}</div>
         <div ng-if="rosterOpen && form.aiRoster.length">
           <!-- Compact all-AI editor (ADR-0047 amendment R2/R3): every AI is listed; each expands its own
                Car/Type/Colour panel via e._open. e._open is an OBJECT property, so the write is safe from
@@ -378,10 +377,10 @@
                   title="Roll a random colour">Roll</button>
               </div>
               <div class="bc-row">
-                <span>Pool</span>
+                <span></span>
                 <span class="bc-roster-actions">
-                  <button type="button" class="bc-preset" ng-click="saveAndDoneRosterEntry(e)"
-                    title="Save this AI's car + colour as its pool name's preferred, and close">Save &amp; Done</button>
+                  <button type="button" class="bc-preset" ng-click="doneRosterEntry(e)"
+                    title="Close this AI's editor (car, type and colour apply to this race only)">Done</button>
                 </span>
               </div>
             </div>

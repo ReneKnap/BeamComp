@@ -263,7 +263,6 @@ angular.module('beamng.apps')
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
         rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
-      scope.rosterHint = '';     // transient roster feedback line (pool save, ...)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
@@ -888,11 +887,23 @@ angular.module('beamng.apps')
         });
         return (scope.data.aiPoolNames || []).filter(function (name) { return !taken[name]; });
       };
-      // Pick a roster name from the pool (object-property write). Options already exclude names taken by
-      // other entries, so no duplicate is possible.
+      // Pick a roster name from the pool (ADR-0048): set the name immediately for instant feedback, then load
+      // that driver's car + colour from the file via the GE pinned resolve (pick_ai_name). The reply
+      // (BeamCompAiRosterName) always overwrites this row's car/carLabel/colour with the pinned driver's --
+      // default AI-car mode -> preferred car + colour; random mode -> a rolled car + the preferred colour --
+      // so the name determines car+colour on pick (Q2/Q3). The DATA index rides along (the list is
+      // display-sorted, so $index is not the data slot), like the reroll calls. Options already exclude names
+      // taken by other entries, so no duplicate is possible.
       scope.pickRosterName = function (e, name) {
         scope.open = null;
-        if (e) { e.name = name; }
+        if (!e) { return; }
+        e.name = name;
+        var i = scope.rosterIndexOf(e);
+        if (i < 0) { return; }
+        var spec = rosterRollSpec();
+        spec.index = i;
+        spec.name = name;
+        geLuaArg('pick_ai_name', JSON.stringify(spec));
       };
 
       // The DATA index of an entry in form.aiRoster. The list is displayed alphabetically (orderBy in the
@@ -952,7 +963,6 @@ angular.module('beamng.apps')
             scope.rosterOpen = true;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
-          scope.rosterHint = '';
         });
       });
 
@@ -1083,26 +1093,11 @@ angular.module('beamng.apps')
         e.color = pick;
       };
 
-      // Save an entry's name to the permanent pool (ADR-0047, add-only, server-persisted): stores the name
-      // with its current car (only when concrete -- the host sentinel points at whoever hosts, not a car)
-      // and its current colour, so the saved name comes back with that car AND colour. Takes the entry
-      // object (the list is sorted for display, so $index is not the data slot).
-      scope.savePoolName = function (e) {
-        var name = e && (e.name || '').trim();
-        if (!name) { return; }
-        var payload = { name: name };
-        if (e.car && e.car !== 'host') { payload.car = e.car; }
-        if (e.color) { payload.color = e.color; }
-        geLuaArg('save_ai_pool_name', JSON.stringify(payload));
-        scope.rosterHint = 'Saving "' + name + '" to the name pool'
-          + (payload.car ? ' with its car + colour…' : ' with its colour…');
-      };
-      // Save & Done (R3): the single Change-panel close button persists the AI's current car/type/colour as
-      // its pool name's preferred (savePoolName) AND collapses the panel. Closing the panel now ALWAYS saves
-      // -- there is no close-without-save path (user decision). e._open is an object-property write.
-      scope.saveAndDoneRosterEntry = function (e) {
+      // Done (ADR-0048): the Change-panel's close button just collapses the per-entry editor. The pool is a
+      // dev-authored, ship-fixed file now -- there is no save-to-pool path (the transient car/type/colour
+      // edits apply to this race only and never write back). e._open is an object-property write.
+      scope.doneRosterEntry = function (e) {
         if (!e) { return; }
-        scope.savePoolName(e);
         e._open = false;
       };
 

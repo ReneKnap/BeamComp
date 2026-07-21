@@ -346,14 +346,6 @@ grid_store.MSG_PRESET_LIST_REQ = "presetListReq"  -- panel lists a map's saved p
 grid_store.MSG_PRESET_DATA = "presetData"         -- reply to presetFetch: a preset's form blob (server -> client)
 grid_store.MSG_PRESET_LIST = "presetList"         -- reply to presetListReq: the map's saved preset names (server -> client)
 
--- Custom AI name-pool messages (ADR-0047). The pool is GLOBAL (names are map-independent, unlike the
--- map-scoped presets) and add-only; entries are opaque {name, car?} tables (race-blind, ADR-0005). It
--- persists in the presets file under its own top-level key (see load_presets/write_presets).
-grid_store.MSG_AI_POOL_SAVE = "aiPoolSave"        -- panel saves one custom name (+ optional preferred car) (admin-gated)
-grid_store.MSG_AI_POOL_REQ = "aiPoolReq"          -- client requests the custom pool (read-only)
-grid_store.MSG_AI_POOL_DATA = "aiPoolData"        -- reply to aiPoolReq + echo after a save: {entries} (server -> client)
-grid_store.AI_POOL_MAX = 256                      -- defensive cap on stored custom names (add-only pool)
-
 -- Persistent best-times records (ADR-0027). A separate data file from the settings config (ADR-0016):
 -- records[race_name] = {track_best = {...}, players = {[identity] = {...}}}. The server stores only
 -- numbers + opaque client-reported strings keyed on the relayed race name, so race-blindness (ADR-0005)
@@ -673,9 +665,6 @@ end
 -- resolved path is logged so the write target is visible in the console. Mirrors load_grids.
 function grid_store.load_presets()
     grid_store.presets = {}
-    -- The global custom AI name pool (ADR-0047) rides the same file under its own key, so it shares the
-    -- load/write/atomic-swap plumbing and the deploy-preserve of the presets file.
-    grid_store.ai_pool = {}
 
     local data, path, err = grid_store.read_presets()
     grid_store.presets_path = path
@@ -691,9 +680,6 @@ function grid_store.load_presets()
 
     if type(data.presets) == "table" then
         grid_store.presets = data.presets
-    end
-    if type(data.aiPool) == "table" then
-        grid_store.ai_pool = data.aiPool
     end
     log_info("beamcomp.preset", "loaded presets from " .. path)
 end
@@ -711,8 +697,7 @@ end
 -- Serialize grid_store.presets and write it back, trying the loaded path first then the candidates.
 -- Atomic temp-swap + pcall-guarded, mirroring write_grids. Returns true + path on success, false else.
 function grid_store.write_presets()
-    local ok, encoded = pcall(Util.JsonEncode,
-        {presets = grid_store.presets, aiPool = grid_store.ai_pool})
+    local ok, encoded = pcall(Util.JsonEncode, {presets = grid_store.presets})
     if not ok then
         log_info("beamcomp.preset", "could not encode presets: " .. tostring(encoded))
         return false
@@ -5551,71 +5536,6 @@ function grid_store.handle_preset_list_request(player_id, payload)
     grid_store.send_preset_list(player_id, map)
 end
 
--- Send the global custom AI name pool to one client (ADR-0047): opaque {name, car?} entries in stored
--- (append) order. Fetched with the setup dataset and echoed after every save so the saver's GE cache
--- refreshes at once.
-function grid_store.send_ai_pool(player_id)
-    grid_store.ensure_presets_loaded()
-    send_event(player_id, grid_store.MSG_AI_POOL_DATA, {entries = grid_store.ai_pool})
-end
-
--- Save one custom AI name to the global pool (ADR-0047), sent by the panel. Admin-gated like presetSave.
--- Add-only: an unknown name appends, a known name updates its preferred setup (name kept, car + colour set
--- or cleared by the payload -- names themselves are never removed; there is no delete by decision).
--- Payload: {name, car?, color?}, all opaque strings (race-blind, ADR-0005). The one Save button (round 3)
--- stores name + current car (only when concrete, not the host sentinel) + current colour together, so a
--- saved name comes back with that car AND colour. Echoes the updated pool.
-function grid_store.handle_ai_pool_save(player_id, payload)
-    local player_name = player_name_of(player_id)
-    if not player_name or not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to edit the AI name pool")
-        return
-    end
-    if type(payload) ~= "table" or type(payload.name) ~= "string" or payload.name == "" then
-        MP.SendChatMessage(player_id, "BeamComp: AI name save rejected -- bad data")
-        return
-    end
-    local car = (type(payload.car) == "string" and payload.car ~= "") and payload.car or nil
-    local color = (type(payload.color) == "string" and payload.color ~= "") and payload.color or nil
-
-    grid_store.ensure_presets_loaded()
-    local entry
-    for _, existing in ipairs(grid_store.ai_pool) do
-        -- Type-guarded: the pool file is server-owned but hand-editable; a malformed entry must not
-        -- break saving (it is skipped here and dropped client-side by draw_roster_names' guards).
-        if type(existing) == "table" and existing.name == payload.name then
-            entry = existing
-            break
-        end
-    end
-    if entry then
-        entry.car = car
-        entry.color = color
-    elseif #grid_store.ai_pool >= grid_store.AI_POOL_MAX then
-        MP.SendChatMessage(player_id, "BeamComp: AI name pool is full")
-        return
-    else
-        grid_store.ai_pool[#grid_store.ai_pool + 1] = {name = payload.name, car = car, color = color}
-    end
-
-    if grid_store.write_presets() then
-        MP.SendChatMessage(player_id, "BeamComp: saved AI name '" .. payload.name .. "'"
-            .. (car and " with preferred car" or ""))
-        log_info("beamcomp.aipool", string.format("saved AI name '%s'%s%s by %s",
-            payload.name, car and (" (car " .. car .. ")") or "",
-            color and (" (colour " .. color .. ")") or "", player_name))
-    else
-        MP.SendChatMessage(player_id, "BeamComp: could not write presets file")
-    end
-
-    grid_store.send_ai_pool(player_id)
-end
-
--- Return the custom AI name pool. Read-only, ungated like the preset fetch. Payload: none used.
-function grid_store.handle_ai_pool_request(player_id, _payload)
-    grid_store.send_ai_pool(player_id)
-end
-
 -- Coerce the settings UI's decoded overrides into the shape begin_race_request/start_race expect (the
 -- parse_race_args output, ADR-0037). The payload is an untrusted network boundary, so every field is
 -- type-checked and clamped; unknown fields are dropped. Most values are opaque relay (race-blind,
@@ -5915,10 +5835,6 @@ local function handle_client_event(player_id, data)
         grid_store.handle_preset_fetch(player_id, decoded.payload)
     elseif decoded.type == grid_store.MSG_PRESET_LIST_REQ then
         grid_store.handle_preset_list_request(player_id, decoded.payload)
-    elseif decoded.type == grid_store.MSG_AI_POOL_SAVE then
-        grid_store.handle_ai_pool_save(player_id, decoded.payload)
-    elseif decoded.type == grid_store.MSG_AI_POOL_REQ then
-        grid_store.handle_ai_pool_request(player_id, decoded.payload)
     elseif decoded.type == MSG_START_RACE then
         handle_start_race(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_GO then

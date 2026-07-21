@@ -24,6 +24,10 @@ local M = {}
 local vehicles = require("beamcomp/race/vehicles")
 local cones = require("beamcomp/race/cones")
 local vehiclespecs = require("beamcomp/race/vehiclespecs")
+-- The dev-authored driver definitions (ADR-0048): the SINGLE source of the named-AI pool -- every driver's
+-- name -> preferred car + preferred colour. Replaces the old built-in NAME_POOL and the runtime-writable,
+-- server-persisted custom pool. A mod-bundled data module, hand-edited in the repo, ships fixed.
+local drivers = require("beamcomp/race/ai_drivers")
 
 local LOG_TAG = "beamcomp.ai"
 
@@ -848,29 +852,27 @@ function M.server_id_of(veh)
     return server_id
 end
 
--- ===== Named AI roster (ADR-0047) =====
+-- ===== Named AI driver pool (ADR-0047 roster + ADR-0048 file-defined pool) =====
 
--- Built-in nickname pool for the named-AI roster: 64 tongue-in-cheek English racing gamer tags (no real
--- people or brands). Custom names saved by admins live in the server-persisted pool and mix in via the
--- custom_pool argument of the draw helpers; only those custom entries can carry a preferred car.
-local NAME_POOL = {
-    "BrakeChecker99", "SundayDriver", "CrashTestDummy", "CaptainOversteer",
-    "LiftOffLenny", "ApexPredator", "GravelMagnet", "WallHugger",
-    "LastLapLarry", "TurboTortoise", "NitroNoodle", "HandbrakeHank",
-    "OversteerOtto", "UndersteerUncle", "PitLanePete", "RedMistRandy",
-    "SlipstreamSally", "TrackLimitTed", "DNFDenny", "BackmarkerBob",
-    "ChicaneCharlie", "DriftKingDave", "FuelSaverFred", "GridGoblin",
-    "HairpinHarry", "KerbstoneKevin", "LockupLuke", "MirrorMissingMike",
-    "NoBrakesNed", "OilPatchOllie", "PhotoFinishPhil", "QualifyingQuinn",
-    "RumbleStripRick", "SandTrapSam", "TailgateTina", "TorqueSteerTom",
-    "VMaxVinnie", "WheelspinWalt", "YellowFlagYuri", "ZigzagZack",
-    "AeroLessAndy", "BargeBoardBarry", "CoastingCarl", "DiveBombDylan",
-    "EarlyApexEddie", "FlatOutFinn", "GhostBraker", "HotLapHugo",
-    "InsideLineIzzy", "JumpStartJack", "KamikazeKarl", "LateBrakeLewis",
-    "MidfieldMarty", "NoGripNigel", "OptimisticOwen", "PanicBrakePaul",
-    "RageQuitRoy", "SpinCycleStan", "ThrottleTherapy", "UnsafeReleaseUli",
-    "VibesOnlyVic", "WreckItWes", "XenonXavier", "BoxThisLapBen",
-}
+-- Name -> driver definition {name, car, color}, built once from the driver file for O(1) pinned lookups
+-- (M.resolve_pick). A malformed row (missing/empty name) is skipped; a duplicate name keeps the first.
+local DRIVERS_BY_NAME = {}
+for _, driver in ipairs(drivers) do
+    if type(driver) == "table" and type(driver.name) == "string" and driver.name ~= ""
+            and not DRIVERS_BY_NAME[driver.name] then
+        DRIVERS_BY_NAME[driver.name] = driver
+    end
+end
+
+-- The driver definition {name, car, color} for a name, or nil when the file has no such driver (ADR-0048):
+-- a hand-typed or legacy roster name that is not in the file resolves to nil (the caller then rolls a car
+-- and draws a fallback colour). Public so the pinned-pick GE endpoint can resolve a specific name.
+function M.driver_by_name(name)
+    if type(name) ~= "string" then
+        return nil
+    end
+    return DRIVERS_BY_NAME[name]
+end
 
 -- Built-in colour palette for the named-AI roster (ADR-0047, round 3): ~18 bold, well-distinguishable
 -- opaque hex strings (lowercase, no leading #). Each AI is painted in one of these as its PRIMARY paint
@@ -890,27 +892,17 @@ function M.palette()
     return COLOR_PALETTE
 end
 
--- The pool NAME list for the panel's name picker (ADR-0047 amendment R2): the server-persisted custom
--- names first (the admin's own), then the built-in nicknames, deduplicated (a custom re-save of a built-in
--- name shows once). The R2 editor picks a roster name from this dropdown instead of free typing; the custom
--- pool arrives via aiPoolData, so before it lands only the built-ins show. `custom_pool` is M.state.ai_pool
--- ({name, car?, color?} entries) or nil.
-function M.pool_names(custom_pool)
+-- The driver NAME list for the panel's name picker (ADR-0048): every driver name from the file, in file
+-- order, deduplicated. The editor picks a roster name from this dropdown instead of free typing. Sourced
+-- from the mod-bundled driver file (the single pool source) -- no server round-trip.
+function M.pool_names()
     local names = {}
     local seen = {}
-    if type(custom_pool) == "table" then
-        for _, entry in ipairs(custom_pool) do
-            if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= ""
-                    and not seen[entry.name] then
-                names[#names + 1] = entry.name
-                seen[entry.name] = true
-            end
-        end
-    end
-    for _, name in ipairs(NAME_POOL) do
-        if not seen[name] then
-            names[#names + 1] = name
-            seen[name] = true
+    for _, driver in ipairs(drivers) do
+        if type(driver) == "table" and type(driver.name) == "string" and driver.name ~= ""
+                and not seen[driver.name] then
+            names[#names + 1] = driver.name
+            seen[driver.name] = true
         end
     end
     return names
@@ -932,13 +924,12 @@ local function draw_color(used)
     return COLOR_PALETTE[math.random(#COLOR_PALETTE)]
 end
 
--- Draw `count` roster names without replacement (ADR-0047): custom pool entries (which may carry a
--- preferred car and/or preferred colour) plus the built-ins, minus `exclude` (the panel's existing roster
--- names, exact match). Custom names take pool priority only in candidate ORDER; the draw itself is uniform
--- over all remaining candidates. Pool exhaustion (impossible in practice: 64+ names vs. max 16 AI)
--- degrades to "AI <k>" fallback names + a log instead of failing the roll. Returns a list of
--- {name, preferred?, preferredColor?}.
-function M.draw_roster_names(count, exclude, custom_pool)
+-- Draw `count` roster names without replacement from the driver file (ADR-0048), minus `exclude` (the
+-- panel's existing roster names, exact match). Every driver carries a preferred car + preferred colour, so
+-- every candidate does. The draw is uniform over the remaining drivers. Pool exhaustion (impossible in
+-- practice: 64 names vs. max 16 AI) degrades to "AI <k>" fallback names + a log instead of failing the
+-- roll. Returns a list of {name, preferred, preferredColor}.
+function M.draw_roster_names(count, exclude)
     local taken = {}
     if type(exclude) == "table" then
         for _, name in ipairs(exclude) do
@@ -946,21 +937,13 @@ function M.draw_roster_names(count, exclude, custom_pool)
         end
     end
     local candidates = {}
-    if type(custom_pool) == "table" then
-        for _, entry in ipairs(custom_pool) do
-            if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= ""
-                    and not taken[entry.name] then
-                candidates[#candidates + 1] = {
-                    name = entry.name, preferred = entry.car, preferredColor = entry.color,
-                }
-                taken[entry.name] = true
-            end
-        end
-    end
-    for _, name in ipairs(NAME_POOL) do
-        if not taken[name] then
-            candidates[#candidates + 1] = {name = name}
-            taken[name] = true
+    for _, driver in ipairs(drivers) do
+        if type(driver) == "table" and type(driver.name) == "string" and driver.name ~= ""
+                and not taken[driver.name] then
+            candidates[#candidates + 1] = {
+                name = driver.name, preferred = driver.car, preferredColor = driver.color,
+            }
+            taken[driver.name] = true
         end
     end
     local drawn = {}
@@ -1061,15 +1044,34 @@ function M.car_label(token)
     return label .. " - " .. vehicle_config
 end
 
--- Roll `count` full roster entries for the panel (ADR-0047): draw unique names (built-ins + the custom
--- pool, minus `exclude`), then per entry resolve the car and the colour. Car: the name's preferred car
--- when the row's car would be rolled at all (preferred_applies) and it passes the active restrictions
--- (preferred_car_compliant), else a car rolled through the spawn chain (roll_roster_car). Colour: the
--- name's preferred colour ALWAYS when it carries one (colour is unrestricted -- no compliance, ADR-0047
--- round 3), else a palette colour drawn without replacement across this batch AND `exclude_colors` (the
--- panel's existing roster colours, so an extend stays distinct from the kept entries). Returns a list of
+-- Resolve one drawn candidate ({name, preferred, preferredColor}) to a full roster entry
+-- {name, car, carLabel, color} (ADR-0047/0048). Car: the name's preferred car when the row's car would be
+-- rolled at all (preferred_applies) and it passes the active restrictions (preferred_car_compliant), else a
+-- car rolled through the spawn chain (roll_roster_car). Colour: the name's preferred colour ALWAYS when it
+-- carries one (colour is unrestricted -- no compliance, ADR-0047 round 3), else a palette colour drawn
+-- without replacement across `used`. `index` cycles content defaults if they ever apply; `used` is the
+-- colour set for the fallback draws. Shared by roll_roster_entries (random names) and resolve_pick (a
+-- pinned name), so the two never drift.
+local function entry_from_drawn(drawn, config, policy, index, used)
+    local car
+    if drawn.preferred and M.preferred_applies(config)
+            and M.preferred_car_compliant(drawn.preferred, config, policy) then
+        car = drawn.preferred
+    else
+        car = M.roll_roster_car(config, policy, index)
+    end
+    local color = drawn.preferredColor or draw_color(used)
+    used[color] = true
+    return {name = drawn.name, car = car, carLabel = M.car_label(car), color = color}
+end
+
+-- Roll `count` full roster entries for the panel (ADR-0047/0048): draw unique driver names from the file
+-- (minus `exclude`), then resolve each to a car + colour via the shared entry_from_drawn. Colours are drawn
+-- without replacement across this batch AND `exclude_colors` (the panel's existing roster colours, so an
+-- extend stays distinct from the kept entries) -- though every file driver carries a preferred colour, so
+-- the fallback draw only fires for a hand-added name without one. Returns a list of
 -- {name, car, carLabel, color} ready for the panel.
-function M.roll_roster_entries(count, exclude, config, policy, custom_pool, exclude_colors)
+function M.roll_roster_entries(count, exclude, config, policy, exclude_colors)
     config = type(config) == "table" and config or {}
     policy = type(policy) == "table" and policy or {}
     local used = {}
@@ -1079,19 +1081,29 @@ function M.roll_roster_entries(count, exclude, config, policy, custom_pool, excl
         end
     end
     local entries = {}
-    for k, drawn in ipairs(M.draw_roster_names(count, exclude, custom_pool)) do
-        local car
-        if drawn.preferred and M.preferred_applies(config)
-                and M.preferred_car_compliant(drawn.preferred, config, policy) then
-            car = drawn.preferred
-        else
-            car = M.roll_roster_car(config, policy, k)
-        end
-        local color = drawn.preferredColor or draw_color(used)
-        used[color] = true
-        entries[k] = {name = drawn.name, car = car, carLabel = M.car_label(car), color = color}
+    for k, drawn in ipairs(M.draw_roster_names(count, exclude)) do
+        entries[k] = entry_from_drawn(drawn, config, policy, k, used)
     end
     return entries
+end
+
+-- Resolve a specific PINNED driver name to a full roster entry {name, car, carLabel, color} (ADR-0048) --
+-- the name-pick load path. Unlike draw_roster_names this does NOT draw randomly: it looks the name up in the
+-- driver file and applies the SAME car/colour rules as a rolled entry (entry_from_drawn), so default mode ->
+-- the driver's preferred car (when compliant) + preferred colour, and random mode (config.car == "random")
+-- -> a freshly rolled car + the preferred colour (Q3: only the car varies by mode). The car+colour it
+-- returns always overwrite the row's prior manual selection (Q2). A name absent from the file resolves too:
+-- no preferred car -> a rolled car, no preferred colour -> a palette colour. Returns the entry table.
+function M.resolve_pick(name, config, policy)
+    config = type(config) == "table" and config or {}
+    policy = type(policy) == "table" and policy or {}
+    local driver = M.driver_by_name(name)
+    local drawn = {
+        name = name,
+        preferred = driver and driver.car or nil,
+        preferredColor = driver and driver.color or nil,
+    }
+    return entry_from_drawn(drawn, config, policy, 1, {})
 end
 
 -- The owner's aiMap entries (ADR-0036): each AI car's label + its BeamMP server id, for the relay that
