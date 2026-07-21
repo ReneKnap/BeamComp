@@ -888,11 +888,23 @@ angular.module('beamng.apps')
         });
         return (scope.data.aiPoolNames || []).filter(function (name) { return !taken[name]; });
       };
-      // Pick a roster name from the pool (object-property write). Options already exclude names taken by
-      // other entries, so no duplicate is possible.
+      // Pick a roster name from the pool (ADR-0048): set the name immediately for instant feedback, then load
+      // that driver's car + colour from the file via the GE pinned resolve (pick_ai_name). The reply
+      // (BeamCompAiRosterName) always overwrites this row's car/carLabel/colour with the pinned driver's --
+      // default AI-car mode -> preferred car + colour; random mode -> a rolled car + the preferred colour --
+      // so the name determines car+colour on pick (Q2/Q3). The DATA index rides along (the list is
+      // display-sorted, so $index is not the data slot), like the reroll calls. Options already exclude names
+      // taken by other entries, so no duplicate is possible.
       scope.pickRosterName = function (e, name) {
         scope.open = null;
-        if (e) { e.name = name; }
+        if (!e) { return; }
+        e.name = name;
+        var i = scope.rosterIndexOf(e);
+        if (i < 0) { return; }
+        var spec = rosterRollSpec();
+        spec.index = i;
+        spec.name = name;
+        geLuaArg('pick_ai_name', JSON.stringify(spec));
       };
 
       // The DATA index of an entry in form.aiRoster. The list is displayed alphabetically (orderBy in the

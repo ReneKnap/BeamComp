@@ -2562,6 +2562,29 @@ function M.reroll_ai_name(json)
     guihooks.trigger("BeamCompAiRosterName", reply)
 end
 
+-- Load a specific PINNED driver's car + colour for a roster entry (UI -> GE, ADR-0048): payload
+-- {index, name, ai, policy}. Unlike reroll_ai_name (a random draw), this resolves the NAMED driver's file
+-- entry via ai.resolve_pick -- default AI-car mode -> the driver's preferred car + colour; random mode -> a
+-- freshly rolled car + the driver's preferred colour (Q3: only the car varies by mode). The reply always
+-- carries a concrete car + colour, so the panel OVERWRITES any prior manual selection for that row (Q2).
+-- Result pushed via the shared BeamCompAiRosterName path. Public as beamcomp_init.pick_ai_name.
+function M.pick_ai_name(json)
+    local ok, request = pcall(jsonDecode, json)
+    if not ok or type(request) ~= "table" or tonumber(request.index) == nil
+            or type(request.name) ~= "string" or request.name == "" then
+        log("W", RACE_LOG_TAG, "pick_ai_name: bad payload")
+        return
+    end
+    local entry = ai.resolve_pick(request.name, request.ai, request.policy)
+    guihooks.trigger("BeamCompAiRosterName", {
+        index = tonumber(request.index),
+        name = entry.name,
+        car = entry.car,
+        carLabel = entry.carLabel,
+        color = entry.color,
+    })
+end
+
 -- Re-roll one roster entry's car (UI -> GE, ADR-0047): payload {index, ai, policy}. An explicit re-roll
 -- is a manual override, so it deliberately bypasses the name's preferred car (which would pin the button
 -- to one result). Result pushed via BeamCompAiRosterCar. Public as beamcomp_init.reroll_ai_car.
