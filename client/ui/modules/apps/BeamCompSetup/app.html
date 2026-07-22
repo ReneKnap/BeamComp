@@ -201,6 +201,19 @@
         <span class="bc-champ-status bc-order-locked" ng-if="championship.active">by championship ({{championship.order}})</span>
         <span class="bc-champ-status bc-order-locked" ng-if="!championship.active && tournament.active">by tournament (class handicap)</span>
       </div>
+      <!-- Qualifying's own start order (ADR-0044 amendment): only for order=quali. The base order used
+           INSIDE the quali -- random (default) or the previous race's finishing order. In a staged sprint
+           quali the spawn slot then predicts the launch sequence (P2 launches first, P3 next, ...). -->
+      <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">
+        <span>Qualifying start</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('qualiStart')">{{labelFor('qualiStart')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'qualiStart'">
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.qualiStart" ng-class="{sel: o.v === form.qualiStart}"
+              ng-click="pick('qualiStart', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
       <!-- Qualifying length (ADR-0041): only for order=quali; a short session sets the grid by best lap.
            A free minute value plus preset quick-buttons. -->
       <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">

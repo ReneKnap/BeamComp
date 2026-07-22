@@ -1272,6 +1272,22 @@ end
 -- same grid.
 local function build_slots(players, order, last_order, champ_order, ai_count)
     local mode = order and order.mode
+    -- The quali provisional grid honors the selectable quali-start order (ADR-0044 amendment,
+    -- quali-start-order): random (default) or `last` (previous finish). Reuse the existing random / last
+    -- slot paths verbatim, so the AI handling and the last_order source behave exactly as order=random /
+    -- order=last; the deferred quali.regrid still sets the real race grid by pace after the qualifying
+    -- session (ADR-0041). The staged launch queue is built from these slots (quali.start_session), so the
+    -- spawn-slot order and the launch order are one and the same (ADR-0044). qualiStart is UI-only -- the
+    -- chat order=quali path leaves it nil, which defaults to random (byte-identical to before). Only the
+    -- local `order`/`mode` are rebound here; session.order keeps mode="quali" so the quali lifecycle holds.
+    if mode == "quali" then
+        if order.qualiStart == "last" then
+            order = {mode = "last", rev = false}  -- pole to the previous winner; quali takes no :rev
+            mode = "last"
+        else
+            mode = "random"
+        end
+    end
     local ids
     if mode == "random" then
         ids = {}
@@ -1298,6 +1314,29 @@ local function build_slots(players, order, last_order, champ_order, ai_count)
             ids = shuffle(field)  -- first race, everyone on 0 points -> random grid (ADR-0040)
         else
             ids = place_by_identity(field, champ_order, order and order.rev)
+        end
+    elseif mode == "last" then
+        -- order=last (ADR-0033) over the FULL field: session.last_order is captured from the final
+        -- standings, which carry the AI's display names (ADR-0031/0047), so the AI have last-race finish
+        -- info too. Rank players + AI together by it -- exactly the championship branch's mixed numeric/
+        -- string-id handling -- instead of ordering only the players and pinning the AI to the back. AI
+        -- present in last_order land in their last-finish order; AI absent from it (fresh roster / first
+        -- race) fall to the back via place_by_identity's rest group. An empty/missing source -> random
+        -- fallback, exactly as the players-only path did (order_ids) and as championship does. This is the
+        -- shared build_slots seam, so it fixes order=last for the main-race grid AND the quali provisional
+        -- grid (qualiStart=last is remapped to this mode above) -- one coherent behavior.
+        local field = {}
+        for id in pairs(players) do
+            field[#field + 1] = id
+        end
+        table.sort(field)
+        for _, ai_id in ipairs(ai_id_list(ai_count)) do
+            field[#field + 1] = ai_id
+        end
+        if type(last_order) ~= "table" or #last_order == 0 then
+            ids = shuffle(field)  -- no finishing-order source yet -> random fallback (ADR-0033 §2)
+        else
+            ids = place_by_identity(field, last_order, order and order.rev)
         end
     else
         ids = order_ids(players, order, last_order)
@@ -1836,6 +1875,23 @@ function quali.clamp(seconds)
     return math.max(quali.MIN_SECONDS, math.min(quali.MAX_SECONDS, seconds))
 end
 
+-- The qualifying's OWN start-order modes (ADR-0044 amendment, quali-start-order): the base order used
+-- INSIDE a quali -- its provisional grid + the staged launch queue -- distinct from the race order= that
+-- grids the main race (ADR-0033). Only `random` (default = today) and `last` (the previous race's
+-- finishing order); NOT the full entry/pwr set. Kept on the quali table (no new top-level local, 200-local
+-- ceiling).
+quali.START_MODES = {random = true, last = true}
+
+-- Normalize a UI-supplied quali-start value to a known mode, defaulting to random (quali-start-order):
+-- an unknown or absent value falls back to random, so a chat /race order=quali (which carries no field)
+-- stays byte-identical to today. Parsed defensively -- only a known string survives.
+function quali.normalize_start(value)
+    if type(value) == "string" and quali.START_MODES[value] then
+        return value
+    end
+    return "random"
+end
+
 -- Begin a quali event with a session length in seconds (already resolved/clamped by the caller, else the
 -- default). Cleared by reset_to_lobby, so it never outlives the event (contrast last_order/championship).
 function quali.begin(duration, staged)
@@ -2277,12 +2333,14 @@ function quali.start_session()
     for id in pairs(session.progress) do
         ids[#ids + 1] = id
     end
-    -- Deterministic base (slot order) then a single random shuffle at session start (ADR-0044/Round5): the
-    -- staged running order (who goes to the ramp first, second, ...) is random rather than the slot order. AI
-    -- shuffle in as regular queue participants. Race-blind -- just an ordering of participant ids; the server
-    -- owns + broadcasts the positions, so every client stays consistent. Reset/requeue still appends to the back.
+    -- Build the turn queue in SLOT order (ADR-0044 amendment, quali-start-order): the holding slots ARE the
+    -- quali provisional grid, which already honors the chosen quali-start order (random default, or last;
+    -- build_slots). So the launch sequence == the spawn-slot order -- whoever spawns on grid position 2
+    -- launches first, position 3 next, ... -- and the two orderings are one and the same at session start.
+    -- (Round 5's independent shuffle here is removed; the ordering now lives in the grid assignment.) AI are
+    -- regular queue participants in slot order. Race-blind -- just an ordering of participant ids the server
+    -- owns + broadcasts, so every client stays consistent. Reset/requeue still appends to the back (unchanged).
     table.sort(ids, function(a, b) return session.progress[a].slot < session.progress[b].slot end)
-    shuffle(ids)
     local q = session.quali
     q.queue = ids
     q.staging_id = nil
@@ -5586,6 +5644,13 @@ local function sanitize_overrides(raw)
     -- Start order (ADR-0033): only a known mode survives; rev is a flag on a directional mode.
     if type(raw.order) == "table" and ORDER_MODES[raw.order.mode] then
         overrides.order = {mode = raw.order.mode, rev = raw.order.rev == true}
+        -- The qualifying's OWN start order (ADR-0044 amendment, quali-start-order): only for order=quali,
+        -- only a known value survives, default random -- so a chat /race order=quali (no field) stays
+        -- byte-identical. It seeds the quali provisional grid (build_slots), and the staged launch queue
+        -- follows that grid (quali.start_session), so the spawn slot and the launch order agree.
+        if raw.order.mode == "quali" then
+            overrides.order.qualiStart = quali.normalize_start(raw.order.qualiStart)
+        end
     end
 
     -- Qualifying length (ADR-0041): a UI-supplied minutes value for order=quali, clamped to bounds.

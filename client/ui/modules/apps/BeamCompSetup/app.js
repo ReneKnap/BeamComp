@@ -18,6 +18,9 @@ angular.module('beamng.apps')
     orderMode: [{ v: 'entry', label: 'entry' }, { v: 'random', label: 'random' },
       { v: 'last', label: 'last result' }, { v: 'pwr', label: 'power/weight' },
       { v: 'quali', label: 'qualifying' }],
+    // The qualifying's OWN start order (ADR-0044 amendment): the base order used INSIDE a quali, shown only
+    // for order=quali. random (default = today) or the previous race's finishing order.
+    qualiStart: [{ v: 'random', label: 'random' }, { v: 'last', label: 'last result' }],
     qualiPresets: [5, 8, 12, 15],
     champPreset: [{ v: 'f1', label: 'F1 (25-18-15…)' }, { v: 'linear', label: 'linear (per starter)' },
       { v: 'quadratic', label: 'quadratic (64-32-16…)' }],
@@ -69,7 +72,7 @@ angular.module('beamng.apps')
       // big/heavy vehicles. Both default ON (parity with the AI freshForm defaults), sent as explicit
       // booleans so a saved preset round-trips the admin's choice.
       carRandomTrim: true, carNoBigCars: true,
-      orderMode: 'random', orderRev: false, qualiMinutes: 5, grid: '',
+      orderMode: 'random', orderRev: false, qualiStart: 'random', qualiMinutes: 5, grid: '',
       f1Start: false, jumpPenalty: 15,
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
@@ -183,6 +186,12 @@ angular.module('beamng.apps')
       },
       order: { mode: form.orderMode, rev: !!form.orderRev },
     };
+    // The qualifying's own start order (ADR-0044 amendment): only for order=quali; nested in the order
+    // block, known value only. The server defaults an absent/unknown value to random (byte-identical to the
+    // chat path), so this is safe to always send when quali is chosen.
+    if (form.orderMode === 'quali') {
+      o.order.qualiStart = form.qualiStart;
+    }
     // Qualifying length (ADR-0041): only meaningful for order=quali; sent as minutes, the server clamps.
     if (form.orderMode === 'quali' && num(form.qualiMinutes) !== undefined) {
       o.qualiMinutes = num(form.qualiMinutes);
