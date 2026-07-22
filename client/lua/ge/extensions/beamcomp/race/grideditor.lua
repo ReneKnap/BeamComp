@@ -33,11 +33,12 @@ local maps = require("beamcomp/race/maps")
 
 local LOG_TAG = "beamcomp.grid"
 
--- The editor previews the grid's full fixed-capacity field by default so the layout reads clearly while
--- tuning, even with fewer (or no) players present -- and so the preview matches where cars actually spawn
--- (the layout is count-independent, grid.LAYOUT_CAPACITY). The count is tunable (M.set_preview_count) so an
--- admin can preview a larger or smaller field; grid.poses grows the layout above the capacity.
-local DEFAULT_PREVIEW_COUNT = grid.LAYOUT_CAPACITY
+-- The editor previews a fixed 16-slot field by default so a large grid reads clearly while tuning, even
+-- with fewer (or no) players present. This is a VIEW default only, deliberately DECOUPLED from the grid's
+-- layout capacity (grid.LAYOUT_CAPACITY, currently 8): the layout is count-independent, so grid.poses grows
+-- the field above the capacity to fill the previewed slots. The count is tunable (M.set_preview_count,
+-- clamped to [MIN_PREVIEW_COUNT, MAX_PREVIEW_COUNT]) so an admin can preview a larger or smaller field.
+local DEFAULT_PREVIEW_COUNT = 16
 local MIN_PREVIEW_COUNT = 1
 local MAX_PREVIEW_COUNT = 32
 

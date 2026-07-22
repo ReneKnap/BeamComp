@@ -23,12 +23,12 @@ angular.module('beamng.apps')
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)' },
     { key: 'offsetLateral', label: 'Offset lateral (m)' },
-    { key: 'offsetHeight', label: 'Height lift (m)' },
     { key: 'headingDeg', label: 'Heading (deg)' },
     { key: 'rowGap', label: 'Row gap (m)' },
     { key: 'colGap', label: 'Col gap (m)' },
     { key: 'rows', label: 'Rows', integer: true, auto: true },
     { key: 'columns', label: 'Columns', integer: true, auto: true },
+    { key: 'offsetHeight', label: 'Height lift (m)' },
   ];
 
   var PREVIEW_MIN = 1;
@@ -120,7 +120,7 @@ angular.module('beamng.apps')
       // ordered breakpoint boundaries ([{startSlot}]), `activeSegment` the 1-based index the knobs edit,
       // `activeStartSlot` that segment's start slot (ADR-0023 amendment).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
-        previewCount: 8, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null };
+        previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null };
       scope.edit = {};          // editable mirror of the knob number fields, synced from state on each push
       scope.savedName = null;   // set after a save/load; gates Assign (you assign an existing grid)
       scope.open = null;        // name of the currently open dropdown, or null
