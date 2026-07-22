@@ -500,6 +500,13 @@
       opacity: 0.7;
       margin-right: 3px;
     }
+    /* The finish-line delta that trails the absolute lap/run time (feature quali-finish-time-with-delta):
+       a space behind the neutral time, slightly smaller; its green/red comes from bc-delta-neg/pos on the
+       span itself (this rule sets no colour, so it never overrides them). */
+    .beamcomp-hud .bc-qd-cum .bc-qd-cum-delta {
+      margin-left: 6px;
+      font-size: 0.85em;
+    }
     .beamcomp-hud .bc-qd-seg {
       font-size: 20px;
       font-weight: bold;
@@ -883,11 +890,14 @@
          record-coloured (purple = session best, green = personal best, red = slower than your best). Persists
          the last completed sector until the next crossing; hidden until the first crossing of the session. -->
     <div class="bc-quali-sector" ng-if="hud.sector">
-      <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+      <!-- Finish (last checkpoint): the absolute lap total (neutral colour, no +/- sign), with the delta
+           vs your previous best behind it on the same line when a reference exists, coloured green faster /
+           red slower (feature quali-finish-time-with-delta). Mutually exclusive with the intermediate div
+           below via the cumulativeTotal null-check, so exactly one bc-qd-cum renders per frame. -->
+      <div class="bc-qd-cum" ng-if="hud.sector.cumulativeTotal != null"><span class="bc-qd-lbl">LAP</span>{{formatTime(hud.sector.cumulativeTotal)}}<span class="bc-qd-cum-delta" ng-if="hud.sector.cumulative != null" ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}">{{formatDelta(hud.sector.cumulative)}}</span></div>
+      <!-- Intermediate sectors: the running cumulative delta vs your best lap only (unchanged). -->
+      <div class="bc-qd-cum" ng-if="hud.sector.cumulativeTotal == null && hud.sector.cumulative != null"
            ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">LAP</span>{{formatDelta(hud.sector.cumulative)}}</div>
-      <!-- First completed lap, no previous best yet: the absolute lap total (neutral colour, no +/- sign),
-           mutually exclusive with the delta div above (quali-finish-delta-prev-best). -->
-      <div class="bc-qd-cum" ng-if="hud.sector.cumulativeTotal != null"><span class="bc-qd-lbl">LAP</span>{{formatTime(hud.sector.cumulativeTotal)}}</div>
       <div class="bc-qd-seg"
            ng-class="'bc-rec-' + hud.sector.record"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
     </div>
@@ -958,11 +968,14 @@
          personal best / red slower). Hidden until the first crossing of the run; no reference on the first
          run shows white (no crash). -->
     <div class="bc-quali-sector" ng-if="hud.sector">
-      <div class="bc-qd-cum" ng-if="hud.sector.cumulative != null"
+      <!-- Finish (last checkpoint): the absolute run total (neutral colour, no +/- sign), with the delta
+           vs your best complete run behind it on the same line when a reference exists, coloured green
+           faster / red slower (feature quali-finish-time-with-delta). Mutually exclusive with the
+           intermediate div below via the cumulativeTotal null-check, so exactly one bc-qd-cum renders. -->
+      <div class="bc-qd-cum" ng-if="hud.sector.cumulativeTotal != null"><span class="bc-qd-lbl">RUN</span>{{formatTime(hud.sector.cumulativeTotal)}}<span class="bc-qd-cum-delta" ng-if="hud.sector.cumulative != null" ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}">{{formatDelta(hud.sector.cumulative)}}</span></div>
+      <!-- Intermediate sectors: the running cumulative delta vs your best run only (unchanged). -->
+      <div class="bc-qd-cum" ng-if="hud.sector.cumulativeTotal == null && hud.sector.cumulative != null"
            ng-class="{'bc-delta-neg': hud.sector.cumulative < 0, 'bc-delta-pos': hud.sector.cumulative > 0}"><span class="bc-qd-lbl">RUN</span>{{formatDelta(hud.sector.cumulative)}}</div>
-      <!-- First completed run, no previous best yet: the absolute run total (neutral colour, no +/- sign),
-           mutually exclusive with the delta div above (quali-finish-delta-prev-best). -->
-      <div class="bc-qd-cum" ng-if="hud.sector.cumulativeTotal != null"><span class="bc-qd-lbl">RUN</span>{{formatTime(hud.sector.cumulativeTotal)}}</div>
       <div class="bc-qd-seg"
            ng-class="'bc-rec-' + hud.sector.record"><span class="bc-qd-name">S{{hud.sector.sector}}</span>{{formatSeconds(hud.sector.split)}}<span class="bc-qd-delta" ng-if="hud.sector.splitDelta != null">{{formatDelta(hud.sector.splitDelta)}}</span></div>
     </div>

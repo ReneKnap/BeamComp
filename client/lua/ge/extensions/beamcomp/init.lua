@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-finish-delta/2026-07-22"
+local BUILD_MARKER = "quali-finish-time-delta/2026-07-22"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -4551,9 +4551,11 @@ local function build_hud_snapshot()
             local cumulative, cumulative_total = nil, nil
             if type(best_cumulative) == "number" then
                 cumulative = last.lap_cumulative - best_cumulative
-            elseif at_finish then
-                -- No previous best yet (first completed lap/run): show the absolute lap/run total
-                -- instead of a delta (Fragerunde 2026-07-22).
+            end
+            if at_finish then
+                -- Always show the absolute lap/run total at the finish; the delta (if any) renders
+                -- behind it (feature quali-finish-time-with-delta). Intermediate sectors keep the
+                -- running delta only (cumulative_total stays nil there).
                 cumulative_total = last.lap_cumulative
             end
             sector_info = {
@@ -4563,7 +4565,7 @@ local function build_hud_snapshot()
                 splitDelta = (last.prev_personal_best ~= nil)
                     and (last.split - last.prev_personal_best) or nil,
                 cumulative = cumulative,  -- vs your previous best run (nil until a prior run exists)
-                cumulativeTotal = cumulative_total,  -- absolute lap/run total on the first finish (no prior best)
+                cumulativeTotal = cumulative_total,  -- absolute lap/run total at the finish (any completed lap/run); nil at intermediate sectors
                 record = sectors.record_class(last.split, last.prev_personal_best, session_best),
             }
         end
