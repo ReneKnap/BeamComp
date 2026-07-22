@@ -61,9 +61,9 @@ angular.module('beamng.apps')
   }
 
   // Curated panel defaults (ADR-0037): a fresh form opens at opinionated race settings -- random start
-  // order, plus (once AI is toggled on) 4 hard AI on random stock cars that avoid each other. These differ
-  // from bare /race (entry order, no AI car); the session form-restore (BeamCompSetupForm) overrides them
-  // after a race has been set up.
+  // order, plus (once AI is toggled on) 4 hard AI on their file-preferred car + colour (ADR-0048) that
+  // avoid each other. These differ from bare /race (entry order, no AI car); the session form-restore
+  // (BeamCompSetupForm) overrides them after a race has been set up.
   function freshForm() {
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
@@ -75,7 +75,7 @@ angular.module('beamng.apps')
       orderMode: 'random', orderRev: false, qualiStart: 'random', qualiMinutes: 5, grid: '',
       f1Start: false, jumpPenalty: 15,
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
-      aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: 'random', aiRoute: '', aiAdvanced: false,
+      aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: '', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
       // Named AI roster (ADR-0047): [{name, car, carLabel}] created via the Create button. THE gate for
       // panel-spawned AI -- buildOverrides sends `ai` only when this is non-empty. Session-restored with
