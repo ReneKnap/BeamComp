@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grideditor-preview-height/2026-07-22"
+local BUILD_MARKER = "quali-finish-delta/2026-07-22"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -4535,13 +4535,26 @@ local function build_hud_snapshot()
             local session_best = sectors.effective_session_best(last.split,
                 last.prev_session_best, session_ref and session_ref[last.sector] or nil,
                 session_counts and session_counts[last.sector] or nil)
-            -- Cumulative delta vs your fastest run: this run's time through the sector minus that run's.
-            local best_sections = sectors.personal_reference(personal_splits, personal_run_up, sector_cps)
+            -- Cumulative delta vs your PREVIOUS best run: this run's time through the sector minus that
+            -- run's. At the finish crossing on a CIRCUIT the just-finished lap is already folded into
+            -- personal_splits (local_entry.splits), so exclude it -- otherwise a new best would diff
+            -- against itself and read ±0 (bug quali-finish-delta-prev-best). The staged sprint reads the
+            -- server-relayed best COMPLETE run (bestSplits), which is still the previous best at the
+            -- finish frame (the round-trip that folds this run in has not returned yet), so it must NOT
+            -- be excluded -- it is a single run, and dropping it would discard the legitimate reference.
+            local at_finish = (last.sector == sector_cps)
+            local exclude_just_finished = at_finish and not M.state.quali_staged
+            local best_sections = sectors.personal_reference(personal_splits, personal_run_up,
+                sector_cps, exclude_just_finished)
             local best_cumulative = best_sections
                 and sectors.cumulative_through(best_sections, last.sector) or nil
-            local cumulative = nil
+            local cumulative, cumulative_total = nil, nil
             if type(best_cumulative) == "number" then
                 cumulative = last.lap_cumulative - best_cumulative
+            elseif at_finish then
+                -- No previous best yet (first completed lap/run): show the absolute lap/run total
+                -- instead of a delta (Fragerunde 2026-07-22).
+                cumulative_total = last.lap_cumulative
             end
             sector_info = {
                 sector = last.sector,
@@ -4549,7 +4562,8 @@ local function build_hud_snapshot()
                 -- Per-segment delta vs your prior personal best for this sector (nil the first time).
                 splitDelta = (last.prev_personal_best ~= nil)
                     and (last.split - last.prev_personal_best) or nil,
-                cumulative = cumulative,  -- vs fastest run (nil until a run is complete)
+                cumulative = cumulative,  -- vs your previous best run (nil until a prior run exists)
+                cumulativeTotal = cumulative_total,  -- absolute lap/run total on the first finish (no prior best)
                 record = sectors.record_class(last.split, last.prev_personal_best, session_best),
             }
         end
