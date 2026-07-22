@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-finish-time-delta/2026-07-22"
+local BUILD_MARKER = "grideditor-clear-buttons/2026-07-23"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2622,7 +2622,8 @@ end
 local function handle_grid_setup_open(_payload)
     M.state.grid_seed_race = nil
     push_grid_data()
-    -- Re-spawn the reference scene for a still-active (persisted) session, since close removed its props.
+    -- Re-spawn the reference scene if a session is still active on open (e.g. one started from the GE
+    -- console) -- its props are otherwise only spawned when the session begins.
     refresh_grid_edit_scene()
     guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
 end
@@ -2792,23 +2793,22 @@ function M.grid_delete(name)
     editor_feedback("deleting grid '" .. name .. "' ...")
 end
 
--- Close the grid-editor panel (UI -> GE): just hide the app. The edit session is deliberately KEPT alive so
--- reopening within the session restores the in-progress grid (its knobs/name persist, reflected by
--- push_grid_data). A starting race or the explicit Clear action ends the session; clearing pillars on a mere
--- panel close would lose the work the user wanted to keep.
+-- Close the grid-editor panel (UI -> GE): END the edit session, then hide the app. Close is now a clean
+-- teardown -- it runs the shared clear (grideditor.clear + grid_active_name = nil), which also drops the
+-- reference props and the preview, then removes the panel, so a reopen starts empty at "pick a race".
+-- A grid you want to keep across a close must be Saved first: there is no reopen-restore. (The old
+-- "keep the session alive on close" behaviour was reversed 2026-07-23, folding the standalone Clear
+-- button's teardown into Close/New/Load.)
 function M.close_grid_editor()
     M.state.grid_seed_race = nil
-    -- Remove the physical reference props (they have collision -- leaving them in free-roam would be
-    -- intrusive); the lightweight grid/checkpoint preview stays with the kept session and a reopen
-    -- re-spawns the props.
-    props.clear(M.state.grid_edit_prop_names or {})
-    M.state.grid_edit_prop_names = nil
+    -- Reuse the full teardown primitive (session + name + props + checkpoint + reflect); no duplication.
+    M.clear_grid_editor()
     guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
 end
 
--- Clear the grid-editor session (UI -> GE): end editing, remove the preview pillars, and reflect the now-empty
--- state so the panel returns to its "pick a race" start. The panel stays open. The explicit counterpart to
--- close (which keeps the session).
+-- Clear the grid-editor session (GE): end editing, drop the preview pillars + reference props, and reflect
+-- the now-empty state so the panel returns to its "pick a race" start. The panel stays open. This is the
+-- shared teardown primitive -- Close reuses it (and then removes the panel).
 function M.clear_grid_editor()
     grideditor.clear()
     M.state.grid_active_name = nil

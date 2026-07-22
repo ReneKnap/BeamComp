@@ -378,14 +378,8 @@ angular.module('beamng.apps')
         geAssign(scope.form.assignRace, scope.savedName);
       };
 
-      // Clear ends the edit session (pillars vanish, panel returns to "pick a race"); the session is kept
-      // alive by Close so a reopen restores it.
-      scope.clearEditor = function () {
-        scope.savedName = null;
-        scope.form.saveName = '';
-        geCall('clear_grid_editor');
-      };
-
+      // Close ends the edit session GE-side (grid + preview cleared) and hides the panel; a reopen starts
+      // empty at "pick a race". A fresh scope on reopen resets savedName/saveName, so no UI reset here.
       scope.close = function () {
         geCall('close_grid_editor');
       };
