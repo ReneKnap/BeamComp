@@ -163,10 +163,20 @@ end
 
 -- The personal reference sectors: the per-section times of the fastest completed lap in `splits`
 -- (ADR-0022 fastest-lap), used for the cumulative delta. Returns a 1-based array of section times, or
--- nil when no lap is complete yet.
-function M.personal_reference(splits, run_up, cps)
+-- nil when no lap is complete yet. `exclude_last` (optional, default off) drops the LAST complete lap
+-- from the search: at the finish crossing on a circuit the just-finished lap is already folded into
+-- `splits`, so excluding it makes the reference the driver's PREVIOUS best (else a new best would diff
+-- against itself; bug quali-finish-delta-prev-best). Backward-compatible -- callers omitting it are
+-- unchanged.
+function M.personal_reference(splits, run_up, cps, exclude_last)
+    local laps = laps_from_splits(splits, cps, run_up)
+    local n = #laps
+    if exclude_last then
+        n = n - 1
+    end
     local best = nil
-    for _, lap in ipairs(laps_from_splits(splits, cps, run_up)) do
+    for i = 1, n do
+        local lap = laps[i]
         if type(lap.total) == "number" and (best == nil or lap.total < best.total) then
             best = lap
         end
