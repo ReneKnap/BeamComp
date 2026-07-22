@@ -34,6 +34,15 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    /* Settings popover (setup-settings-menu): a right-aligned gear reusing .bc-dd. Overrides geometry
+       only -- .bc-settings shrinks the wrapper and pushes it to the right of the toolbar; the head drops
+       the full width + the ::after chevron and shows just the gear; the list anchors to the right edge
+       (not stretched full-width) and sizes to its two toggle rows. */
+    .bc-settings { flex: 0 0 auto; margin-left: auto; }
+    .bc-settings-head { width: auto; text-align: center; padding: 2px 8px; }
+    .bc-settings-head::after { content: none; }
+    .bc-settings-list { left: auto; right: 0; min-width: 190px; padding: 4px; }
+    .bc-settings-item { padding: 4px 7px; white-space: nowrap; }
     /* Long dropdown labels (bcSetupFit): the directive wraps each label in .bc-fit-clip > .bc-fit-text.
        The clip is a block that fills the cell content box (so it stops before the head's 22px chevron
        padding) and hides overflow; the inline-block text is shrunk to fit and, if still too wide, given a
@@ -97,9 +106,19 @@
     .bc-swatch-inline { display: inline-block; vertical-align: middle; width: 14px; height: 14px; }
   </style>
 
+  <!-- Settings popover (setup-settings-menu): a gear on the right of the toolbar reuses the .bc-dd
+       open/close + outside-click infra (scope.toggle / scope.open / closeOnOutsideClick). The .bc-dd
+       wrapper is exactly what closeOnOutsideClick exempts, so a toggle click inside keeps it open while
+       an outside click closes it -- no JS change. It houses the relocated "incl. deprecated" (keeps its
+       ng-change="refresh()") and "Force" toggles. -->
   <div class="bc-toolbar">
-    <button class="bc-refresh" ng-click="refresh()">Refresh</button>
-    <label class="bc-tog"><input type="checkbox" ng-model="form.includeDeprecated" ng-change="refresh()"><span>incl. deprecated</span></label>
+    <div class="bc-dd bc-settings">
+      <button type="button" class="bc-dd-head bc-settings-head" ng-click="toggle('settings')" title="Settings">&#x2699;</button>
+      <div class="bc-dd-list bc-settings-list" ng-if="open === 'settings'">
+        <label class="bc-tog bc-settings-item"><input type="checkbox" ng-model="form.includeDeprecated" ng-change="refresh()"><span>incl. deprecated</span></label>
+        <label class="bc-tog bc-settings-item"><input type="checkbox" ng-model="form.force"><span>Force (ignore mismatch)</span></label>
+      </div>
+    </div>
   </div>
 
   <div class="bc-setup-scroll">
@@ -132,7 +151,6 @@
         <input type="number" min="1" ng-model="form.laps" placeholder="auto">
       </label>
       <label class="bc-row bc-check"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
-      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.force"><span>Force (ignore mismatch)</span></label>
     </div>
 
     <!-- Vehicles -->
