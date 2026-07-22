@@ -1315,6 +1315,29 @@ local function build_slots(players, order, last_order, champ_order, ai_count)
         else
             ids = place_by_identity(field, champ_order, order and order.rev)
         end
+    elseif mode == "last" then
+        -- order=last (ADR-0033) over the FULL field: session.last_order is captured from the final
+        -- standings, which carry the AI's display names (ADR-0031/0047), so the AI have last-race finish
+        -- info too. Rank players + AI together by it -- exactly the championship branch's mixed numeric/
+        -- string-id handling -- instead of ordering only the players and pinning the AI to the back. AI
+        -- present in last_order land in their last-finish order; AI absent from it (fresh roster / first
+        -- race) fall to the back via place_by_identity's rest group. An empty/missing source -> random
+        -- fallback, exactly as the players-only path did (order_ids) and as championship does. This is the
+        -- shared build_slots seam, so it fixes order=last for the main-race grid AND the quali provisional
+        -- grid (qualiStart=last is remapped to this mode above) -- one coherent behavior.
+        local field = {}
+        for id in pairs(players) do
+            field[#field + 1] = id
+        end
+        table.sort(field)
+        for _, ai_id in ipairs(ai_id_list(ai_count)) do
+            field[#field + 1] = ai_id
+        end
+        if type(last_order) ~= "table" or #last_order == 0 then
+            ids = shuffle(field)  -- no finishing-order source yet -> random fallback (ADR-0033 §2)
+        else
+            ids = place_by_identity(field, last_order, order and order.rev)
+        end
     else
         ids = order_ids(players, order, last_order)
         for _, ai_id in ipairs(ai_id_list(ai_count)) do
