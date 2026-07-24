@@ -45,9 +45,21 @@ local CONE_PROP_NAME_PREFIX = "beamcomp_cone_"
 
 -- Where the filtered prefab copies are written (one per source prefab index). BeamNG temp vpaths,
 -- overwritten each load -- no cleanup needed. statics-only for the non-host barriers, cones-only for
--- the host's quickrace cone source.
+-- the host's quickrace cone source, cone-capped for the host's mission prefabs.
 local STATICS_TMP_PREFIX = "/temp/beamcomp_statics_"
 local CONES_TMP_PREFIX = "/temp/beamcomp_cones_"
+local CAPPED_TMP_PREFIX = "/temp/beamcomp_capped_"
+
+-- The host caps the number of cone prop-vehicles it instantiates from a mission prefab (ADR-0020
+-- amendment). A cone-rich time-trial track (wcusa trackAttack_002/003: 72/81 cones vs 33 in the working
+-- _001) otherwise spawns every cone as a real, BeamMP-propagated vehicle synchronously, and a burst of
+-- 70+ hangs the BeamMP race start so handle_race_start never completes (no timer/countdown/AI). This is
+-- NOT the MaxCars cap (reproduced at MaxCars=256) -- it is the act of spawning that many vehicles at
+-- once, so a fixed conservative cap is the fix, not a count limit. 48 = first bet: 33 is proven to work,
+-- 72 hangs; it also stays under a default MaxCars of 64. Kept as a single constant so it drops trivially
+-- if 48 still hangs in the in-game test. Non-cone objects (statics/decals/SimGroup) are always kept;
+-- only cones beyond the cap are dropped.
+local MAX_CONE_VEHICLES = 48
 
 -- The set of vehicle object IDs currently in the scene, so the cone prop-vehicles a subsequent
 -- prefab load creates can be told apart from pre-existing (player/synced) vehicles.
@@ -93,20 +105,33 @@ function M.load(prefab_files, keep_cones, cone_files)
         -- Clear the name first: addPrefab refuses an existing name, and this also reaps any
         -- orphan from a prior load whose tracked names were lost (e.g. a hard reload).
         pcall(removePrefab, name)
-        -- Non-hosts spawn a statics-only copy so the cone vehicles are never created (ADR-0020). The
-        -- host spawns the full file as-is. If the filter fails, degrade to the full prefab rather
-        -- than leave the client with no barriers (logged). The statics filter is JSONL-only, so it is
-        -- applied only to .prefab.json files (the mission prefabs); a legacy .prefab (the cone-free
-        -- quickrace barriers, ADR-0024) has no cone vehicles to drop and is spawned full on every
-        -- client -- routing its TorqueScript through the JSONL filter would corrupt it.
+        -- Filter the JSONL mission prefabs (ADR-0020); a legacy .prefab (the cone-free quickrace
+        -- barriers, ADR-0024) has no cone vehicles and is spawned full on every client -- routing its
+        -- TorqueScript through the JSONL filter would corrupt it, so only .prefab.json files are filtered.
+        --   * Non-hosts spawn a STATICS-ONLY copy so the cone vehicles are never created (ADR-0020).
+        --   * The host spawns a CONE-CAPPED copy: statics + at most MAX_CONE_VEHICLES cones, the overflow
+        --     dropped, so a cone-rich track's 70+ synchronous cone spawns can't hang the BeamMP race start
+        --     (ADR-0020 amendment). Under the cap it is content-identical to the full prefab.
+        -- Either filter degrades to the full prefab (logged) rather than leaving the client with no
+        -- barriers / the host with no cones.
         local source = file
-        if not keep_cones and file:find("%.prefab%.json$") then
-            local statics_file = STATICS_TMP_PREFIX .. i .. ".prefab.json"
-            if prefab.write_statics_only(file, statics_file) then
-                source = statics_file
+        if file:find("%.prefab%.json$") then
+            if keep_cones then
+                local capped_file = CAPPED_TMP_PREFIX .. i .. ".prefab.json"
+                if prefab.write_capped(file, capped_file, MAX_CONE_VEHICLES) then
+                    source = capped_file
+                else
+                    log("W", LOG_TAG, "cone-cap filter failed; loading full prefab '"
+                        .. tostring(file) .. "'")
+                end
             else
-                log("W", LOG_TAG, "statics-only filter failed; loading full prefab '"
-                    .. tostring(file) .. "'")
+                local statics_file = STATICS_TMP_PREFIX .. i .. ".prefab.json"
+                if prefab.write_statics_only(file, statics_file) then
+                    source = statics_file
+                else
+                    log("W", LOG_TAG, "statics-only filter failed; loading full prefab '"
+                        .. tostring(file) .. "'")
+                end
             end
         end
         -- Identity pos/rot/scale: prefab object coords are absolute world-space, so the

@@ -107,6 +107,77 @@ function M.write_statics_only(prefab_file, dest_file)
     return true
 end
 
+-- Split a JSONL prefab's lines into a capped list -- every non-cone line PLUS the first `max_cones`
+-- cone prop-vehicle lines, in file order -- along with the kept-cone and dropped-cone counts. The host
+-- spawns this instead of the full mission prefab so a cone-rich track cannot instantiate 70+ cone
+-- vehicles synchronously and hang the BeamMP race start (ADR-0020 amendment). Keeps anything not
+-- positively identified as a cone (statics/decals/SimGroup) -- a bad line decodes to nil (pcall is the
+-- boundary) and is kept, exactly like filter_statics. Same class match as filter_statics, so a grinder
+-- prop-vehicle counts toward the cap too.
+local function filter_capped(raw, max_cones)
+    local kept = {}
+    local kept_cones = 0
+    local dropped = 0
+    for line in (raw .. "\n"):gmatch("(.-)\n") do
+        local trimmed = line:gsub("\r$", "")
+        if trimmed ~= "" then
+            local ok, obj = pcall(jsonDecode, trimmed)
+            if ok and is_cone_object(obj) then
+                if kept_cones < max_cones then
+                    kept[#kept + 1] = trimmed
+                    kept_cones = kept_cones + 1
+                else
+                    dropped = dropped + 1
+                end
+            else
+                kept[#kept + 1] = trimmed
+            end
+        end
+    end
+    return kept, kept_cones, dropped
+end
+
+-- Write a cone-capped copy of `prefab_file` to `dest_file`: every non-cone line plus at most
+-- `max_cones` cone prop-vehicle lines, kept verbatim, the overflow cones dropped. Returns true on
+-- success, false (logged) if the file cannot be read/written or has no objects to keep. The host spawns
+-- `dest_file` instead of the full mission prefab so a cone-rich track cannot hang the race start with a
+-- burst of synchronous cone-vehicle spawns (ADR-0020 amendment); under the cap the copy is
+-- content-identical to the full prefab. JSONL-only (mission prefabs are `.prefab.json`).
+function M.write_capped(prefab_file, dest_file, max_cones)
+    if type(readFile) ~= "function" or type(writeFile) ~= "function" then
+        log("W", LOG_TAG, "readFile/writeFile unavailable -- cannot filter prefab")
+        return false
+    end
+
+    local raw = readFile(prefab_file)
+    if not raw then
+        log("W", LOG_TAG, "could not read prefab '" .. tostring(prefab_file) .. "'")
+        return false
+    end
+
+    local kept, kept_cones, dropped = filter_capped(raw, max_cones)
+    if #kept == 0 then
+        log("W", LOG_TAG, "prefab '" .. tostring(prefab_file) .. "' had no objects to keep")
+        return false
+    end
+
+    if not writeFile(dest_file, table.concat(kept, "\n")) then
+        log("W", LOG_TAG, "could not write filtered prefab '" .. tostring(dest_file) .. "'")
+        return false
+    end
+
+    if dropped > 0 then
+        log("I", LOG_TAG, string.format(
+            "capped race cones: spawned %d of %d (dropped %d to avoid the BeamMP mass-spawn "
+                .. "race-start hang) -> %s", kept_cones, kept_cones + dropped, dropped, dest_file))
+    else
+        log("I", LOG_TAG, string.format(
+            "capped race cones: kept all %d cone(s) (under the cap of %d) -> %s",
+            kept_cones, max_cones, dest_file))
+    end
+    return true
+end
+
 -- The static-scenery content to ship to a file-less client so it can spawn this race's barriers/signs
 -- without the local file (ADR-0039). For a JSONL mission prefab the statics-only string (cone vehicles
 -- dropped, like write_statics_only -- a file-less client must never instantiate a cone, ADR-0020); for
