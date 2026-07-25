@@ -24,6 +24,43 @@ local LOG_TAG = "beamcomp.spawn"
 -- getPlayerVehicle(0) is (the walking unicycle, or a prop), so the player landed in a non-car.
 local DEFAULT_VEHICLE_MODEL = "etk800"
 
+-- Max length of a real partConfig PRESET NAME (bug partconfig-blob-bloats-standings). Named .pc presets are
+-- short (e.g. "etk800_300d"); an inline-customized car can instead expose its FULL serialized partsTree as
+-- veh.partConfig -- a ~74 KB string. That blob must never be reported as a records `variant` (it keyed the
+-- per-race records AND, pre-fix, bloated every ~1 Hz standings broadcast to ~150 KB, freezing the host). 64
+-- is comfortably above any real preset name and far below a serialized blob. Kept in sync with the server
+-- gate (main.lua net.safe_variant).
+local VARIANT_MAX_LEN = 64
+
+-- True when `s` is a plausible partConfig PRESET NAME: a short, single-line string with no serialized-table
+-- markers ("{" / "partsTree"), as opposed to an inline-customized car's serialized partsTree blob. Gates
+-- what may be reported as a records `variant` and what may ride a spec's `config` onto a spawn. A rejected
+-- value buckets the car under model-only for records (ADR-0029), the documented intent for a customized car.
+local function is_preset_variant(s)
+    if type(s) ~= "string" or s == "" or #s > VARIANT_MAX_LEN then
+        return false
+    end
+    if s:find("[{\r\n]") or s:find("partsTree", 1, true) then
+        return false
+    end
+    return true
+end
+
+-- Guard a captured spec `config` (bug partconfig-blob-bloats-standings). A config that reproduces a car for a
+-- local spawn is legitimately either an inline parts TABLE (a tuned car) or a named preset STRING -- both are
+-- kept unchanged. But an inline-customized car can expose its serialized partsTree as a ~74 KB STRING; that
+-- blob is neither a real preset nor a parts table, so it is dropped (-> nil -> the model's default trim)
+-- rather than copied onto a spawn or onto any spec that could leave this client. A table is never the blob.
+local function safe_config(config)
+    if type(config) == "table" then
+        return config
+    end
+    if is_preset_variant(config) then
+        return config
+    end
+    return nil
+end
+
 -- Delete every owned vehicle except `keep_id` (pass nil to delete all). Returns the count deleted
 -- (0 is valid), or nil plus a reason when there is no MP session to act in. Shared by despawn_own
 -- and despawn_owned_except. getOwnMap is a BeamMP GE global that exists only inside an MP session;
@@ -135,7 +172,9 @@ function M.capture_spec(veh)
         local paints = veh:getMetallicPaintData()
         return {
             model = veh.JBeam,
-            config = veh.partConfig,
+            -- Gate a serialized-partsTree blob out of the copied config (bug partconfig-blob-bloats-standings):
+            -- a legitimate parts table or short preset name is kept; a ~74 KB blob-string is dropped to nil.
+            config = safe_config(veh.partConfig),
             paint = createVehiclePaint(veh.color, paints[1]),
             paint2 = createVehiclePaint(veh.colorPalette0, paints[2]),
             paint3 = createVehiclePaint(veh.colorPalette1, paints[3]),
@@ -160,7 +199,9 @@ function M.host_car_spec(veh)
         return nil
     end
     local ok, spec = pcall(function()
-        return {model = veh.JBeam, config = veh.partConfig}
+        -- Gate a serialized-partsTree blob out of the "same as host" config (bug partconfig-blob-bloats-
+        -- standings): a legit parts table / short preset is kept; a ~74 KB blob-string is dropped to nil.
+        return {model = veh.JBeam, config = safe_config(veh.partConfig)}
     end)
     if not ok or type(spec.model) ~= "string" or spec.model == "" then
         return nil
@@ -749,11 +790,14 @@ local function detect_modified(veh)
     if not ok or part_config == nil then
         return nil
     end
-    if type(part_config) == "string" then
-        return false
-    end
     if type(part_config) == "table" then
         return true
+    end
+    if type(part_config) == "string" then
+        -- A real preset name -> stock/preset (not modified). A serialized partsTree blob string (an inline-
+        -- customized car whose partConfig came through as text, bug partconfig-blob-bloats-standings) is NOT
+        -- a clean preset -> modified. This corrects the prior type-only check that mislabeled such a car.
+        return not is_preset_variant(part_config)
     end
     return nil
 end
@@ -793,10 +837,12 @@ function M.collect_client_info(veh)
     end
 
     -- Vehicle variant: the named partConfig preset (e.g. "etk800_300d") when the car is a stock/preset
-    -- config (partConfig is a string); nil for an inline-customized parts blob, which buckets under the
-    -- model alone for records (ADR-0029). Same field detect_modified reads, so it is known to work here.
+    -- config, nil otherwise -- an inline-customized car buckets under the model alone for records (ADR-0029).
+    -- Only a SHORT, non-serialized preset name is accepted (is_preset_variant): an inline-customized car can
+    -- expose its full serialized partsTree as a ~74 KB string here, which must never be reported -- pre-fix
+    -- it leaked into the per-second standings car.key and froze the host (bug partconfig-blob-bloats-standings).
     local ok_variant, part_config = pcall(function() return veh.partConfig end)
-    if ok_variant and type(part_config) == "string" and part_config ~= "" then
+    if ok_variant and is_preset_variant(part_config) then
         info.vehicle.variant = part_config
     end
 

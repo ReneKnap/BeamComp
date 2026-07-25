@@ -856,6 +856,25 @@ end
 -- than top-level locals: main.lua sits at LuaJIT's 200-local ceiling (see grid_store / f1).
 local net = {peak = {}}
 
+-- Guard a reported partConfig `variant` before it can key a record, ride the wire, or be persisted (bug
+-- partconfig-blob-bloats-standings). A real preset name is a short string; an inline-customized car can
+-- report its full serialized partsTree (~74 KB) as `variant`, which pre-fix leaked into car.key and bloated
+-- every ~1 Hz standings broadcast to ~150 KB, freezing the host. Accept only a short (<= 64 char),
+-- single-line string with no serialized-table markers ("{" / "partsTree"); anything else -> nil, so the car
+-- buckets under model-only (vehicle_car_key). The 64 cap matches the client gate (race/vehicles.lua).
+-- Defense-in-depth: the client already gates this at the source, but an old/malformed client -- or a legacy
+-- records.json entry loaded into track.vehicle -- can still carry a blob. On `net` (not a top-level local):
+-- main.lua sits at LuaJIT's 200-local ceiling, and guarding what goes on the wire is a net concern.
+function net.safe_variant(variant)
+    if type(variant) ~= "string" or variant == "" or #variant > 64 then
+        return nil
+    end
+    if variant:find("[{\r\n]") or variant:find("partsTree", 1, true) then
+        return nil
+    end
+    return variant
+end
+
 -- Note an outgoing envelope's encoded size; log it only if it is that type's largest so far. The encode
 -- is pcall-guarded and its result discarded (BeamMP re-encodes the table for the wire) -- a measurement
 -- must never be the thing that breaks a send.
@@ -1396,20 +1415,26 @@ local function vehicle_car_key(vehicle)
     if type(vehicle) ~= "table" or type(vehicle.model) ~= "string" or vehicle.model == "" then
         return nil
     end
-    if type(vehicle.variant) == "string" and vehicle.variant ~= "" then
-        return vehicle.model .. "/" .. vehicle.variant
+    -- Only a short, non-serialized preset name is a valid variant (bug partconfig-blob-bloats-standings). A
+    -- malformed/old client or a legacy records.json entry can carry a full serialized partsTree here; gate it
+    -- so it can never key a record or ride a payload. Rejected -> model-only key (the inline-modified bucket).
+    local variant = net.safe_variant(vehicle.variant)
+    if variant then
+        return vehicle.model .. "/" .. variant
     end
     return vehicle.model
 end
 
--- A compact car descriptor for the standings entry and the records payload (ADR-0029): the records key
--- plus the raw fields the overlay shows. nil when there is no usable vehicle.
+-- A compact car descriptor for the one-shot carInfo channel and the records payload (ADR-0029 amendment): the
+-- records key plus the raw fields the overlay shows. nil when there is no usable vehicle. `variant` is NOT
+-- shipped separately -- `key` already encodes the (capped) variant, so the client derives the label from it
+-- (car_label); shipping both duplicated the ~74 KB blob pre-fix (bug partconfig-blob-bloats-standings).
 local function car_descriptor(vehicle)
     local key = vehicle_car_key(vehicle)
     if not key then
         return nil
     end
-    return {key = key, model = vehicle.model, variant = vehicle.variant, modified = vehicle.modified}
+    return {key = key, model = vehicle.model, modified = vehicle.modified}
 end
 
 -- Build the live ranked standings from session.progress: a pure function over the per-player
@@ -1425,7 +1450,6 @@ local function build_standings(final)
 
     local ranked = {}
     local known_count
-    local identities = session.identities or {}
     for id, record in pairs(session.progress) do
         ranked[#ranked + 1] = {id = id, record = record}
         if not known_count and record.count then
@@ -1455,8 +1479,11 @@ local function build_standings(final)
     local entries = {}
     for i, item in ipairs(ranked) do
         local record = item.record
-        local info = identities[item.id]
         entries[i] = {
+            -- Participant id (the progress key): the client joins the one-shot car descriptor (carInfo
+            -- channel) to this entry by id. Small + regrid-stable (survives quali.regrid re-seeding progress
+            -- with new slots), unlike slot (ADR-0029 amendment, bug partconfig-blob-bloats-standings).
+            id = item.id,
             position = i,
             slot = record.slot,
             -- Resolve the canonical identity live (ADR-0031): the license name may have arrived only at
@@ -1482,9 +1509,10 @@ local function build_standings(final)
             -- downstream readers must not mutate. DNF entries carry only the splits completed before
             -- DNF; the results UI derives segment deltas from this.
             splits = record.splits,
-            -- The driver's car (ADR-0029), so the client can filter "best lap with the car" in the
-            -- analysis overlay. nil when no identity/vehicle was reported.
-            car = car_descriptor(info and info.vehicle),
+            -- The driver's car (ADR-0029) is NO LONGER on the periodic standings entry (ADR-0029 amendment,
+            -- bug partconfig-blob-bloats-standings): it is static per driver per race, so it now travels once
+            -- on the carInfo channel (see handle_client_info) and the client renders it from its cache. This
+            -- keeps a standings broadcast size-independent of the car.
             -- Synthetic host-driven AI slot (ADR-0036), so the HUD can tag it; nil for real players.
             ai = record.ai or nil,
         }
@@ -4650,6 +4678,12 @@ local function handle_client_info(player_id, payload)
         return
     end
     local vehicle = type(payload.vehicle) == "table" and payload.vehicle or nil
+    -- Gate the reported variant at ingestion (bug partconfig-blob-bloats-standings): a serialized partsTree
+    -- blob is dropped here, in place, before it is keyed, broadcast, or persisted -- entry.vehicle/track.vehicle
+    -- store this same table by reference, so this one gate covers records.json too.
+    if vehicle then
+        vehicle.variant = net.safe_variant(vehicle.variant)
+    end
     session.identities = session.identities or {}
     -- A proxied AI report (ADR-0036 Etappe B): the owner reports an AI car's pwr tagged with its aiId, so
     -- the pwr re-grid can sort the AI into the field (ADR-0033). Stored under the AI id, never the owner's,
@@ -4671,6 +4705,18 @@ local function handle_client_info(player_id, payload)
         tostring(vehicle and vehicle.model),
         tostring(vehicle and vehicle.type),
         tostring(vehicle and vehicle.modified)))
+
+    -- One-shot per-driver car channel (ADR-0029 amendment, bug partconfig-blob-bloats-standings): the car
+    -- descriptor is STATIC per driver per race, so ship it ONCE here (when first known / on change) instead
+    -- of on every ~1 Hz standings broadcast. Keyed by the participant id (matches the standings entry id;
+    -- regrid-stable). The client caches it and renders the overlay from the cache; build_standings no longer
+    -- carries `car`. AI report no vehicle -> no descriptor -> no entry (car stays nil, as before). "carInfo"
+    -- matches the client HANDLERS key (inlined -- main.lua has no MSG_* table to extend and sits at the
+    -- 200-local ceiling). Race-blind: the descriptor is opaque relayed data (ADR-0005).
+    local car = car_descriptor(vehicle)
+    if car and session.progress and session.progress[target_id] then
+        broadcast_event("carInfo", {entries = {{id = target_id, car = car}}})
+    end
 end
 
 -- Store a client's reported BeamNG name for identity resolution (ADR-0031). Connection-scoped: kept

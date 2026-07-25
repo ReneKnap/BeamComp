@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "quali-results-cp/2026-07-25"
+local BUILD_MARKER = "partconfig-lag-fix/2026-07-25"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -222,6 +222,7 @@ M.state = {
     provisional_open = true,  -- local-only per-player: auto-show the provisional results card once the local player is finished/DNF while the race still runs; toggled by the HUD buttons / racing-phase /results, reset per race
     interval_mode = "self",  -- local-only live-standings interval reference: "self" | "ahead" | "leader"; cycled by the HUD toggle, session-persistent (not reset per race)
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
+    car_info = nil,      -- one-shot per-driver car descriptors, cached from the carInfo channel keyed by the standings row (slot, else name); the standings entries no longer carry `car` (ADR-0029 amendment, bug partconfig-blob-bloats-standings), or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
     staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
     countdown = nil,     -- start-countdown {remaining = seconds}, ticked locally to drive the 8s count (ADR-0021), or nil
@@ -378,6 +379,7 @@ local function handle_race_start(payload)
         M.state.laptimer = nil
         M.state.marker_angles = nil
         M.state.standings = nil
+        M.state.car_info = nil
         M.state.race_records = nil
         M.state.analysis_open = false
         M.state.provisional_open = true
@@ -439,6 +441,7 @@ local function handle_race_start(payload)
     -- posts must not ease from the prior race's stored angles.
     M.state.marker_angles = nil
     M.state.standings = nil
+    M.state.car_info = nil
     M.state.race_records = nil
     M.state.analysis_open = false
     M.state.provisional_open = true
@@ -782,6 +785,7 @@ local function teardown_race_world()
     -- Drop the marker orientation slew state so the next race's posts never ease from a stale angle.
     M.state.marker_angles = nil
     M.state.standings = nil
+    M.state.car_info = nil
     M.state.race_records = nil
     M.state.analysis_open = false
     M.state.provisional_open = true
@@ -2900,6 +2904,23 @@ local HANDLERS = {
     raceStart = handle_race_start,
     racePhase = handle_race_phase,
     standings = handle_standings,
+    -- One-shot per-driver car descriptors (ADR-0029 amendment, bug partconfig-blob-bloats-standings): merge
+    -- each into the cache keyed by the participant id (the standings entry's id). The standings entries no
+    -- longer carry `car`; the overlay renders it from this cache. id is regrid-stable (survives a quali
+    -- re-grid re-seeding progress with new slots). Defined inline (a table field costs no top-level local --
+    -- init.lua is near the ceiling). Cleared alongside M.state.standings on every race reset.
+    carInfo = function(payload)
+        local entries = type(payload) == "table" and payload.entries or nil
+        if type(entries) ~= "table" then
+            return
+        end
+        M.state.car_info = M.state.car_info or {}
+        for _, entry in ipairs(entries) do
+            if entry.id ~= nil then
+                M.state.car_info[tostring(entry.id)] = entry.car
+            end
+        end
+    end,
     championship = handle_championship,
     tournament = handle_tournament,
     quali = quali.handle_snapshot,
@@ -3848,17 +3869,25 @@ local function derive_segments(splits)
 end
 
 -- A human label for a car descriptor (ADR-0029): "model: variant" with a "(mod)" suffix when parts were
--- changed. The variant is shown as its leaf preset name only -- any directory prefix and the ".pc"
--- extension are stripped, so a full partConfig path like "vehicles/van/offroad_alt.pc" reads as
+-- changed. The variant leaf is derived from the descriptor `key` ("model/variant") rather than a duplicated
+-- `variant` field (ADR-0029 amendment, bug partconfig-blob-bloats-standings) -- any directory prefix and the
+-- ".pc" extension are stripped, so a full partConfig path like "vehicles/van/offroad_alt.pc" reads as
 -- "offroad_alt". nil when there is no car.
 local function car_label(car)
     if type(car) ~= "table" then
         return nil
     end
     local label = car.model or "?"
-    if type(car.variant) == "string" and car.variant ~= "" then
-        local short = (car.variant:gsub("^.*/", ""):gsub("%.pc$", ""))
-        label = label .. ": " .. short
+    -- The key is "model" or "model/variant"; the portion after the first "/" is the variant. When present,
+    -- show its leaf preset name only (strip any dir prefix + ".pc").
+    if type(car.key) == "string" then
+        local slash = car.key:find("/", 1, true)
+        if slash then
+            local short = (car.key:sub(slash + 1):gsub("^.*/", ""):gsub("%.pc$", ""))
+            if short ~= "" then
+                label = label .. ": " .. short
+            end
+        end
     end
     if car.modified == true then
         label = label .. " (mod)"
@@ -4364,10 +4393,9 @@ local function build_hud_snapshot()
                     end
                 end
             end
+            -- Stable per-row key for the client's position-gain flash (keyed across frames, independent of
+            -- the standings windowing): the server slot when present, else the canonical name (ADR-0031).
             entries[i] = {
-                -- Stable per-row key for the client's position-gain flash (keyed across frames,
-                -- independent of the standings windowing): the server slot when present, else the
-                -- canonical name (ADR-0031).
                 id = (e.slot ~= nil and "s" .. tostring(e.slot)) or ("n" .. tostring(e.name)),
                 position = e.position,
                 name = e.name,
@@ -4387,7 +4415,10 @@ local function build_hud_snapshot()
                 cpPerLap = cp_per_lap,
                 splits = e.splits,
                 run_up = e.run_up,  -- gun -> start/finish run-up (ADR-0022), for the analysis S0 column
-                car = e.car,  -- driver's car (ADR-0029), for the Race section's "best lap with the car"
+                -- Driver's car (ADR-0029), for the Race section's "best lap with the car". No longer on the
+                -- standings entry (ADR-0029 amendment, bug partconfig-blob-bloats-standings) -- joined from the
+                -- one-shot carInfo cache by the participant id, so a standings broadcast stays car-size-independent.
+                car = M.state.car_info and e.id ~= nil and M.state.car_info[tostring(e.id)] or nil,
                 ai = e.ai or nil,  -- synthetic host-driven AI slot (ADR-0036), so the row can be tagged
                 jumpPenalty = e.jump_penalty,  -- F1 jump-start penalty seconds (ADR-0043); HUD tags "+Ns"
                 reaction = e.reaction,  -- F1 start reaction seconds (ADR-0043); HUD React column, neg = jump
