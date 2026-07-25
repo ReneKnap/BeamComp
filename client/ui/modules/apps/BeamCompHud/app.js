@@ -259,6 +259,30 @@ angular.module('beamng.apps')
     return 'CP ' + cp;
   }
 
+  // The Best cell for a quali RESULTS-card row (feature quali-results-cp-progress): mirror the live boards
+  // so a timeless driver shows checkpoint progress instead of '--'. A row WITH a time shows it -- the
+  // grid-setting number, as before. Otherwise "CP x/y": a staged row carries the run total (r.cpTotal,
+  // server-relayed); a circuit row has no cpTotal, so the denominator is one lap's cps (cpsPerLap =
+  // hud.qualiCpsPerLap, client-local -- the server count is the whole quali plan). CP x fallback when
+  // neither denominator is known. Rows are the server quali.snapshot() classification (ADR-0041), so a
+  // version mix that drops a field degrades to the fallback, never a '--' regression or crash for a timed row.
+  function qualiResultCell(r, cpsPerLap) {
+    if (!r) {
+      return '--';
+    }
+    if (typeof r.time === 'number') {
+      return formatTime(r.time);
+    }
+    var cp = typeof r.cp === 'number' ? r.cp : 0;
+    if (typeof r.cpTotal === 'number') {
+      return 'CP ' + cp + '/' + r.cpTotal;
+    }
+    if (typeof cpsPerLap === 'number' && cpsPerLap > 0) {
+      return 'CP ' + cp + '/' + cpsPerLap;
+    }
+    return 'CP ' + cp;
+  }
+
   // The local player's full entry (the one flagged isLocal), or null. Resolved from the full field
   // -- not the windowed live rows -- so the header, time block, and results best-lap bind to it even
   // when the local player is scrolled out of the live row window.
@@ -328,10 +352,11 @@ angular.module('beamng.apps')
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
       // Staged sprint quali status line (ADR-0044) + board row time (ADR-0044/Round6) + the circuit
-      // board's lap-or-CP cell (Round 12).
+      // board's lap-or-CP cell (Round 12) + the results-card Best cell (quali-results-cp-progress).
       scope.qualiStatusText = qualiStatusText;
       scope.qualiRowTime = qualiRowTime;
       scope.qualiLapCell = qualiLapCell;
+      scope.qualiResultCell = qualiResultCell;
 
       // UI-presence heartbeat (self-healing HUD: race/hud.lua + the init.lua watchdog). Tell GE this app
       // is alive on link and once a second after. If GE stops hearing it while a race wants the HUD up --

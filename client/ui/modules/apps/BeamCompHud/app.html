@@ -1006,7 +1006,7 @@
         <tr ng-repeat="r in hud.quali.rows" ng-class="{'bc-ai': r.ai}">
           <td class="bc-pos">P{{r.position}}</td>
           <td class="bc-name">{{r.name}}</td>
-          <td class="bc-time">{{r.time != null ? formatTime(r.time) : '--'}}</td>
+          <td class="bc-time">{{qualiResultCell(r, hud.qualiCpsPerLap)}}</td>
         </tr>
       </table>
     </div>

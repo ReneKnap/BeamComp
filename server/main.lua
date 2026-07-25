@@ -2014,16 +2014,43 @@ function quali.order_identities()
     return ids
 end
 
+-- The run's shared total checkpoint count for a staged CP-progress denominator: the first progress record
+-- that still carries a count -- a requeue reset wipes the per-record count, so scan for any survivor. nil
+-- before the session's first crossing (the display then shows the reached count only). Staged-quali data,
+-- server-paced (ADR-0044); broadcast_queue and quali.snapshot read this one seam so their "/y" agrees.
+function quali.checkpoint_total()
+    if not session.progress then
+        return nil
+    end
+    for _, record in pairs(session.progress) do
+        if record.count then
+            return record.count
+        end
+    end
+    return nil
+end
+
 -- A client-facing snapshot of the qualifying classification (ADR-0041), shipped on entering quali-results
--- for the HUD results card. Rows carry the pace as seconds (nil for an unclassified driver).
+-- for the HUD results card. Rows carry the pace as seconds (nil for an unclassified driver). A timeless row
+-- also carries the checkpoint progress quali.ranking already computed (cp), so the results card mirrors the
+-- live board's "CP x/y" instead of "--" (feature quali-results-cp-progress); a staged row adds cpTotal (the
+-- run's total, the number broadcast_queue relays). The circuit "/y" is one lap's cps -- client-local
+-- knowledge the client fills in (the HUD's qualiCpsPerLap), never derived here (the server count is the
+-- whole quali plan). Timed rows carry only their time. Race-blind (ADR-0005) -- quali classification only.
 function quali.snapshot()
     local rows = {}
+    local cp_total = quali.is_staged() and quali.checkpoint_total() or nil
     for position, item in ipairs(quali.ranking()) do
+        local timeless = item.pace == nil
         rows[#rows + 1] = {
             position = position,
             name = item.identity,
             time = item.pace,
             ai = item.ai or nil,
+            -- Only a timeless row renders CP; cp keeps 0 (Lua 0 is truthy). cpTotal is staged-only, so a
+            -- circuit row omits it and the client uses its per-lap count instead.
+            cp = timeless and item.cp or nil,
+            cpTotal = timeless and cp_total or nil,
         }
     end
     return {rows = rows}
@@ -2268,16 +2295,10 @@ function quali.broadcast_queue()
     for i, id in ipairs(q.queue or {}) do
         queue_pos[id] = i
     end
-    -- Shared total checkpoint count for the CP progress display (Round 7): the first record that has reported
-    -- a count -- a requeue reset wipes the per-record count, so fall back like build_standings' known_count.
-    -- nil before the first crossing of the session; the board then shows the reached count only (0).
-    local known_count
-    for _, record in pairs(session.progress) do
-        if record.count then
-            known_count = record.count
-            break
-        end
-    end
+    -- Shared total checkpoint count for the CP progress display (Round 7): the first record that still
+    -- carries a count (a requeue reset wipes the per-record count). nil before the session's first crossing;
+    -- the board then shows the reached count only (0). quali.snapshot reads the same seam for the results card.
+    local known_count = quali.checkpoint_total()
     local rows = {}
     for id, record in pairs(session.progress) do
         local identity = quali.identity_of(id)
