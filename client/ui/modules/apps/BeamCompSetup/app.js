@@ -128,6 +128,25 @@ angular.module('beamng.apps')
     });
   }
 
+  // The model key inside a roster entry's car token: 'host' for the host sentinel, '' when unset, else
+  // the part before the first ':' (the token is model[:config]). One reader for the token shape, shared
+  // by the scope accessor and the config prefetch below.
+  function modelOfCarToken(car) {
+    if (!car) {
+      return '';
+    }
+    return car === 'host' ? 'host' : String(car).split(':')[0];
+  }
+
+  // The car models of a roster ([{car}] entries) and of the class-drop class rows ([{car}]), as plain
+  // model keys for prefetchConfigs.
+  function rosterModels(entries) {
+    return (entries || []).map(function (e) { return modelOfCarToken(e && e.car); });
+  }
+  function classModels(classes) {
+    return (classes || []).map(function (c) { return c && c.car; });
+  }
+
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
   // the JSON's double quotes pass through; backslashes and single quotes are escaped). Inert when bngApi
   // is unavailable (see header) -- the panel simply cannot submit, never throws.
@@ -144,6 +163,26 @@ angular.module('beamng.apps')
     if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
       bngApi.engineLua('beamcomp_init.' + fn + '()');
     }
+  }
+
+  // Ask GE for the configs of each given car model, so everything that resolves out of the configsByModel
+  // cache -- the per-race, per-class and per-roster-row Type dropdowns and their labels -- has real
+  // options instead of a lone 'stock' and a raw config key. Blanks and the 'host'/'random' sentinels are
+  // not models, and a model repeated across the list is requested once, so a full roster of 16 AI on one
+  // model costs one round-trip rather than 16.
+  //
+  // Cached models are deliberately re-requested: a reply for the CURRENTLY selected car model also
+  // refreshes scope.data.configs, which the per-race Config dropdown reads, so skipping a warm model
+  // would leave that dropdown empty on a restore.
+  function prefetchConfigs(models) {
+    var requested = {};
+    (models || []).forEach(function (model) {
+      if (!model || model === 'host' || model === 'random' || requested[model]) {
+        return;
+      }
+      requested[model] = true;
+      geLuaArg('request_car_configs', model);
+    });
   }
 
   // A numeric field value or undefined when blank/non-numeric, so optional numbers are omitted from the
@@ -374,26 +413,13 @@ angular.module('beamng.apps')
             || num(scope.form.maxkg) !== undefined || num(scope.form.minkg) !== undefined) {
           scope.form.restrictVehicles = true;
         }
-        // Re-sync the race list to the restored include-deprecated flag, and fetch the restored model's
-        // configs so the config dropdown + label resolve (without clearing the stored config).
+        // Re-sync the race list to the restored include-deprecated flag, then fetch, as one deduplicated
+        // batch, the configs every restored car needs: the race's own model (so its config dropdown +
+        // label resolve without clearing the stored config), each class row's car (ADR-0042) and each
+        // roster entry's car (ADR-0047). UX only -- the stored tokens spawn regardless.
         scope.refresh();
-        if (scope.form.carModel && scope.form.carModel !== 'random') {
-          geLuaArg('request_car_configs', scope.form.carModel);
-        }
-        // Re-fetch configs for each restored class car so the per-class config dropdowns repopulate (ADR-0042).
-        (scope.form.tourClasses || []).forEach(function (c) {
-          if (c.car) {
-            geLuaArg('request_car_configs', c.car);
-          }
-        });
-        // Same for the restored roster entries' cars (ADR-0047), so each row's config dropdown has its
-        // options without re-picking the model. UX only -- the stored token spawns regardless.
-        (scope.form.aiRoster || []).forEach(function (e) {
-          var model = (e.car && e.car !== 'host') ? String(e.car).split(':')[0] : '';
-          if (model) {
-            geLuaArg('request_car_configs', model);
-          }
-        });
+        prefetchConfigs([scope.form.carModel].concat(
+          classModels(scope.form.tourClasses), rosterModels(scope.form.aiRoster)));
       }
 
       // GE pushes the dynamic lists on open AND on every refresh (the include-deprecated toggle, the Refresh
@@ -937,8 +963,7 @@ angular.module('beamng.apps')
 
       // The model key of a roster entry's car token ('host' for the host sentinel, '' when unset).
       scope.rosterModelOf = function (e) {
-        if (!e || !e.car) { return ''; }
-        return e.car === 'host' ? 'host' : String(e.car).split(':')[0];
+        return modelOfCarToken(e && e.car);
       };
       // The config key of a roster entry's car token ('' for stock/host/unset).
       scope.rosterConfigOf = function (e) {
@@ -1065,6 +1090,11 @@ angular.module('beamng.apps')
             scope.rosterOpen = true;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
+          // The rolled cars are models the panel may never have probed. Without their configs each row's
+          // Type field falls back to the raw config key and its Type dropdown holds nothing but 'stock',
+          // so the type cannot be changed at all (bug setup-dropdowns-sort-by-display-name). On 'extend'
+          // only the new entries need it -- the kept ones were fetched when they were rolled.
+          prefetchConfigs(rosterModels(entries));
         });
       });
 
@@ -1087,6 +1117,9 @@ angular.module('beamng.apps')
           if (payload.car) {
             e.car = payload.car;
             e.carLabel = payload.carLabel;
+            // A drawn/pinned name brings its own preferred car, so this row's model can change here too
+            // -- fetch its configs like a manual pick does (bug setup-dropdowns-sort-by-display-name).
+            prefetchConfigs(rosterModels([e]));
           }
           // A drawn pool name's preferred colour always applies (ADR-0047 round 3, no compliance gate).
           if (payload.color) { e.color = payload.color; }
@@ -1109,6 +1142,9 @@ angular.module('beamng.apps')
           if (!e || !payload.car) { return; }
           e.car = payload.car;
           e.carLabel = payload.carLabel;
+          // The re-rolled car is a fresh model, so its configs are fetched exactly like a manual pick's
+          // (bug setup-dropdowns-sort-by-display-name).
+          prefetchConfigs(rosterModels([e]));
         });
       });
 
@@ -1236,11 +1272,7 @@ angular.module('beamng.apps')
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars
       // regardless (buildTourClasses reads cls.config directly). Mirrors the form-restore prefetch above.
-      (scope.form.tourClasses || []).forEach(function (c) {
-        if (c.car) {
-          geLuaArg('request_car_configs', c.car);
-        }
-      });
+      prefetchConfigs(classModels(scope.form.tourClasses));
     },
   };
 }]);
