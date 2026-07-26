@@ -1014,7 +1014,10 @@
   </div>
   <!-- Provisional standings (ADR-0022): a finished/DNF'd player views the live classification while the
        race still runs. Same layout as the final card, but gap-vs-leader and no podium tints so it reads
-       as not-yet-final; the live corner regions are hidden while it is up. -->
+       as not-yet-final; the live corner regions are hidden while it is up.
+       Rows come from `provisionalRows`, not `entries`: this is a RESULT view, so it ranks (and shows the
+       time/gap) with the F1 jump-start penalty applied, exactly as the final card will (ADR-0043). The
+       live corner board next to it keeps the on-track order with the penalty still pending. -->
   <div class="bc-results-card" ng-if="hud.provisionalShown">
     <div class="bc-results-title">Provisional Standings</div>
     <div class="bc-provisional-badge">{{hud.grace != null ? 'Race ends in ' + formatTime(hud.grace) : 'Race in progress'}}</div>
@@ -1028,7 +1031,7 @@
           <td class="bc-int">Gap</td>
           <td class="bc-react" ng-if="hud.f1Start">React</td>
         </tr>
-        <tr ng-repeat="e in hud.entries"
+        <tr ng-repeat="e in hud.provisionalRows"
             ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai}">
           <td class="bc-pos">P{{e.position}}</td>
           <td class="bc-name"><span class="bc-fin-mark" ng-if="e.finished">&#10003; </span>{{e.name}}<span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
