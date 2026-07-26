@@ -11,6 +11,7 @@
 local M = {}
 
 local vehiclespecs = require("beamcomp/race/vehiclespecs")
+local optsort = require("beamcomp/race/optsort")
 
 -- Models packed per line so a stock install's ~50+ models do not flood chat one-per-line.
 local MODELS_PER_LINE = 8
@@ -80,21 +81,28 @@ end
 -- model lists that model's configs ({config, name} pairs for the car= dropdown -- power/weight are dropped
 -- here, the panel only needs to pick); nil/empty lists the drivable models as {model, label} pairs
 -- (props/trailers excluded, so a car= can't pick a cone). `model` is the selection key, `label` the human
--- display name (e.g. "Ibishu Pessima") the dropdown shows; the key-based order of list_car_models is kept
--- (display only, no re-sort). Configs are probed lazily per selected model since an all-models probe is heavy.
+-- display name (e.g. "Ibishu Pessima") the dropdown shows; a config's key is likewise the selection value
+-- and its `name` the in-game label. Configs are probed lazily per selected model since an all-models probe
+-- is heavy.
+--
+-- Both lists are ordered by the DISPLAYED text (optsort.by_display), not by the key the vehiclespecs
+-- source sorts on: the panel shows "Ibishu Pessima", so that entry belongs under I, not under its
+-- `pessima` key -- and the same for a config shown by its in-game name. The re-sort runs on the local
+-- copies built here; the vehiclespecs order itself stays key-based on purpose, since the random AI pool,
+-- the compliant-substitute search and the /cars chat listing all read it.
 function M.options(model)
     if type(model) == "string" and model ~= "" then
         local configs = {}
         for _, entry in ipairs(vehiclespecs.list_configs(model)) do
             configs[#configs + 1] = {config = entry.config, name = entry.name}
         end
-        return {configs = configs}
+        return {configs = optsort.by_display(configs, "name", "config")}
     end
     local models = {}
     for _, key in ipairs(vehiclespecs.list_car_models()) do
         models[#models + 1] = {model = key, label = vehiclespecs.model_label(key)}
     end
-    return {models = models}
+    return {models = optsort.by_display(models, "label", "model")}
 end
 
 return M

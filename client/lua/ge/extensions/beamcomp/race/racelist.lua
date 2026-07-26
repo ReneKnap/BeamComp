@@ -13,6 +13,7 @@ local M = {}
 local discovery = require("beamcomp/race/discovery")
 local parser = require("beamcomp/race/parser")
 local maps = require("beamcomp/race/maps")
+local optsort = require("beamcomp/race/optsort")
 
 -- The user-facing word for a race's source (ADR-0024/0035): the freeroam timeTrial set is "map", the
 -- aiRace set is "ai", the rallyStage set is "rally", the crawl set is "crawl", the level quickrace set is
@@ -149,6 +150,13 @@ end
 -- geometry -- the panel needs only a pick list; the issuer client validates the choice on start. Deprecated
 -- races (ADR-0026) are excluded unless include_deprecated is set (the panel's "include deprecated" toggle),
 -- in which case they are listed with a "(deprecated)" marker.
+--
+-- Ordered by the DISPLAYED label (optsort.by_display), not by the locator id discovery.list sorts on --
+-- the dropdown shows the display name, so that is what it is ordered by, and the whole label counts
+-- including its "[short]", source and "(deprecated)" suffixes. The sort runs on the finished option array,
+-- so neither discovery.list's id order (which /races and every resolve read) nor the shortname pass above
+-- it can be affected. This one list feeds BOTH panels -- the race-setup dropdown and the grid editor's
+-- race list (init.lua push_setup_data / push_grid_data) -- so both are ordered from here.
 function M.options(loaded_map, include_deprecated)
     if not loaded_map then
         return {}
@@ -174,7 +182,7 @@ function M.options(loaded_map, include_deprecated)
         end
         options[#options + 1] = {id = locator.id, label = label}
     end
-    return options
+    return optsort.by_display(options, "label", "id")
 end
 
 return M
