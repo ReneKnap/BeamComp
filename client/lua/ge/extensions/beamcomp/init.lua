@@ -267,7 +267,7 @@ M.state = {
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037). The panel autosaves it on every change, so it also survives a UI reload that never runs the panel's Close (bug setup-panel-settings-survive-ui-reload)
-    setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037)
+    setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037). Does NOT survive a Lua reload: this extension has no onSerialize/onDeserialize, so a reload rebuilds M.state from this literal -- the panel stays on screen but is no longer watched until the next /raceui
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
@@ -3431,12 +3431,6 @@ function M.onExtensionLoaded()
     -- Best-effort from the current freeroam car; refreshed reliably from the race car at spawn. Fires on
     -- a Lua reload / reconnect too, so a reconnecting client re-reports.
     report_identity(own)
-    -- The race-setup panel is a UI app: it survives a Lua reload, but the in-flight presence readings do
-    -- not. Re-arm from the serialized open state rather than trusting a stale ack gap or a spent one-shot
-    -- latch (bug setup-panel-settings-survive-ui-reload).
-    if M.state.setup_open then
-        setup.arm()
-    end
     -- Include a distinctive build marker so a redeploy can be confirmed live in beamng.log before trusting
     -- an in-game result -- the BeamMP client mod cache can serve a stale zip (memory
     -- beammp-client-mod-cache-stale).
