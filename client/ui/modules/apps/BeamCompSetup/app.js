@@ -10,8 +10,17 @@
 // Dropdowns are custom (a button + a div list driven by ng-click), not native <select>: native selects do
 // not open in the BeamNG CEF overlay. ng-click works (checkboxes/number inputs do too), so the custom
 // list is the robust path.
+//
+// The form is autosaved to GE on every change (debounced), not just on Close: a UI timeout/reload
+// destroys this scope without ever running close(), which used to throw away the whole race setup
+// (bug setup-panel-settings-survive-ui-reload).
 angular.module('beamng.apps')
-.directive('beamCompSetup', [function () {
+.directive('beamCompSetup', ['$timeout', function ($timeout) {
+  // How long after the last form change the panel pushes the form to GE (ms). Each save serialises the
+  // whole form and costs a bngApi round-trip, so it is slow enough to collapse a burst of typing or
+  // clicking into one write, and fast enough that a UI reload can lose nothing that matters.
+  var AUTOSAVE_DELAY = 700;
+
   // Static enum options (value + label). Dynamic lists (race/car/grid/config) are built from GE pushes.
   var STATIC_OPTS = {
     mode: [{ v: '', label: 'auto' }, { v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }],
@@ -277,6 +286,14 @@ angular.module('beamng.apps')
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
       scope.phase = 'lobby';                   // latest GE-pushed race phase, gates the race-stop controls (ADR-0038)
 
+      // Session-autosave state. The panel links with freshForm() and only THEN pulls the remembered blob
+      // (request_setup_form -> BeamCompSetupForm, async), so the form watcher must stay muted until that
+      // reply has been applied: a save inside that window would write these DEFAULTS over the good stored
+      // blob and lose the settings for good -- worse than the bug it fixes.
+      var autosaveArmed = false;   // true once the initial restore (or its confirmed absence) has landed
+      var autosaveTimer = null;    // pending debounced save, re-armed on every change
+      var lastStoredJson = null;   // last blob handed to GE, so an unchanged form is never re-sent
+
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
         scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
@@ -307,6 +324,21 @@ angular.module('beamng.apps')
       }
       function rebuildPresetOpts() {
         scope.opts.preset = (scope.data.presets || []).map(function (p) { return { v: p, label: p }; });
+      }
+
+      // Serialise the current form into the JSON blob GE remembers for the session (store_setup_form) or
+      // the server persists as a preset -- the write counterpart of applyStoredForm below. angular.toJson
+      // (not JSON.stringify) drops every $$-prefixed key at any depth, so ng-repeat's $$hashKey tracking
+      // ids on the roster and the tournament class rows never reach the blob, and cleanRoster strips the
+      // transient _open editor flag on top. That hygiene matters far more now than it did for the old
+      // close-only save: an autosave almost always runs while those lists are rendered, and a foreign
+      // tracking id riding back into a restored roster is a known breakage (bug
+      // preset-multirace-roster-not-created).
+      function formJson(excludeKeys) {
+        var copy = angular.extend({}, scope.form);
+        (excludeKeys || []).forEach(function (k) { delete copy[k]; });
+        copy.aiRoster = cleanRoster(copy.aiRoster);
+        return angular.toJson(copy);
       }
 
       // Apply a stored form JSON string (the session-restore blob OR a loaded preset) over a fresh form,
@@ -394,6 +426,12 @@ angular.module('beamng.apps')
       scope.$on('BeamCompSetupForm', function (event, payload) {
         scope.$evalAsync(function () {
           applyStoredForm(payload && payload.form);
+          // The restore has landed -- or GE confirmed it has nothing stored (payload.form nil, which
+          // applyStoredForm returns on). Either way the form on screen is now the session's truth, so the
+          // autosave may write from here on. Arming inside the same digest task means the watcher's first
+          // real fire is that restored form: a harmless write-back of exactly what GE just handed us,
+          // normalised over freshForm.
+          autosaveArmed = true;
         });
       });
 
@@ -531,14 +569,7 @@ angular.module('beamng.apps')
         if (!name) {
           return;
         }
-        var formCopy = angular.extend({}, scope.form);
-        PRESET_EXCLUDE_KEYS.forEach(function (k) { delete formCopy[k]; });
-        // Strip Angular's ng-repeat internals from the roster before it is stored/transported (see
-        // cleanRoster). angular.toJson (not JSON.stringify) drops any remaining $$-prefixed keys elsewhere
-        // too -- e.g. the tournament class rows once they have rendered -- so no tracking ids leak into the
-        // opaque preset blob.
-        formCopy.aiRoster = cleanRoster(formCopy.aiRoster);
-        geLuaArg('save_preset', JSON.stringify({ name: name, form: angular.toJson(formCopy) }));
+        geLuaArg('save_preset', JSON.stringify({ name: name, form: formJson(PRESET_EXCLUDE_KEYS) }));
       };
       scope.loadPreset = function () {
         if (scope.selectedPreset) {
@@ -586,10 +617,61 @@ angular.module('beamng.apps')
       scope.endRace = function () { geCall('end_race_from_ui'); };        // /raceend: force finish + score
 
       scope.close = function () {
-        // Remember the current form so the next open restores it within the session (ADR-0037).
-        geLuaArg('store_setup_form', JSON.stringify(scope.form));
+        // Remember the current form so the next open restores it within the session (ADR-0037). The
+        // autosave below already keeps GE current; this stays the explicit, immediate end point.
+        storeForm();
         geCall('close_setup');
       };
+
+      // ----- Session autosave (bug setup-panel-settings-survive-ui-reload) ---------------------------
+      // GE remembers the form for the session (ADR-0037), but the ONLY save used to be the Close button
+      // above -- so a UI timeout/reload, which destroys this scope without ever running close(), threw
+      // away everything configured since the panel was opened (only the tournament fields came back,
+      // rebuilt from live server state). Every form change now saves itself, debounced, so GE's copy is
+      // at most AUTOSAVE_DELAY behind what is on screen.
+
+      function storeForm() {
+        var json = formJson();
+        if (json === lastStoredJson) {
+          return;  // nothing GE does not already have (e.g. a change that vanishes in the clean shape)
+        }
+        lastStoredJson = json;
+        geLuaArg('store_setup_form', json);
+      }
+
+      function scheduleStore() {
+        if (autosaveTimer) {
+          $timeout.cancel(autosaveTimer);
+        }
+        // invokeApply false: the save is a pure side effect (a GE call), so it must not kick off another
+        // digest -- it is the digest that feeds the watcher below.
+        autosaveTimer = $timeout(function () {
+          autosaveTimer = null;
+          storeForm();
+        }, AUTOSAVE_DELAY, false);
+      }
+
+      // Deep watch, because the nested rows (AI roster, class ladder) are edited in place and a shallow
+      // watch would miss them. angular.equals ignores $$-prefixed keys, so ng-repeat merely rendering
+      // those lists never counts as a change. A loaded preset (applyStoredForm) is a legitimate change
+      // and is saved like any other; the arm gate only bars the pre-restore window.
+      scope.$watch(function () { return scope.form; }, function () {
+        if (!autosaveArmed) {
+          return;
+        }
+        scheduleStore();
+      }, true);
+
+      scope.$on('$destroy', function () {
+        // Flush a pending save, so a clean removal (Close, or BeamNG's own app-container X) loses
+        // nothing. A hard UI reload kills the page without ever firing $destroy -- that case is what the
+        // debounce window bounds.
+        if (autosaveTimer) {
+          $timeout.cancel(autosaveTimer);
+          autosaveTimer = null;
+          storeForm();
+        }
+      });
 
       // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
       // Sync the section's dropdowns to the active settings so the controls reflect reality, not stale form.
