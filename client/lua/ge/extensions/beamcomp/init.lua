@@ -187,7 +187,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "partconfig-lag-fix/2026-07-25"
+local BUILD_MARKER = "provisional-jump-penalty/2026-07-26"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -4327,7 +4327,8 @@ end
 -- client. `lapCount` is the resolved race lap count (1 for sprint; the HUD shows a lap indicator
 -- only when > 1, ADR-0013). Per-entry `splits` (cumulative race-time at each crossing, ADR-0015)
 -- rides through opaquely for the results template; the finished phase also derives the analysis
--- block (ADR-0028). Pure read of M.state; the server is unaffected.
+-- block (ADR-0028), and an open provisional card derives its penalized row list (ADR-0043). Pure read
+-- of M.state; the server is unaffected.
 local function build_hud_snapshot()
     local race = M.state.race
     local detection = M.state.detection
@@ -4484,6 +4485,100 @@ local function build_hud_snapshot()
         end
     end
 
+    -- Rows for the provisional results card (ADR-0022): the live classification re-ranked by the F1
+    -- jump-start penalty (ADR-0043), i.e. the order build_standings(true) will produce at the finish. That
+    -- card is a RESULT view, so a jumper must not sit on a position the final card then visibly takes away
+    -- again. Returns nil when nothing is penalized (every non-F1 race) -- the app binds `entries` unchanged.
+    --
+    -- Derived COPIES, never a mutation: `entries` is shared with the live corner board (hud.liveEntries
+    -- slices the same row tables), and that board deliberately keeps the on-track order with the penalty
+    -- still pending (ADR-0043 -- you should see live who is actually ahead).
+    --
+    -- Ranks on the SERVER keys (the broadcast standings rows, index-aligned with the rendered `rows`), not
+    -- on the rendered values: the local row's checkpoint/time are the live detector's, which keep advancing
+    -- for a DNF'd viewer and would drift that viewer's own row through the classification. On the server
+    -- keys the order is exactly build_standings(true), and with no penalty every key is the one the server
+    -- already sorted on -- so the card stays identical to before. Final tiebreak is the server's own rank,
+    -- in which it has already resolved slot (and which, unlike slot, is never nil).
+    local function build_provisional_entries(rows, sent_rows)
+        local penalized = false
+        for i = 1, #rows do
+            if sent_rows[i] and sent_rows[i].jump_penalty then
+                penalized = true
+                break
+            end
+        end
+        if not penalized then
+            return nil
+        end
+
+        local ranked = {}
+        for i = 1, #rows do
+            local sent = sent_rows[i] or {}
+            ranked[i] = {
+                row = rows[i],
+                rank = i,
+                dnf = sent.dnf and true or false,
+                completed = sent.completed or 0,
+                -- Effective time = raw + penalty, the term build_standings(true) sorts on.
+                time = (sent.total_time or 0) + (sent.jump_penalty or 0),
+            }
+        end
+        table.sort(ranked, function(x, y)
+            if x.dnf ~= y.dnf then
+                return not x.dnf  -- non-DNF ranks ahead of DNF (ADR-0014)
+            end
+            if x.completed ~= y.completed then
+                return x.completed > y.completed
+            end
+            if x.time ~= y.time then
+                return x.time < y.time
+            end
+            return x.rank < y.rank
+        end)
+
+        local out = {}
+        for i, item in ipairs(ranked) do
+            local copy = {}
+            for k, v in pairs(item.row) do
+                copy[k] = v
+            end
+            copy.position = i  -- the broadcast position is the live rank and is stale in this order
+            -- Effective time in the Time column, so the shown times stay monotone with the shown order.
+            -- The template renders it for finishers only; the "+Ns" tag on the name stays as the reason.
+            if copy.time ~= nil then
+                copy.time = copy.time + (copy.jumpPenalty or 0)
+            end
+            -- Live-order metrics: the interval belongs to the corner board's reference (this card renders
+            -- none), and an inherited leader gap would contradict the new order. Gaps recomputed below.
+            copy.gap, copy.cpGap, copy.interval, copy.cpInterval = nil, nil, nil, nil
+            out[i] = copy
+        end
+
+        -- Leader gap on the NEW order: the raw shared-crossing split gap (ADR-0015) plus the penalty
+        -- difference, so each gap matches the position the row now holds -- otherwise the card could show
+        -- a smaller gap below a larger one. The CP gap stays raw: that is a track metric, not a time.
+        local new_leader = out[1]
+        if new_leader and not new_leader.dnf then
+            for i = 2, #out do
+                local entry = out[i]
+                if not entry.dnf then
+                    local raw_gap = shared_split_gap(entry, new_leader)
+                    if raw_gap ~= nil then
+                        entry.gap = raw_gap + (entry.jumpPenalty or 0) - (new_leader.jumpPenalty or 0)
+                    end
+                    entry.cpGap = new_leader.checkpoint - entry.checkpoint
+                end
+            end
+        end
+        -- Those gaps were the only consumer of the shared splits reference (ADR-0015 hands it out
+        -- read-only); dropping it keeps this second row list off the per-frame UI payload's size.
+        for i = 1, #out do
+            out[i].splits = nil
+        end
+        return out
+    end
+
     -- Show the finish-grace countdown to everyone during the grace; the label adapts to whether the
     -- local player can still finish (ADR-0014) -- finished/DNF players see how long until the race ends.
     local grace = M.state.grace and M.state.grace.remaining or nil
@@ -4602,6 +4697,15 @@ local function build_hud_snapshot()
         end
     end
 
+    -- Provisional results card (ADR-0022), shown to a finished/DNF'd player while the race still runs.
+    -- Its penalized row list is built only while the card is actually up -- like the analysis block above,
+    -- the closed default costs nothing per frame.
+    local provisional_available = ((phase == "racing") and (local_finished or local_dnf)) and true or false
+    local provisional_entries = nil
+    if provisional_available and M.state.provisional_open and standings then
+        provisional_entries = build_provisional_entries(entries, standings)
+    end
+
     return {
         active = true,
         phase = phase,
@@ -4617,8 +4721,12 @@ local function build_hud_snapshot()
         analysisOpen = M.state.analysis_open or false,
         analysis = analysis,
         -- Provisional results card: shown to a finished/DNF'd player while the race still runs (ADR-0022).
-        provisionalAvailable = ((phase == "racing") and (local_finished or local_dnf)) and true or false,
+        provisionalAvailable = provisional_available,
         provisionalOpen = M.state.provisional_open,
+        -- The same rows re-ranked by the F1 jump-start penalty (see build_provisional_entries): that card
+        -- is a result view, so it shows the order the final card will show. nil = nothing to re-rank; the
+        -- app then binds `entries` unchanged. The live corner board always binds `entries` (ADR-0043).
+        provisionalEntries = provisional_entries,
         -- The multi-race championship table (ADR-0040), shown on the finished results card when active; nil
         -- or active=false hides it. Rides opaquely through to the app.
         championship = M.state.championship,

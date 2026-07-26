@@ -698,6 +698,10 @@ angular.module('beamng.apps')
           // finish banner holds it back until it fades, so a finisher first sees "FINISHED", then the card.
           scope.hud.provisionalShown = !!(scope.hud.provisionalAvailable && scope.hud.provisionalOpen &&
             !scope.hud.analysisOpen && !scope.finishBanner.active);
+          // That card is a result view, so it ranks with the F1 jump-start penalty applied (ADR-0043) --
+          // the GE side ships the re-ranked rows. Absent (non-F1 race / nobody jumped) it falls back to
+          // the live rows, unchanged. The live corner board keeps binding `entries` either way.
+          scope.hud.provisionalRows = scope.hud.provisionalEntries || scope.hud.entries;
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
         });
