@@ -12,10 +12,11 @@
 // list is the robust path.
 //
 // The form is autosaved to GE on every change (debounced), not just on Close: a UI timeout/reload
-// destroys this scope without ever running close(), which used to throw away the whole race setup
+// destroys this scope without ever running close(), which used to throw away the whole race setup. The
+// panel also heartbeats to GE once a second, so GE can put it back after such a reload dropped the app
 // (bug setup-panel-settings-survive-ui-reload).
 angular.module('beamng.apps')
-.directive('beamCompSetup', ['$timeout', function ($timeout) {
+.directive('beamCompSetup', ['$interval', '$timeout', function ($interval, $timeout) {
   // How long after the last form change the panel pushes the form to GE (ms). Each save serialises the
   // whole form and costs a bngApi round-trip, so it is slow enough to collapse a burst of typing or
   // clicking into one write, and fast enough that a UI reload can lose nothing that matters.
@@ -1191,6 +1192,23 @@ angular.module('beamng.apps')
         if (!e) { return; }
         e._open = false;
       };
+
+      // UI-presence heartbeat (the init.lua setup watchdog, bug setup-panel-settings-survive-ui-reload).
+      // Tell GE this panel is alive on link and once a second after. If GE stops hearing it while the
+      // panel is meant to be open -- an engine/BeamMP UI reload dropped our late-mounted app
+      // (ADR-0008/0012) -- GE re-adds the app once, and its fresh link restores the form via the pull
+      // below. Mirrors the HUD's note_hud_alive: bngApi is the core UI global (not an injected service,
+      // see the header) and typeof-guarded so a miss is inert.
+      function noteAlive() {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.note_setup_alive() end');
+        }
+      }
+      noteAlive();
+      var heartbeat = $interval(noteAlive, 1000);
+      scope.$on('$destroy', function () {
+        $interval.cancel(heartbeat);
+      });
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
       // asks GE for the lists itself (BeamCompSetupData arrives back via the $on above). Also pull the

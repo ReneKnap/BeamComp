@@ -82,8 +82,12 @@ local qualisprint = require("beamcomp/race/qualisprint")
 --          re-grid AI respawn (ADR-0041), and the HUD's quali row.
 -- hold  -- the qualifying HOLD: the single `is_held()` predicate and the layers that enforce it
 --          (bug quali-hold-reset-and-repaint-leak).
+-- setup -- the race-setup panel's GE-side presence: the session open-state set by the admin-gated
+--          /raceui open, and the one-shot watchdog that re-adds the app when a UI reload drops it
+--          (bug setup-panel-settings-survive-ui-reload).
 local quali = {}
 local hold = {}
+local setup = {}
 -- ===== end namespace tables =============================================================
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
@@ -187,7 +191,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "provisional-jump-penalty/2026-07-26"
+local BUILD_MARKER = "setup-panel-reload-safe/2026-07-26"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -262,7 +266,11 @@ M.state = {
     grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
-    setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037)
+    setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037). The panel autosaves it on every change, so it also survives a UI reload that never runs the panel's Close (bug setup-panel-settings-survive-ui-reload)
+    setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037)
+    setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
+    setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
+    setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
@@ -2248,10 +2256,86 @@ function M.request_car_configs(model)
     guihooks.trigger("BeamCompSetupCars", {model = model, configs = carlist.options(model).configs})
 end
 
+-- ===== race-setup panel presence (bug setup-panel-settings-survive-ui-reload) =====================
+-- The panel is put on screen by the admin-gated /raceui relay and taken down by its own Close button --
+-- but an engine/BeamMP UI reload destroys it (and its Angular scope) without ever running that close,
+-- and our server-delivered app does not come back on its own (ADR-0008/0012). GE therefore remembers
+-- that the panel SHOULD be on screen and re-adds it once when the app's heartbeat goes silent. Same
+-- mechanism as the HUD watchdog (M.note_hud_alive / step_hud_watchdog), reduced to its Stage A and
+-- latched to a single shot per open: the user wants a lost panel back, not a panel that fights BeamNG's
+-- own app-container X.
+
+-- Seconds of heartbeat silence (the app beats ~1 s) after which the panel counts as lost. Two missed
+-- beats of tolerance: the loss is permanent when it is real (the app is gone until something re-adds
+-- it), so reacting a second later costs nothing, while a UI thread that merely stutters is not worth
+-- spending the single restore on.
+setup.ACK_STALE = 3.0
+
+-- Start tracking a freshly authorized open. Called ONLY from handle_setup_open, i.e. downstream of the
+-- server's admin check, so the watchdog can reproduce an authorized open state but never invent one
+-- (ADR-0016/0037).
+function setup.arm()
+    M.state.setup_open = true
+    M.state.setup_seen = false
+    M.state.setup_ack_gap = 0
+    M.state.setup_restored = false
+end
+
+-- Forget the open state, so nothing can pop the panel back up: the panel's own Close (the clean way out)
+-- and the level boundary, where the UI reloads anyway and a remembered open would surface as a zombie
+-- panel on the next map. Deliberately NOT called from teardown_race_world: that also runs on the
+-- finished -> lobby transition, and the lobby is exactly where the panel is most legitimately open
+-- (setting up the next race). A race end cannot produce a zombie -- an open panel is still on screen,
+-- and a closed one has already cleared this.
+function setup.clear()
+    M.state.setup_open = false
+    M.state.setup_seen = false
+    M.state.setup_ack_gap = 0
+    M.state.setup_restored = false
+end
+
+-- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
+-- the panel is used in the lobby and carries the race-stop controls mid-race (ADR-0038 amendment).
+-- Silence only counts once we have heard the app alive: a panel that has not linked yet is merely slow
+-- (this bug lives on laggy clients), and spending the single restore on that would leave a real loss
+-- unrecovered. No Stage B -- unlike the HUD, this surface is not worth a full reloadUI.
+function setup.step(dt)
+    if M.state.setup_restored or not M.state.setup_seen then
+        return
+    end
+    M.state.setup_ack_gap = M.state.setup_ack_gap + (dt or 0)
+    if M.state.setup_ack_gap < setup.ACK_STALE then
+        return
+    end
+    M.state.setup_restored = true
+    log("I", RACE_LOG_TAG, "race-setup panel went silent -- re-adding it once")
+    -- Guarded + pcall-wrapped like race/hud.lua's trigger_ui: this runs from the onUpdate tick, so a
+    -- missing/failed engine call must never take the rest of the frame's work down with it. The latch is
+    -- already set above, so a failure costs the one restore rather than repeating every frame.
+    if not guihooks then
+        return
+    end
+    local ok, err = pcall(function()
+        guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
+    end)
+    if not ok then
+        log("W", RACE_LOG_TAG, "re-adding the race-setup panel failed: " .. tostring(err))
+    end
+end
+
+-- UI -> GE presence heartbeat from the open panel (mirrors note_hud_alive). Public so the app can reach
+-- it as beamcomp_init.note_setup_alive.
+function M.note_setup_alive()
+    M.state.setup_ack_gap = 0
+    M.state.setup_seen = true
+end
+
 -- Remove the race-setup panel from the live layout (UI -> GE, ADR-0037), the close counterpart to the
 -- setupOpen auto-add. Public so the panel's Close button can reach it as beamcomp_init.close_setup.
 function M.close_setup()
     guihooks.trigger("appContainer:removeApp", "beamCompSetup")
+    -- The admin is done with the panel, so stop expecting it on screen (nothing re-adds it from here).
+    setup.clear()
 end
 
 -- Surface grid-editor feedback both as a toast (visible while in-game) and in the log (visible in the
@@ -2430,6 +2514,8 @@ local function handle_setup_open(_payload)
     push_setup_data(false)
     -- Ensure the panel app is on the live layout (ADR-0012 best-effort auto-add); dedups by appName.
     guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
+    -- Remember this (server-authorized) open, so a UI reload that drops the app can be recovered once.
+    setup.arm()
     -- Auto-minimize the final standings card so the opening panel has a clear view. Only visible in the
     -- finished phase (the snapshot gates it), so this is inert otherwise; manual restore via
     -- M.toggle_results_min and the per-race reset (driving-phase start) stay the counter-force.
@@ -3345,6 +3431,12 @@ function M.onExtensionLoaded()
     -- Best-effort from the current freeroam car; refreshed reliably from the race car at spawn. Fires on
     -- a Lua reload / reconnect too, so a reconnecting client re-reports.
     report_identity(own)
+    -- The race-setup panel is a UI app: it survives a Lua reload, but the in-flight presence readings do
+    -- not. Re-arm from the serialized open state rather than trusting a stale ack gap or a spent one-shot
+    -- latch (bug setup-panel-settings-survive-ui-reload).
+    if M.state.setup_open then
+        setup.arm()
+    end
     -- Include a distinctive build marker so a redeploy can be confirmed live in beamng.log before trusting
     -- an in-game result -- the BeamMP client mod cache can serve a stale zip (memory
     -- beammp-client-mod-cache-stale).
@@ -5577,6 +5669,14 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
             M.state.grinder_activate_until = nil
         end
     end
+    -- Phase-independent: keep the race-setup panel on screen while it is meant to be open (bug
+    -- setup-panel-settings-survive-ui-reload). The panel heartbeats, and a UI reload that dropped our
+    -- late-mounted app (ADR-0008/0012) is recovered by a single re-add. Not phase-gated on purpose --
+    -- the panel is used in the lobby AND carries the race-stop controls mid-race. One boolean read when
+    -- no panel is open.
+    if M.state.setup_open then
+        setup.step(dtReal)
+    end
     if M.state.phase == "staging" and M.state.race then
         -- Tick the staging-wait indicator on the centered overlay (ADR-0021).
         step_staging(dtReal)
@@ -5789,6 +5889,10 @@ end
 function M.onClientEndMission(_levelPath)
     teardown_race_world()
     M.state.phase = nil
+    -- Leaving the level reloads the UI and drops our server-delivered apps; without this the remembered
+    -- open state would pop the setup panel back up on the next map, unasked (ADR-0037 stays
+    -- command-opened -- bug setup-panel-settings-survive-ui-reload).
+    setup.clear()
 end
 
 function M.onExtensionUnloaded()
