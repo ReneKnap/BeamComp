@@ -294,6 +294,7 @@ angular.module('beamng.apps')
       var autosaveArmed = false;   // true once the initial restore (or its confirmed absence) has landed
       var autosaveTimer = null;    // pending debounced save, re-armed on every change
       var lastStoredJson = null;   // last blob handed to GE, so an unchanged form is never re-sent
+      var phaseSeeded = false;     // the first phase push has run, so it can no longer touch `prepared`
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -681,6 +682,15 @@ angular.module('beamng.apps')
       scope.$on('BeamCompSetupPhase', function (event, payload) {
         scope.$evalAsync(function () {
           scope.phase = (payload && payload.phase) || 'lobby';
+          // The Start Race button is revealed by Prepare Race (scope.prepared), which is link-time state
+          // -- so a panel restored after a UI reload would show a staged race with no way to start it.
+          // The FIRST phase push after link (request_race_phase, pulled below) therefore seeds prepared
+          // from server truth: a race already in staging IS prepared. One-shot, so a live panel behaves
+          // exactly as before -- someone else's later prepare changes nothing here.
+          if (!phaseSeeded) {
+            phaseSeeded = true;
+            scope.prepared = scope.prepared || scope.phase === 'staging';
+          }
         });
       });
 
