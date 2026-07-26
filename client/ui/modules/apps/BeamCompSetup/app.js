@@ -1215,7 +1215,11 @@ angular.module('beamng.apps')
         }
       }
       noteAlive();
-      var heartbeat = $interval(noteAlive, 1000);
+      // count 0 (run forever), invokeApply false -- same reasoning as the autosave's $timeout: noteAlive
+      // only talks to GE and touches no scope state, so it must not force a digest every second. With
+      // the deep form watcher registered above, that digest would deep-compare the whole form (roster +
+      // class rows) once a second for nothing.
+      var heartbeat = $interval(noteAlive, 1000, 0, false);
       scope.$on('$destroy', function () {
         $interval.cancel(heartbeat);
       });
