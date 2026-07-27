@@ -191,7 +191,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "setup-dropdown-sort/2026-07-27"
+local BUILD_MARKER = "grid-per-race/2026-07-27"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2409,13 +2409,14 @@ local function refresh_grid_edit_scene()
 end
 
 -- Open a saved grid the server returned for a beamcomp_grid_edit/gridui fetch (ADR-0023). `found` false
--- means no such grid for this map; otherwise hand the record to the editor -- re-anchored onto the panel's
--- selected race (grid_load_anchor) so a grid authored for another race previews against the current one --
+-- means that race has no such grid; otherwise hand the record to the editor -- re-anchored onto the panel's
+-- selected race (grid_load_anchor) so a grid owned by another race previews against the current one --
 -- then refresh the reference scene and reflect the loaded block to the panel so its knobs fill in.
 local function handle_grid_data(payload)
     if type(payload) ~= "table" or not payload.found then
         local name = type(payload) == "table" and payload.name or "?"
-        editor_feedback("no saved grid '" .. tostring(name) .. "' on this map", "warning")
+        local race = type(payload) == "table" and payload.race or "?"
+        editor_feedback("no saved grid '" .. tostring(name) .. "' for " .. tostring(race), "warning")
         return
     end
     local anchor_race = M.state.grid_load_anchor
@@ -2437,27 +2438,45 @@ local function handle_grid_data(payload)
     end
 end
 
--- Post the current map's saved grid names from a gridListReq (ADR-0023). gridListReq has three callers, so
+-- Post the current map's saved grids from a gridListReq (ADR-0023). The reply carries the WHOLE map as
+-- {name, race, isDefault} entries sorted by race then name (ADR-0023 amendment 2026-07-27), so each
+-- consumer filters/groups it locally instead of asking again per race. gridListReq has three callers, so
 -- the one-shot grid_list_target (set by the requester) routes this reply: "setup" -> the race-setup panel's
 -- grid dropdown (ADR-0037); "gridui" -> the grid-editor panel's saved-grid dropdown (ADR-0037 amendment);
--- nil -> the grid-editor console command's toast (beamcomp_grid_list).
+-- nil -> the grid-editor console command's toast (beamcomp_grid_list), which groups the entries by race.
 local function handle_grid_list(payload)
-    local names = type(payload) == "table" and type(payload.names) == "table" and payload.names or {}
+    local grids = type(payload) == "table" and type(payload.grids) == "table" and payload.grids or {}
     local target = M.state.grid_list_target
     M.state.grid_list_target = nil
     if target == "setup" then
-        guihooks.trigger("BeamCompSetupGrids", {names = names})
+        guihooks.trigger("BeamCompSetupGrids", {grids = grids})
         return
     end
     if target == "gridui" then
-        guihooks.trigger("BeamCompGridList", {names = names})
+        guihooks.trigger("BeamCompGridList", {grids = grids})
         return
     end
-    if #names == 0 then
+    if #grids == 0 then
         editor_feedback("no saved grids on this map")
         return
     end
-    editor_feedback("saved grids: " .. table.concat(names, ", "))
+    -- Console toast: one "<race>: a*, b" group per race, the default marked with a star. The server
+    -- already sorted by race then name, so consecutive entries of one race group without a lookup.
+    local groups = {}
+    local current_race = nil
+    for _, entry in ipairs(grids) do
+        if entry.race ~= current_race then
+            current_race = entry.race
+            groups[#groups + 1] = {race = current_race, names = {}}
+        end
+        local names = groups[#groups].names
+        names[#names + 1] = tostring(entry.name) .. (entry.isDefault and "*" or "")
+    end
+    local lines = {}
+    for _, group in ipairs(groups) do
+        lines[#lines + 1] = tostring(group.race) .. ": " .. table.concat(group.names, ", ")
+    end
+    editor_feedback("saved grids (* = race default) -- " .. table.concat(lines, " | "))
 end
 
 -- Push the current map's saved preset names to the race-setup panel (ADR-0037 amendment). The panel is
@@ -2754,10 +2773,12 @@ function M.grid_open_new(race)
 end
 
 -- Request a saved grid's data so the editor opens it (UI -> GE); handle_grid_data opens + reflects on reply.
--- `anchor_race` (the panel's selected race) re-targets the grid's relative params onto that race's start
--- line; remembered until the reply arrives.
-function M.grid_open_saved(name, anchor_race)
-    if type(name) ~= "string" or name == "" then
+-- `race` is the race the grid BELONGS to (its store key, ADR-0023 amendment) -- the name alone no longer
+-- identifies a grid. `anchor_race` (the panel's selected race) re-targets the grid's relative params onto
+-- that race's start line, which is how a finished layout is copied onto another track: saving it there
+-- moves the grid to that race. Remembered until the reply arrives.
+function M.grid_open_saved(race, name, anchor_race)
+    if type(race) ~= "string" or race == "" or type(name) ~= "string" or name == "" then
         return
     end
     local map = maps.current()
@@ -2766,7 +2787,7 @@ function M.grid_open_saved(name, anchor_race)
         return
     end
     M.state.grid_load_anchor = (type(anchor_race) == "string" and anchor_race ~= "") and anchor_race or nil
-    send_to_server("gridFetch", {map = map, name = name})
+    send_to_server("gridFetch", {map = map, race = race, name = name})
 end
 
 -- Set one knob on the active SEGMENT (UI -> GE) and reflect the clamped result back to the panel.
@@ -2846,11 +2867,13 @@ function M.grid_save(name)
     editor_feedback("saving grid '" .. name .. "' ...")
 end
 
--- Bind a saved grid as the default for `race` (UI -> GE -> server, ADR-0023). The race is resolved to its
--- canonical id client-side (race_start.resolve_id), exactly like beamcomp_grid_assign.
+-- Make a saved grid the default of `race` (UI -> GE -> server, ADR-0023). Since a grid belongs to a race,
+-- the panel always passes the ACTIVE grid's own race here -- there is no cross-race assignment any more.
+-- The race is resolved to its canonical id client-side (race_start.resolve_id, idempotent on an id),
+-- exactly like beamcomp_grid_assign.
 function M.grid_assign(race, name)
     if type(race) ~= "string" or race == "" or type(name) ~= "string" or name == "" then
-        editor_feedback("pick a race and save a grid first", "warning")
+        editor_feedback("save (or load) a grid first", "warning")
         return
     end
     local map = maps.current()
@@ -2867,10 +2890,10 @@ function M.grid_assign(race, name)
     editor_feedback("assigning '" .. name .. "' as default for " .. race_id .. " ...")
 end
 
--- Delete a saved grid (UI -> GE -> server, ADR-0023). The server replies with the updated grid list (routed
--- to the panel via grid_list_target), so the dropdown refreshes itself.
-function M.grid_delete(name)
-    if type(name) ~= "string" or name == "" then
+-- Delete one of `race`'s saved grids (UI -> GE -> server, ADR-0023). The server replies with the updated
+-- grid list (routed to the panel via grid_list_target), so the dropdown refreshes itself.
+function M.grid_delete(race, name)
+    if type(race) ~= "string" or race == "" or type(name) ~= "string" or name == "" then
         return
     end
     local map = maps.current()
@@ -2879,7 +2902,7 @@ function M.grid_delete(name)
         return
     end
     M.state.grid_list_target = "gridui"
-    send_to_server("gridDelete", {map = map, name = name})
+    send_to_server("gridDelete", {map = map, race = race, name = name})
     editor_feedback("deleting grid '" .. name .. "' ...")
 end
 
@@ -5912,6 +5935,10 @@ end
 -- straight into the BeamNG GE Lua console (the only authoring UI this iteration). Each is a thin
 -- wrapper over race/grideditor (preview, client-local), with save/assign/fetch/list going over
 -- send_to_server (server owns the shared grids file; save/assign are admin-gated server-side).
+-- A grid BELONGS to a race (ADR-0023 amendment 2026-07-27) -- the race it is authored/anchored against
+-- when saved -- and names are unique only within one race, so beamcomp_grid_edit takes the race too:
+-- beamcomp_grid_edit("<race>", "<gridname>"). The first grid saved for a race becomes that race's default
+-- grid automatically; beamcomp_grid_assign re-points it.
 -- Knobs (beamcomp_grid_set):
 --   offsetForward  -- shift the whole grid forward/back along the travel axis (m)
 --   offsetLateral  -- shift the whole grid left/right (m)
@@ -5945,11 +5972,13 @@ function beamcomp_grid_new(race_name)
     end
 end
 
--- GE console command (intentionally global): open a SAVED grid by name for further editing. The grid
--- lives on the server, so we request it (gridFetch); handle_grid_data opens it when the reply arrives.
-function beamcomp_grid_edit(grid_name)
-    if type(grid_name) ~= "string" or grid_name == "" then
-        editor_feedback("usage: beamcomp_grid_edit(\"<gridname>\")", "warning")
+-- GE console command (intentionally global): open a SAVED grid for further editing. A grid belongs to a
+-- race and names are unique only within one (ADR-0023 amendment), so the race is part of the address; it
+-- is resolved to its canonical id here like in beamcomp_grid_assign. The grid lives on the server, so we
+-- request it (gridFetch); handle_grid_data opens it when the reply arrives.
+function beamcomp_grid_edit(race_name, grid_name)
+    if type(race_name) ~= "string" or race_name == "" or type(grid_name) ~= "string" or grid_name == "" then
+        editor_feedback("usage: beamcomp_grid_edit(\"<race>\", \"<gridname>\")", "warning")
         return
     end
     local map = maps.current()
@@ -5957,11 +5986,17 @@ function beamcomp_grid_edit(grid_name)
         editor_feedback("no map loaded", "warning")
         return
     end
-    send_to_server("gridFetch", {map = map, name = grid_name})
-    editor_feedback("opening saved grid '" .. grid_name .. "' ...")
+    local race_id, reason = race_start.resolve_id(race_name)
+    if not race_id then
+        editor_feedback(tostring(reason), "warning")
+        return
+    end
+    send_to_server("gridFetch", {map = map, race = race_id, name = grid_name})
+    editor_feedback("opening saved grid '" .. grid_name .. "' of " .. race_id .. " ...")
 end
 
--- GE console command (intentionally global): list the grids saved for the current map (gridListReq).
+-- GE console command (intentionally global): list the grids saved for the current map (gridListReq),
+-- grouped by race with the per-race default starred (see handle_grid_list).
 function beamcomp_grid_list()
     local map = maps.current()
     if not map then
