@@ -46,14 +46,21 @@
     /* Long dropdown labels (bcSetupFit): the directive wraps each label in .bc-fit-clip > .bc-fit-text.
        The clip is a block that fills the cell content box (so it stops before the head's 22px chevron
        padding) and hides overflow; the inline-block text is shrunk to fit and, if still too wide, given a
-       calm ping-pong marquee driven by the per-cell --bc-fit-shift / --bc-fit-dur the directive sets. */
+       calm ping-pong marquee driven by the per-cell --bc-fit-shift / --bc-fit-dur the directive sets.
+       The marquee animates `left` -- a paint property on a relatively positioned box -- and deliberately
+       NOT `transform`. A never-ending transform animation, or a will-change transform hint, hands the
+       label its own compositing layer; that layer is rastered once, loses subpixel antialiasing and is
+       from then on only re-composited, so the text renders blurry even in the 0-12% / 88-100% hold phases
+       where it stands still. `left` keeps the marquee on the main thread, so every frame -- and every
+       standstill -- is re-rastered crisply. Do not reintroduce transform or any will-change here. */
     .bc-fit-clip { display: block; width: 100%; overflow: hidden; }
-    .bc-fit-text { display: inline-block; white-space: nowrap; vertical-align: bottom; }
-    .bc-fit-text.bc-fit-scroll { will-change: transform;
+    .bc-fit-text { position: relative; display: inline-block; white-space: nowrap;
+      vertical-align: bottom; }
+    .bc-fit-text.bc-fit-scroll {
       animation: bc-fit-marquee var(--bc-fit-dur, 6s) ease-in-out infinite alternate; }
     @keyframes bc-fit-marquee {
-      0%, 12% { transform: translateX(0); }
-      88%, 100% { transform: translateX(var(--bc-fit-shift, 0px)); }
+      0%, 12% { left: 0; }
+      88%, 100% { left: var(--bc-fit-shift, 0px); }
     }
     .bc-actions { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 10px;
       border-top: 1px solid rgba(255,255,255,0.12); }
