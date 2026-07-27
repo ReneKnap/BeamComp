@@ -127,13 +127,13 @@ local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict
 local MSG_SPAWN_READY = "spawnReady"  -- a client's "car spawned + seated" ack, gating spawning (ADR-0006 amendment)
 local MSG_CLIENT_INFO = "clientInfo"  -- a client's vehicle metadata for best-times records (ADR-0027)
 local MSG_CLIENT_IDENTITY = "clientIdentity"  -- a client's BeamNG name, reported on connect, for identity resolution (ADR-0031)
-local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a map (ADR-0023; admin-gated)
-local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a map's default grid for a race (ADR-0023; admin-gated)
-local MSG_GRID_DELETE = "gridDelete"  -- editor deletes a saved grid for a map (ADR-0023; admin-gated)
+local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a race (ADR-0023; admin-gated)
+local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a race's default grid (ADR-0023; admin-gated)
+local MSG_GRID_DELETE = "gridDelete"  -- editor deletes one of a race's saved grids (ADR-0023; admin-gated)
 local MSG_GRID_FETCH = "gridFetch"    -- editor opens a saved grid: request its data (ADR-0023; read-only)
 local MSG_GRID_LIST_REQ = "gridListReq"  -- editor lists a map's saved grids (ADR-0023; read-only)
 local MSG_GRID_DATA = "gridData"      -- reply to gridFetch: a saved grid's params (server -> client)
-local MSG_GRID_LIST = "gridList"      -- reply to gridListReq: the map's saved grid names (server -> client)
+local MSG_GRID_LIST = "gridList"      -- reply to gridListReq: the map's grids as {name, race, isDefault}
 local MSG_START_RACE = "startRace"   -- the settings UI's structured race request: {race, overrides} (ADR-0037; admin-gated)
 local MSG_RACE_GO = "raceGo"         -- the settings UI's "start now": end staging -> countdown, the /go equivalent (ADR-0037; admin-gated)
 -- Server -> client broadcast/request types.
@@ -304,7 +304,12 @@ local GRIDS_CANDIDATE_PATHS = {
     "beamcomp.grids.json",
 }
 
--- grids[map][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
+-- grids[map][raceId][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
+-- A grid belongs to a RACE, not to a map (ADR-0023 amendment 2026-07-27): the race id is the middle key,
+-- so grid names are unique per race and two races on one map may both own a grid called "Main". The
+-- record carries no `race` field -- it IS the key; gridData echoes the race back from the request.
+-- defaults stays the single source of truth for "which grid is this race's default" (no flag in the
+-- record); grid_store.ensure_default holds the one-default-per-race invariant.
 -- presets[map][name] = <race-setup form JSON string> is the named-preset store (ADR-0037 amendment
 -- 2026-07-03), folded onto this same table -- see the preset block below.
 --
@@ -322,6 +327,10 @@ local grid_store = {
     presets = {},
     grids_path = nil,
     grids_loaded = false,
+    -- Set when the loaded grids file was rejected as the pre-2026-07-27 map-keyed schema. It blocks
+    -- write_grids, so an in-game save can never overwrite an unmigrated file with the empty store the
+    -- rejection left behind (that file still holds the admin's authored grids).
+    grids_legacy = false,
 }
 
 -- Named race-setup presets (ADR-0037 amendment 2026-07-03). A preset is the setup panel's form JSON,
@@ -473,13 +482,17 @@ local function read_grids()
 end
 
 -- Populate grid_store from the grids file (ADR-0023). A missing or unparseable file leaves the store
--- empty, so every race uses the procedural grid -- the safe default. The resolved path is logged so the
--- write target is visible in the server console (recon TODO #4). Called from on_init.
+-- empty, so every race uses the procedural grid -- the safe default. A file still written in the old
+-- map-keyed schema is treated exactly like an unreadable one (ADR-0023 amendment 2026-07-27): there is
+-- deliberately NO migration path, so it is rejected whole with one clear log line and the write path is
+-- blocked until it has been migrated by hand. The resolved path is logged so the write target is visible
+-- in the server console (recon TODO #4). Called from on_init.
 local function load_grids()
     -- Clear the grid fields in place rather than reassigning grid_store: the named-preset store folds
     -- its state + helpers onto this same table (200/200 local ceiling), and a fresh table would drop them.
     grid_store.grids = {}
     grid_store.defaults = {}
+    grid_store.grids_legacy = false
 
     local data, path, err = read_grids()
     grid_store.grids_path = path
@@ -493,6 +506,13 @@ local function load_grids()
         return
     end
 
+    if type(data.grids) == "table" and grid_store.is_legacy_grids(data.grids) then
+        grid_store.grids_legacy = true
+        log_info("beamcomp.grid", "grids file at " .. path .. " is still keyed by map only"
+            .. " (grids[map][name]); grids now belong to a race (grids[map][race][name]) and must be"
+            .. " migrated by hand -- using procedural grids and refusing to write this file")
+        return
+    end
     if type(data.grids) == "table" then
         grid_store.grids = data.grids
     end
@@ -514,9 +534,12 @@ local function ensure_grids_loaded()
 end
 
 -- The grid param record for a race start, or nil to fall back to the procedural grid (ADR-0023).
--- An explicit `grid_name` (from /race grid=<name>) wins; otherwise the map's default for this race is
--- used. A requested-but-unknown name resolves to nil, so a typo'd /race grid= silently falls back
--- rather than failing the start. The server never interprets the record -- it relays it verbatim.
+-- Grids belong to a race, so both lookups are scoped to `race_name` (the canonical race id, or the raw
+-- name when the client reported none): an explicit `grid_name` (from /race grid=<name>) is looked up
+-- among THAT race's grids, otherwise the race's default is used. Every miss resolves to nil, so a typo'd
+-- /race grid= silently falls back rather than failing the start -- these log lines are the only trace it
+-- leaves. The race id is an opaque table key here, never parsed (race-blind, ADR-0005), and the server
+-- never interprets the record -- it relays it verbatim.
 local function resolve_grid(map, race_name, grid_name)
     ensure_grids_loaded()
     if type(map) ~= "string" then
@@ -525,6 +548,12 @@ local function resolve_grid(map, race_name, grid_name)
     local map_grids = grid_store.grids[map]
     if type(map_grids) ~= "table" then
         log_info("beamcomp.grid", "resolve: no saved grids for map '" .. map .. "' -> procedural")
+        return nil
+    end
+    local race_grids = type(race_name) == "string" and map_grids[race_name] or nil
+    if type(race_grids) ~= "table" then
+        log_info("beamcomp.grid", "resolve: no saved grids for race '" .. tostring(race_name)
+            .. "' on '" .. map .. "' -> procedural")
         return nil
     end
 
@@ -539,9 +568,10 @@ local function resolve_grid(map, race_name, grid_name)
         return nil
     end
 
-    local record = map_grids[name]
+    local record = race_grids[name]
     if type(record) ~= "table" then
-        log_info("beamcomp.grid", "resolve: grid '" .. name .. "' missing for '" .. map .. "' -> procedural")
+        log_info("beamcomp.grid", "resolve: grid '" .. name .. "' missing for race '"
+            .. tostring(race_name) .. "' -> procedural")
         return nil
     end
     log_info("beamcomp.grid", "resolve: using grid '" .. name .. "' for race '" .. tostring(race_name) .. "'")
@@ -552,6 +582,15 @@ end
 -- Returns true + path on success, false otherwise. pcall-guarded around the encode + file I/O so a
 -- write failure is reported, never thrown into the BeamMP runtime.
 local function write_grids()
+    -- Never write over a file we refused to load: the rejected legacy-schema file still holds the admin's
+    -- authored grids, and the store is empty by design, so a write would wipe them before the hand
+    -- migration ever happens (ADR-0023 amendment 2026-07-27).
+    if grid_store.grids_legacy then
+        log_info("beamcomp.grid", "refusing to write grids: the file at " .. tostring(grid_store.grids_path)
+            .. " is still keyed by map only and must be migrated to grids[map][race][name] first")
+        return false
+    end
+
     local ok, encoded = pcall(Util.JsonEncode, {grids = grid_store.grids, defaults = grid_store.defaults})
     if not ok then
         log_info("beamcomp.grid", "could not encode grids: " .. tostring(encoded))
@@ -595,18 +634,30 @@ local function write_grids()
     return false
 end
 
--- Store a named grid for a map and persist it (ADR-0023). `record` is {forward = <params>,
--- reverse = <params>?}. Returns the write_grids result.
-local function save_grid(map, name, record)
+-- Store a named grid for a race on a map and persist it (ADR-0023 amendment 2026-07-27). `record` is
+-- {forward = <params>, reverse = <params>?} -- the race is the key, not a field. Returns the write_grids
+-- result plus the name ensure_default promoted, so the caller can tell the admin that this save also made
+-- the grid the race's default (the FIRST grid of a race becomes its default with nobody assigning it).
+local function save_grid(map, race_name, name, record)
     ensure_grids_loaded()
     if type(grid_store.grids[map]) ~= "table" then
         grid_store.grids[map] = {}
     end
-    grid_store.grids[map][name] = record
-    return write_grids()
+    local race_grids = grid_store.grids[map][race_name]
+    if type(race_grids) ~= "table" then
+        race_grids = {}
+        grid_store.grids[map][race_name] = race_grids
+    end
+    race_grids[name] = record
+
+    local promoted = grid_store.ensure_default(map, race_name)
+    local ok, path = write_grids()
+    return ok, path, promoted
 end
 
--- Set a map's default grid for a race and persist it (ADR-0023). Returns the write_grids result.
+-- Point a race's default grid at `name` and persist it (ADR-0023). The explicit counterpart to
+-- grid_store.ensure_default's automatic promotion; the caller checks that the grid exists for that race.
+-- Returns the write_grids result.
 local function assign_default(map, race_name, name)
     ensure_grids_loaded()
     if type(grid_store.defaults[map]) ~= "table" then
@@ -616,26 +667,86 @@ local function assign_default(map, race_name, name)
     return write_grids()
 end
 
--- Delete a saved grid from a map and persist it (ADR-0023). Also drops any race defaults that pointed at
--- it, so a deleted grid leaves no dangling default mapping. Returns (existed, write_grids ok): existed is
--- false when there was no such grid (nothing written).
-local function delete_grid(map, name)
+-- Delete one of a race's saved grids and persist it (ADR-0023 amendment 2026-07-27). Deleting the race's
+-- default promotes a survivor; deleting the last grid leaves the race with no default at all -- both via
+-- the one ensure_default that also runs on save, so the invariant has a single owner. Returns
+-- (existed, write_grids ok, promoted name): existed is false when there was no such grid (nothing written).
+local function delete_grid(map, race_name, name)
     ensure_grids_loaded()
     local map_grids = grid_store.grids[map]
-    if type(map_grids) ~= "table" or type(map_grids[name]) ~= "table" then
+    local race_grids = type(map_grids) == "table" and map_grids[race_name] or nil
+    if type(race_grids) ~= "table" or type(race_grids[name]) ~= "table" then
         return false
     end
-    map_grids[name] = nil
+    race_grids[name] = nil
+    -- Drop an emptied race bucket so "this race has grids" stays a plain presence check.
+    if next(race_grids) == nil then
+        map_grids[race_name] = nil
+    end
+
+    local promoted = grid_store.ensure_default(map, race_name)
+    local ok = write_grids()
+    return true, ok, promoted
+end
+
+-- Hold the one-default-per-race invariant (ADR-0023 amendment 2026-07-27): a race with at least one grid
+-- has exactly one default, a race with none has no default. Called after every grid insert/delete, so the
+-- FIRST grid saved for a race becomes its default automatically and deleting the default promotes the
+-- alphabetically first survivor. A standing default that still resolves is never overridden -- an explicit
+-- gridAssign wins. Returns the newly promoted name, or nil when nothing changed. The caller persists.
+-- On grid_store (not a top-level local) like every other helper added since main.lua hit 200/200.
+function grid_store.ensure_default(map, race_name)
+    local map_grids = grid_store.grids[map]
+    local race_grids = type(map_grids) == "table" and map_grids[race_name] or nil
     local map_defaults = grid_store.defaults[map]
-    if type(map_defaults) == "table" then
-        for race_name, default_name in pairs(map_defaults) do
-            if default_name == name then
-                map_defaults[race_name] = nil
+    if type(race_grids) ~= "table" or next(race_grids) == nil then
+        if type(map_defaults) == "table" then
+            map_defaults[race_name] = nil
+        end
+        return nil
+    end
+
+    local current = type(map_defaults) == "table" and map_defaults[race_name] or nil
+    if type(current) == "string" and type(race_grids[current]) == "table" then
+        return nil
+    end
+
+    local first = nil
+    for grid_name in pairs(race_grids) do
+        if first == nil or grid_name < first then
+            first = grid_name
+        end
+    end
+    if type(map_defaults) ~= "table" then
+        map_defaults = {}
+        grid_store.defaults[map] = map_defaults
+    end
+    map_defaults[race_name] = first
+    return first
+end
+
+-- Whether a decoded `grids` table is still in the pre-2026-07-27 map-keyed schema (grids[map][name] =
+-- record) instead of the race-keyed one (grids[map][race][name] = record). Discriminates on SHAPE alone,
+-- by DEPTH: the second level holds race buckets now, records before.
+--   old:  grids[map].<name>.forward   = <params>   -- and a param set has no `forward` of its own
+--   new:  grids[map].<race>.<name>.forward = <params>
+-- So a second-level entry whose `forward` is a table is a record only if THAT table is not itself a
+-- record -- which is what keeps a race whose grid is literally named "forward" from being mistaken for
+-- the old schema. No key is ever inspected and no param value is read, so the server stays race-blind
+-- (ADR-0005). `forward` alone is enough: every saved record has one (handle_grid_save rejects it
+-- otherwise). There is deliberately no reader for the old shape -- see load_grids.
+function grid_store.is_legacy_grids(grids)
+    for _, map_grids in pairs(grids) do
+        if type(map_grids) == "table" then
+            for _, entry in pairs(map_grids) do
+                if type(entry) == "table" and type(entry.forward) == "table"
+                    and type(entry.forward.forward) ~= "table" then
+                    return true
+                end
             end
         end
     end
-    local ok = write_grids()
-    return true, ok
+    return false
 end
 
 -- Preset store helpers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200
@@ -3289,10 +3400,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
         champ.order_identities(), overrides.ai and overrides.ai.count)
     local roster = build_roster(slots)
     local assists = overrides.assists
-    -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). The default is
-    -- keyed by the canonical race id (race_id) so it resolves whatever shorthand was typed for /race;
-    -- fall back to the raw name if the client did not report an id. nil = no custom grid -> clients lay
-    -- out the procedural grid. The server relays the params verbatim and never interprets them (ADR-0005).
+    -- Resolve the named/default grid for this race on the issuer-reported map (ADR-0023). Grids AND
+    -- defaults are keyed by the canonical race id (race_id) so they resolve whatever shorthand was typed
+    -- for /race; fall back to the raw name if the client did not report an id. nil = no custom grid ->
+    -- clients lay out the procedural grid. The server relays the params verbatim, never interprets them,
+    -- and never parses the race id -- it is a table key only (ADR-0005).
     local grid_params = resolve_grid(map, race_id or race_name, overrides.grid)
 
     session.race = race_name
@@ -5405,9 +5517,45 @@ local function player_name_of(player_id)
     return MP.GetPlayers()[player_id]
 end
 
+-- Send a map's saved grids to one client (ADR-0023 amendment 2026-07-27): {grids = {{name, race,
+-- isDefault}, ...}}, sorted by race then name. The whole map travels in ONE reply so all three consumers
+-- can filter locally -- the setup panel narrows it to the selected race, the grid editor splits it into
+-- "this race" plus the rest of the map, and the GE console groups it for its toast -- and so switching
+-- race in a panel stays a local, synchronous operation instead of a new round-trip. Shared by the list
+-- request and the delete echo, so a panel always sees the post-change truth.
+-- Lives here rather than with the other grid_store helpers because it captures send_event/MSG_GRID_LIST,
+-- which are declared further up the chunk than those.
+function grid_store.send_grid_list(player_id, map)
+    ensure_grids_loaded()
+    local entries = {}
+    local map_grids = type(map) == "string" and grid_store.grids[map] or nil
+    local map_defaults = type(map) == "string" and grid_store.defaults[map] or nil
+    if type(map_grids) == "table" then
+        for race_name, race_grids in pairs(map_grids) do
+            if type(race_grids) == "table" then
+                local default_name = type(map_defaults) == "table" and map_defaults[race_name] or nil
+                for name in pairs(race_grids) do
+                    entries[#entries + 1] = {
+                        name = name,
+                        race = race_name,
+                        isDefault = name == default_name,
+                    }
+                end
+            end
+        end
+    end
+    table.sort(entries, function(a, b)
+        if a.race ~= b.race then
+            return a.race < b.race
+        end
+        return a.name < b.name
+    end)
+    send_event(player_id, MSG_GRID_LIST, {grids = entries})
+end
+
 -- Store a named grid sent by the in-game editor (ADR-0023). Admin-gated like /race (ADR-0016): only a
 -- race admin may write the shared grids file. The server validates shape but never interprets the param
--- numbers (race-blind, ADR-0005). Payload: {map, name, forward = <params>, reverse = <params>?}.
+-- numbers (race-blind, ADR-0005). Payload: {map, race, name, forward = <params>, reverse = <params>?}.
 local function handle_grid_save(player_id, payload)
     local player_name = player_name_of(player_id)
     if not player_name or not is_race_admin(player_name) then
@@ -5423,25 +5571,31 @@ local function handle_grid_save(player_id, payload)
         return
     end
 
-    -- Store the race the grid was authored against (canonical id) so beamcomp_grid_edit can re-anchor a
-    -- reopened grid to the right start line (ADR-0023).
-    local record = {forward = payload.forward, race = payload.race}
+    -- The race the grid was authored against is its OWNER (the store key), and it is also what lets
+    -- beamcomp_grid_edit re-anchor a reopened grid to the right start line (ADR-0023 amendment).
+    local record = {forward = payload.forward}
     if type(payload.reverse) == "table" then
         record.reverse = payload.reverse
     end
 
-    local ok, path = save_grid(payload.map, payload.name, record)
+    local ok, path, promoted = save_grid(payload.map, payload.race, payload.name, record)
     if ok then
-        MP.SendChatMessage(player_id, "BeamComp: saved grid '" .. payload.name .. "' for " .. payload.map)
-        log_info("beamcomp.grid", string.format("saved grid '%s' for map '%s' (%s) by %s",
-            payload.name, payload.map, tostring(path), player_name))
+        local message = "BeamComp: saved grid '" .. payload.name .. "' for " .. payload.race
+        if promoted == payload.name then
+            -- The race had no (valid) default, so this grid just became it. Say so: nothing else in the
+            -- editor surfaces that automatic assignment.
+            message = message .. " -- it is now this race's default grid"
+        end
+        MP.SendChatMessage(player_id, message)
+        log_info("beamcomp.grid", string.format("saved grid '%s' for race '%s' on map '%s' (%s) by %s",
+            payload.name, payload.race, payload.map, tostring(path), player_name))
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
 end
 
--- Set a map's default grid for a race, sent by the editor (ADR-0023). Admin-gated. The grid must
--- already exist for that map. Payload: {map, race, name}.
+-- Set a race's default grid, sent by the editor (ADR-0023). Admin-gated. The grid must already exist for
+-- that race. Payload: {map, race, name}.
 local function handle_grid_assign(player_id, payload)
     local player_name = player_name_of(player_id)
     if not player_name or not is_race_admin(player_name) then
@@ -5457,8 +5611,9 @@ local function handle_grid_assign(player_id, payload)
 
     ensure_grids_loaded()
     local map_grids = grid_store.grids[payload.map]
-    if type(map_grids) ~= "table" or type(map_grids[payload.name]) ~= "table" then
-        MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.map)
+    local race_grids = type(map_grids) == "table" and map_grids[payload.race] or nil
+    if type(race_grids) ~= "table" or type(race_grids[payload.name]) ~= "table" then
+        MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.race)
         return
     end
 
@@ -5473,9 +5628,9 @@ local function handle_grid_assign(player_id, payload)
     end
 end
 
--- Delete a saved grid sent by the editor (ADR-0023). Admin-gated like save/assign. Replies with the map's
--- updated grid-name list (MSG_GRID_LIST) so the panel's dropdown refreshes without a second round-trip.
--- Payload: {map, name}.
+-- Delete one of a race's saved grids, sent by the editor (ADR-0023). Admin-gated like save/assign.
+-- Replies with the map's updated grid list (MSG_GRID_LIST) so the panel's dropdown refreshes without a
+-- second round-trip. Payload: {map, race, name}.
 local function handle_grid_delete(player_id, payload)
     local player_name = player_name_of(player_id)
     if not player_name or not is_race_admin(player_name) then
@@ -5483,46 +5638,49 @@ local function handle_grid_delete(player_id, payload)
         return
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
+        or type(payload.race) ~= "string" or payload.race == ""
         or type(payload.name) ~= "string" or payload.name == "" then
         MP.SendChatMessage(player_id, "BeamComp: grid delete rejected -- bad data")
         return
     end
 
-    local existed, ok = delete_grid(payload.map, payload.name)
+    local existed, ok, promoted = delete_grid(payload.map, payload.race, payload.name)
     if not existed then
-        MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.map)
+        MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.race)
     elseif ok then
-        MP.SendChatMessage(player_id, "BeamComp: deleted grid '" .. payload.name .. "' for " .. payload.map)
-        log_info("beamcomp.grid", string.format("deleted grid '%s' for map '%s' by %s",
-            payload.name, payload.map, player_name))
+        local message = "BeamComp: deleted grid '" .. payload.name .. "' for " .. payload.race
+        if promoted then
+            -- The deleted grid was this race's default, so a survivor took over (a race with grids always
+            -- has exactly one default).
+            message = message .. " -- '" .. promoted .. "' is now its default grid"
+        end
+        MP.SendChatMessage(player_id, message)
+        log_info("beamcomp.grid", string.format("deleted grid '%s' for race '%s' on map '%s' by %s",
+            payload.name, payload.race, payload.map, player_name))
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
 
-    -- Always echo the current names so the editor's dropdown reflects the post-delete state.
-    local names = {}
-    local map_grids = grid_store.grids[payload.map]
-    if type(map_grids) == "table" then
-        for grid_name in pairs(map_grids) do
-            names[#names + 1] = grid_name
-        end
-        table.sort(names)
-    end
-    send_event(player_id, MSG_GRID_LIST, {names = names})
+    -- Always echo the current list so the editor's dropdown reflects the post-delete state.
+    grid_store.send_grid_list(player_id, payload.map)
 end
 
 -- Return a saved grid's data so the editor can reopen it (ADR-0023). Read-only, so ungated like
--- /races. A missing map/name or unknown grid replies found = false rather than an error.
+-- /races. Payload: {map, race, name} -- the name alone no longer identifies a grid. A missing field or an
+-- unknown grid replies found = false rather than an error. The race is echoed back from the request (it
+-- is the store key, not a record field), so the editor can re-anchor the reopened grid.
 local function handle_grid_fetch(player_id, payload)
-    if type(payload) ~= "table" or type(payload.map) ~= "string" or type(payload.name) ~= "string" then
+    if type(payload) ~= "table" or type(payload.map) ~= "string" or type(payload.race) ~= "string"
+        or type(payload.name) ~= "string" then
         send_event(player_id, MSG_GRID_DATA, {found = false})
         return
     end
     ensure_grids_loaded()
     local map_grids = grid_store.grids[payload.map]
-    local record = type(map_grids) == "table" and map_grids[payload.name] or nil
+    local race_grids = type(map_grids) == "table" and map_grids[payload.race] or nil
+    local record = type(race_grids) == "table" and race_grids[payload.name] or nil
     if type(record) ~= "table" then
-        send_event(player_id, MSG_GRID_DATA, {name = payload.name, found = false})
+        send_event(player_id, MSG_GRID_DATA, {name = payload.name, race = payload.race, found = false})
         return
     end
     send_event(player_id, MSG_GRID_DATA, {
@@ -5530,23 +5688,13 @@ local function handle_grid_fetch(player_id, payload)
         found = true,
         forward = record.forward,
         reverse = record.reverse,
-        race = record.race,
+        race = payload.race,
     })
 end
 
--- Return the saved grid names for a map (ADR-0023). Read-only, sorted for a stable listing.
+-- Return the saved grids for a map (ADR-0023). Read-only; see grid_store.send_grid_list for the shape.
 local function handle_grid_list_request(player_id, payload)
-    ensure_grids_loaded()
-    local names = {}
-    local map = type(payload) == "table" and payload.map or nil
-    local map_grids = type(map) == "string" and grid_store.grids[map] or nil
-    if type(map_grids) == "table" then
-        for name in pairs(map_grids) do
-            names[#names + 1] = name
-        end
-        table.sort(names)
-    end
-    send_event(player_id, MSG_GRID_LIST, {names = names})
+    grid_store.send_grid_list(player_id, type(payload) == "table" and payload.map or nil)
 end
 
 -- Preset handlers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200 ceiling);

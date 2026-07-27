@@ -39,6 +39,9 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    /* Non-selectable divider between this race's grids and the rest of the map's (copy templates). */
+    .bc-dd-sep, .bc-dd-opt.bc-dd-sep:hover { background: rgba(255,255,255,0.06); color: #9aa3ad;
+      cursor: default; text-align: center; font-size: 11px; letter-spacing: 0.04em; }
     /* Long dropdown labels (bcGridFit): the directive wraps each label in .bc-fit-clip > .bc-fit-text.
        The clip is a block that fills the cell content box (so it stops before the head's 22px chevron
        padding) and hides overflow; the inline-block text is shrunk to fit and, if still too wide, given a
@@ -99,8 +102,9 @@
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('loadName')">{{labelFor('loadName', 'none saved')}}</button>
           <div class="bc-dd-list" ng-if="open === 'loadName'">
-            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.loadName" ng-class="{sel: o.v === form.loadName}"
-              ng-click="pick('loadName', o.v)">{{o.label}}</div>
+            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.loadName"
+              ng-class="{sel: o.v === form.loadName, 'bc-dd-sep': o.separator}"
+              ng-click="pickGrid(o)">{{o.label}}</div>
           </div>
         </div>
       </div>
@@ -109,8 +113,10 @@
         <button class="bc-mini" ng-disabled="!form.loadName" ng-click="loadGrid()">Load</button>
         <button class="bc-mini bc-danger" ng-disabled="!form.loadName" ng-click="deleteGrid()">Delete</button>
       </div>
-      <div class="bc-hint" ng-if="state.active">Editing <b>{{state.race}}</b></div>
-      <div class="bc-hint" ng-if="!state.active">Pick a race, then New grid or Load.</div>
+      <div class="bc-hint" ng-if="state.active">Editing <b>{{state.race}}</b> — Save stores the grid for
+        this race.</div>
+      <div class="bc-hint" ng-if="!state.active">Pick a race, then New grid or Load. The list holds this
+        race's grids first; below the divider are the map's other grids, to copy one over.</div>
     </div>
 
     <!-- Direction -->
@@ -197,25 +203,17 @@
       <div class="bc-hint" ng-if="savedName && form.saveName === savedName">Overwrites '{{savedName}}'.</div>
     </div>
 
-    <!-- Assign -->
+    <!-- Default grid -->
     <div class="bc-section" ng-if="state.active">
-      <div class="bc-section-title">Assign as default</div>
-      <div class="bc-row">
-        <span>For race</span>
-        <div class="bc-dd">
-          <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('assignRace')">{{labelFor('assignRace', 'select…')}}</button>
-          <div class="bc-dd-list" ng-if="open === 'assignRace'">
-            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.assignRace" ng-class="{sel: o.v === form.assignRace}"
-              ng-click="pick('assignRace', o.v)">{{o.label}}</div>
-          </div>
-        </div>
-      </div>
+      <div class="bc-section-title">Default grid</div>
+      <div class="bc-hint">A grid belongs to the race it is saved for. The first grid saved for a race
+        becomes its default automatically; use this to point the default at another one.</div>
       <div class="bc-row">
         <span></span>
-        <button class="bc-mini" ng-disabled="!savedName || !form.assignRace" ng-click="assignGrid()">
-          Assign {{savedName ? "'" + savedName + "'" : ''}}</button>
+        <button class="bc-mini" ng-disabled="!savedName" ng-click="makeDefault()">
+          Make {{savedName ? "'" + savedName + "'" : 'this grid'}} the default of this race</button>
       </div>
-      <div class="bc-hint" ng-if="!savedName">Save (or load) a grid first to assign it.</div>
+      <div class="bc-hint" ng-if="!savedName">Save (or load) a grid first.</div>
     </div>
 
   </div>

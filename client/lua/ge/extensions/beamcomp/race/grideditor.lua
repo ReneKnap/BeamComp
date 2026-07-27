@@ -96,8 +96,8 @@ end
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
-    race = nil,        -- canonical id of the race being edited (the default-grid key, ADR-0023)
-    map = nil,         -- the map it lives on (grids are keyed by map, ADR-0023)
+    race = nil,        -- canonical id of the race being edited; saving OWNS the grid to it (ADR-0023)
+    map = nil,         -- the map it lives on (grids are keyed grids[map][race][name], ADR-0023)
     direction = "forward",  -- which direction's segment list the knobs currently edit
     blocks = nil,      -- {forward = <segment_list>, reverse = <segment_list>?}; each is {{startSlot, params}, ...}
     segment = 1,       -- 1-based index of the active segment (the one the knobs edit) in the active direction
@@ -466,8 +466,9 @@ function M.current_scene()
     return {prefabFiles = anchor.prefabFiles, checkpoint = anchor.checkpoint}
 end
 
--- The current edit as a save payload: the map and the authored blocks (reverse only if it was edited).
--- `name` is supplied by the caller (the save command). Returns nil when not editing.
+-- The current edit as a save payload: the map, the anchored race (which OWNS the saved grid -- re-anchoring
+-- a loaded grid and saving it moves it to that race, ADR-0023 amendment 2026-07-27) and the authored blocks
+-- (reverse only if it was edited). `name` is supplied by the caller (the save command). Nil when not editing.
 function M.snapshot(name)
     if not M.state.active then
         return nil

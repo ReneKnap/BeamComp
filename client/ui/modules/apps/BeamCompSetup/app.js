@@ -334,6 +334,7 @@ angular.module('beamng.apps')
       var autosaveTimer = null;    // pending debounced save, re-armed on every change
       var lastStoredJson = null;   // last blob handed to GE, so an unchanged form is never re-sent
       var phaseSeeded = false;     // the first phase push has run, so it can no longer touch `prepared`
+      var gridsLoaded = false;     // a saved-grid list has arrived, so `data.grids` may be trusted as truth
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -355,9 +356,28 @@ angular.module('beamng.apps')
         // sentinel (resolved at spawn) plus the installed models.
         scope.opts.rosterCar = [{ v: 'host', label: "host's car" }].concat(cars);
       }
+      // Grids belong to a race, so the dropdown shows only the SELECTED race's grids (the GE push carries
+      // the whole map as {name, race, isDefault}, so a race change re-filters locally -- no round-trip).
+      // 'default' stays the first entry and means "whatever this race's default grid is"; the grid that
+      // actually is that default is labelled as such. A selection that the new race does not have is
+      // dropped back to 'default', otherwise a grid of the previously selected race would be submitted.
+      // Only prune once a list has actually arrived: before that, `data.grids` is empty for want of data,
+      // not because the race has no grids, and pruning would wipe a restored form's grid choice.
       function rebuildGridOpts() {
+        var raceGrids = (scope.data.grids || []).filter(function (g) {
+          return g && g.race === scope.form.race;
+        });
         scope.opts.grid = [{ v: '', label: 'default' }].concat(
-          (scope.data.grids || []).map(function (g) { return { v: g, label: g }; }));
+          raceGrids.map(function (g) {
+            return { v: g.name, label: g.isDefault ? g.name + ' (default)' : g.name };
+          }));
+        if (!gridsLoaded || !scope.form.grid) {
+          return;
+        }
+        var stillValid = raceGrids.some(function (g) { return g.name === scope.form.grid; });
+        if (!stillValid) {
+          scope.form.grid = '';
+        }
       }
       function rebuildConfigOpts() {
         scope.opts.carConfig = [{ v: '', label: 'default' }].concat(
@@ -413,6 +433,10 @@ angular.module('beamng.apps')
             || num(scope.form.maxkg) !== undefined || num(scope.form.minkg) !== undefined) {
           scope.form.restrictVehicles = true;
         }
+        // The restored race decides which grids are offered, and a stored grid of another race (or one
+        // deleted meanwhile) has to go -- but only once a grid list is actually on hand (see
+        // rebuildGridOpts); otherwise the pending list push does it.
+        rebuildGridOpts();
         // Re-sync the race list to the restored include-deprecated flag, then fetch, as one deduplicated
         // batch, the configs every restored car needs: the race's own model (so its config dropdown +
         // label resolve without clearing the stored config), each class row's car (ADR-0042) and each
@@ -473,9 +497,12 @@ angular.module('beamng.apps')
         });
       });
 
+      // The map's saved grids as {name, race, isDefault} (ADR-0023 amendment): server truth, kept whole so
+      // the dropdown can re-filter on a race change without asking again.
       scope.$on('BeamCompSetupGrids', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.grids = (payload && payload.names) || [];
+          scope.data.grids = (payload && payload.grids) || [];
+          gridsLoaded = true;
           rebuildGridOpts();
         });
       });
@@ -528,6 +555,10 @@ angular.module('beamng.apps')
         scope.open = null;
         if (field === 'carModel') {
           onModelChange();
+        }
+        if (field === 'race') {
+          // Grids are per race: the new race has its own set, and the old race's pick is no longer valid.
+          rebuildGridOpts();
         }
       };
 
