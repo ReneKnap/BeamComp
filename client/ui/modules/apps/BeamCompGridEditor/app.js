@@ -1,7 +1,12 @@
 // BeamComp Grid Editor -- AngularJS directive (ADR-0037 amendment, fronting ADR-0023).
-// An on-demand, admin-only panel that tunes, previews, saves and assigns parametric start grids. Opened by
+// An on-demand, admin-only panel that tunes, previews and saves parametric start grids. Opened by
 // the server-gated /gridui relay (or the race-setup panel's "Grid bearbeiten" button): the GE extension
-// (init.lua) pushes the race list + saved-grid names here via guihooks and ensures this app is visible.
+// (init.lua) pushes the race list + the map's saved grids here via guihooks and ensures this app is visible.
+//
+// A grid BELONGS to a race (ADR-0023 amendment 2026-07-27): the anchored race IS the assignment, so there
+// is no "assign to race" picker -- saving writes the grid to the race being edited, and the Default button
+// points that race's default at the active grid. The saved-grid list shows this race's grids first, then a
+// non-selectable divider, then the map's other grids (loading one and saving copies it onto this race).
 //
 // GE owns the live edit session (race/grideditor.lua) -- this panel is render + input only. It reflects
 // BeamCompGridState (the authoritative, clamped knob values) and calls the knob setters back via
@@ -45,14 +50,15 @@ angular.module('beamng.apps')
     bngApi.engineLua('beamcomp_init.' + fn + "('" + escaped + "')");
   }
 
-  // Run a GE command with two string arguments, each single-quoted + escaped.
-  function geLuaArg2(fn, a, b) {
+  // Run a GE command with N string arguments, each single-quoted + escaped.
+  function geLuaArgs(fn) {
     if (typeof bngApi === 'undefined' || !bngApi.engineLua) {
       return;
     }
-    var ea = String(a).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-    var eb = String(b).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-    bngApi.engineLua('beamcomp_init.' + fn + "('" + ea + "', '" + eb + "')");
+    var args = Array.prototype.slice.call(arguments, 1).map(function (a) {
+      return "'" + String(a).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+    });
+    bngApi.engineLua('beamcomp_init.' + fn + '(' + args.join(', ') + ')');
   }
 
   // Run a GE command with one numeric argument (no quoting needed; non-finite values are dropped).
@@ -97,14 +103,12 @@ angular.module('beamng.apps')
     bngApi.engineLua("beamcomp_init.grid_set('mirror', " + (on ? 'true' : 'false') + ')');
   }
 
-  // Assign a saved grid as a race default: grid_assign(race, name), both single-quoted.
-  function geAssign(race, name) {
-    if (typeof bngApi === 'undefined' || !bngApi.engineLua) {
-      return;
-    }
-    var r = String(race).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-    var n = String(name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-    bngApi.engineLua("beamcomp_init.grid_assign('" + r + "', '" + n + "')");
+  // The saved-grid dropdown lists grids of several races, and a name is unique only within one race, so an
+  // option's value has to address the pair. The key is an opaque token -- never split, never rendered;
+  // scope.gridsByKey maps it back to {race, name}. A grid name may not contain whitespace (both save
+  // paths reject it), so a single space separates the two parts unambiguously.
+  function gridKey(race, name) {
+    return String(race) + ' ' + String(name);
   }
 
   return {
@@ -115,24 +119,59 @@ angular.module('beamng.apps')
     link: function (scope, element) {
       scope.knobs = KNOBS;
       scope.data = { races: [], grids: [] };
-      scope.form = { race: '', loadName: '', saveName: '', assignRace: '' };
+      // `loadName` holds a gridKey (race + name), not a bare name: the list spans several races.
+      scope.form = { race: '', loadName: '', saveName: '' };
       // The authoritative live session as last reflected by GE (BeamCompGridState). `segments` is the
       // ordered breakpoint boundaries ([{startSlot}]), `activeSegment` the 1-based index the knobs edit,
       // `activeStartSlot` that segment's start slot (ADR-0023 amendment).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null };
       scope.edit = {};          // editable mirror of the knob number fields, synced from state on each push
-      scope.savedName = null;   // set after a save/load; gates Assign (you assign an existing grid)
+      scope.savedName = null;   // set after a save/load; gates the default button (it needs a saved grid)
       scope.open = null;        // name of the currently open dropdown, or null
-      scope.opts = { race: [], loadName: [], assignRace: [] };
+      scope.opts = { race: [], loadName: [] };
+      scope.gridsByKey = {};    // gridKey -> {name, race, isDefault}, rebuilt with the load options
 
       function rebuildRaceOpts() {
-        var races = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
-        scope.opts.race = races;
-        scope.opts.assignRace = races;
+        scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
       }
+
+      // A race's display name, for labelling grids that belong to another race. Falls back to the id.
+      function raceLabel(raceId) {
+        var races = scope.data.races || [];
+        for (var i = 0; i < races.length; i++) {
+          if (races[i].id === raceId) {
+            return races[i].label;
+          }
+        }
+        return raceId;
+      }
+
+      // The saved-grid list in two blocks (ADR-0023 amendment): the anchored race's own grids first, then
+      // a non-selectable separator, then the rest of the map's grids labelled with their race. The second
+      // block is deliberately kept -- loading a finished layout from another track and saving it here is
+      // how a grid is copied over. GE pushes the whole map sorted by race then name, so both blocks come
+      // out alphabetical on their own.
       function rebuildGridOpts() {
-        scope.opts.loadName = (scope.data.grids || []).map(function (g) { return { v: g, label: g }; });
+        var own = [];
+        var foreign = [];
+        scope.gridsByKey = {};
+        (scope.data.grids || []).forEach(function (g) {
+          if (!g || !g.name) {
+            return;
+          }
+          var key = gridKey(g.race, g.name);
+          scope.gridsByKey[key] = g;
+          if (g.race === scope.form.race) {
+            own.push({ v: key, label: g.isDefault ? g.name + ' (default)' : g.name });
+          } else {
+            foreign.push({ v: key, label: g.name + ' — ' + raceLabel(g.race) });
+          }
+        });
+        if (own.length && foreign.length) {
+          own.push({ v: null, label: '— other races (copy) —', separator: true });
+        }
+        scope.opts.loadName = own.concat(foreign);
       }
 
       // Sync the editable number fields from the authoritative state, so the inputs show GE's clamped values
@@ -159,12 +198,15 @@ angular.module('beamng.apps')
           if (!scope.form.race && payload && payload.seedRace) {
             scope.form.race = payload.seedRace;
           }
+          // The race labels and the anchored race both feed the saved-grid blocks.
+          rebuildGridOpts();
         });
       });
 
+      // The map's saved grids as {name, race, isDefault} (ADR-0023 amendment).
       scope.$on('BeamCompGridList', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.grids = (payload && payload.names) || [];
+          scope.data.grids = (payload && payload.grids) || [];
           rebuildGridOpts();
         });
       });
@@ -172,17 +214,14 @@ angular.module('beamng.apps')
       scope.$on('BeamCompGridState', function (event, payload) {
         scope.$evalAsync(function () {
           scope.state = payload || scope.state;
-          // savedName tracks the active grid's persisted name (gates Assign, marks the overwrite target).
+          // savedName tracks the active grid's persisted name (gates the default button, marks the
+          // overwrite target).
           scope.savedName = scope.state.name || null;
-          if (scope.state.active && scope.state.race) {
-            // Restore the anchor + assign targets after a panel reopen (fresh scope), without clobbering a
-            // choice the admin has already made this open.
-            if (!scope.form.race) {
-              scope.form.race = scope.state.race;
-            }
-            if (!scope.form.assignRace) {
-              scope.form.assignRace = scope.state.race;
-            }
+          if (scope.state.active && scope.state.race && !scope.form.race) {
+            // Restore the anchor after a panel reopen (fresh scope), without clobbering a choice the admin
+            // has already made this open. The anchor decides which grids are "this race's", so re-block.
+            scope.form.race = scope.state.race;
+            rebuildGridOpts();
           }
           // Restore the overwrite name only when the field is empty (reopen) -- loadGrid/newGrid set it
           // explicitly, and a knob push must not wipe a save-as name the admin is typing.
@@ -205,11 +244,24 @@ angular.module('beamng.apps')
             return list[i].label;
           }
         }
-        return value || emptyLabel;
+        // loadName holds an internal key, so never fall back to showing it raw.
+        return (field === 'loadName' ? '' : value) || emptyLabel;
       };
       scope.pick = function (field, value) {
         scope.form[field] = value;
         scope.open = null;
+        if (field === 'race') {
+          // The anchored race splits the saved-grid list into "this race" and the rest.
+          rebuildGridOpts();
+        }
+      };
+      // The saved-grid dropdown carries a non-selectable separator between the two blocks; clicking it
+      // must do nothing at all (not even close the list).
+      scope.pickGrid = function (option) {
+        if (!option || option.separator) {
+          return;
+        }
+        scope.pick('loadName', option.v);
       };
 
       // Close any open dropdown on a click outside it (standard dropdown UX). No DI here: injected
@@ -246,24 +298,33 @@ angular.module('beamng.apps')
         geLuaArg('grid_open_new', scope.form.race);
       };
 
+      // The {name, race, isDefault} entry behind the selected saved-grid key, or null.
+      function selectedGrid() {
+        return scope.gridsByKey[scope.form.loadName] || null;
+      }
+
       // Load a saved grid for editing, re-anchored onto the currently selected race (grid params are
-      // relative to a start line, so a grid keeps its layout against whatever race is being edited).
-      // Pre-fill its name so a later Save overwrites it without retyping.
+      // relative to a start line, so a grid keeps its layout against whatever race is being edited). Load
+      // addresses the grid by its OWN race; saving it afterwards writes it to the ANCHORED race, which is
+      // how a layout is copied from one track to another. Pre-fill its name so a later Save overwrites it
+      // without retyping.
       scope.loadGrid = function () {
-        if (!scope.form.loadName) {
+        var grid = selectedGrid();
+        if (!grid) {
           return;
         }
-        scope.savedName = scope.form.loadName;
-        scope.form.saveName = scope.form.loadName;
-        geLuaArg2('grid_open_saved', scope.form.loadName, scope.form.race || '');
+        scope.savedName = grid.name;
+        scope.form.saveName = grid.name;
+        geLuaArgs('grid_open_saved', grid.race, grid.name, scope.form.race || '');
       };
 
       // Delete the selected saved grid; the server echoes the updated list, refreshing the dropdown.
       scope.deleteGrid = function () {
-        if (!scope.form.loadName) {
+        var grid = selectedGrid();
+        if (!grid) {
           return;
         }
-        geLuaArg('grid_delete', scope.form.loadName);
+        geLuaArgs('grid_delete', grid.race, grid.name);
         scope.form.loadName = '';
       };
 
@@ -371,11 +432,13 @@ angular.module('beamng.apps')
         scope.savedName = scope.form.saveName;
       };
 
-      scope.assignGrid = function () {
-        if (!scope.savedName || !scope.form.assignRace) {
+      // Make the active grid its race's default (ADR-0023 amendment): a grid belongs to the race it was
+      // saved against, so there is no race to pick -- the target is always state.race.
+      scope.makeDefault = function () {
+        if (!scope.savedName || !scope.state.race) {
           return;
         }
-        geAssign(scope.form.assignRace, scope.savedName);
+        geLuaArgs('grid_assign', scope.state.race, scope.savedName);
       };
 
       // Close ends the edit session GE-side (grid + preview cleared) and hides the panel; a reopen starts
