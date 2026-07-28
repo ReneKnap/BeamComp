@@ -2382,6 +2382,11 @@ local function push_grid_state()
             columns = block.columns,
             mirror = block.mirror,
         } or nil,
+        -- The layout defaults behind the knobs above, so a knob a stored block omits (offsetHeight on a
+        -- grid saved before that knob existed) shows the value that actually applies as its grey
+        -- placeholder instead of a bare "-". Constant, but sent with the knobs it annotates so the panel
+        -- always has both together.
+        knobDefaults = grideditor.knob_defaults(),
     })
 end
 

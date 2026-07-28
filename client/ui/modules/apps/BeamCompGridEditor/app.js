@@ -164,8 +164,11 @@ angular.module('beamng.apps')
       // The authoritative live session as last reflected by GE (BeamCompGridState). `segments` is the
       // ordered breakpoint boundaries ([{startSlot}]), `activeSegment` the 1-based index the knobs edit,
       // `activeStartSlot` that segment's start slot (ADR-0023 amendment).
+      // `knobDefaults` are the layout defaults GE falls back to for a knob a loaded block omits -- shown as
+      // that field's placeholder (see scope.knobHint).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
-        previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null };
+        previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
+        knobDefaults: null };
       scope.edit = {};          // editable mirror of the knob number fields, synced from state on each push
       scope.savedName = null;   // set after a save/load; gates the default button (it needs a saved grid)
       scope.open = null;        // name of the currently open dropdown, or null
@@ -414,6 +417,21 @@ angular.module('beamng.apps')
           return;
         }
         geSetMirror(on);
+      };
+
+      // The grey placeholder of an empty knob field. A knob only reads empty when the loaded block carries
+      // no value for it -- a grid saved before that knob existed (offsetHeight), or a breakpoint seeded
+      // from such a block -- and GE then falls back to the layout default (grid.resolved_params). So name
+      // that number, "0 (default)", instead of the old bare "-". The value is pushed with the knobs
+      // (BeamCompGridState.knobDefaults), so nothing here duplicates a Lua constant; the original "-"
+      // remains the fallback for a knob GE carries no default for.
+      //
+      // The two `auto` knobs never get here: rows and columns are mutually exclusive width pins and the
+      // unpinned one is genuinely derived at spawn, so "auto" is the correct word for it (see app.html).
+      scope.knobHint = function (knob) {
+        var defaults = scope.state.knobDefaults || {};
+        var value = defaults[knob.key];
+        return (typeof value === 'number' && isFinite(value)) ? value + ' (default)' : '-';
       };
 
       // Number-field commit: send the typed value to GE (which clamps and reflects it back).

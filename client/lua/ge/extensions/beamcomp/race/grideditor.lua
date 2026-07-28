@@ -416,6 +416,16 @@ function M.active_params()
     return seg and seg.params or nil
 end
 
+-- The layout defaults a knob falls back to when its param is absent, for the panel's placeholder hint:
+-- an empty knob field then reads "0 (default)" instead of a bare "-". A stored block only omits a knob
+-- when it predates that knob (offsetHeight on an older saved grid) or when a breakpoint inherited such a
+-- block -- grid.resolved_params fills exactly these values at spawn, so this is the number that actually
+-- applies. Straight from race/grid so the panel carries no second copy of the constants. `rows` is
+-- deliberately absent (it is the derived axis and reads "auto"), `mirror` has no number field.
+function M.knob_defaults()
+    return grid.default_params()
+end
+
 -- The active direction's segment boundaries as a light list {{startSlot = N}, ...} (for the panel's
 -- breakpoint read-out). Empty when not editing; never leaks the internal param tables.
 function M.segment_bounds()

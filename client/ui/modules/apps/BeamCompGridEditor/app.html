@@ -181,7 +181,7 @@
           <button class="bc-coarse" ng-click="stepKnob(k, -1)" title="-1">&minus;1</button>
           <button ng-if="!k.integer" ng-click="stepKnob(k, -0.05)" title="-0.05">&minus;</button>
           <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
-            placeholder="{{k.auto ? 'auto' : '-'}}">
+            placeholder="{{k.auto ? 'auto' : knobHint(k)}}">
           <button ng-if="!k.integer" ng-click="stepKnob(k, 0.05)" title="+0.05">+</button>
           <button class="bc-coarse" ng-click="stepKnob(k, 1)" title="+1">+1</button>
         </div>
