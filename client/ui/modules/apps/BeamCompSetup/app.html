@@ -31,7 +31,12 @@
       cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bc-dd-head::after { content: '\25BC'; position: absolute; right: 6px; top: 50%;
       transform: translateY(-50%); font-size: 9px; color: #9aa3ad; pointer-events: none; }
-    .bc-dd-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 50; max-height: 170px;
+    /* The popup height follows the screen: the track list holds 100+ entries, so the old flat 170px (~7
+       rows) stayed a peephole no matter how tall the panel got. The list is absolutely positioned inside
+       a scrolling parent and is therefore already clipped to the space below the head -- raising the
+       MAXIMUM can only reveal more of it, never less. .bc-settings-list reuses this rule but holds two
+       rows, and a max-height never forces height, so that popover is unaffected. */
+    .bc-dd-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 50; max-height: min(50vh, 420px);
       overflow-y: auto; background: #20242b; border: 1px solid rgba(255,255,255,0.22);
       border-radius: 3px; margin-top: 2px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
     .bc-dd-opt { padding: 4px 7px; cursor: pointer; white-space: nowrap; overflow: hidden;
