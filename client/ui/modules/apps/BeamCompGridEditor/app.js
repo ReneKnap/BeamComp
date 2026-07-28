@@ -39,6 +39,15 @@ angular.module('beamng.apps')
   var PREVIEW_MIN = 1;
   var PREVIEW_MAX = 32;
 
+  // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
+  // every further one "<EXTRA_GRID_PREFIX><n>". Both are prefills only -- the field stays freely editable,
+  // and nothing downstream depends on a grid actually carrying one of these names.
+  // Neither may contain whitespace: a grid name has to survive canSave() below, grid_save's own guard in
+  // init.lua, and above all `/race grid=<name>`, whose argument parser splits on whitespace -- a spaced
+  // name is unsaveable AND unaddressable (ADR-0023 spells its example name `Main` for the same reason).
+  var MAIN_GRID_NAME = 'MainGrid';
+  var EXTRA_GRID_PREFIX = 'NewGrid';
+
   // Run a Lua command on the GE side with one string argument safely embedded (single-quoted, so the
   // value's own quotes pass through; backslashes and single quotes are escaped). Inert when bngApi is
   // unavailable -- the panel simply cannot submit, never throws.
@@ -109,6 +118,37 @@ angular.module('beamng.apps')
   // paths reject it), so a single space separates the two parts unambiguously.
   function gridKey(race, name) {
     return String(race) + ' ' + String(name);
+  }
+
+  // Does `race` already own a saved grid called `name`? The pushed list spans the WHOLE map, so the race
+  // is part of the comparison -- the same name on another race is a different grid (ADR-0023).
+  function raceHasGrid(grids, race, name) {
+    var list = grids || [];
+    for (var i = 0; i < list.length; i++) {
+      var g = list[i];
+      if (g && g.race === race && g.name === name) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // The save name to prefill when a fresh grid is started for `race`: the main name while that race has
+  // none, otherwise "<prefix><n>" with the smallest free n from 1 up. Scoped to ONE race on purpose -- a
+  // grid name only has to be unique within its race (grids[map][race][name], ADR-0023), so the other
+  // tracks' identically named grids must not push this race's suggestion up. A plain scan instead of a
+  // lookup table: the list is short (one map's grids) and an object keyed by user-chosen names would
+  // inherit Object.prototype ("constructor" would read as taken). The loop terminates because each step
+  // consumes one of the finitely many existing names.
+  function suggestGridName(grids, race) {
+    if (!raceHasGrid(grids, race, MAIN_GRID_NAME)) {
+      return MAIN_GRID_NAME;
+    }
+    var n = 1;
+    while (raceHasGrid(grids, race, EXTRA_GRID_PREFIX + n)) {
+      n++;
+    }
+    return EXTRA_GRID_PREFIX + n;
   }
 
   return {
@@ -224,7 +264,12 @@ angular.module('beamng.apps')
             rebuildGridOpts();
           }
           // Restore the overwrite name only when the field is empty (reopen) -- loadGrid/newGrid set it
-          // explicitly, and a knob push must not wipe a save-as name the admin is typing.
+          // explicitly, and a knob push must not wipe a save-as name the admin is typing. A reopen onto an
+          // active but never-saved session leaves the field empty (there is no name to restore) and gets no
+          // suggestion either: push_grid_data pushes this state SYNCHRONOUSLY but fetches the grid list
+          // over the server, so scope.data.grids is still empty here and any suggestion computed now would
+          // be the "race has nothing yet" one -- wrong, and frozen in place, since a suggestion must never
+          // overwrite the field once the real list arrives. The admin gets one from the next New grid.
           if (!scope.form.saveName && scope.state.name) {
             scope.form.saveName = scope.state.name;
           }
@@ -253,6 +298,12 @@ angular.module('beamng.apps')
         if (field === 'race') {
           // The anchored race splits the saved-grid list into "this race" and the rest.
           rebuildGridOpts();
+          // No save-name re-suggestion here on purpose. Re-anchoring does NOT move where a running session
+          // saves: grideditor owns the session's race (set by grid_open_new / grid_open_saved) and
+          // snapshot() stores under THAT race -- which is why the hint below reads "Editing {{state.race}}".
+          // A suggestion recomputed for the newly picked race would therefore describe a race the Save
+          // never reaches. The save field instead follows the save target, and is set exactly where that
+          // target is decided: newGrid() (a suggestion) and loadGrid() (the loaded grid's own name).
         }
       };
       // The saved-grid dropdown carries a non-selectable separator between the two blocks; clicking it
@@ -288,13 +339,17 @@ angular.module('beamng.apps')
       };
 
       // Start a fresh grid from the track default for the chosen race. A new grid has no saved name, so
-      // clear the overwrite target until the admin saves it.
+      // clear the overwrite target until the admin saves it, and prefill the save field with a suggestion
+      // for the race this session will belong to -- the admin would otherwise retype the same name on
+      // every track. The suggestion is computed for scope.form.race because that is exactly the race
+      // grid_open_new anchors the new session to (and therefore the race a later Save writes to).
+      // Deliberately after the early return: with no race picked, nothing is touched at all.
       scope.newGrid = function () {
         if (!scope.form.race) {
           return;
         }
         scope.savedName = null;
-        scope.form.saveName = '';
+        scope.form.saveName = suggestGridName(scope.data.grids, scope.form.race);
         geLuaArg('grid_open_new', scope.form.race);
       };
 
