@@ -191,7 +191,7 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ai-names-sorted/2026-07-28"
+local BUILD_MARKER = "ui-default-placeholders/2026-07-28"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2382,6 +2382,11 @@ local function push_grid_state()
             columns = block.columns,
             mirror = block.mirror,
         } or nil,
+        -- The layout defaults behind the knobs above, so a knob a stored block omits (offsetHeight on a
+        -- grid saved before that knob existed) shows the value that actually applies as its grey
+        -- placeholder instead of a bare "-". Constant, but sent with the knobs it annotates so the panel
+        -- always has both together.
+        knobDefaults = grideditor.knob_defaults(),
     })
 end
 
@@ -2515,6 +2520,14 @@ local function push_setup_data(include_deprecated)
         -- The static AI colour palette (ADR-0047 round 3) for the roster swatch picker; same list the
         -- GE roster draw uses, so swatches and auto-assigned colours share one source.
         aiPalette = ai.palette(),
+        -- The default values behind the panel's OPTIONAL number fields, so an empty field can show its
+        -- real default as the grey placeholder ("5 (default)") instead of a useless "default"/"-". Both
+        -- come straight from the modules that resolve them, so the panel carries no second copy that
+        -- could drift: the AI difficulty numbers per preset (race/ai.lua PRESETS, preset-dependent, so
+        -- the panel re-reads them whenever the Preset dropdown changes) and the recover/repair assist
+        -- hold seconds (race/start.lua, a constant).
+        aiDefaults = ai.preset_defaults(),
+        assistHoldDefault = race_start.assist_hold_default(),
     })
     -- The driver NAME list for the panel's roster name picker (ADR-0048): sourced from the mod-bundled
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.

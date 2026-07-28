@@ -195,6 +195,18 @@ angular.module('beamng.apps')
     return isNaN(n) ? undefined : n;
   }
 
+  // The grey placeholder of an OPTIONAL number field: "<value> (default)" (e.g. "5 (default)"), so an
+  // empty field names the value that actually applies instead of just saying "default". CEF renders a
+  // placeholder grey by itself -- no CSS involved.
+  //
+  // The numbers are pushed by GE (BeamCompSetupData), so `fallback` -- the field's original placeholder
+  // text -- covers the window before that push lands and any value GE does not carry. The panel never
+  // invents a default it was not told.
+  function defaultHint(value, fallback) {
+    var n = num(value);
+    return n === undefined ? fallback : n + ' (default)';
+  }
+
   // Copy the form's set vehicle caps (hp / hp-per-kg / weight range) onto a target object, blanks
   // omitted. Shared by buildOverrides (the race payload) and buildRosterPolicy (the roster rolls), so
   // the two can never relay different caps.
@@ -312,7 +324,11 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [] };
+      // aiDefaults / assistHoldDefault carry the GE-side default values behind the optional number fields
+      // (see defaultHint): aiDefaults = {presets: {<preset>: {aggr, skill, rubber}}, fallback: '<preset>'}
+      // from race/ai.lua, assistHoldDefault = the recover/repair hold seconds from race/start.lua.
+      scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [],
+        aiDefaults: null, assistHoldDefault: null };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
@@ -457,6 +473,14 @@ angular.module('beamng.apps')
           // The AI roster colour palette (ADR-0047 round 3): the swatch picker + the JS-side colour reroll
           // draw from this. Static, pushed with the setup data so it is present on link and after restore.
           scope.data.aiPalette = (payload && payload.aiPalette) || scope.data.aiPalette || [];
+          // The default values behind the optional number fields (see defaultHint). Kept on a miss like
+          // the palette above, so a partial/older GE push never blanks a hint the panel already has. The
+          // hold is tested explicitly rather than with `||`, because a numeric default may legitimately be
+          // falsy (0) and would otherwise be thrown away.
+          scope.data.aiDefaults = (payload && payload.aiDefaults) || scope.data.aiDefaults;
+          if (payload && payload.assistHoldDefault !== undefined && payload.assistHoldDefault !== null) {
+            scope.data.assistHoldDefault = payload.assistHoldDefault;
+          }
           rebuildRaceCarOpts();
           // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
           // harmless (labelFor falls back) and re-fetched on the next model change.
@@ -595,6 +619,31 @@ angular.module('beamng.apps')
       // composes with the caps), but not for a fixed car (its caps are dropped by the car-wins precedence).
       scope.showRestrictions = function () {
         return !scope.form.carModel || scope.form.carModel === 'random';
+      };
+
+      // ----- Placeholder hints for the optional number fields ---------------------------------------
+      // Each of these fields may be left empty, and the value that then applies is decided GE-side. The
+      // placeholder names it ("5 (default)") instead of the old useless "default" / "-"; the numbers ride
+      // in with the setup data (see scope.data above), so nothing here duplicates a Lua constant.
+
+      // Recover / repair hold: race/start.lua's ASSIST_DEFAULT_HOLD_SECONDS. One constant for both fields.
+      scope.holdHint = function () {
+        return defaultHint(scope.data.assistHoldDefault, 'default');
+      };
+
+      // Aggression / skill / rubberband: race/ai.lua's PRESETS, so the hint FOLLOWS the Preset dropdown --
+      // `key` is 'aggr', 'skill' or 'rubber'.
+      //
+      // The dropdown's empty option ("default") sends no preset at all, and GE then resolves the fallback
+      // preset -- but that is also the one branch where an aiRace track's own authored defaults can
+      // override aggression and skill (race/ai.lua resolve_params). Those are per-race data the panel has
+      // no view of, so it shows the fallback preset's numbers: exact whenever the track authors none (the
+      // common case), indicative otherwise.
+      scope.aiParamHint = function (key) {
+        var defaults = scope.data.aiDefaults || {};
+        var presets = defaults.presets || {};
+        var preset = presets[scope.form.aiPreset || defaults.fallback] || {};
+        return defaultHint(preset[key], '-');
       };
 
       // Re-pull the option lists from GE (Refresh button, the include-deprecated toggle, and on link). The

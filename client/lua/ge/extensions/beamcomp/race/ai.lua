@@ -92,6 +92,24 @@ function M.resolve_params(config, content_defaults)
     return params
 end
 
+-- The presets' driving numbers for the setup panel's placeholder hints (ADR-0037): the grey
+-- "<value> (default)" the empty Aggression/Skill/Rubberband fields show for the SELECTED preset. Keyed by
+-- preset name, with the field names the panel's overrides already use (aggr/skill/rubber), plus the
+-- fallback preset resolve_params applies when no preset is sent. Pushed with the setup data so the panel
+-- reads these numbers instead of carrying a second copy of PRESETS that would silently drift.
+--
+-- Display only, and deliberately NOT a model of the full resolution: the no-preset branch of
+-- resolve_params also lets an aiRace track's authored content_defaults override aggression/skill, which is
+-- per-race data the panel has no view of. The fallback preset's numbers are what applies whenever the
+-- track authors none (the common case).
+function M.preset_defaults()
+    local presets = {}
+    for name, preset in pairs(PRESETS) do
+        presets[name] = {aggr = preset.aggression, skill = preset.skill, rubber = preset.rubberband}
+    end
+    return {presets = presets, fallback = DEFAULT_PRESET}
+end
+
 -- Candidate MPVehicleGE entry fields that carry a vehicle's cross-client BeamMP id (spike #2). Tried in
 -- order until one yields a value; logged so the handover test can pin the real field.
 local SERVER_ID_FIELDS = {"serverVehicleString", "serverVehicleID", "remoteVehID", "gameVehicleID"}

@@ -271,13 +271,13 @@
       <div class="bc-section-title">Assists</div>
       <label class="bc-row bc-check"><input type="checkbox" ng-model="form.recover"><span>Recover</span></label>
       <label class="bc-row" ng-if="form.recover">
-        <span>Recover hold (s)</span>
-        <input type="number" min="0" ng-model="form.recoverSecs" placeholder="default">
+        <span>Recover hold (sec)</span>
+        <input type="number" min="0" ng-model="form.recoverSecs" placeholder="{{holdHint()}}">
       </label>
       <label class="bc-row bc-check"><input type="checkbox" ng-model="form.repair"><span>Repair</span></label>
       <label class="bc-row" ng-if="form.repair">
-        <span>Repair hold (s)</span>
-        <input type="number" min="0" ng-model="form.repairSecs" placeholder="default">
+        <span>Repair hold (sec)</span>
+        <input type="number" min="0" ng-model="form.repairSecs" placeholder="{{holdHint()}}">
       </label>
     </div>
 
@@ -287,7 +287,7 @@
       <div class="bc-section-title">Start</div>
       <label class="bc-row bc-check"><input type="checkbox" ng-model="form.f1Start"><span>F1 light start</span></label>
       <label class="bc-row" ng-if="form.f1Start">
-        <span>Jump-start penalty (s)</span>
+        <span>Jump-start penalty (sec)</span>
         <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="15">
       </label>
     </div>
@@ -438,9 +438,11 @@
               </div>
             </div>
           </div>
-          <label class="bc-row"><span>Aggression</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiAggr" placeholder="-"></label>
-          <label class="bc-row"><span>Skill</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiSkill" placeholder="-"></label>
-          <label class="bc-row"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="-"></label>
+          <!-- The three placeholders name the value the SELECTED preset would apply (aiParamHint), so they
+               change with the Preset dropdown above. -->
+          <label class="bc-row"><span>Aggression</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiAggr" placeholder="{{aiParamHint('aggr')}}"></label>
+          <label class="bc-row"><span>Skill</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiSkill" placeholder="{{aiParamHint('skill')}}"></label>
+          <label class="bc-row"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="{{aiParamHint('rubber')}}"></label>
           <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
         </div>
       </div>
