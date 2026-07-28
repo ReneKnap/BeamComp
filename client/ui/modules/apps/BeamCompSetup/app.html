@@ -15,7 +15,11 @@
     .bc-subdivider { border-top: 1px solid rgba(255,255,255,0.12); margin: 8px 0; }
     .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
       margin: 4px 0; }
-    .bc-row > span { flex: 0 0 42%; }
+    /* The label column is CAPPED, not proportional. 42% of the old 440px content box was ~185px, so the
+       min() is a no-op at the old width and only stops the labels growing with the window -- every pixel
+       the wider panel adds lands on the dropdown/input beside them instead of on text that never needed
+       it. The percentage still governs below the old width, so a hand-narrowed panel behaves as before. */
+    .bc-row > span { flex: 0 0 min(42%, 185px); }
     .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
       color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
     .bc-check { justify-content: flex-start; }

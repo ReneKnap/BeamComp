@@ -12,7 +12,11 @@
       font-size: 11px; color: #8fd3ff; border-bottom: 1px solid rgba(255,255,255,0.12);
       padding-bottom: 2px; margin-bottom: 6px; }
     .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
-    .bc-row > span { flex: 0 0 44%; }
+    /* The label column is CAPPED, not proportional. 44% of the old 420px content box was ~185px, so the
+       min() is a no-op at the old width and only stops the labels growing with the window -- every pixel
+       the wider panel adds lands on the field beside them instead of on text that never needed it. The
+       percentage still governs below the old width, so a hand-narrowed panel behaves as before. */
+    .bc-row > span { flex: 0 0 min(44%, 185px); }
     .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
       color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
     .bc-hint { font-size: 11px; color: #9aa3ad; margin: 2px 0 4px; }
@@ -24,7 +28,9 @@
     .bc-step button:hover { background: #2e7d32; }
     .bc-step button.bc-coarse { flex: 0 0 26px; font-size: 11px; background: #2b4a4a; }
     .bc-step button.bc-coarse:hover { background: #2e7d32; }
-    .bc-row.bc-knob > span { flex: 0 0 30%; }
+    /* Knob rows keep their own narrower label column, capped the same way (30% of the old 420px = 126px)
+       so the whole gain goes to the stepper's number field. Still (0,2,1) -- it beats .bc-row > span. */
+    .bc-row.bc-knob > span { flex: 0 0 min(30%, 126px); }
     /* Custom dropdown (native <select> does not open in the BeamNG CEF overlay). */
     .bc-dd { position: relative; flex: 1 1 auto; min-width: 0; }
     .bc-dd-head { width: 100%; text-align: left; background: #2a2e35; color: #f0f0f0;
