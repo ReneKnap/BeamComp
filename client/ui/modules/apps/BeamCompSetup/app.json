@@ -12,8 +12,8 @@
   "css": {
     "top": "90px",
     "left": "50px",
-    "width": "460px",
-    "height": "560px",
+    "width": "min(660px, 92vw)",
+    "height": "clamp(420px, calc(100vh - 220px), 1100px)",
     "min-width": "360px",
     "min-height": "320px"
   }

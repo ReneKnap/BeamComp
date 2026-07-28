@@ -15,7 +15,11 @@
     .bc-subdivider { border-top: 1px solid rgba(255,255,255,0.12); margin: 8px 0; }
     .bc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
       margin: 4px 0; }
-    .bc-row > span { flex: 0 0 42%; }
+    /* The label column is CAPPED, not proportional. 42% of the old 440px content box was ~185px, so the
+       min() is a no-op at the old width and only stops the labels growing with the window -- every pixel
+       the wider panel adds lands on the dropdown/input beside them instead of on text that never needed
+       it. The percentage still governs below the old width, so a hand-narrowed panel behaves as before. */
+    .bc-row > span { flex: 0 0 min(42%, 185px); }
     .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
       color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
     .bc-check { justify-content: flex-start; }
@@ -27,7 +31,12 @@
       cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bc-dd-head::after { content: '\25BC'; position: absolute; right: 6px; top: 50%;
       transform: translateY(-50%); font-size: 9px; color: #9aa3ad; pointer-events: none; }
-    .bc-dd-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 50; max-height: 170px;
+    /* The popup height follows the screen: the track list holds 100+ entries, so the old flat 170px (~7
+       rows) stayed a peephole no matter how tall the panel got. The list is absolutely positioned inside
+       a scrolling parent and is therefore already clipped to the space below the head -- raising the
+       MAXIMUM can only reveal more of it, never less. .bc-settings-list reuses this rule but holds two
+       rows, and a max-height never forces height, so that popover is unaffected. */
+    .bc-dd-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 50; max-height: min(50vh, 420px);
       overflow-y: auto; background: #20242b; border: 1px solid rgba(255,255,255,0.22);
       border-radius: 3px; margin-top: 2px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
     .bc-dd-opt { padding: 4px 7px; cursor: pointer; white-space: nowrap; overflow: hidden;
@@ -100,8 +109,14 @@
       padding: 2px 6px; margin: 4px 0; }
     .bc-roster-hint { font-size: 12px; opacity: 0.75; font-style: italic; margin: 2px 0 6px; }
     .bc-roster-actions { display: flex; gap: 6px; flex: 1 1 auto; justify-content: flex-end; }
-    /* AI colour swatches (ADR-0047 round 3): a wrapping row of fixed-palette colour buttons. */
-    .bc-swatches { display: flex; flex-wrap: wrap; gap: 3px; flex: 1 1 auto; min-width: 0; }
+    /* AI colour swatches (ADR-0047 round 3): a wrapping row of fixed-palette colour buttons. The
+       compound selector is deliberate: at (0,1,0) this rule's `flex: 1 1 auto` silently lost to
+       `.bc-row > span` (0,1,1) above, which pinned the palette to the LABEL width -- harmless while the
+       label was ~42% of a narrow panel, but with the label capped it would leave the palette stranded at
+       185px in the middle of a 660px row instead of using the space. (.bc-quali-len and
+       .bc-roster-actions lose the same fight but are justify-content: flex-end, so growing them would
+       change nothing visually -- left as they are.) */
+    .bc-row > span.bc-swatches { display: flex; flex-wrap: wrap; gap: 3px; flex: 1 1 auto; min-width: 0; }
     .bc-swatch { width: 16px; height: 16px; padding: 0; border: 1px solid rgba(255,255,255,0.25);
       border-radius: 3px; cursor: pointer; }
     .bc-swatch.sel { border: 2px solid #fff; box-shadow: 0 0 3px rgba(255,255,255,0.8); }
