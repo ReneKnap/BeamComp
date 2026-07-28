@@ -892,9 +892,9 @@ function M.palette()
     return COLOR_PALETTE
 end
 
--- The driver NAME list for the panel's name picker (ADR-0048): every driver name from the file, in file
--- order, deduplicated. The editor picks a roster name from this dropdown instead of free typing. Sourced
--- from the mod-bundled driver file (the single pool source) -- no server round-trip.
+-- The driver NAME list for the panel's name picker (ADR-0048): every driver name from the file,
+-- deduplicated and sorted alphabetically. The editor picks a roster name from this dropdown instead of
+-- free typing. Sourced from the mod-bundled driver file (the single pool source) -- no server round-trip.
 function M.pool_names()
     local names = {}
     local seen = {}
@@ -905,6 +905,17 @@ function M.pool_names()
             seen[driver.name] = true
         end
     end
+    -- Case-insensitive, mirroring the roster list's own display sort (nameSortKey in BeamCompSetup), so the
+    -- picker and the rows it fills read in the same order. This is a DISPLAY sort only: the roll/draw chain
+    -- walks `drivers` directly, so the file order that defines the pool itself is untouched. The exact-tie
+    -- fallback keeps the comparator a strict ordering for names differing only in case.
+    table.sort(names, function(a, b)
+        local lower_a, lower_b = a:lower(), b:lower()
+        if lower_a == lower_b then
+            return a < b
+        end
+        return lower_a < lower_b
+    end)
     return names
 end
 
