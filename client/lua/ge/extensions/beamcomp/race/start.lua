@@ -123,6 +123,13 @@ local function resolve_hold(seconds)
     return math.max(ASSIST_MIN_HOLD_SECONDS, math.min(ASSIST_MAX_HOLD_SECONDS, value))
 end
 
+-- The hold-time default, for the setup panel's placeholder hint (ADR-0037): the grey "5 (default)" an
+-- empty Recover/Repair hold field shows. Exposed rather than duplicated in the panel so the shown number
+-- always is the one resolve_hold above would apply.
+function M.assist_hold_default()
+    return ASSIST_DEFAULT_HOLD_SECONDS
+end
+
 -- The opt-in recover/repair assist config for this race, read from the relayed raceStart fields
 -- (ADR-0017). Both are off unless the payload explicitly enables them; the hold time only matters
 -- when enabled but is resolved either way so the VE never reads a nil.
