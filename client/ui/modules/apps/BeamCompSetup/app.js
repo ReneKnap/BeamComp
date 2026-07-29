@@ -1056,20 +1056,30 @@ angular.module('beamng.apps')
         return spec;
       }
 
-      // The panel's AI-count range applied to a parsed field value: 1..16, with anything that floors to 0
-      // (including a blank field, which num() gives us as undefined) reading as "no count" and falling back
-      // to the fresh-form default of 4. Pure -- writing the result back into the field is the caller's call,
-      // and the debounced live path deliberately does not (see applyTypedRosterCount).
+      // The panel's AI-count range applied to a READABLE field value: 1..16, with anything that floors to 0
+      // falling back to the fresh-form default of 4. Pure -- writing the result back into the field is the
+      // caller's call, and the debounced live path deliberately does not (see applyTypedRosterCount).
       function clampedAiCount(value) {
         var count = Math.floor(value || 0);
         return Math.max(1, Math.min(16, count || 4));
       }
 
-      // Clamp the count field into the panel's AI range AND write it back, so a blank or wild value never
-      // sizes a roll and the field shows what actually applied. For the paths where a write-back is right:
-      // the blur/Enter apply and the fresh-roster rolls.
+      // Resolve the count field to the number that applies, and write it back so the field shows what
+      // actually happened. For the paths where a write-back is right: the blur/Enter apply and the
+      // fresh-roster rolls.
+      //
+      // An UNREADABLE field answers with the roster's current length. Blank is the common case -- clearing
+      // the box to type a new number is a natural gesture now that the count is live -- but the input's own
+      // min="1"/max="16" validators also hand us undefined for 0, 99 or -3, so the panel genuinely cannot
+      // tell what was meant. It must therefore not act, and answering with the length the roster already
+      // has makes every caller a no-op by construction: resizeRosterTo sees no difference and does nothing
+      // (an 8-AI field stays 8 instead of being cut to 4), and Roll all re-rolls the field at its own size.
+      // Only with no roster at all is there nothing to preserve, and the fresh-form default of 4 applies.
       function clampAiCount() {
-        scope.form.aiCount = clampedAiCount(num(scope.form.aiCount));
+        var typed = num(scope.form.aiCount);
+        scope.form.aiCount = typed === undefined
+          ? ((scope.form.aiRoster || []).length || 4)
+          : clampedAiCount(typed);
         return scope.form.aiCount;
       }
 
@@ -1299,8 +1309,10 @@ angular.module('beamng.apps')
       }
 
       // The debounced apply. Two things it must NOT do, both of which would fight the user mid-edit:
-      //   * apply an unparseable field -- clearing the box to type a new number reads as 4 through
-      //     clampedAiCount, which would halve an 8-AI field on the spot. A blank field applies nothing.
+      //   * act on an unreadable field. Clearing the box to type a new number leaves ng-model undefined
+      //     (as do 0/99/-3, which the input's own min/max reject), and a count the panel cannot read is
+      //     not a count the admin asked for. Nothing applies -- and unlike the blur path there is nothing
+      //     to write back either, because the user is still typing.
       //   * write the clamped value back into the field. That belongs on blur/Enter (clampAiCount), where
       //     the user has finished typing; doing it here would rewrite the digits under the cursor.
       // Also inert once AI is off: the checkbox hides the field but a keystroke from just before the untick
@@ -1325,8 +1337,10 @@ angular.module('beamng.apps')
         }, ROSTER_COUNT_DELAY);
       };
 
-      // Blur / Enter: apply at once, and clamp the field itself now that the user has finished typing.
-      // Cancels any pending debounce so tabbing out cannot apply the same change a second time.
+      // Blur / Enter: apply at once, and settle the field itself now that the user has finished typing.
+      // Cancels any pending debounce so tabbing out cannot apply the same change a second time. An
+      // unreadable field resizes nothing here either -- clampAiCount answers with the roster's own length,
+      // which makes the resize a no-op and puts the real number back in the box.
       scope.applyRosterCount = function () {
         cancelRosterCountApply();
         resizeRosterTo(clampAiCount());
