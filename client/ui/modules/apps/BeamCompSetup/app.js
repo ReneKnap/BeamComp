@@ -22,6 +22,12 @@ angular.module('beamng.apps')
   // clicking into one write, and fast enough that a UI reload can lose nothing that matters.
   var AUTOSAVE_DELAY = 700;
 
+  // How long after the last keystroke in the AI Count field the new count applies to the roster (ms).
+  // A debounce, NOT a per-keystroke apply: typing your way from 4 to 12 passes through "1", and acting on
+  // that would splice eight entries away for good and then roll eleven fresh ones. Blur and Enter still
+  // apply immediately, so this only bounds how long a purely typed change waits.
+  var ROSTER_COUNT_DELAY = 500;
+
   // Static enum options (value + label). Dynamic lists (race/car/grid/config) are built from GE pushes.
   var STATIC_OPTS = {
     mode: [{ v: '', label: 'auto' }, { v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }],
@@ -1026,9 +1032,10 @@ angular.module('beamng.apps')
 
       // ----- Named AI roster (ADR-0047; live since the 2026-07-29 amendment) ------------------------
       // The roster is a LIVE artefact, not something the admin creates: ticking "AI opponents" fields one,
-      // the three AI-car settings re-roll the CARS of the entries that are there, and "Roll all" inside
-      // the expanded editor is the deliberate fresh-field action. Names -- and with them the spawn/grid
-      // slots and every identity keyed off them -- change only through Roll all or a per-entry pick/roll.
+      // the three AI-car settings re-roll the CARS of the entries that are there, the Count field resizes
+      // it on a debounce (round 2), and "Roll all" inside the expanded editor is the deliberate fresh-field
+      // action. Names -- and with them the spawn/grid slots and every identity keyed off them -- change
+      // only through Roll all, a per-entry pick/roll, or the tail a lower count drops.
       // Every roll happens GE-side through the SAME resolution chain the spawn uses, so the shown car is
       // the spawned car. Rolls are async: the GE replies via the BeamCompAiRoster* events below.
 
@@ -1049,13 +1056,21 @@ angular.module('beamng.apps')
         return spec;
       }
 
-      // Clamp the count field into the panel's AI range and write it back, so a blank or wild value
-      // never sizes a roll.
+      // The panel's AI-count range applied to a parsed field value: 1..16, with anything that floors to 0
+      // (including a blank field, which num() gives us as undefined) reading as "no count" and falling back
+      // to the fresh-form default of 4. Pure -- writing the result back into the field is the caller's call,
+      // and the debounced live path deliberately does not (see applyTypedRosterCount).
+      function clampedAiCount(value) {
+        var count = Math.floor(value || 0);
+        return Math.max(1, Math.min(16, count || 4));
+      }
+
+      // Clamp the count field into the panel's AI range AND write it back, so a blank or wild value never
+      // sizes a roll and the field shows what actually applied. For the paths where a write-back is right:
+      // the blur/Enter apply and the fresh-roster rolls.
       function clampAiCount() {
-        var count = Math.floor(num(scope.form.aiCount) || 0);
-        count = Math.max(1, Math.min(16, count || 4));
-        scope.form.aiCount = count;
-        return count;
+        scope.form.aiCount = clampedAiCount(num(scope.form.aiCount));
+        return scope.form.aiCount;
       }
 
       // The model key of a roster entry's car token ('host' for the host sentinel, '' when unset).
@@ -1201,13 +1216,14 @@ angular.module('beamng.apps')
       };
 
       // ----- The live settings ------------------------------------------------------------------------
-      // Exactly four form fields drive the roster on their own: the enable checkbox and the three AI-CAR
-      // axes. The omissions are deliberate. The player restriction fields (carModel/maxhp/maxkg/
+      // Exactly four form fields drive a ROLL on their own: the enable checkbox and the three AI-CAR axes.
+      // The omissions are deliberate. The player restriction fields (carModel/maxhp/maxkg/
       // restrictVehicles…) feed a roll too, through buildRosterPolicy -- but re-rolling on every keystroke
       // in a caps field would be churn, and "the roster was rolled before the caps changed" is exactly
-      // what the panel did before, so nothing regresses. The Count field keeps its blur/Enter semantics
-      // (typing your way to "12" would otherwise roll a 1-entry field in passing), and the AI difficulty
-      // Preset is not a roll input at all (rosterRollSpec never reads it).
+      // what the panel did before, so nothing regresses. The AI difficulty Preset is not a roll input at
+      // all (rosterRollSpec never reads it). The Count field IS live too (round 2) but stays out of this
+      // watcher on purpose: it resizes the roster instead of re-rolling its cars, and it needs a debounce
+      // that a digest-driven watcher cannot give it -- see resizeRosterTo below.
       function aiLiveState() {
         return {
           enabled: !!scope.form.aiEnabled,
@@ -1246,17 +1262,22 @@ angular.module('beamng.apps')
         }
       }, true);
 
-      // Count changed with an existing roster (applied on blur/Enter, the panel's number-field
-      // convention -- deliberately NOT live per keystroke, or typing your way to "12" would roll a
-      // 1-entry field in passing): fewer -> tail entries drop; more -> new entries are rolled in, names
-      // unique against the kept ones. Existing entries stay untouched. Without a roster the count only
-      // sizes the next roll.
-      scope.applyRosterCount = function () {
-        var count = clampAiCount();
+      // ----- The AI count, live on a debounce (round 2) -----------------------------------------------
+      // Resize the roster to `count` entries. Fewer -> the TAIL drops and every kept entry stays exactly as
+      // it was (name, car AND colour); more -> only the missing entries are rolled in, unique against the
+      // kept names and colours. Without a roster the count only sizes the next roll. These semantics are
+      // the user's own words and do not change -- round 2 changed nothing here but the trigger.
+      function resizeRosterTo(count) {
         var roster = scope.form.aiRoster || [];
-        if (!roster.length || roster.length === count) { return; }
+        if (!roster.length || roster.length === count) {
+          return;
+        }
         if (count < roster.length) {
           roster.splice(count);
+          // A shrink talks to nobody, so it has to retire what is in flight by hand: an extend whose reply
+          // landed afterwards would concat its entries onto the roster we just shortened. Bumping the token
+          // is the same "last action wins" rule sendRosterRoll applies, minus the request.
+          rosterRollToken += 1;
           return;
         }
         var spec = rosterRollSpec();
@@ -1266,7 +1287,54 @@ angular.module('beamng.apps')
         // Keep the new entries' colours distinct from the kept ones too (ADR-0047 round 3).
         spec.excludeColors = rosterColors();
         sendRosterRoll(spec);
+      }
+
+      var rosterCountTimer = null;
+
+      function cancelRosterCountApply() {
+        if (rosterCountTimer) {
+          $timeout.cancel(rosterCountTimer);
+          rosterCountTimer = null;
+        }
+      }
+
+      // The debounced apply. Two things it must NOT do, both of which would fight the user mid-edit:
+      //   * apply an unparseable field -- clearing the box to type a new number reads as 4 through
+      //     clampedAiCount, which would halve an 8-AI field on the spot. A blank field applies nothing.
+      //   * write the clamped value back into the field. That belongs on blur/Enter (clampAiCount), where
+      //     the user has finished typing; doing it here would rewrite the digits under the cursor.
+      // Also inert once AI is off: the checkbox hides the field but a keystroke from just before the untick
+      // can still have a timer pending, and unticking leaves the roster alone by decision.
+      function applyTypedRosterCount() {
+        var typed = num(scope.form.aiCount);
+        if (typed === undefined || !scope.form.aiEnabled) {
+          return;
+        }
+        resizeRosterTo(clampedAiCount(typed));
+      }
+
+      // Typing in the Count field: apply after a short pause, re-armed on every keystroke, so only the
+      // number the user stopped on ever resizes the field.
+      scope.rosterCountTyped = function () {
+        cancelRosterCountApply();
+        // No invokeApply:false here (unlike the autosave): this callback mutates the roster, so it needs
+        // the digest that $timeout runs by default or a shrink would not reach the rendered list.
+        rosterCountTimer = $timeout(function () {
+          rosterCountTimer = null;
+          applyTypedRosterCount();
+        }, ROSTER_COUNT_DELAY);
       };
+
+      // Blur / Enter: apply at once, and clamp the field itself now that the user has finished typing.
+      // Cancels any pending debounce so tabbing out cannot apply the same change a second time.
+      scope.applyRosterCount = function () {
+        cancelRosterCountApply();
+        resizeRosterTo(clampAiCount());
+      };
+
+      scope.$on('$destroy', function () {
+        cancelRosterCountApply();  // a pending apply must not fire into a dead scope
+      });
 
       // Apply a 'cars' reply: one {name, car, carLabel} per name the request carried. Matched by NAME, not
       // by position -- the request was built from a snapshot, and a per-entry name pick or roll landing in

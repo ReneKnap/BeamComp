@@ -314,9 +314,13 @@
       <div ng-if="form.aiEnabled">
         <label class="bc-row">
           <span>Count</span>
-          <!-- With an existing roster the count applies on blur/Enter (the panel's number-field
-               convention): fewer AI drop tail entries, more AI roll new ones in (ADR-0047). -->
+          <!-- The count is live like the rest of the AI block (ADR-0047 live amendment, round 2): fewer AI
+               drop tail entries, more AI roll new ones in. ng-change debounces (~500 ms) rather than acting
+               per keystroke -- typing 4 -> 12 passes through "1" and would splice eight entries away for
+               good. ng-change fires only on real view input, so a preset load or session restore writing
+               form.aiCount never triggers it. Blur/Enter still apply at once, on top of the debounce. -->
           <input type="number" min="1" max="16" ng-model="form.aiCount"
+            ng-change="rosterCountTyped()"
             ng-blur="applyRosterCount()" ng-keydown="$event.keyCode === 13 && applyRosterCount()">
         </label>
         <div class="bc-row">
