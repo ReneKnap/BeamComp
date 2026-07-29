@@ -199,12 +199,6 @@ local BUILD_MARKER = "race-prop-seat-guard/2026-07-29"
 -- on the host, so a larger field is heavier on the owner's machine.
 local AI_PERF_HINT_THRESHOLD = 6
 
--- Seconds after a grinder spawn that the host keeps re-issuing the powered-prop activation (ADR-0020
--- amendment). The `spinner` main-controller only exists once the freshly spawned grinder VE's powertrain
--- init has run, so activation is re-issued each frame until it lands, then stopped -- the controller owns
--- the throttle from then on. Wall-clock (os.clockhp) anchored: dtReal is clamped on the spawn-load spike.
-local GRINDER_ACTIVATE_WINDOW = 2.0
-
 -- Reload-surviving state (BeamNG serializes M.state across a Lua reload).
 M.state = {
     last_event_at = 0,
@@ -215,7 +209,7 @@ M.state = {
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
     cone_ids = nil,      -- ids of the shared cone vehicles we spawned + must clear (host only, ADR-0020)
     grinder_ids = nil,   -- ids of the shared powered prop-vehicles (grinders) we spawned + must clear on teardown (host only, ADR-0020 amendment)
-    grinder_activate_until = nil,  -- os.clockhp deadline for re-issuing grinder activation over the spawn readiness window; nil when idle/non-host or the window has closed (ADR-0020 amendment)
+    grinder_activate = nil,  -- powered-prop activation window state owned by race/grinders (arm/step/note_spinning): pending ids, confirmations, frame budget; nil when idle/non-host or the window has closed (ADR-0020 amendment, frame-anchored in round 2 of bug race-prop-steals-player-seat)
     pending_nametag = nil,  -- map of cone game-id -> seconds waited for MPVehicleGE nametag suppression to stick; lazily created, nil when idle (ADR-0020)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
@@ -526,11 +520,14 @@ local function handle_race_start(payload)
     M.state.prop_names, M.state.cone_ids, M.state.grinder_ids = props.load(race.prefabFiles or {},
         payload.propOwner, race.coneFiles or {})
     -- Arm the powered props' (grinders') activation window: their `spinner` controller only comes up after
-    -- the freshly spawned VE's powertrain init, so onUpdate re-issues the activation each frame until the
-    -- deadline, then stops (ADR-0020 amendment). Anchored on os.clockhp (dtReal is clamped on the load
-    -- spike). nil = idle / non-host / no grinders (re-armed on every /race; nil'd again on teardown).
-    M.state.grinder_activate_until = (M.state.grinder_ids and #M.state.grinder_ids > 0)
-        and (os.clockhp() + GRINDER_ACTIVATE_WINDOW) or nil
+    -- the freshly spawned VE's powertrain init, so onUpdate re-issues the activation until every grinder
+    -- confirms (ADR-0020 amendment). Arming only OPENS the window -- its budget is counted in frames by
+    -- grinders.step, so the rest of this handler (the AI field spawns synchronously below, plus the own-car
+    -- respawn and the collision rebuild) cannot spend it before a single frame has run. That is exactly what
+    -- happened with the old wall-clock deadline: the grinders never got the command (bug
+    -- race-prop-steals-player-seat round 2). nil = idle / non-host / no grinders (re-armed on every /race;
+    -- nil'd again on teardown).
+    M.state.grinder_activate = grinders.arm(M.state.grinder_ids)
 
     -- Clear any AI cars from a prior race up front so a re-issued /race never stacks them (ADR-0036), the
     -- same reason cones are cleared here. Host-only state; all nil on a non-owner. The new AI cars are
@@ -784,7 +781,7 @@ local function teardown_race_world()
     M.state.prop_names = nil
     M.state.cone_ids = nil
     M.state.grinder_ids = nil
-    M.state.grinder_activate_until = nil
+    M.state.grinder_activate = nil
     M.state.race = nil
     M.state.race_car_id = nil
     M.state.detection = nil
@@ -5331,6 +5328,16 @@ function M.on_assist_key_up()
     end
 end
 
+-- A powered prop's (grinder's) VE reporting whether its `spinner` controller took the activation command
+-- (ADR-0020 amendment, bug race-prop-steals-player-seat round 2). Reached from the grinder VE as
+-- `beamcomp_init.note_grinder_spinning(...)`, the same GE<->VE path the assist keys above use. A thin
+-- wrapper over the module that owns the window; a reply with no window open (teardown raced the last queued
+-- command) is a no-op. This is what lets the window stop on evidence instead of on a timer, and what makes
+-- the log say whether the controller ever came up.
+function M.note_grinder_spinning(vehicle_id, has_controller)
+    grinders.note_spinning(M.state.grinder_activate, vehicle_id, has_controller)
+end
+
 -- Drive the hold-to-activate recover/repair each frame (ADR-0017): the countdown runs only while the
 -- key is held AND the car is (near) stationary -- releasing or driving off cancels it. On completion
 -- the held kind is consumed (cleared) so it does not immediately re-fire while the key is still down.
@@ -5762,19 +5769,17 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- Phase-independent: a synced cone's MPVehicleGE registration can land a frame or two after its
     -- spawn, so this runs until the queued nametag suppressions stick (no-op when nothing is pending).
     retry_pending_nametags(dtReal)
-    -- Phase-independent, host-only: drive the powered props' (grinders') activation over a short readiness
-    -- window after spawn. The `spinner` main-controller only comes up after the freshly spawned grinder
-    -- VE's powertrain init, so a single activation at spawn can land before getControllerSafe("spinner")
-    -- is non-nil (-> no-op); we re-issue each frame until the deadline, then stop -- the controller owns
-    -- the throttle from then on (its locked target ratio holds), so re-asserting past the window would
-    -- fight its PID (ADR-0020 amendment). grinder_activate_until is nil off-race / on a non-host / once the
-    -- window closes, so the idle path is zero-work; os.clockhp (dtReal is clamped). BeamMP syncs the spin.
-    if M.state.grinder_activate_until then
-        if os.clockhp() < M.state.grinder_activate_until then
-            grinders.activate(M.state.grinder_ids)
-        else
-            M.state.grinder_activate_until = nil
-        end
+    -- Phase-independent, host-only: drive the powered props' (grinders') activation readiness window. The
+    -- `spinner` main-controller only comes up after the freshly spawned grinder VE's powertrain init, so a
+    -- single activation at spawn lands before getControllerSafe("spinner") is non-nil (-> no-op); step
+    -- re-issues per frame and stops the moment every grinder's VE confirms its controller took the command,
+    -- so we never re-assert against a running PID (ADR-0020 amendment). The budget is counted in FRAMES
+    -- here, which is the fix for round 2 of bug race-prop-steals-player-seat: the old wall-clock deadline
+    -- was armed before the AI field spawned synchronously in handle_race_start, so it could expire before
+    -- this line ever ran once. grinder_activate is nil off-race / on a non-host / once the window closes, so
+    -- the idle path is one nil check. BeamMP syncs the resulting spin to every client.
+    if M.state.grinder_activate then
+        M.state.grinder_activate = grinders.step(M.state.grinder_activate)
     end
     -- Phase-independent: keep the race-setup panel on screen while it is meant to be open (bug
     -- setup-panel-settings-survive-ui-reload). The panel heartbeats, and a UI reload that dropped our
