@@ -93,8 +93,15 @@ end
 -- empty for missions, whose cones ride inside `prefab_files`. Non-hosts never spawn it.
 -- Returns the list of prefab names spawned (for prefab cleanup), the list of kept cone vehicle ids
 -- (empty unless host; for cone cleanup), and the list of kept powered-prop vehicle ids (the grinders --
--- empty unless host; for spin + cleanup, ADR-0020 amendment). One bad prefab warns and is skipped rather
--- than aborting.
+-- empty unless host, ADR-0020 amendment). One bad prefab warns and is skipped rather than aborting.
+--
+-- NOTE on the two id lists: BeamMP deletes and re-spawns a freshly spawned prop-vehicle under a NEW id a few
+-- seconds later, as part of its ownership/sync round-trip, so both lists go stale (measured, bug
+-- race-prop-steals-player-seat round 3). The grinder list is therefore only a SEED for the activation window,
+-- which re-derives the live set from the scene, and grinder cleanup scans the scene instead
+-- (grinders.clear_scene). The CONE list is still used as-is by cones.clear and so has the same latent flaw --
+-- deliberately left alone in that item's scope and filed separately; the cone bounce and the cone nametag
+-- suppression are unaffected because both are driven by live hooks rather than by these ids.
 function M.load(prefab_files, keep_cones, cone_files)
     if type(spawnPrefab) ~= "function" or type(removePrefab) ~= "function" then
         log("W", LOG_TAG, "spawnPrefab/removePrefab unavailable -- cannot load props")
