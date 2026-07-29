@@ -83,8 +83,9 @@ local qualisprint = require("beamcomp/race/qualisprint")
 -- hold  -- the qualifying HOLD: the single `is_held()` predicate and the layers that enforce it
 --          (bug quali-hold-reset-and-repaint-leak).
 -- setup -- the race-setup panel's GE-side presence: the session open-state set by the admin-gated
---          /raceui open, and the one-shot watchdog that re-adds the app when a UI reload drops it
---          (bug setup-panel-settings-survive-ui-reload).
+--          /raceui open, the one-shot watchdog that re-adds the app when a UI reload drops it
+--          (bug setup-panel-settings-survive-ui-reload), and the panel's AI-roster car re-resolve
+--          (ADR-0047 live amendment).
 local quali = {}
 local hold = {}
 local setup = {}
@@ -2636,16 +2637,63 @@ function M.request_presets()
     send_to_server("presetListReq", {map = map})
 end
 
--- Roll a full or additional named-AI roster for the setup panel (UI -> GE, ADR-0047/0048). Payload JSON:
--- {count, mode = "create"|"extend", exclude = [names], ai = {car?, randomTrim, noBigCars},
--- policy = {car?, maxhp?, maxpwr?, maxkg?, minkg?, randomTrim?, noBigCars?}}. Names draw from the
--- mod-bundled driver file (the single pool source, ADR-0048) without replacement; each entry's car
--- resolves through the SAME chain the spawn uses (race/ai.lua), so the shown car IS the spawned car.
+-- Re-resolve the CARS of an existing roster (the "cars" mode of roll_ai_roster, ADR-0047 live amendment):
+-- one entry per requested name, in the requested order, carrying {name, car, carLabel} and deliberately NO
+-- colour -- a colour belongs to the driver, not to the AI-car settings that trigger this roll.
+--
+-- Each name goes through ai.resolve_pick, the PINNED-name resolver behind the panel's name pick, because it
+-- shares entry_from_drawn with roll_roster_entries: the car a name gets here is exactly the car a fresh
+-- create would give it, including the driver's file-preferred car under the default AI-car mode (ADR-0048).
+-- Rolling each car with reroll_ai_car's helper instead would NOT do -- that path is a MANUAL override that
+-- deliberately bypasses the preferred car (see below), so switching the panel's AI car back to "default"
+-- would hand out random cars.
+--
+-- Hangs off the `setup` namespace table rather than being a top-level local: init.lua sits at 187/200
+-- (memory beamcomp-200-local-ceiling).
+function setup.roster_cars(names, config, policy)
+    local entries = {}
+    if type(names) ~= "table" then
+        return entries
+    end
+    for k, name in ipairs(names) do
+        -- The same 16-AI ceiling the count branch below clamps to: one roll can never cost more work
+        -- than a full create, whatever a caller hands in.
+        if #entries >= 16 then
+            break
+        end
+        if type(name) == "string" and name ~= "" then
+            local entry = ai.resolve_pick(name, config, policy)
+            entries[#entries + 1] = {name = name, car = entry.car, carLabel = entry.carLabel}
+        else
+            log("W", RACE_LOG_TAG, "roll_ai_roster: skipping unnamed roster entry " .. tostring(k))
+        end
+    end
+    return entries
+end
+
+-- Roll a named-AI roster for the setup panel (UI -> GE, ADR-0047/0048). Payload JSON:
+-- {token, count, mode = "create"|"extend"|"cars", exclude = [names], names = [names] (cars mode),
+-- ai = {car?, randomTrim, noBigCars}, policy = {car?, maxhp?, maxpwr?, maxkg?, minkg?, randomTrim?,
+-- noBigCars?}}. Names draw from the mod-bundled driver file (the single pool source, ADR-0048) without
+-- replacement; each entry's car resolves through the SAME chain the spawn uses (race/ai.lua), so the shown
+-- car IS the spawned car. "cars" re-rolls an existing roster's cars in place (see setup.roster_cars above).
+--
+-- `token` is the panel's request id, echoed back untouched: these replies ride guihooks with no correlation,
+-- and the panel now rolls automatically on a settings change, so overlapping rolls and a reply landing after
+-- the admin unticked the box are real. The panel applies only its newest request's reply.
 -- Result pushed via BeamCompAiRoster. Public as beamcomp_init.roll_ai_roster.
 function M.roll_ai_roster(json)
     local ok, request = pcall(jsonDecode, json)
     if not ok or type(request) ~= "table" then
         log("W", RACE_LOG_TAG, "roll_ai_roster: bad payload")
+        return
+    end
+    if request.mode == "cars" then
+        guihooks.trigger("BeamCompAiRoster", {
+            token = request.token,
+            mode = "cars",
+            entries = setup.roster_cars(request.names, request.ai, request.policy),
+        })
         return
     end
     local count = math.max(1, math.min(16, math.floor(tonumber(request.count) or 1)))
@@ -2654,6 +2702,7 @@ function M.roll_ai_roster(json)
     local entries = ai.roll_roster_entries(count, request.exclude, request.ai, request.policy,
         request.excludeColors)
     guihooks.trigger("BeamCompAiRoster", {
+        token = request.token,
         mode = request.mode == "extend" and "extend" or "create",
         entries = entries,
     })
