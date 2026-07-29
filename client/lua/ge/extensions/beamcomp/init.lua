@@ -16,8 +16,9 @@
 --                 race's static-scenery prop prefab(s) into the scene (race/props). The knockable
 --                 cones are shared: only the payload's propOwner (host) spawns them and BeamMP syncs
 --                 them to everyone; non-hosts spawn a statics-only prefab and never instantiate a
---                 cone. The cones are kept non-enterable / out of the Tab cycle on every client via
---                 race/cones (ADR-0020, superseding ADR-0009).
+--                 cone. Every race prop -- cone or powered grinder -- is kept non-enterable on every
+--                 client via race/props (ADR-0020, superseding ADR-0009), and the cones additionally
+--                 stay out of the Tab cycle via race/cones.
 --   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
 --                 ADR-0006). We record + surface it, and drive the start lock off it: the car is
 --                 spawned frozen (handle_race_start) and held through the countdown, released on
@@ -3529,8 +3530,8 @@ local last_block_toast_at = 0
 
 -- Put the player straight back into their race car after a blocked switch, and surface a throttled
 -- toast so a deliberate Tab press is not silently swallowed. Returns false when the race car is gone
--- (so the caller lets the switch through rather than trapping the player). Mirrors the cone bounce
--- (cones.enforce_non_enterable), but race-car-general and with the in-race feedback toast.
+-- (so the caller lets the switch through rather than trapping the player). Mirrors the race-prop bounce
+-- (props.enforce_non_enterable), but race-car-general and with the in-race feedback toast.
 local function bounce_to_race_car()
     local race_car = be and be:getObjectByID(M.state.race_car_id)
     if not race_car then
@@ -3554,16 +3555,6 @@ local function bounce_to_race_car()
     return true
 end
 
--- Track the vehicle the player is currently in, keep them in their race car during the race, and keep
--- them out of the shared cones otherwise. BeamNG fires onVehicleSwitched(old, new) on every switch.
--- During the locked sequence (countdown + racing) any switch to a vehicle that is not the race car is
--- bounced straight back to it (this also covers the cones while racing); when the race car is gone the
--- bounce is skipped so the player is never trapped. Outside the race we keep the latest non-cone `new`
--- as the authoritative seated car, because in BeamMP the polling API be:getPlayerVehicle(0) sticks to
--- the first owned car -- so race/vehicles.lua resolve_own_car prefers this tracked id (confirmed
--- in-game). A switch into a cone bounces back to the last real car and is NOT recorded -- the
--- guaranteed non-enterable layer (ADR-0009). A blocked switch likewise never updates current_vehicle_id
--- (the checkpoint detector must keep reading the race car).
 -- Whether a game vehicle id is one of this client's AI cars (ADR-0036): the host's spawned ai_cars or, on
 -- a non-owner, a synced car resolved from the relayed aiMap (ai_remote_ids). Used to keep the player out
 -- of an AI car the same way cones are kept non-enterable.
@@ -3590,10 +3581,10 @@ local function is_ai_game_id(game_id)
     return false
 end
 
--- Put the player back into their last real car after they switched into an AI car (ADR-0036), the cone
--- bounce generalized to the AI cars (which are real models, so cones.enforce_non_enterable -- gated on
--- is_cone -- does not catch them). No fallback car id -> no-op so the player is never trapped. Returns
--- true if it bounced.
+-- Put the player back into their last real car after they switched into an AI car (ADR-0036), the prop
+-- bounce generalized to the AI cars (which are real car models, so props.is_race_prop does not catch
+-- them). The fallback is current_vehicle_id, which the prop rule guarantees is never a prop itself. No
+-- fallback car id -> no-op so the player is never trapped. Returns true if it bounced.
 local function bounce_off_ai(new_id)
     local fallback_id = M.state.current_vehicle_id
     if not be or fallback_id == nil or tostring(new_id) == tostring(fallback_id) then
@@ -3606,17 +3597,41 @@ local function bounce_off_ai(new_id)
     return pcall(function() be:enterVehicle(0, fallback) end)
 end
 
+-- Track the vehicle the player is currently in, keep them in their race car for the whole locked race
+-- sequence, and keep them out of the race's prop vehicles at all times. BeamNG fires
+-- onVehicleSwitched(old, new) on every switch -- a player-driven one AND the engine's own auto-enter
+-- after a spawn, which is what a race prop rides in on.
+--
+-- Outside those rules we keep the latest `new` as the authoritative seated car, because in BeamMP the
+-- polling API be:getPlayerVehicle(0) sticks to the first owned car -- so race/vehicles.lua
+-- resolve_own_car prefers this tracked id (confirmed in-game). Every bounce branch returns WITHOUT
+-- recording, so a prop / AI car / blocked switch never becomes current_vehicle_id (the checkpoint
+-- detector must keep reading the real race car, and bounce_off_ai must never fall back onto a prop).
+--
+-- The three rules, in order:
+--   1. RACE PROPS (bug race-prop-steals-player-seat) -- cones, the powered grinders, and any known
+--      non-car model while a race runs. First and phase-independent, because a prop auto-enter can land
+--      in ANY phase -- including staging (the reported case) and the part of handle_race_start where
+--      race_car_id is still nil, neither of which rule 2 covers. The player's own assigned race car is
+--      exempted up front so a mis-read model Type can never bounce them out of the car they are racing.
+--   2. THE RACE SEAT LOCK -- during countdown + racing + qualifying any switch away from the race car
+--      is bounced back to it. When the race car is gone the bounce is skipped so the player is never
+--      trapped.
+--   3. AI CARS (ADR-0036) -- real car models, so rule 1 does not catch them.
 function M.onVehicleSwitched(_oldId, newId)
     local phase = M.state.phase
-    if (phase == "countdown" or phase == "racing" or phase == "qualifying") and M.state.race_car_id ~= nil
-            and tostring(newId) ~= tostring(M.state.race_car_id) then
+    local race_car_id = M.state.race_car_id
+    local is_race_car = race_car_id ~= nil and tostring(newId) == tostring(race_car_id)
+    local race_active = M.state.race ~= nil
+    if not is_race_car and props.is_race_prop(be and be:getObjectByID(newId), race_active) then
+        props.enforce_non_enterable(newId, race_car_id, M.state.current_vehicle_id)
+        return
+    end
+    if (phase == "countdown" or phase == "racing" or phase == "qualifying")
+            and race_car_id ~= nil and not is_race_car then
         if bounce_to_race_car() then
             return
         end
-    end
-    if cones.is_cone(be and be:getObjectByID(newId)) then
-        cones.enforce_non_enterable(newId, M.state.current_vehicle_id)
-        return
     end
     -- Keep the player out of an AI car (ADR-0036) and never record it as the seated car, so the detector
     -- keeps reading the real own car.
@@ -3745,6 +3760,11 @@ function M.onVehicleSpawned(vehicleId)
         return
     end
     local veh = be:getObjectByID(vehicleId)
+    -- Cones only, on purpose: exclude_from_cycle sets isParkingVehicle, and its effect on a POWERED prop
+    -- is unverified while a grinder MUST keep spinning (ADR-0020 amendment). Keeping a grinder in the Tab
+    -- cycle costs nothing -- switching is input-blocked for the whole race, the grinders are deleted at
+    -- race end, and onVehicleSwitched bounces the player out of one anyway (bug
+    -- race-prop-steals-player-seat).
     cones.exclude_from_cycle(veh)
     -- A freshly synced vehicle may be one of the owner's AI cars (ADR-0036): try to resolve the pending
     -- aiMap now so it is labelled + nametag-suppressed as soon as it appears. No-op when nothing pending

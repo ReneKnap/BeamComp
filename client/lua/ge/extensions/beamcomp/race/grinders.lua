@@ -37,8 +37,14 @@
 --     uses. BeamMP propagates the owned delete ('Od:'), removing them for all clients. This fixes the leak
 --     regardless of whether activation succeeds.
 --
--- The cone correctness guarantees are untouched: cones.is_cone / enforce_non_enterable / exclude_from_cycle
--- stay jbeam-"cones"-keyed, so a grinder is never parked/frozen (it must spin).
+-- Non-enterable, but never parked (ADR-0020 amendment, refined by bug race-prop-steals-player-seat): the
+-- original amendment kept grinders out of the WHOLE cone policy so a grinder is never parked/frozen -- and
+-- threw out the seat bounce with the park/freeze treatment, which let a grinder steal the player's seat for
+-- a whole race. The two halves are now separated:
+--   * the seat BOUNCE covers grinders (props.is_race_prop keys off M.is_grinder below). It only re-seats
+--     the player -- it touches nothing on the prop, so the spin is unaffected.
+--   * cones.exclude_from_cycle (isParkingVehicle) stays jbeam-"cones"-keyed. Its effect on a POWERED prop
+--     is unverified, and a grinder must keep spinning, so it is deliberately NOT applied here.
 
 local M = {}
 

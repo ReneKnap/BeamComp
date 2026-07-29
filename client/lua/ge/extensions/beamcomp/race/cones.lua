@@ -15,12 +15,15 @@
 -- ownership, which a freshly-spawned cone is not yet in synchronously, so it deleted nothing.)
 --
 -- The cones must never be enterable or clutter the Tab vehicle cycle, on every client. Two layers:
---   * M.enforce_non_enterable -- GUARANTEED: bounce the player off a cone back to the race car.
---     Reactive (driven from init.lua's onVehicleSwitched) and internals-free, so it cannot fail to
---     keep the player out of a cone -- owner-local or remote-synced.
+--   * the GUARANTEED bounce -- it lives in race/props.lua now (props.is_race_prop /
+--     props.enforce_non_enterable), because it must cover every prop, not just cones. It still keys off
+--     M.is_cone below for the cone half. It used to sit HERE gated on is_cone alone, which is exactly
+--     why a powered grinder could steal the player's seat (bug race-prop-steals-player-seat).
 --   * M.exclude_from_cycle -- BEST-EFFORT: try to drop the cone from the Tab cycle entirely. The
 --     field a BeamMP-synced remote vehicle honours for switching is unverified (ADR-0009), so this
---     is fully guarded; the bounce above is what actually enforces non-enterability.
+--     is fully guarded; the bounce is what actually enforces non-enterability. Cone-keyed on purpose:
+--     it sets isParkingVehicle, whose effect on a POWERED prop is unverified, and a grinder must keep
+--     spinning (ADR-0020 amendment).
 
 local M = {}
 
@@ -80,33 +83,6 @@ function M.clear(ids)
     end
     log("I", LOG_TAG, string.format("cleared %d shared cone(s)", cleared))
     return cleared
-end
-
--- GUARANTEED non-enterable: when the player switches into a cone, put them straight back into the
--- race car. Driven from init.lua's onVehicleSwitched, so it fires on every switch -- the player can
--- never stay seated in a cone, owner-local or remote-synced. No-op when the switched-into vehicle
--- is not a cone or no fallback car id is known. Returns true if it bounced the player.
-function M.enforce_non_enterable(new_id, fallback_id)
-    if not be or new_id == nil or fallback_id == nil then
-        return false
-    end
-    if tostring(new_id) == tostring(fallback_id) then
-        return false
-    end
-    if not M.is_cone(be:getObjectByID(new_id)) then
-        return false
-    end
-    local fallback = be:getObjectByID(fallback_id)
-    if not fallback then
-        return false
-    end
-    local ok, err = pcall(function() be:enterVehicle(0, fallback) end)
-    if not ok then
-        log("W", LOG_TAG, "could not bounce player off cone: " .. tostring(err))
-        return false
-    end
-    log("I", LOG_TAG, "bounced player off cone back to race car")
-    return true
 end
 
 -- BEST-EFFORT exclusion from the Tab vehicle cycle. The flag a BeamMP-synced remote vehicle honours
