@@ -87,10 +87,11 @@ angular.module('beamng.apps')
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: '', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
-      // Named AI roster (ADR-0047): [{name, car, carLabel}] created via the Create button. THE gate for
-      // panel-spawned AI -- buildOverrides sends `ai` only when this is non-empty. Session-restored with
-      // the form AND saved in a preset (ADR-0047 amendment 2026-07-18): a loaded non-empty roster restores
-      // the "created" state (pre-fill only -- restoring the roster never rolls or spawns).
+      // Named AI roster (ADR-0047): [{name, car, carLabel, color}]. LIVE since the 2026-07-29 amendment --
+      // ticking aiEnabled fields it and the three AI-car settings re-roll its cars, so there is no Create
+      // button and no "ticked but empty" state to fall into. Session-restored with the form AND saved in a
+      // preset (ADR-0047 amendment 2026-07-18): a stored non-empty roster is restored verbatim, never
+      // re-rolled and never spawned by the restore itself.
       aiRoster: [],
       // Composable random-AI axes (aiCar='random'): stock vs random trim, and exclude big/heavy vehicles.
       // Both default ON (sensible-defaults, like the curated race settings): a random compliant trim plus a
@@ -108,10 +109,10 @@ angular.module('beamng.apps')
   // champQualiMinutes, tourClasses/tourOrder) AND the full AI setup including the named roster
   // (aiRoster = [{name, car, carLabel, color, ...}]; the ai* scalars were already saved). Load is
   // PRE-FILL ONLY -- applyStoredForm sets scope.form directly (angular.extend), so it restores the format
-  // fields and the roster verbatim WITHOUT firing any live command (championshipCmd/tournamentCmd) or roll/
-  // spawn: a loaded non-empty roster is simply in the "created" state (ADR-0047: buildOverrides gates `ai`
-  // on a non-empty roster) and spawns at race start like any created roster. The live .active state stays
-  // server-driven. Kept as a (currently empty) list so a future must-exclude field has an obvious home.
+  // fields and the roster verbatim WITHOUT firing any live command (championshipCmd/tournamentCmd), roll or
+  // spawn: a loaded non-empty roster is the saved field itself and spawns at race start exactly as saved.
+  // The live .active state stays server-driven. Kept as a (currently empty) list so a future must-exclude
+  // field has an obvious home.
   var PRESET_EXCLUDE_KEYS = [];
 
   // Reduce a roster to only its meaningful, persistable fields. Once the roster list has RENDERED, Angular's
@@ -289,8 +290,10 @@ angular.module('beamng.apps')
       capsInto(form, o);
     }
 
-    // AI roster gate (ADR-0047): the panel fields AI only from a created roster -- aiEnabled + count alone
-    // send NO `ai` at all, so no AI spawns. The typed /race chat path is unaffected. The roster length IS
+    // AI gate (ADR-0047 + the 2026-07-29 live amendment): the "AI opponents" checkbox is the gate. An `ai`
+    // block still needs a non-empty roster, but the panel now keeps the roster filled by itself (ticking
+    // rolls one), so "ticked yet nothing spawns" -- the footgun that cost the Create button its job -- is
+    // no longer reachable. The typed /race chat path is unaffected. The roster length IS
     // the AI count; each entry's pre-picked {name, car, color} rides opaquely to the server (race-blind) --
     // the car lands on the per-slot spawn policy and the colour (round 3) becomes the AI's PRIMARY paint
     // layer at spawn (nil = stock). ai.car stays relayed as the chain fallback for an entry without a car
@@ -423,10 +426,14 @@ angular.module('beamng.apps')
       // BeamCompSetupForm and BeamCompSetupPresetData so a loaded preset restores EXACTLY like the session
       // form (ADR-0037 amendment). The merge over freshForm is a plain assignment -- it sets the format
       // fields (tourMode/champ*/tour*) and the AI roster verbatim but never fires championshipCmd/
-      // tournamentCmd or a roster roll/spawn, so a loaded preset pre-fills everything (the format AND the
-      // "created" roster) without auto-starting or spawning it (ADR-0037/0047 amendments 2026-07-18). An
-      // OLDER preset that predates this simply lacks those keys, so they fall back to freshForm defaults
-      // (tourMode 'off', empty roster).
+      // tournamentCmd or a spawn, so a loaded preset pre-fills everything without auto-starting it
+      // (ADR-0037/0047 amendments 2026-07-18). An OLDER preset that predates this simply lacks those keys,
+      // so they fall back to freshForm defaults (tourMode 'off', empty roster).
+      //
+      // It is also the one path that must NOT wake the live AI watchers (ADR-0047 amendment 2026-07-29):
+      // it replaces scope.form wholesale, so every restored AI setting would look like a change the admin
+      // just made and re-roll the roster the restore had just brought back -- on every preset load and
+      // every UI reload. The tail below settles that explicitly.
       function applyStoredForm(formJson) {
         if (!formJson) {
           return;
@@ -460,6 +467,13 @@ angular.module('beamng.apps')
         scope.refresh();
         prefetchConfigs([scope.form.carModel].concat(
           classModels(scope.form.tourClasses), rosterModels(scope.form.aiRoster)));
+        // Record the restored AI settings as already-acted-on before the digest reaches the live watcher
+        // (see aiLive), so the restore itself can never re-roll. Then run the ONE deliberate exception by
+        // hand: a form that enables AI but carries no roster -- an old preset saved before the roster
+        // existed, or before Create was ever pressed -- gets one rolled now, so "AI opponents ticked"
+        // means the same thing after a load as it does after a click.
+        syncAiLive();
+        fieldRosterIfEmpty();
       }
 
       // GE pushes the dynamic lists on open AND on every refresh (the include-deprecated toggle, the Refresh
@@ -1010,10 +1024,13 @@ angular.module('beamng.apps')
         geLuaArg('tournament_cmd', JSON.stringify({ action: 'reset' }));
       };
 
-      // ----- Named AI roster (ADR-0047) -----------------------------------------------------------
-      // The Create button rolls a named roster GE-side (names from the pool, cars through the SAME
-      // resolution chain the spawn uses), the list edits it per entry, and buildOverrides sends AI only
-      // when a roster exists. Rolls are async: the GE replies via the BeamCompAiRoster* events below.
+      // ----- Named AI roster (ADR-0047; live since the 2026-07-29 amendment) ------------------------
+      // The roster is a LIVE artefact, not something the admin creates: ticking "AI opponents" fields one,
+      // the three AI-car settings re-roll the CARS of the entries that are there, and "Roll all" inside
+      // the expanded editor is the deliberate fresh-field action. Names -- and with them the spawn/grid
+      // slots and every identity keyed off them -- change only through Roll all or a per-entry pick/roll.
+      // Every roll happens GE-side through the SAME resolution chain the spawn uses, so the shown car is
+      // the spawned car. Rolls are async: the GE replies via the BeamCompAiRoster* events below.
 
       function rosterNames() {
         return (scope.form.aiRoster || []).map(function (e) { return e.name; });
@@ -1126,19 +1143,114 @@ angular.module('beamng.apps')
         return (e && e.name ? e.name : '').toLowerCase();
       };
 
-      // Create (or completely re-roll) the roster: aiCount fresh entries, nothing excluded.
-      scope.createRoster = function () {
+      // Every roster roll carries a monotonic token that GE echoes back untouched. The replies arrive
+      // through guihooks with NO request correlation, and the panel now rolls by ITSELF on a settings
+      // change -- so two rolls really can be in flight at once and land out of order, and one can still be
+      // in flight when the admin unticks the box. Only the newest request's reply may write: last request
+      // wins. (Trade-off: a count-driven extend that is still in flight when a car setting changes is
+      // dropped, so the count field may briefly read higher than the roster until the next blur/Enter.)
+      var rosterRollToken = 0;
+
+      function sendRosterRoll(spec) {
+        rosterRollToken += 1;
+        spec.token = rosterRollToken;
+        geLuaArg('roll_ai_roster', JSON.stringify(spec));
+      }
+
+      // A completely fresh roster: aiCount new entries with new names, cars and colours, replacing
+      // whatever is there. Nothing excluded -- this IS the reset.
+      function rollFreshRoster() {
         var spec = rosterRollSpec();
         spec.count = clampAiCount();
         spec.mode = 'create';
         spec.exclude = [];
-        geLuaArg('roll_ai_roster', JSON.stringify(spec));
+        sendRosterRoll(spec);
+      }
+
+      // Re-roll the CARS of the existing entries, keeping their names (and with them their spawn/grid
+      // slots) and their colours. One GE call for the whole set, resolved per name through the same chain
+      // a fresh roll uses -- so switching the AI car back to "default" hands every driver their preferred
+      // car again (ADR-0048), which a per-entry re-roll (a manual override by definition) would not.
+      // Cars set by hand via Change… are NOT protected: a live re-roll overwrites them, by decision.
+      function rerollRosterCars() {
+        var names = rosterNames();
+        if (!names.length) {
+          return;
+        }
+        var spec = rosterRollSpec();
+        spec.mode = 'cars';
+        spec.names = names;
+        sendRosterRoll(spec);
+      }
+
+      // Field a roster because AI was just enabled (by a tick or by a restored form) -- but ONLY when
+      // there is none. An existing roster is a possibly hand-tuned field that a mis-click on the checkbox
+      // must not destroy; Roll all is the deliberate way to replace it.
+      function fieldRosterIfEmpty() {
+        if (!scope.form.aiEnabled || (scope.form.aiRoster || []).length) {
+          return;
+        }
+        rollFreshRoster();
+      }
+
+      // Roll all: the former Create/Re-create, now living inside the expanded editor as the explicit
+      // "give me a new field" action. A scope METHOD for the same reason toggleRoster is one -- the button
+      // renders under an ng-if, i.e. on a child scope.
+      scope.rollAllRoster = function () {
+        rollFreshRoster();
       };
 
+      // ----- The live settings ------------------------------------------------------------------------
+      // Exactly four form fields drive the roster on their own: the enable checkbox and the three AI-CAR
+      // axes. The omissions are deliberate. The player restriction fields (carModel/maxhp/maxkg/
+      // restrictVehicles…) feed a roll too, through buildRosterPolicy -- but re-rolling on every keystroke
+      // in a caps field would be churn, and "the roster was rolled before the caps changed" is exactly
+      // what the panel did before, so nothing regresses. The Count field keeps its blur/Enter semantics
+      // (typing your way to "12" would otherwise roll a 1-entry field in passing), and the AI difficulty
+      // Preset is not a roll input at all (rosterRollSpec never reads it).
+      function aiLiveState() {
+        return {
+          enabled: !!scope.form.aiEnabled,
+          car: scope.form.aiCar || '',
+          randomTrim: !!scope.form.aiRandomTrim,
+          noBigCars: !!scope.form.aiNoBigCars,
+        };
+      }
+
+      // The state the panel has already acted on. Comparing against THIS instead of against the watcher's
+      // own previous value is what makes the restore path safe: applyStoredForm records the restored
+      // settings here (syncAiLive) before the digest reaches the watcher, so they arrive already handled
+      // and no preset load or UI reload can re-roll the roster it just restored. A value-level
+      // suppression rather than a timing flag -- it cannot leak and cannot be left set.
+      var aiLive = null;
+      function syncAiLive() {
+        aiLive = aiLiveState();
+      }
+
+      scope.$watch(aiLiveState, function (now) {
+        var prev = aiLive;
+        aiLive = now;
+        if (!prev) {
+          return;  // the watcher's registration run (oldVal === newVal): nothing has changed yet
+        }
+        if (now.enabled && !prev.enabled) {
+          fieldRosterIfEmpty();
+          return;
+        }
+        if (!now.enabled) {
+          return;  // AI off: the checkbox gates the spawn, the roster is simply left alone
+        }
+        if (now.car !== prev.car || now.randomTrim !== prev.randomTrim
+            || now.noBigCars !== prev.noBigCars) {
+          rerollRosterCars();
+        }
+      }, true);
+
       // Count changed with an existing roster (applied on blur/Enter, the panel's number-field
-      // convention): fewer -> tail entries drop; more -> new entries are rolled in, names unique against
-      // the kept ones. Existing entries stay untouched (decision 7). Without a roster the count only
-      // sizes the next Create.
+      // convention -- deliberately NOT live per keystroke, or typing your way to "12" would roll a
+      // 1-entry field in passing): fewer -> tail entries drop; more -> new entries are rolled in, names
+      // unique against the kept ones. Existing entries stay untouched. Without a roster the count only
+      // sizes the next roll.
       scope.applyRosterCount = function () {
         var count = clampAiCount();
         var roster = scope.form.aiRoster || [];
@@ -1153,21 +1265,50 @@ angular.module('beamng.apps')
         spec.exclude = rosterNames();
         // Keep the new entries' colours distinct from the kept ones too (ADR-0047 round 3).
         spec.excludeColors = rosterColors();
-        geLuaArg('roll_ai_roster', JSON.stringify(spec));
+        sendRosterRoll(spec);
       };
+
+      // Apply a 'cars' reply: one {name, car, carLabel} per name the request carried. Matched by NAME, not
+      // by position -- the request was built from a snapshot, and a per-entry name pick or roll landing in
+      // between would otherwise paint a car onto the wrong AI. An entry the reply does not mention keeps
+      // its car, and no colour is touched: a colour belongs to the driver, not to the AI-car settings.
+      function applyRosterCars(entries) {
+        var rolledByName = {};
+        entries.forEach(function (e) {
+          if (e.name) {
+            rolledByName[e.name] = e;
+          }
+        });
+        (scope.form.aiRoster || []).forEach(function (entry) {
+          var rolled = entry.name && rolledByName[entry.name];
+          if (!rolled || !rolled.car) {
+            return;
+          }
+          entry.car = rolled.car;
+          entry.carLabel = rolled.carLabel;
+        });
+        prefetchConfigs(rosterModels(entries));
+      }
 
       scope.$on('BeamCompAiRoster', function (event, payload) {
         scope.$evalAsync(function () {
-          var entries = ((payload && payload.entries) || []).map(function (e) {
+          // A stale reply -- an older roll answering a question the panel no longer asks (see
+          // rosterRollToken) -- or one that landed after the box was unticked, which for a create would
+          // resurrect the field the admin just switched off.
+          if (!payload || payload.token !== rosterRollToken || !scope.form.aiEnabled) {
+            return;
+          }
+          var entries = (payload.entries || []).map(function (e) {
             return { name: e.name, car: e.car, carLabel: e.carLabel, color: e.color };
           });
-          if (payload && payload.mode === 'extend') {
+          if (payload.mode === 'cars') {
+            applyRosterCars(entries);
+            return;
+          }
+          if (payload.mode === 'extend') {
             scope.form.aiRoster = (scope.form.aiRoster || []).concat(entries);
           } else {
             scope.form.aiRoster = entries;
-            // Auto-expand the list on a fresh Create so the generated AI are visible at once (ADR-0047
-            // round 3); the Hide toggle still collapses it. Not on extend -- the list is already open.
-            scope.rosterOpen = true;
           }
           scope.form.aiCount = scope.form.aiRoster.length || scope.form.aiCount;
           // The rolled cars are models the panel may never have probed. Without their configs each row's
