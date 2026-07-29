@@ -3532,7 +3532,10 @@ local last_block_toast_at = 0
 -- toast so a deliberate Tab press is not silently swallowed. Returns false when the race car is gone
 -- (so the caller lets the switch through rather than trapping the player). Mirrors the race-prop bounce
 -- (props.enforce_non_enterable), but race-car-general and with the in-race feedback toast.
-local function bounce_to_race_car()
+--
+-- `silent` suppresses only the toast, never the log line: the staging caller passes it because every
+-- switch reaching it there is engine-driven rather than a player key press (see onVehicleSwitched).
+local function bounce_to_race_car(silent)
     local race_car = be and be:getObjectByID(M.state.race_car_id)
     if not race_car then
         return false
@@ -3543,7 +3546,7 @@ local function bounce_to_race_car()
         return false
     end
     local now = os.clock()
-    if now - last_block_toast_at >= SWITCH_BLOCK_TOAST_THROTTLE then
+    if not silent and now - last_block_toast_at >= SWITCH_BLOCK_TOAST_THROTTLE then
         last_block_toast_at = now
         guihooks.trigger("toastrMsg", {
             type = "warning",
@@ -3614,9 +3617,11 @@ end
 --      in ANY phase -- including staging (the reported case) and the part of handle_race_start where
 --      race_car_id is still nil, neither of which rule 2 covers. The player's own assigned race car is
 --      exempted up front so a mis-read model Type can never bounce them out of the car they are racing.
---   2. THE RACE SEAT LOCK -- during countdown + racing + qualifying any switch away from the race car
---      is bounced back to it. When the race car is gone the bounce is skipped so the player is never
---      trapped.
+--   2. THE RACE SEAT LOCK -- during staging + countdown + racing + qualifying any switch away from the
+--      race car is bounced back to it. staging is included because switching cars is not allowed there
+--      either (the staging relaxation is a model/parts REPLACE, which keeps the same vehicle id, so an
+--      id comparison can never fight it -- lock.lua replace_seen, restage_swapped_car). When the race
+--      car is gone the bounce is skipped so the player is never trapped.
 --   3. AI CARS (ADR-0036) -- real car models, so rule 1 does not catch them.
 function M.onVehicleSwitched(_oldId, newId)
     local phase = M.state.phase
@@ -3627,9 +3632,12 @@ function M.onVehicleSwitched(_oldId, newId)
         props.enforce_non_enterable(newId, race_car_id, M.state.current_vehicle_id)
         return
     end
-    if (phase == "countdown" or phase == "racing" or phase == "qualifying")
+    if (phase == "staging" or phase == "countdown" or phase == "racing" or phase == "qualifying")
             and race_car_id ~= nil and not is_race_car then
-        if bounce_to_race_car() then
+        -- Silent in staging: the swap-allowed lock already blocks every switch key there, so a switch
+        -- that still arrives is engine-driven (a prop or AI auto-enter) and toasting the player about a
+        -- lock they never hit would be pure noise. The log line is kept in both cases.
+        if bounce_to_race_car(phase == "staging") then
             return
         end
     end
