@@ -16,8 +16,9 @@
 --                 race's static-scenery prop prefab(s) into the scene (race/props). The knockable
 --                 cones are shared: only the payload's propOwner (host) spawns them and BeamMP syncs
 --                 them to everyone; non-hosts spawn a statics-only prefab and never instantiate a
---                 cone. The cones are kept non-enterable / out of the Tab cycle on every client via
---                 race/cones (ADR-0020, superseding ADR-0009).
+--                 cone. Every race prop -- cone or powered grinder -- is kept non-enterable on every
+--                 client via race/props (ADR-0020, superseding ADR-0009), and the cones additionally
+--                 stay out of the Tab cycle via race/cones.
 --   racePhase  -- the server-authoritative race phase (lobby/spawning/countdown/racing/finished,
 --                 ADR-0006). We record + surface it, and drive the start lock off it: the car is
 --                 spawned frozen (handle_race_start) and held through the countdown, released on
@@ -192,17 +193,11 @@ local DASH_REFRESH_AFTER_RELOAD = 2.0
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ai-count-blank-guard/2026-07-29"
+local BUILD_MARKER = "grinder-follow-respawn/2026-07-30"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
 local AI_PERF_HINT_THRESHOLD = 6
-
--- Seconds after a grinder spawn that the host keeps re-issuing the powered-prop activation (ADR-0020
--- amendment). The `spinner` main-controller only exists once the freshly spawned grinder VE's powertrain
--- init has run, so activation is re-issued each frame until it lands, then stopped -- the controller owns
--- the throttle from then on. Wall-clock (os.clockhp) anchored: dtReal is clamped on the spawn-load spike.
-local GRINDER_ACTIVATE_WINDOW = 2.0
 
 -- Reload-surviving state (BeamNG serializes M.state across a Lua reload).
 M.state = {
@@ -213,8 +208,8 @@ M.state = {
     marker_warned = false,
     prop_names = nil,    -- names of the prop prefabs we spawned, for cleanup (or nil)
     cone_ids = nil,      -- ids of the shared cone vehicles we spawned + must clear (host only, ADR-0020)
-    grinder_ids = nil,   -- ids of the shared powered prop-vehicles (grinders) we spawned + must clear on teardown (host only, ADR-0020 amendment)
-    grinder_activate_until = nil,  -- os.clockhp deadline for re-issuing grinder activation over the spawn readiness window; nil when idle/non-host or the window has closed (ADR-0020 amendment)
+    prop_owner = false,  -- whether we are (or were) the client that spawns + owns the shared prop-vehicles (payload.propOwner, ADR-0020); gates the grinder activation window and the scene-scan cleanup long after handle_race_start, and survives teardown on purpose so a repeat cleanup pass still reaps a late re-spawn (see teardown_race_world)
+    grinder_activate = nil,  -- powered-prop activation window state owned by race/grinders (arm/step/note_spinning): tracked + pending ids, confirmations, deadline; nil when idle/non-host or the window has closed. No spawn-time id list is kept any more -- BeamMP re-spawns the props under new ids, so the window re-derives them from the scene (ADR-0020 amendment, bug race-prop-steals-player-seat rounds 2+3)
     pending_nametag = nil,  -- map of cone game-id -> seconds waited for MPVehicleGE nametag suppression to stick; lazily created, nil when idle (ADR-0020)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
@@ -520,16 +515,29 @@ local function handle_race_start(payload)
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     -- Despawn any prior powered props (grinders) too, so a re-issued /race never stacks them -- the same
-    -- reason cones are cleared here (ADR-0020 amendment). Host-only state; nil on a non-owner.
-    grinders.clear(M.state.grinder_ids or {})
-    M.state.prop_names, M.state.cone_ids, M.state.grinder_ids = props.load(race.prefabFiles or {},
+    -- reason cones are cleared here (ADR-0020 amendment). By SCENE SCAN, not by the ids the last load
+    -- captured: BeamMP re-spawns the props under new ids a few seconds after they appear, so a stored id
+    -- list is dead and deleted nothing (bug race-prop-steals-player-seat round 3). Run it when we owned the
+    -- previous set OR are about to spawn a new one, so a leftover can never stack under a fresh load.
+    if M.state.prop_owner or payload.propOwner then
+        grinders.clear_scene()
+    end
+    local grinder_seed
+    M.state.prop_names, M.state.cone_ids, grinder_seed = props.load(race.prefabFiles or {},
         payload.propOwner, race.coneFiles or {})
+    -- Whether we are the client that spawns and owns the shared prop-vehicles (ADR-0020). Kept in state
+    -- because the grinder paths need it long after this handler: the activation window and the scene-scan
+    -- cleanup must both stay host-only, and teardown runs with no payload in hand.
+    M.state.prop_owner = payload.propOwner == true
     -- Arm the powered props' (grinders') activation window: their `spinner` controller only comes up after
-    -- the freshly spawned VE's powertrain init, so onUpdate re-issues the activation each frame until the
-    -- deadline, then stops (ADR-0020 amendment). Anchored on os.clockhp (dtReal is clamped on the load
-    -- spike). nil = idle / non-host / no grinders (re-armed on every /race; nil'd again on teardown).
-    M.state.grinder_activate_until = (M.state.grinder_ids and #M.state.grinder_ids > 0)
-        and (os.clockhp() + GRINDER_ACTIVATE_WINDOW) or nil
+    -- the freshly spawned VE's powertrain init, so onUpdate re-issues the activation while the window is open
+    -- (ADR-0020 amendment). Arming only OPENS it -- the deadline starts on the first frame that actually
+    -- runs, so the rest of this handler (the AI field spawns synchronously below, plus the own-car respawn
+    -- and the collision rebuild) cannot spend the window before a single activation went out; that is
+    -- precisely what happened before (round 2). The prefab's ids are only a SEED: grinders.step re-derives
+    -- the live set from the scene each frame, because BeamMP replaces the props under new ids a few seconds
+    -- in (round 3). nil = idle / non-host / no grinders (re-armed on every /race; nil'd again on teardown).
+    M.state.grinder_activate = payload.propOwner and grinders.arm(grinder_seed) or nil
 
     -- Clear any AI cars from a prior race up front so a re-issued /race never stacks them (ADR-0036), the
     -- same reason cones are cleared here. Host-only state; all nil on a non-owner. The new AI cars are
@@ -762,9 +770,14 @@ local function teardown_race_world()
     props.clear(M.state.prop_names or {})
     cones.clear(M.state.cone_ids or {})
     -- Despawn the host's powered props (grinders) too, so they never orphan into free-roam after the race
-    -- (ADR-0020 amendment). Idempotent + host-only (nil on a non-owner). Shared by lobby end,
-    -- onClientEndMission (session leave / level change) and onExtensionUnloaded (reload).
-    grinders.clear(M.state.grinder_ids or {})
+    -- (ADR-0020 amendment). Shared by lobby end, onClientEndMission (session leave / level change) and
+    -- onExtensionUnloaded (reload). By SCENE SCAN and gated on being the prop owner: the ids captured at the
+    -- prefab load are dead within seconds (BeamMP re-spawns the props), so the old id-based clear deleted
+    -- nothing that existed and the real grinders leaked into free-roam -- the ADR-0020 leak was still open
+    -- until now (bug race-prop-steals-player-seat round 3).
+    if M.state.prop_owner then
+        grinders.clear_scene()
+    end
     -- Despawn the host's AI cars (ADR-0036): stop them first so none lurches on the delete frame.
     -- Idempotent + host-only (all nil on a non-owner). Remote AI id sets are just dropped below.
     ai.stop(M.state.ai_cars or {})
@@ -782,8 +795,12 @@ local function teardown_race_world()
     M.state.ai_server_ids = nil
     M.state.prop_names = nil
     M.state.cone_ids = nil
-    M.state.grinder_ids = nil
-    M.state.grinder_activate_until = nil
+    M.state.grinder_activate = nil
+    -- prop_owner is deliberately NOT cleared here: it is the "we spawned the shared props" marker that gates
+    -- the scene-scan cleanup, and teardown runs from several places (lobby, session leave, extension
+    -- unload). Clearing it would make every pass after the first a no-op, so a prop that reappeared late --
+    -- BeamMP's re-spawn racing our delete -- could never be reaped. handle_race_start overwrites it with the
+    -- new race's value, and nothing else reads it without also requiring an active race.
     M.state.race = nil
     M.state.race_car_id = nil
     M.state.detection = nil
@@ -3529,9 +3546,12 @@ local last_block_toast_at = 0
 
 -- Put the player straight back into their race car after a blocked switch, and surface a throttled
 -- toast so a deliberate Tab press is not silently swallowed. Returns false when the race car is gone
--- (so the caller lets the switch through rather than trapping the player). Mirrors the cone bounce
--- (cones.enforce_non_enterable), but race-car-general and with the in-race feedback toast.
-local function bounce_to_race_car()
+-- (so the caller lets the switch through rather than trapping the player). Mirrors the race-prop bounce
+-- (props.enforce_non_enterable), but race-car-general and with the in-race feedback toast.
+--
+-- `silent` suppresses only the toast, never the log line: the staging caller passes it because every
+-- switch reaching it there is engine-driven rather than a player key press (see onVehicleSwitched).
+local function bounce_to_race_car(silent)
     local race_car = be and be:getObjectByID(M.state.race_car_id)
     if not race_car then
         return false
@@ -3542,7 +3562,7 @@ local function bounce_to_race_car()
         return false
     end
     local now = os.clock()
-    if now - last_block_toast_at >= SWITCH_BLOCK_TOAST_THROTTLE then
+    if not silent and now - last_block_toast_at >= SWITCH_BLOCK_TOAST_THROTTLE then
         last_block_toast_at = now
         guihooks.trigger("toastrMsg", {
             type = "warning",
@@ -3554,16 +3574,6 @@ local function bounce_to_race_car()
     return true
 end
 
--- Track the vehicle the player is currently in, keep them in their race car during the race, and keep
--- them out of the shared cones otherwise. BeamNG fires onVehicleSwitched(old, new) on every switch.
--- During the locked sequence (countdown + racing) any switch to a vehicle that is not the race car is
--- bounced straight back to it (this also covers the cones while racing); when the race car is gone the
--- bounce is skipped so the player is never trapped. Outside the race we keep the latest non-cone `new`
--- as the authoritative seated car, because in BeamMP the polling API be:getPlayerVehicle(0) sticks to
--- the first owned car -- so race/vehicles.lua resolve_own_car prefers this tracked id (confirmed
--- in-game). A switch into a cone bounces back to the last real car and is NOT recorded -- the
--- guaranteed non-enterable layer (ADR-0009). A blocked switch likewise never updates current_vehicle_id
--- (the checkpoint detector must keep reading the race car).
 -- Whether a game vehicle id is one of this client's AI cars (ADR-0036): the host's spawned ai_cars or, on
 -- a non-owner, a synced car resolved from the relayed aiMap (ai_remote_ids). Used to keep the player out
 -- of an AI car the same way cones are kept non-enterable.
@@ -3590,10 +3600,10 @@ local function is_ai_game_id(game_id)
     return false
 end
 
--- Put the player back into their last real car after they switched into an AI car (ADR-0036), the cone
--- bounce generalized to the AI cars (which are real models, so cones.enforce_non_enterable -- gated on
--- is_cone -- does not catch them). No fallback car id -> no-op so the player is never trapped. Returns
--- true if it bounced.
+-- Put the player back into their last real car after they switched into an AI car (ADR-0036), the prop
+-- bounce generalized to the AI cars (which are real car models, so props.is_race_prop does not catch
+-- them). The fallback is current_vehicle_id, which the prop rule guarantees is never a prop itself. No
+-- fallback car id -> no-op so the player is never trapped. Returns true if it bounced.
 local function bounce_off_ai(new_id)
     local fallback_id = M.state.current_vehicle_id
     if not be or fallback_id == nil or tostring(new_id) == tostring(fallback_id) then
@@ -3606,17 +3616,46 @@ local function bounce_off_ai(new_id)
     return pcall(function() be:enterVehicle(0, fallback) end)
 end
 
+-- Track the vehicle the player is currently in, keep them in their race car for the whole locked race
+-- sequence, and keep them out of the race's prop vehicles at all times. BeamNG fires
+-- onVehicleSwitched(old, new) on every switch -- a player-driven one AND the engine's own auto-enter
+-- after a spawn, which is what a race prop rides in on.
+--
+-- Outside those rules we keep the latest `new` as the authoritative seated car, because in BeamMP the
+-- polling API be:getPlayerVehicle(0) sticks to the first owned car -- so race/vehicles.lua
+-- resolve_own_car prefers this tracked id (confirmed in-game). Every bounce branch returns WITHOUT
+-- recording, so a prop / AI car / blocked switch never becomes current_vehicle_id (the checkpoint
+-- detector must keep reading the real race car, and bounce_off_ai must never fall back onto a prop).
+--
+-- The three rules, in order:
+--   1. RACE PROPS (bug race-prop-steals-player-seat) -- cones, the powered grinders, and any known
+--      non-car model while a race runs. First and phase-independent, because a prop auto-enter can land
+--      in ANY phase -- including staging (the reported case) and the part of handle_race_start where
+--      race_car_id is still nil, neither of which rule 2 covers. The player's own assigned race car is
+--      exempted up front so a mis-read model Type can never bounce them out of the car they are racing.
+--   2. THE RACE SEAT LOCK -- during staging + countdown + racing + qualifying any switch away from the
+--      race car is bounced back to it. staging is included because switching cars is not allowed there
+--      either (the staging relaxation is a model/parts REPLACE, which keeps the same vehicle id, so an
+--      id comparison can never fight it -- lock.lua replace_seen, restage_swapped_car). When the race
+--      car is gone the bounce is skipped so the player is never trapped.
+--   3. AI CARS (ADR-0036) -- real car models, so rule 1 does not catch them.
 function M.onVehicleSwitched(_oldId, newId)
     local phase = M.state.phase
-    if (phase == "countdown" or phase == "racing" or phase == "qualifying") and M.state.race_car_id ~= nil
-            and tostring(newId) ~= tostring(M.state.race_car_id) then
-        if bounce_to_race_car() then
+    local race_car_id = M.state.race_car_id
+    local is_race_car = race_car_id ~= nil and tostring(newId) == tostring(race_car_id)
+    local race_active = M.state.race ~= nil
+    if not is_race_car and props.is_race_prop(be and be:getObjectByID(newId), race_active) then
+        props.enforce_non_enterable(newId, race_car_id, M.state.current_vehicle_id)
+        return
+    end
+    if (phase == "staging" or phase == "countdown" or phase == "racing" or phase == "qualifying")
+            and race_car_id ~= nil and not is_race_car then
+        -- Silent in staging: the swap-allowed lock already blocks every switch key there, so a switch
+        -- that still arrives is engine-driven (a prop or AI auto-enter) and toasting the player about a
+        -- lock they never hit would be pure noise. The log line is kept in both cases.
+        if bounce_to_race_car(phase == "staging") then
             return
         end
-    end
-    if cones.is_cone(be and be:getObjectByID(newId)) then
-        cones.enforce_non_enterable(newId, M.state.current_vehicle_id)
-        return
     end
     -- Keep the player out of an AI car (ADR-0036) and never record it as the seated car, so the detector
     -- keeps reading the real own car.
@@ -3745,7 +3784,23 @@ function M.onVehicleSpawned(vehicleId)
         return
     end
     local veh = be:getObjectByID(vehicleId)
+    -- Cones only, on purpose: exclude_from_cycle sets isParkingVehicle, and its effect on a POWERED prop
+    -- is unverified while a grinder MUST keep spinning (ADR-0020 amendment). Keeping a grinder in the Tab
+    -- cycle costs nothing -- switching is input-blocked for the whole race, the grinders are deleted at
+    -- race end, and onVehicleSwitched bounces the player out of one anyway (bug
+    -- race-prop-steals-player-seat).
     cones.exclude_from_cycle(veh)
+    -- A powered prop appearing while we own the race's props is BeamMP re-spawning one it just deleted (its
+    -- ownership round-trip, ~5 s after the prefab load). While a window is open its per-frame rescan adopts
+    -- the newcomer by itself; this branch is for the case the rescan cannot cover -- a re-spawn that lands
+    -- after the window has already closed. Re-opening a seedless window is enough: its first frame discovers
+    -- whatever is in the scene. Gated on an active race so a spinner spawned in free-roam is never driven
+    -- (bug race-prop-steals-player-seat round 3).
+    if M.state.prop_owner and M.state.race and not M.state.grinder_activate
+            and grinders.is_grinder(veh) then
+        M.state.grinder_activate = grinders.arm(nil)
+        log("I", RACE_LOG_TAG, "powered prop re-spawned after the activation window closed; re-opening it")
+    end
     -- A freshly synced vehicle may be one of the owner's AI cars (ADR-0036): try to resolve the pending
     -- aiMap now so it is labelled + nametag-suppressed as soon as it appears. No-op when nothing pending
     -- or on the owner (it has no ai_server_ids).
@@ -5303,6 +5358,16 @@ function M.on_assist_key_up()
     end
 end
 
+-- A powered prop's (grinder's) VE reporting whether its `spinner` controller took the activation command
+-- (ADR-0020 amendment, bug race-prop-steals-player-seat round 2). Reached from the grinder VE as
+-- `beamcomp_init.note_grinder_spinning(...)`, the same GE<->VE path the assist keys above use. A thin
+-- wrapper over the module that owns the window; a reply with no window open (teardown raced the last queued
+-- command) is a no-op. This is what lets the window stop on evidence instead of on a timer, and what makes
+-- the log say whether the controller ever came up.
+function M.note_grinder_spinning(vehicle_id, has_controller)
+    grinders.note_spinning(M.state.grinder_activate, vehicle_id, has_controller)
+end
+
 -- Drive the hold-to-activate recover/repair each frame (ADR-0017): the countdown runs only while the
 -- key is held AND the car is (near) stationary -- releasing or driving off cancels it. On completion
 -- the held kind is consumed (cleared) so it does not immediately re-fire while the key is still down.
@@ -5734,19 +5799,17 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- Phase-independent: a synced cone's MPVehicleGE registration can land a frame or two after its
     -- spawn, so this runs until the queued nametag suppressions stick (no-op when nothing is pending).
     retry_pending_nametags(dtReal)
-    -- Phase-independent, host-only: drive the powered props' (grinders') activation over a short readiness
-    -- window after spawn. The `spinner` main-controller only comes up after the freshly spawned grinder
-    -- VE's powertrain init, so a single activation at spawn can land before getControllerSafe("spinner")
-    -- is non-nil (-> no-op); we re-issue each frame until the deadline, then stop -- the controller owns
-    -- the throttle from then on (its locked target ratio holds), so re-asserting past the window would
-    -- fight its PID (ADR-0020 amendment). grinder_activate_until is nil off-race / on a non-host / once the
-    -- window closes, so the idle path is zero-work; os.clockhp (dtReal is clamped). BeamMP syncs the spin.
-    if M.state.grinder_activate_until then
-        if os.clockhp() < M.state.grinder_activate_until then
-            grinders.activate(M.state.grinder_ids)
-        else
-            M.state.grinder_activate_until = nil
-        end
+    -- Phase-independent, host-only: drive the powered props' (grinders') activation readiness window. The
+    -- `spinner` main-controller only comes up after the freshly spawned grinder VE's powertrain init, so a
+    -- single activation at spawn lands before getControllerSafe("spinner") is non-nil (-> no-op); step
+    -- re-issues per frame and stops the moment every grinder's VE confirms its controller took the command,
+    -- so we never re-assert against a running PID (ADR-0020 amendment). The budget is counted in FRAMES
+    -- here, which is the fix for round 2 of bug race-prop-steals-player-seat: the old wall-clock deadline
+    -- was armed before the AI field spawned synchronously in handle_race_start, so it could expire before
+    -- this line ever ran once. grinder_activate is nil off-race / on a non-host / once the window closes, so
+    -- the idle path is one nil check. BeamMP syncs the resulting spin to every client.
+    if M.state.grinder_activate then
+        M.state.grinder_activate = grinders.step(M.state.grinder_activate)
     end
     -- Phase-independent: keep the race-setup panel on screen while it is meant to be open (bug
     -- setup-panel-settings-survive-ui-reload). The panel heartbeats, and a UI reload that dropped our

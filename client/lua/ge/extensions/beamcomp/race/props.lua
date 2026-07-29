@@ -1,8 +1,14 @@
--- BeamComp -- race prop lifecycle (load + clear the track's scenery prefabs on a race start).
+-- BeamComp -- race props: the track's scenery prefabs (load + clear) AND the shared seat policy that
+-- keeps the player out of every prop vehicle those prefabs bring along.
 --
 -- Lives at lua/ge/extensions/beamcomp/race/props.lua inside the client mod zip. Stateless and
 -- reload-safe (no M.state, no file-scope mutable state): the caller owns the list of spawned
 -- object names and passes it back to M.clear. Target: client GE (LuaJIT 5.1).
+--
+-- This is also the one module that knows EVERY prop identity -- it already requires race/cones.lua
+-- (knockable cones) and race/grinders.lua (powered grinders) -- which is why the reactive seat policy
+-- lives here rather than in either of them (see the "race-prop seat policy" section at the bottom, and
+-- bug race-prop-steals-player-seat).
 --
 -- On a race start each client loads the race's static-scenery prefab(s) -- the plastic barriers,
 -- sign posts and direction arrows the singleplayer time-trial places -- into the scene. This is
@@ -36,6 +42,7 @@ local M = {}
 local cones = require("beamcomp/race/cones")
 local grinders = require("beamcomp/race/grinders")
 local prefab = require("beamcomp/race/prefab")
+local vehiclespecs = require("beamcomp/race/vehiclespecs")
 
 local LOG_TAG = "beamcomp.props"
 local PROP_NAME_PREFIX = "beamcomp_prop_"
@@ -86,8 +93,15 @@ end
 -- empty for missions, whose cones ride inside `prefab_files`. Non-hosts never spawn it.
 -- Returns the list of prefab names spawned (for prefab cleanup), the list of kept cone vehicle ids
 -- (empty unless host; for cone cleanup), and the list of kept powered-prop vehicle ids (the grinders --
--- empty unless host; for spin + cleanup, ADR-0020 amendment). One bad prefab warns and is skipped rather
--- than aborting.
+-- empty unless host, ADR-0020 amendment). One bad prefab warns and is skipped rather than aborting.
+--
+-- NOTE on the two id lists: BeamMP deletes and re-spawns a freshly spawned prop-vehicle under a NEW id a few
+-- seconds later, as part of its ownership/sync round-trip, so both lists go stale (measured, bug
+-- race-prop-steals-player-seat round 3). The grinder list is therefore only a SEED for the activation window,
+-- which re-derives the live set from the scene, and grinder cleanup scans the scene instead
+-- (grinders.clear_scene). The CONE list is still used as-is by cones.clear and so has the same latent flaw --
+-- deliberately left alone in that item's scope and filed separately; the cone bounce and the cone nametag
+-- suppression are unaffected because both are driven by live hooks rather than by these ids.
 function M.load(prefab_files, keep_cones, cone_files)
     if type(spawnPrefab) ~= "function" or type(removePrefab) ~= "function" then
         log("W", LOG_TAG, "spawnPrefab/removePrefab unavailable -- cannot load props")
@@ -214,6 +228,66 @@ function M.clear(names)
 
     log("I", LOG_TAG, string.format("cleared %d prop prefab(s)", cleared))
     return cleared
+end
+
+
+-- ===== race-prop seat policy ==============================================================
+-- A race prefab's prop-vehicles are real, enterable vehicles: the cones carry autoEnterVehicle, and the
+-- GridMap GrinderGrandPrix grinders auto-enter once their VE finishes loading -- AFTER the own car has
+-- been placed, which is how the player ended up driving a rotating morning-star for a whole race (bug
+-- race-prop-steals-player-seat). The guarantee is a REACTIVE bounce off any prop, in any phase; it
+-- touches nothing on the prop itself, so a grinder keeps spinning (ADR-0020 amendment).
+
+-- Whether a vehicle is one of the race's PROPS -- something the player must never sit in. Two layers:
+--   * GUARANTEED, jbeam-keyed: a knockable cone (cones.is_cone) or a powered grinder
+--     (grinders.is_grinder). Exact identities read straight off the vehicle, so the concrete reported
+--     cases stay fixed even when model metadata is unreadable.
+--   * WIDENED, metadata-keyed, only while a race is running (`race_active`): any model the engine
+--     reports as a KNOWN non-car (Prop/Trailer via vehiclespecs.is_known_non_car -- the same test
+--     race/vehicles.lua's is_owned_race_car already uses). This covers a FUTURE prefab prop whose jbeam
+--     is neither "cones" nor "large_spinner". An unreadable Type counts as a car there, so the widening
+--     can only ever ADD a known non-car, never drop a real one. It is race-gated because outside a race
+--     a Trailer-type vehicle is a legitimate free-roam vehicle the player may own and switch into.
+function M.is_race_prop(veh, race_active)
+    if veh == nil then
+        return false
+    end
+    if cones.is_cone(veh) or grinders.is_grinder(veh) then
+        return true
+    end
+    return race_active == true and vehiclespecs.is_known_non_car(veh.JBeam)
+end
+
+-- The vehicle to bounce into for candidate `id`, or nil when the candidate is absent, is the prop the
+-- player just landed in (`prop_id` -- bouncing a vehicle into itself is not a bounce), or no longer
+-- resolves. Ids are compared as strings: tracked ids and getID() may differ in number/string type (the
+-- same rule the AI bounce uses).
+local function fallback_car(id, prop_id)
+    if not be or id == nil or tostring(id) == tostring(prop_id) then
+        return nil
+    end
+    return be:getObjectByID(id)
+end
+
+-- GUARANTEED non-enterable: when the player lands in a race prop -- by the engine's auto-enter after the
+-- prefab spawn, via the Tab cycle, or from a BeamMP-synced spawn -- put them straight back into a real
+-- car. Reactive (driven from init.lua's onVehicleSwitched) and internals-free, so it cannot fail to keep
+-- the player out of a prop, owner-local or remote-synced, in any phase. Candidates are tried in order:
+-- `preferred_id` (the assigned race car) first, then `alternate_id` (the last tracked seated car); a
+-- candidate whose vehicle is gone is skipped, and NO resolvable candidate is a no-op -- the player is
+-- never trapped, the rule every BeamComp bounce follows. Returns true if it bounced the player.
+function M.enforce_non_enterable(new_id, preferred_id, alternate_id)
+    local fallback = fallback_car(preferred_id, new_id) or fallback_car(alternate_id, new_id)
+    if not fallback then
+        return false
+    end
+    local ok, err = pcall(function() be:enterVehicle(0, fallback) end)
+    if not ok then
+        log("W", LOG_TAG, "could not bounce player off a race prop: " .. tostring(err))
+        return false
+    end
+    log("I", LOG_TAG, "bounced player off a race prop back into their car")
+    return true
 end
 
 return M
