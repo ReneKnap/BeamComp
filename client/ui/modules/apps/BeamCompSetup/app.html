@@ -105,7 +105,7 @@
     .bc-end { background: #1565c0; color: #fff; }
     .bc-cancel[disabled], .bc-end[disabled] { background: #444; color: #999; cursor: default; }
     /* AI roster (ADR-0047): a bordered card per entry, and the right-aligned button cluster of the
-       Roster / All AI rows. */
+       AI lineup / All AI rows. */
     .bc-roster-entry { border: 1px solid rgba(255,255,255,0.12); border-radius: 3px;
       padding: 2px 6px; margin: 4px 0; }
     .bc-roster-actions { display: flex; gap: 6px; flex: 1 1 auto; justify-content: flex-end; }
@@ -145,9 +145,9 @@
 
   <div class="bc-setup-scroll">
 
-    <!-- Basis -->
+    <!-- Basics -->
     <div class="bc-section">
-      <div class="bc-section-title">Basis</div>
+      <div class="bc-section-title">Basics</div>
       <div class="bc-row">
         <span>Race</span>
         <div class="bc-dd">
@@ -307,9 +307,9 @@
       </label>
     </div>
 
-    <!-- KI -->
+    <!-- AI -->
     <div class="bc-section">
-      <div class="bc-section-title">KI</div>
+      <div class="bc-section-title">AI</div>
       <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiEnabled"><span>AI opponents</span></label>
       <div ng-if="form.aiEnabled">
         <label class="bc-row">
@@ -352,10 +352,15 @@
         <!-- Named AI roster (ADR-0047, live since the 2026-07-29 amendment): the roster fields itself when
              "AI opponents" is ticked and the three AI-car settings above re-roll its cars, so there is no
              Create button left -- this row only opens the editor. The whole row hides on an empty roster:
-             that state lasts a round-trip at most, and a lone "Roster" label with no control reads broken.
+             that state lasts a round-trip at most, and a lone "AI lineup" label with no control reads broken.
              The list does NOT auto-expand on a roll; Edit… is the only opener. -->
         <div class="bc-row" ng-if="form.aiRoster.length">
-          <span>Roster</span>
+          <!-- Label wording diverges from the code on purpose: the DISPLAY says "AI lineup" (a roster reads
+               as *all* participants, but this lists only the AI), while the data keeps aiRoster/roster
+               everywhere. Do not "fix" the mismatch by renaming the identifiers -- aiRoster is persisted in
+               saved presets and the session blob, and overrides.ai.roster is the ADR-0047 wire contract, so
+               a rename means a data migration plus a lockstep client+server deploy. -->
+          <span>AI lineup</span>
           <span class="bc-roster-actions">
             <button type="button" class="bc-refresh"
               ng-click="toggleRoster()">{{rosterOpen ? 'Hide' : 'Edit…'}}</button>
@@ -370,7 +375,7 @@
             <span>All AI</span>
             <span class="bc-roster-actions">
               <button type="button" class="bc-refresh" ng-click="rollAllRoster()"
-                title="Roll a completely fresh roster -- new names, cars and colours">Roll all</button>
+                title="Roll a completely fresh AI lineup -- new names, cars and colours">Roll all</button>
             </span>
           </div>
           <!-- Compact all-AI editor (ADR-0047 amendment R2/R3): every AI is listed; each expands its own
