@@ -81,9 +81,29 @@
     .bc-refresh { background: #355; color: #cde; padding: 3px 10px; border: none; border-radius: 3px;
       font-weight: 700; cursor: pointer; }
     .bc-refresh[disabled] { background: #2a2e35; color: #777; cursor: default; }
-    /* Presets (ADR-0037 amendment): a Save/Load/Delete button row sharing the refresh look. */
+    /* Presets (ADR-0037 amendment 2026-07-30): collapsed, the section is nothing but this two-button row,
+       sharing the refresh look -- Save reveals the name row below it, Load opens the saved list. */
     .bc-preset-actions { gap: 8px; }
     .bc-preset-actions button { flex: 1 1 auto; }
+    /* The revealed Save row: the label + name input of a normal .bc-row plus the confirm that now carries
+       the non-empty-name guard (Save itself must stay enabled -- it only reveals). */
+    .bc-preset-ok { flex: 0 0 auto; background: #2e7d32; color: #fff; border: none; border-radius: 3px;
+      padding: 2px 10px; font-weight: 700; cursor: pointer; }
+    .bc-preset-ok[disabled] { background: #444; color: #999; cursor: default; }
+    /* A preset row in the list: the name shrinks/marquees, the delete button stays put on the right.
+       bcSetupFit sits on the NAME SPAN, never on the row -- the directive moves every child node of its
+       element into the span it measures and scrolls (app.js), so a button on the row would be measured as
+       part of the label and would ride along with the marquee. min-width: 0 is what lets the flex item
+       shrink below the label's natural width; without it .bc-fit-clip reports the full width and the
+       shrink/marquee stage never runs on a long name. */
+    .bc-preset-opt { display: flex; align-items: center; gap: 6px; }
+    .bc-preset-opt-name { flex: 1 1 auto; min-width: 0; }
+    /* Two-step delete: the armed look must beat the hover look, because the cursor is sitting on the
+       button at the moment it arms -- hover only warms it, armed goes full danger. */
+    .bc-preset-del { flex: 0 0 auto; background: #2a2e35; color: #e0a0a0; border: 1px solid #3a3f47;
+      border-radius: 3px; padding: 0 6px; font-size: 12px; cursor: pointer; }
+    .bc-preset-del:hover { background: #3a3f47; color: #f0c0c0; }
+    .bc-preset-del.armed { background: #a33; color: #fff; border-color: #e88; font-weight: 700; }
     .bc-close { background: #444; color: #ddd; flex: 0 0 80px; }
     /* Championship section (ADR-0040): a status line plus Start/Apply/Reset buttons sharing the refresh look. */
     .bc-champ-status { flex: 1 1 auto; text-align: right; opacity: 0.85; font-size: 12px;
@@ -614,28 +634,47 @@
 
     <!-- Presets (ADR-0037 amendment): save the current setup under a name, or load/delete a saved one.
          The panel's LAST section, below the Tournament block. The whole form is saved -- the race, the
-         multi-race format + its settings, and the full AI setup incl. the roster (nothing is excluded). -->
+         multi-race format + its settings, and the full AI setup incl. the roster (nothing is excluded).
+         Amendment 2026-07-30: each control is revealed by the action that needs it, so the collapsed
+         section costs two lines instead of six -- Save reveals the name row, Load opens the list, and
+         deleting happens on the row of the preset it deletes (there is no Delete button any more).
+         The wrapper is a .bc-dd for two reasons: it is the positioned anchor .bc-dd-list resolves its
+         `top: 100%; left: 0; right: 0` against (so the list opens under the button row, exactly as wide),
+         and it is precisely what closeOnOutsideClick exempts (app.js) -- a click on a row's delete keeps
+         the list open, a click anywhere else closes it, with no new JS. The name row sits INSIDE the
+         wrapper on purpose: that way the absolutely positioned list anchors BELOW it rather than over it,
+         so revealing one never has to collapse the other. -->
     <div class="bc-section">
       <div class="bc-section-title">Presets</div>
-      <div class="bc-row">
-        <span>Name</span>
-        <input type="text" ng-model="presetName" placeholder="preset name">
-      </div>
-      <div class="bc-row">
-        <span>Saved</span>
-        <div class="bc-dd">
-          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('preset')">{{presetLabel()}}</button>
-          <div class="bc-dd-list" ng-if="open === 'preset'">
-            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
-              ng-click="pickPreset(o.v)">{{o.label}}</div>
-            <div class="bc-dd-opt" bc-setup-fit ng-if="!opts.preset.length">no saved presets</div>
-          </div>
+      <div class="bc-dd">
+        <div class="bc-row bc-preset-actions">
+          <button class="bc-refresh" ng-click="togglePresetSave()" title="Save the current setup under a name">Save</button>
+          <!-- Nothing saved -> nothing to open. The `open` clause keeps the button live while the list IS
+               open, so it can always close what it opened: deleting the last preset empties the list under
+               an open dropdown, and a greyed-out toggle over a visible list reads as broken. -->
+          <button class="bc-refresh" ng-disabled="!opts.preset.length && open !== 'preset'" ng-click="toggle('preset')" title="Show this map's saved presets">Load</button>
         </div>
-      </div>
-      <div class="bc-row bc-preset-actions">
-        <button class="bc-refresh" ng-disabled="!presetName.trim()" ng-click="savePreset()">Save</button>
-        <button class="bc-refresh" ng-disabled="!selectedPreset" ng-click="loadPreset()">Load</button>
-        <button class="bc-refresh bc-champ-reset" ng-disabled="!selectedPreset" ng-click="deletePreset()">Delete</button>
+        <!-- ng-show, NOT ng-if: ng-if would give this row its own child scope, and ng-model="presetName" is
+             a bare primitive -- the typed name would be assigned onto THAT scope, while savePreset() reads
+             the directive scope and would keep saving the prefilled (or empty) name for ever. Same trap the
+             roster's toggleRoster comment describes in app.js. Do not convert this to ng-if. -->
+        <div class="bc-row bc-preset-name" ng-show="presetSaveOpen">
+          <span>Name</span>
+          <input type="text" ng-model="presetName" placeholder="preset name"
+            ng-keydown="$event.keyCode === 13 && savePreset()">
+          <button type="button" class="bc-preset-ok" ng-disabled="!presetName.trim()" ng-click="savePreset()"
+            title="Save under this name">&#x2713;</button>
+        </div>
+        <div class="bc-dd-list" ng-if="open === 'preset'">
+          <div class="bc-dd-opt bc-preset-opt" ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
+            ng-click="pickPreset(o.v)" title="Load this preset">
+            <span class="bc-preset-opt-name" bc-setup-fit>{{o.label}}</span>
+            <button type="button" class="bc-preset-del" ng-class="{armed: armedPreset === o.v}"
+              ng-click="deletePreset(o.v, $event)"
+              title="Delete this preset (click twice)">{{armedPreset === o.v ? 'sure?' : '&#215;'}}</button>
+          </div>
+          <div class="bc-dd-opt" bc-setup-fit ng-if="!opts.preset.length">no saved presets</div>
+        </div>
       </div>
     </div>
 
