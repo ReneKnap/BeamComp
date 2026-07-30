@@ -25,11 +25,22 @@
 --   * removeApp is INDEX-based and expects 0-based indices (JS convention: Lua-side does +1).
 --
 -- Semantics preserved from the old hooks: ensure_visible dedups by appName (a manual copy is never
--- duplicated, an existing placement never disturbed, ADR-0012 par.3); remove takes every instance
--- of the name (also sweeps duplicates a crash may have left) and is a no-op when absent. New with
--- 0.39: an added entry lives in the user's current layout file between show and remove --
--- acceptable, the add stores NO placement, so the app.json css keeps governing geometry, and every
--- close path sweeps the entry back out.
+-- duplicated, a user-authored placement never disturbed, ADR-0012 par.3); remove takes every
+-- instance of the name (also sweeps duplicates a crash may have left) and is a no-op when absent.
+-- New with 0.39: an added entry lives in the user's current layout file between show and remove --
+-- acceptable, and every close path sweeps the entry back out.
+--
+-- Placement (round 2): 0.39 renders every layout-hosted app from its placement through a px
+-- resolver (ui/ui-vue/src/modules/apps/placementResolve.js) that parses ONLY number/px/%/em/rem
+-- values -- CSS functions (min/clamp/calc) and vw/vh yield null, the dimension collapses to 0 and
+-- is clamped up to the app's min-width/min-height, a quarter-size box. The app.json css is NOT
+-- applied to layout entries. ensure_visible therefore guarantees an explicit, parseable placement:
+-- derived from the app's own app.json css (function expressions evaluated to px against a
+-- 1920x1080 reference viewport -- the render-time clamp bounds it into the real frame, and any
+-- user drag/resize rewrites it with real px). An entry already on the layout gets its placement
+-- repaired when it is missing (a stale round-1 add) or still carries css functions (the editor's
+-- own manual add passes the css through verbatim); a plain-value placement is user-authored (the
+-- 0.39 editor writes pure px) and is never touched.
 --
 -- Defensive posture: both entry points are reached from onUpdate watchdog ticks, so every engine
 -- call is pcall-wrapped (mirrors race/hud.lua's trigger_ui) -- a missing API or failed file write
@@ -109,6 +120,270 @@ local function notify_layouts_changed()
     end
 end
 
+-- ===== placement derivation (round 2, see the header) ====================================
+
+-- Reference viewport for evaluating vw/vh/%-of-viewport in css expressions. Oversize on smaller
+-- screens is harmless: the 0.39 overlay clamps every rect into the real frame at render time.
+local REF_VIEWPORT_W = 1920
+local REF_VIEWPORT_H = 1080
+local FONT_SIZE_PX = 16
+
+-- Every placement key the px resolver reads, mapped to whether it measures the horizontal axis
+-- (for %/viewport-relative evaluation).
+local AXIS_BY_KEY = {
+    left = true, right = true, width = true, ["min-width"] = true, ["max-width"] = true,
+    top = false, bottom = false, height = false, ["min-height"] = false, ["max-height"] = false,
+}
+
+-- Whether a raw css value already survives 0.39's placement parser (number, or a plain
+-- px/%/em/rem/bare-number string -- placementResolve.js parsePlacementValue).
+local function is_parseable_value(raw)
+    if type(raw) == "number" then
+        return true
+    end
+    if type(raw) ~= "string" then
+        return false
+    end
+    return raw:lower():match("^%s*-?%d*%.?%d+%s*(px)%s*$") ~= nil
+        or raw:lower():match("^%s*-?%d*%.?%d+%s*(%%)%s*$") ~= nil
+        or raw:lower():match("^%s*-?%d*%.?%d+%s*(r?em)%s*$") ~= nil
+        or raw:match("^%s*-?%d*%.?%d+%s*$") ~= nil
+end
+
+local eval_css_length -- recursive: terms reference nested function expressions
+
+-- One css length term to px: "660px" | "92vw" | "50%" | "1.5em" | bare number (= px).
+local function term_to_px(term, axis_px)
+    local number_str = term:match("^(-?%d*%.?%d+)")
+    local value = number_str and tonumber(number_str)
+    if not value then
+        return nil
+    end
+    local unit = term:sub(#number_str + 1):lower():match("^%s*(.-)%s*$")
+    if unit == "" or unit == "px" then
+        return value
+    end
+    if unit == "vw" then
+        return value * REF_VIEWPORT_W / 100
+    end
+    if unit == "vh" then
+        return value * REF_VIEWPORT_H / 100
+    end
+    if unit == "%" then
+        return value * axis_px / 100
+    end
+    if unit == "em" or unit == "rem" then
+        return value * FONT_SIZE_PX
+    end
+    return nil
+end
+
+-- Split a function argument list at top-level commas (nested parentheses kept intact).
+local function split_args(inner)
+    local args = {}
+    local depth = 0
+    local start = 1
+    for i = 1, #inner do
+        local char = inner:sub(i, i)
+        if char == "(" then
+            depth = depth + 1
+        elseif char == ")" then
+            depth = depth - 1
+        elseif char == "," and depth == 0 then
+            args[#args + 1] = inner:sub(start, i - 1)
+            start = i + 1
+        end
+    end
+    args[#args + 1] = inner:sub(start)
+    return args
+end
+
+-- Left-to-right top-level " + " / " - " arithmetic (css calc requires the spaces around the
+-- operator, which disambiguates from negative numbers). * and / are unsupported -> nil.
+local function eval_arith(expr, axis_px)
+    local parts = {}
+    local ops = {}
+    local depth = 0
+    local start = 1
+    local i = 1
+    while i <= #expr do
+        local char = expr:sub(i, i)
+        if char == "(" then
+            depth = depth + 1
+        elseif char == ")" then
+            depth = depth - 1
+        elseif depth == 0 and (char == "+" or char == "-")
+            and expr:sub(i - 1, i - 1) == " " and expr:sub(i + 1, i + 1) == " " then
+            parts[#parts + 1] = expr:sub(start, i - 2)
+            ops[#ops + 1] = char
+            start = i + 2
+        end
+        i = i + 1
+    end
+    parts[#parts + 1] = expr:sub(start)
+
+    local total = eval_css_length(parts[1], axis_px)
+    for k = 2, #parts do
+        if total == nil then
+            return nil
+        end
+        local value = eval_css_length(parts[k], axis_px)
+        if value == nil then
+            return nil
+        end
+        total = (ops[k - 1] == "+") and (total + value) or (total - value)
+    end
+    return total
+end
+
+-- A css length expression to px: nested min()/max()/clamp()/calc(), " + "/" - " arithmetic, and
+-- the unit terms above. nil for anything else (the caller keeps the raw value).
+eval_css_length = function(expr, axis_px)
+    expr = expr:match("^%s*(.-)%s*$")
+    local fname, inner = expr:match("^(%a+)%s*%((.*)%)$")
+    if not fname then
+        return term_to_px(expr, axis_px)
+    end
+    fname = fname:lower()
+    if fname == "calc" then
+        return eval_arith(inner, axis_px)
+    end
+    local values = {}
+    for _, arg in ipairs(split_args(inner)) do
+        local value = eval_arith(arg, axis_px)
+        if value == nil then
+            return nil
+        end
+        values[#values + 1] = value
+    end
+    if fname == "min" and #values > 0 then
+        return math.min(unpack(values))
+    end
+    if fname == "max" and #values > 0 then
+        return math.max(unpack(values))
+    end
+    if fname == "clamp" and #values == 3 then
+        return math.max(values[1], math.min(values[2], values[3]))
+    end
+    return nil
+end
+
+-- Parser-compatible form of one css value: parseable values pass through verbatim, function
+-- expressions are evaluated to whole px. nil when unresolvable.
+local function normalize_css_value(raw, is_horizontal)
+    if is_parseable_value(raw) then
+        return raw
+    end
+    if type(raw) ~= "string" then
+        return nil
+    end
+    local px = eval_css_length(raw, is_horizontal and REF_VIEWPORT_W or REF_VIEWPORT_H)
+    if px == nil then
+        return nil
+    end
+    return string.format("%dpx", math.floor(px + 0.5))
+end
+
+-- The app's own app.json css block -- the single geometry source, read at call time so mod-side
+-- geometry updates keep flowing into fresh adds/repairs. Folder convention: appName
+-- "beamCompSetup" -> /ui/modules/apps/BeamCompSetup/app.json (all BeamComp apps follow it).
+local function read_app_css(app_name)
+    local file = "/ui/modules/apps/" .. app_name:sub(1, 1):upper() .. app_name:sub(2) .. "/app.json"
+    local app_json = jsonReadFile(file)
+    if type(app_json) ~= "table" or type(app_json.css) ~= "table" then
+        return nil, file
+    end
+    return app_json.css, file
+end
+
+-- Build the explicit placement for an add: the app.json css, normalized to values the 0.39 px
+-- resolver understands. nil (add without placement, round-1 behavior) only when the css is
+-- unreadable; an individual unresolvable value stays raw -- never worse than the css fallback.
+local function derive_placement(app_name)
+    local css, source = read_app_css(app_name)
+    if not css then
+        log("W", LOG_TAG, "no app.json css for '" .. app_name .. "' (" .. source
+            .. "); adding without placement")
+        return nil
+    end
+    local placement = {position = type(css.position) == "string" and css.position or "absolute"}
+    for key, is_horizontal in pairs(AXIS_BY_KEY) do
+        if css[key] ~= nil then
+            local value = normalize_css_value(css[key], is_horizontal)
+            if value == nil then
+                log("W", LOG_TAG, "unresolvable css " .. key .. " for '" .. app_name .. "': "
+                    .. tostring(css[key]))
+                value = css[key]
+            end
+            placement[key] = value
+        end
+    end
+    return placement
+end
+
+-- Classify an existing entry's placement:
+--   "missing" -- absent/empty (a stale round-1 add)      -> repair with a derived placement
+--   "legacy"  -- carries css-function values ("(")       -> repair by normalizing in place
+--   "custom"  -- plain values (the 0.39 editor writes    -> never touched
+--                pure px on drag/resize)
+local function placement_state(placement)
+    if type(placement) ~= "table" or next(placement) == nil then
+        return "missing"
+    end
+    for key in pairs(AXIS_BY_KEY) do
+        local value = placement[key]
+        if type(value) == "string" and value:find("(", 1, true) then
+            return "legacy"
+        end
+    end
+    return "custom"
+end
+
+-- Normalized copy of a legacy css-function placement: only the offending values are evaluated,
+-- every other value stays byte-identical (it may be user-authored).
+local function normalized_placement_copy(placement)
+    local copy = {}
+    for key, value in pairs(placement) do
+        copy[key] = value
+    end
+    for key, is_horizontal in pairs(AXIS_BY_KEY) do
+        local value = copy[key]
+        if type(value) == "string" and value:find("(", 1, true) then
+            copy[key] = normalize_css_value(value, is_horizontal) or value
+        end
+    end
+    return copy
+end
+
+-- Repair the placement of the already-on-layout instances that need it (see placement_state);
+-- returns whether anything was written. Never touches a "custom" placement.
+local function repair_placements(api, layout, app_name, indices)
+    if type(api.applyPlacementPatch) ~= "function" then
+        return false
+    end
+    local patched = false
+    for _, idx in ipairs(indices) do
+        local entry = layout.apps[idx]
+        local state = placement_state(entry.placement)
+        local replacement = nil
+        if state == "missing" then
+            replacement = derive_placement(app_name)
+        elseif state == "legacy" then
+            replacement = normalized_placement_copy(entry.placement)
+        end
+        -- the patch API expects 0-based indices, like removeApp
+        if replacement
+            and api.applyPlacementPatch(layout.filename, idx - 1, replacement) == true then
+            patched = true
+            log("I", LOG_TAG, "repaired " .. state .. " placement of '" .. app_name
+                .. "' in " .. tostring(layout.filename))
+        end
+    end
+    return patched
+end
+
+-- ===== show / remove =====================================================================
+
 -- The appContainer:ensureAppVisible replacement: add app_name to the current layout unless it is
 -- already there. True when the app is (now) on the layout.
 local function do_ensure_visible(app_name)
@@ -126,14 +401,16 @@ local function do_ensure_visible(app_name)
         log("W", LOG_TAG, "cannot show '" .. app_name .. "': " .. reason)
         return false
     end
-    if #app_indices(layout, app_name) > 0 then
-        -- Already on the layout (manual add or an earlier show): nothing to write, and the
-        -- existing placement stays untouched.
+    local indices = app_indices(layout, app_name)
+    if #indices > 0 then
+        -- Already on the layout (manual add or an earlier show): repair a missing/legacy
+        -- placement so the panel renders full-size, leave a user-authored one untouched.
+        if repair_placements(api, layout, app_name, indices) then
+            notify_layouts_changed()
+        end
         return true
     end
-    -- nil placement on purpose: the renderer then falls back to the app.json css, so mod-side
-    -- geometry updates keep applying instead of freezing in the user's layout file.
-    if api.addApp(layout.filename, app_name, nil) ~= true then
+    if api.addApp(layout.filename, app_name, derive_placement(app_name)) ~= true then
         log("W", LOG_TAG, "addApp refused '" .. app_name .. "' for " .. tostring(layout.filename))
         return false
     end
