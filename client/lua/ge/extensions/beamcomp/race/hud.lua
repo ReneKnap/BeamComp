@@ -11,6 +11,10 @@
 
 local M = {}
 
+-- App show/remove goes through the BeamNG 0.39 layout compat seam (the old appContainer guihooks
+-- are dead since 0.39, bug beamng-039-breakage).
+local uilayout = require("beamcomp/race/uilayout")
+
 local LOG_TAG = "beamcomp.race"
 
 -- The GE->UI contract: the AngularJS app subscribes with scope.$on(HOOK, ...) (ADR-0012).
@@ -43,17 +47,18 @@ function M.clear()
     M.push({active = false})
 end
 
--- Show the HUD app for the race: ask the apps container to add it if it isn't already on the layout
--- (ensureAppVisible dedups by appName, so a manual copy isn't duplicated). Transient: spawns into
--- the live container; the saved layout is untouched (app-container.js / app-service.js, ADR-0012).
+-- Show the HUD app for the race: add it to the current layout if it isn't already there
+-- (ensure_visible dedups by appName, so a manual copy isn't duplicated and an existing placement
+-- is never disturbed, ADR-0012). Since 0.39 the add lands in the user's current layout file until
+-- hide() sweeps it back out (race/uilayout.lua) -- there is no transient container any more.
 function M.show()
-    trigger_ui("appContainer:ensureAppVisible", jsonEncode({appName = APP_NAME}))
+    uilayout.ensure_visible(APP_NAME)
 end
 
--- Hide the HUD app after the race: remove it from the live container by appName, reverting to the
--- player's normal (multiplayer) HUD. Transient like show() -- the saved layout is untouched.
+-- Hide the HUD app after the race: remove it from the current layout by appName, reverting to the
+-- player's normal (multiplayer) HUD. The counterpart sweep to show()'s add.
 function M.hide()
-    trigger_ui("appContainer:removeApp", APP_NAME)
+    uilayout.remove(APP_NAME)
 end
 
 -- Last-resort recovery for the self-healing watchdog (init.lua): force a full UI reload. During the

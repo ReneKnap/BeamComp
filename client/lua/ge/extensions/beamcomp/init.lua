@@ -70,6 +70,11 @@ local placement = require("beamcomp/race/placement")
 local ai = require("beamcomp/race/ai")
 -- Rally staged sprint qualifying per-driver run state machine (ADR-0044); pure timing helpers.
 local qualisprint = require("beamcomp/race/qualisprint")
+-- BeamNG 0.39 UI-app layout compat (bug beamng-039-breakage): every panel show/remove goes through
+-- this seam since the Angular appContainer guihooks died in 0.39. Hung on M instead of a `local`
+-- to spare a slot under the 200-local ceiling (see the header) -- which also makes it reachable
+-- from the in-game console as beamcomp_init.uilayout for manual verification.
+M.uilayout = require("beamcomp/race/uilayout")
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -253,7 +258,7 @@ M.state = {
     ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
     ai_server_ids = nil,      -- non-owner: set of BeamMP server ids from the latest aiMap awaiting local resolution (ADR-0036), or nil
     hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
-    hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle ensureAppVisible
+    hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle hud.show()
     hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
     idle_info_shown = false,  -- whether the between-races series info box (ADR-0042) currently holds the HUD app up (lobby/free-roam, no race), so it is shown once and taken down when the series ends
     grid_list_target = nil,   -- routes the next gridList reply by its requester: nil = grid-editor console toast (default) | "setup" = race-setup panel grid dropdown (ADR-0037) | "gridui" = grid-editor panel saved-grid dropdown
@@ -355,9 +360,7 @@ local function handle_race_start(payload)
         props.clear(M.state.grid_edit_prop_names or {})
         M.state.grid_edit_prop_names = nil
         M.state.grid_edit_checkpoint = nil
-        if guihooks then
-            guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
-        end
+        M.uilayout.remove("beamCompGridEditor")
     end
 
     local race, reason = race_start.prepare(payload)
@@ -1162,7 +1165,7 @@ local function begin_driving(plan, ai_laps)
     M.state.results_min = false
     M.state.analysis_open = false
     M.state.provisional_open = true
-    -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. ensureAppVisible dedups.
+    -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. The show dedups.
     hud.show()
 end
 
@@ -2327,18 +2330,10 @@ function setup.step(dt)
     end
     M.state.setup_restored = true
     log("I", RACE_LOG_TAG, "race-setup panel went silent -- re-adding it once")
-    -- Guarded + pcall-wrapped like race/hud.lua's trigger_ui: this runs from the onUpdate tick, so a
-    -- missing/failed engine call must never take the rest of the frame's work down with it. The latch is
-    -- already set above, so a failure costs the one restore rather than repeating every frame.
-    if not guihooks then
-        return
-    end
-    local ok, err = pcall(function()
-        guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
-    end)
-    if not ok then
-        log("W", RACE_LOG_TAG, "re-adding the race-setup panel failed: " .. tostring(err))
-    end
+    -- The compat seam self-guards and pcalls every engine call (race/uilayout.lua), so this onUpdate
+    -- tick can never be taken down. The latch is already set above, so a failure costs the one
+    -- restore rather than repeating every frame -- unchanged semantics.
+    M.uilayout.ensure_visible("beamCompSetup")
 end
 
 -- UI -> GE presence heartbeat from the open panel (mirrors note_hud_alive). Public so the app can reach
@@ -2348,10 +2343,10 @@ function M.note_setup_alive()
     M.state.setup_seen = true
 end
 
--- Remove the race-setup panel from the live layout (UI -> GE, ADR-0037), the close counterpart to the
--- setupOpen auto-add. Public so the panel's Close button can reach it as beamcomp_init.close_setup.
+-- Remove the race-setup panel from the current layout (UI -> GE, ADR-0037), the close counterpart to
+-- the setupOpen auto-add. Public so the panel's Close button can reach it as beamcomp_init.close_setup.
 function M.close_setup()
-    guihooks.trigger("appContainer:removeApp", "beamCompSetup")
+    M.uilayout.remove("beamCompSetup")
     -- The admin is done with the panel, so stop expecting it on screen (nothing re-adds it from here).
     setup.clear()
 end
@@ -2562,8 +2557,8 @@ end
 -- also pulls the dataset itself on link via request_setup_data -- the two together cover every timing.
 local function handle_setup_open(_payload)
     push_setup_data(false)
-    -- Ensure the panel app is on the live layout (ADR-0012 best-effort auto-add); dedups by appName.
-    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
+    -- Ensure the panel app is on the current layout (ADR-0012 best-effort auto-add); dedups by appName.
+    M.uilayout.ensure_visible("beamCompSetup")
     -- Remember this (server-authorized) open, so a UI reload that drops the app can be recovered once.
     setup.arm()
     -- Auto-minimize the final standings card so the opening panel has a clear view. Only visible in the
@@ -2813,7 +2808,7 @@ local function handle_grid_setup_open(_payload)
     -- Re-spawn the reference scene if a session is still active on open (e.g. one started from the GE
     -- console) -- its props are otherwise only spawned when the session begins.
     refresh_grid_edit_scene()
-    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
+    M.uilayout.ensure_visible("beamCompGridEditor")
 end
 
 -- Pull the grid-editor dataset on demand (UI -> GE): the panel calls this on link (covers the freshly-added
@@ -2831,7 +2826,7 @@ function M.open_grid_editor_with_race(race)
     M.state.grid_seed_race = (type(race) == "string" and race ~= "") and race or nil
     push_grid_data()
     refresh_grid_edit_scene()
-    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
+    M.uilayout.ensure_visible("beamCompGridEditor")
 end
 
 -- Start a fresh grid for `race` from the track's generated default (UI -> GE) and reflect the new session.
@@ -2995,7 +2990,7 @@ function M.close_grid_editor()
     M.state.grid_seed_race = nil
     -- Reuse the full teardown primitive (session + name + props + checkpoint + reflect); no duplication.
     M.clear_grid_editor()
-    guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
+    M.uilayout.remove("beamCompGridEditor")
 end
 
 -- Clear the grid-editor session (GE): end editing, drop the preview pillars + reference props, and reflect
