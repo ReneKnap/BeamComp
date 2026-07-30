@@ -49,9 +49,41 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
-    /* Non-selectable divider between this race's grids and the rest of the map's (copy templates). */
+    /* Non-selectable divider between this race's grids and the rest of the map's (copy templates).
+       It renders through the same .bc-grid-opt flex row as every other option and stays centred anyway:
+       the name span is its only flex item, so it spans the row, and the inherited text-align centres the
+       inline-block .bc-fit-text inside it. */
     .bc-dd-sep, .bc-dd-opt.bc-dd-sep:hover { background: rgba(255,255,255,0.06); color: #9aa3ad;
       cursor: default; text-align: center; font-size: 11px; letter-spacing: 0.04em; }
+    /* Reveal-on-demand for the Load and Save areas (ADR-0023 amendment 2026-07-30, applying ADR-0037's
+       2026-07-30 amendment to this panel). Collapsed, Load is nothing but the two-button row below and
+       Save nothing but its own single button; both buttons share their row equally, which beats
+       .bc-mini's flex: 0 0 auto on specificity. */
+    .bc-grid-actions button { flex: 1 1 auto; }
+    /* A saved-grid row: the name shrinks/marquees, the two-step delete stays put on the right.
+       bcGridFit sits on the NAME SPAN, never on the row -- the directive moves every child node of its
+       element into the span it measures and scrolls (app.js), so a button on the row would be measured as
+       part of the label and would ride along with the marquee. min-width: 0 is what lets the flex item
+       shrink below the label's natural width; without it .bc-fit-clip reports the full width and the
+       shrink/marquee stage silently never runs on a long name. */
+    .bc-grid-opt { display: flex; align-items: center; gap: 6px; }
+    .bc-grid-opt-name { flex: 1 1 auto; min-width: 0; }
+    /* Two-step delete: the armed look must beat the hover look, because the cursor is sitting on the
+       button at the moment it arms -- hover only warms it, armed goes full danger. */
+    .bc-grid-del { flex: 0 0 auto; background: #2a2e35; color: #e0a0a0; border: 1px solid #3a3f47;
+      border-radius: 3px; padding: 0 6px; font-size: 12px; cursor: pointer; }
+    .bc-grid-del:hover { background: #3a3f47; color: #f0c0c0; }
+    .bc-grid-del.armed { background: #a33; color: #fff; border-color: #e88; font-weight: 700; }
+    /* The armed-for-load chip, shown only while a session is running (loading clears the editor first).
+       Deliberately NOT the danger colour of the delete beside it: replacing the session destroys unsaved
+       edits, never anything on disk, so it reads as the panel's blue accent. */
+    .bc-grid-replace { flex: 0 0 auto; font-size: 11px; font-weight: 700; color: #8fd3ff;
+      border: 1px solid rgba(143,211,255,0.5); border-radius: 3px; padding: 0 5px; }
+    /* The revealed Save row: the label + name input of a normal .bc-row plus the confirm that now carries
+       the non-empty/no-whitespace guard (Save grid itself must stay enabled -- it only reveals). */
+    .bc-grid-ok { flex: 0 0 auto; background: #2e7d32; color: #fff; border: none; border-radius: 3px;
+      padding: 2px 10px; font-weight: 700; cursor: pointer; }
+    .bc-grid-ok[disabled] { background: #444; color: #999; cursor: default; }
     /* Long dropdown labels (bcGridFit): the directive wraps each label in .bc-fit-clip > .bc-fit-text.
        The clip is a block that fills the cell content box (so it stops before the head's 22px chevron
        padding) and hides overflow; the inline-block text is shrunk to fit and, if still too wide, given a
@@ -110,28 +142,41 @@
           </div>
         </div>
       </div>
-      <div class="bc-row">
-        <span>New from default</span>
-        <button class="bc-mini" ng-disabled="!form.race" ng-click="newGrid()">New grid</button>
-      </div>
-      <div class="bc-row">
-        <span>Saved grid</span>
-        <div class="bc-dd">
-          <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('loadName')">{{labelFor('loadName', 'none saved')}}</button>
-          <div class="bc-dd-list" ng-if="open === 'loadName'">
-            <div class="bc-dd-opt" bc-grid-fit ng-repeat="o in opts.loadName"
-              ng-class="{sel: o.v === form.loadName, 'bc-dd-sep': o.separator}"
-              ng-click="pickGrid(o)">{{o.label}}</div>
+      <!-- The way in, reveal-on-demand (ADR-0023 amendment 2026-07-30): the two actions share one row and
+           the saved-grid list opens underneath it, so the collapsed Load area costs one line instead of
+           three. The wrapper is a .bc-dd for two reasons: it is the positioned anchor .bc-dd-list resolves
+           its `top: 100%; left: 0; right: 0` against (so the list opens under the button row, exactly as
+           wide), and it is precisely what closeOnOutsideClick exempts (app.js) -- a click on a row's delete
+           keeps the list open, a click anywhere else closes it, with no new JS. The load reveal therefore
+           needs no state of its own: `open === 'loadName'` IS the revealed state. -->
+      <div class="bc-dd">
+        <div class="bc-row bc-grid-actions">
+          <button class="bc-mini" ng-disabled="!form.race" ng-click="newGrid()"
+            title="Start a fresh grid from this race's track default">New grid</button>
+          <!-- Nothing saved -> nothing to open. The `open` clause keeps the button live while the list IS
+               open, so it can always close what it opened: deleting the last grid empties the list under an
+               open dropdown, and a greyed-out toggle over a visible list reads as broken. -->
+          <button class="bc-mini" ng-disabled="!opts.loadName.length && open !== 'loadName'"
+            ng-click="toggle('loadName')" title="Show this map's saved grids">Load</button>
+        </div>
+        <div class="bc-dd-list" ng-if="open === 'loadName'">
+          <div class="bc-dd-opt bc-grid-opt" ng-repeat="o in opts.loadName"
+            ng-class="{sel: o.v === form.loadName, 'bc-dd-sep': o.separator}" ng-click="pickGrid(o)"
+            title="{{o.separator ? '' : (state.active ? 'Load this grid -- click twice, it replaces the current edits' : 'Load this grid')}}">
+            <span class="bc-grid-opt-name" bc-grid-fit>{{o.label}}</span>
+            <!-- Armed for load: only reachable while a session is running, where a load is two-step. The
+                 state.active clause is what it says -- a session cancelled from the console with this list
+                 open would otherwise leave a stale "replace?" over a row that now loads on one click. -->
+            <span class="bc-grid-replace" ng-if="state.active && armedLoad === o.v">replace?</span>
+            <button type="button" class="bc-grid-del" ng-if="!o.separator"
+              ng-class="{armed: armedDelete === o.v}" ng-click="deleteGrid(o.v, $event)"
+              title="Delete this grid (click twice)">{{armedDelete === o.v ? 'sure?' : '&#215;'}}</button>
           </div>
+          <div class="bc-dd-opt" ng-if="!opts.loadName.length">no saved grids</div>
         </div>
       </div>
-      <div class="bc-row">
-        <span></span>
-        <button class="bc-mini" ng-disabled="!form.loadName" ng-click="loadGrid()">Load</button>
-        <button class="bc-mini bc-danger" ng-disabled="!form.loadName" ng-click="deleteGrid()">Delete</button>
-      </div>
       <div class="bc-hint" ng-if="state.active">Editing <b>{{state.race}}</b> — Save stores the grid for
-        this race.</div>
+        this race. Loading another grid discards these edits, so a row in the list asks twice.</div>
       <div class="bc-hint" ng-if="!state.active">Pick a race, then New grid or Load. The list holds this
         race's grids first; below the divider are the map's other grids, to copy one over.</div>
     </div>
@@ -206,18 +251,33 @@
       </div>
     </div>
 
-    <!-- Save -->
+    <!-- Save (reveal-on-demand, ADR-0023 amendment 2026-07-30): collapsed, the section is its title plus
+         one button. Save grid reveals the name row and the overwrite warning that belongs next to it;
+         pressing it again cancels. Save grid is deliberately NOT ng-disabled -- it only reveals now (the
+         whole section is already gated on state.active), and greying out the instant it is pressed would
+         read as broken. The canSave() guard (non-empty AND no whitespace: four save paths reject a spaced
+         grid name) moves onto the confirm, with saveGrid's own check as the backstop that also makes Enter
+         on an invalid name inert.
+         ng-show, not ng-if: form.saveName is a property of the shared `form` object, so an ng-if child
+         scope would write through to it and the setup panel's bare-primitive trap does not apply here --
+         but ng-show keeps the field's DOM identity (and thus focus and cursor) across a cancel + reveal,
+         and leaves no room for that trap if the model ever becomes a primitive. -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Save</div>
-      <div class="bc-row">
-        <span>Name</span>
-        <input type="text" ng-model="form.saveName" placeholder="no spaces">
+      <div class="bc-row bc-grid-actions">
+        <button class="bc-mini" ng-click="toggleSave()"
+          title="Save this grid for the race being edited">Save grid</button>
       </div>
-      <div class="bc-row">
-        <span></span>
-        <button class="bc-mini" ng-disabled="!canSave()" ng-click="saveGrid()">Save grid</button>
+      <div class="bc-grid-save" ng-show="saveOpen">
+        <div class="bc-row">
+          <span>Name</span>
+          <input type="text" ng-model="form.saveName" placeholder="no spaces"
+            ng-keydown="$event.keyCode === 13 && saveGrid()">
+          <button type="button" class="bc-grid-ok" ng-disabled="!canSave()" ng-click="saveGrid()"
+            title="Save under this name">&#x2713;</button>
+        </div>
+        <div class="bc-hint" ng-if="savedName && form.saveName === savedName">Overwrites '{{savedName}}'.</div>
       </div>
-      <div class="bc-hint" ng-if="savedName && form.saveName === savedName">Overwrites '{{savedName}}'.</div>
     </div>
 
     <!-- Default grid -->
