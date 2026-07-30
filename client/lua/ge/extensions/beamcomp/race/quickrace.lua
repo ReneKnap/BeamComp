@@ -54,7 +54,8 @@ end
 
 -- Load a quickrace track locator into a configured engine path, or nil plus a reason. Wrapped in pcall
 -- so a malformed track or a missing scene waypoint never throws into the engine. The returned path is
--- autoConfig'd, so it carries the same config.linearSegments the parser's build_checkpoints reads.
+-- autoConfig'd, so it carries the same traversal node list (config.linearPathnodes since BeamNG
+-- 0.39, linearSegments before) the parser's build_checkpoints reads.
 function M.load_path(locator)
     local info = jsonReadFile(locator.raceFile)
     if type(info) ~= "table" then

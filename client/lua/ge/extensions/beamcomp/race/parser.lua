@@ -57,6 +57,15 @@ local function is_reversible(path)
     return start_position_exists(path, path.reverseStartPosition)
 end
 
+-- The engine's ordered traversal node-id list built by autoConfig. BeamNG 0.39 renamed the field
+-- (config.linearSegments -> config.linearPathnodes, gameplay/race/path.lua) with identical
+-- content: the start node id first, then each jump's target node, a closed loop repeating the
+-- start node at the end. The legacy name stays as a fallback read for older engine builds. nil
+-- when autoConfig bailed out (start node missing) -- the parse gate below rejects that.
+local function linear_pathnodes(path)
+    return path.config.linearPathnodes or path.config.linearSegments
+end
+
 -- Load and graph-configure a race file via the engine loader. Wrapped in pcall so a
 -- malformed file never throws into the engine. Returns the configured path or nil.
 local function load_race_path(race_file)
@@ -120,7 +129,7 @@ local function build_checkpoints(path)
     local checkpoints = {}
     local seen = {}
     local nodes = path.pathnodes.objects
-    for _, node_id in ipairs(path.config.linearSegments) do
+    for _, node_id in ipairs(linear_pathnodes(path)) do
         local node = nodes[node_id]
         if node and node.visible and not seen[node_id] then
             seen[node_id] = true
@@ -151,7 +160,7 @@ local function build_route_points(path)
     local points = {}
     local nodes = path.pathnodes.objects
     local last_id = nil
-    for _, node_id in ipairs(path.config.linearSegments) do
+    for _, node_id in ipairs(linear_pathnodes(path)) do
         local node = nodes[node_id]
         if node and node_id ~= last_id then
             points[#points + 1] = {pos = vec3_to_table(node.pos), radius = node.radius}
@@ -290,8 +299,8 @@ function M.parse(locator)
         return nil, "branching unsupported"
     end
 
-    -- autoConfig leaves config empty (no linearSegments) when the start node is missing.
-    if not path.config.linearSegments then
+    -- autoConfig leaves config empty (no traversal node list) when the start node is missing.
+    if not linear_pathnodes(path) then
         log("W", LOG_TAG, "race has no traversable path: " .. race_file)
         return nil, "race has no traversable path"
     end
