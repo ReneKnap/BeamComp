@@ -8,6 +8,12 @@
 // points that race's default at the active grid. The saved-grid list shows this race's grids first, then a
 // non-selectable divider, then the map's other grids (loading one and saving copies it onto this race).
 //
+// The Load and Save areas are collapsed to their buttons and reveal what each action needs (ADR-0023
+// amendment 2026-07-30, applying ADR-0037's 2026-07-30 amendment to this second panel): Load opens the
+// saved-grid list and a row IS the load, Save grid reveals the name row, and a grid is deleted from the row
+// it sits on, two-step. Because a load clears the running edit session, a row click is itself two-step while
+// a session is active -- the one deliberate divergence from the setup panel's presets.
+//
 // GE owns the live edit session (race/grideditor.lua) -- this panel is render + input only. It reflects
 // BeamCompGridState (the authoritative, clamped knob values) and calls the knob setters back via
 // beamcomp_init.* . bngApi is referenced as the core UI global (NOT injected -- a DI miss takes the whole
@@ -174,6 +180,14 @@ angular.module('beamng.apps')
       scope.open = null;        // name of the currently open dropdown, or null
       scope.opts = { race: [], loadName: [] };
       scope.gridsByKey = {};    // gridKey -> {name, race, isDefault}, rebuilt with the load options
+      // The Load and Save areas are collapsed to their buttons and reveal what each action needs
+      // (ADR-0023 amendment 2026-07-30, applying ADR-0037's 2026-07-30 amendment to this panel). The LOAD
+      // reveal is just `open === 'loadName'` and needs no field of its own; the save row is not a dropdown,
+      // so it gets one. The two armed keys are gridKeys, so arming one row disarms every other for free.
+      // None of the three lives in `form`, so no GE push can open a section by itself.
+      scope.saveOpen = false;   // the Save name row is revealed
+      scope.armedLoad = '';     // gridKey of the row armed to REPLACE the running session with its grid
+      scope.armedDelete = '';   // gridKey of the row whose delete is armed for its confirming click
 
       function rebuildRaceOpts() {
         scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
@@ -215,6 +229,23 @@ angular.module('beamng.apps')
           own.push({ v: null, label: '— other races (copy) —', separator: true });
         }
         scope.opts.loadName = own.concat(foreign);
+        // A key that is no longer in the map's grids must not survive as the marked row, and above all not
+        // as an ARMED one: a grid deleted and re-created while this list stayed open would otherwise render
+        // already armed and delete (or replace the session) on ONE click. This is the single owner of the
+        // pruning -- deleteGrid deliberately does not clear the selection by hand, so a server-side write
+        // failure (which echoes the list back WITH the grid) correctly leaves everything standing, and
+        // another admin's delete is covered by the same code. Called from the race pick and the race-list
+        // push too, where scope.data.grids is unchanged and no key can vanish, so it is a no-op there.
+        // A gridKey always contains a space, so it can never collide with an Object.prototype name.
+        if (scope.form.loadName && !scope.gridsByKey[scope.form.loadName]) {
+          scope.form.loadName = '';
+        }
+        if (scope.armedLoad && !scope.gridsByKey[scope.armedLoad]) {
+          scope.armedLoad = '';
+        }
+        if (scope.armedDelete && !scope.gridsByKey[scope.armedDelete]) {
+          scope.armedDelete = '';
+        }
       }
 
       // Sync the editable number fields from the authoritative state, so the inputs show GE's clamped values
@@ -284,6 +315,9 @@ angular.module('beamng.apps')
       scope.toggle = function (field) {
         scope.open = (scope.open === field) ? null : field;
       };
+      // The Race dropdown's head label. The saved-grid list lost its head with the 2026-07-30 reveal
+      // amendment (the rows are the only labels now), so the loadName case -- never show that internal key
+      // raw -- went with its last caller.
       scope.labelFor = function (field, emptyLabel) {
         var list = scope.opts[field] || [];
         var value = scope.form[field];
@@ -292,8 +326,7 @@ angular.module('beamng.apps')
             return list[i].label;
           }
         }
-        // loadName holds an internal key, so never fall back to showing it raw.
-        return (field === 'loadName' ? '' : value) || emptyLabel;
+        return value || emptyLabel;
       };
       scope.pick = function (field, value) {
         scope.form[field] = value;
@@ -309,14 +342,41 @@ angular.module('beamng.apps')
           // target is decided: newGrid() (a suggestion) and loadGrid() (the loaded grid's own name).
         }
       };
-      // The saved-grid dropdown carries a non-selectable separator between the two blocks; clicking it
-      // must do nothing at all (not even close the list).
+      // Clicking a row in the saved-grid list is the way IN: it loads that grid. The separator between the
+      // two blocks is not a row you can click -- it must do nothing at all, not even close the list.
+      //
+      // This is the one place the panel deliberately diverges from the setup panel's presets, which load on
+      // a single click: grid_open_saved CLEARS THE EDITOR FIRST, so while a session is running a mis-click
+      // would throw away a hand-placed layout. So with no session the click loads at once (there is nothing
+      // to lose and this is the normal way in), and with one running the first click only ARMS that row --
+      // it grows a "replace?" chip -- and the second one loads. Arming a row for load disarms any armed
+      // delete and vice versa: one armed thing at a time, on one row at a time.
       scope.pickGrid = function (option) {
         if (!option || option.separator) {
           return;
         }
+        scope.armedDelete = '';
+        if (scope.state.active && scope.armedLoad !== option.v) {
+          scope.armedLoad = option.v;
+          return;
+        }
+        scope.armedLoad = '';
+        // pick() sets form.loadName (which marks the loaded row) and closes the list; loadGrid() then
+        // resolves that key back to its {race, name} and dispatches. Unchanged, both of them.
         scope.pick('loadName', option.v);
+        scope.loadGrid();
       };
+
+      // Closing the saved-grid list disarms every row: an armed load or delete left behind would fire on
+      // the FIRST click the next time the list opened. The list is closed from three places (toggle, the
+      // pick inside pickGrid, and the outside-click handler) and opening the Race dropdown closes it too,
+      // so watch the state they all end up in instead of patching each one.
+      scope.$watch(function () { return scope.open; }, function (now) {
+        if (now !== 'loadName') {
+          scope.armedLoad = '';
+          scope.armedDelete = '';
+        }
+      });
 
       // Close any open dropdown on a click outside it (standard dropdown UX). No DI here: injected
       // services fail to resolve for this late-loaded mod directive, so use the document global. A click
@@ -347,10 +407,14 @@ angular.module('beamng.apps')
       // every track. The suggestion is computed for scope.form.race because that is exactly the race
       // grid_open_new anchors the new session to (and therefore the race a later Save writes to).
       // Deliberately after the early return: with no race picked, nothing is touched at all.
+      // Closing the saved-grid list is part of the action: the button sits INSIDE the .bc-dd wrapper, so the
+      // outside-click handler exempts it, and an absolutely positioned list would otherwise hang over the
+      // Direction/Layout sections this very click just revealed.
       scope.newGrid = function () {
         if (!scope.form.race) {
           return;
         }
+        scope.open = null;
         scope.savedName = null;
         scope.form.saveName = suggestGridName(scope.data.grids, scope.form.race);
         geLuaArg('grid_open_new', scope.form.race);
@@ -365,7 +429,8 @@ angular.module('beamng.apps')
       // relative to a start line, so a grid keeps its layout against whatever race is being edited). Load
       // addresses the grid by its OWN race; saving it afterwards writes it to the ANCHORED race, which is
       // how a layout is copied from one track to another. Pre-fill its name so a later Save overwrites it
-      // without retyping.
+      // without retyping. Its only caller is pickGrid (the row click) -- there is no separate
+      // Load-the-selection button any more (ADR-0023 amendment 2026-07-30).
       scope.loadGrid = function () {
         var grid = selectedGrid();
         if (!grid) {
@@ -376,14 +441,31 @@ angular.module('beamng.apps')
         geLuaArgs('grid_open_saved', grid.race, grid.name, scope.form.race || '');
       };
 
-      // Delete the selected saved grid; the server echoes the updated list, refreshing the dropdown.
-      scope.deleteGrid = function () {
-        var grid = selectedGrid();
+      // Delete one saved grid from the row it sits on, two-step on the same button (ADR-0023 amendment
+      // 2026-07-30): the first click ARMS that row (the button becomes "sure?" in the danger colour), only
+      // a second click deletes. Both clicks must stop the event, or the row's own ng-click would load -- or
+      // arm for load -- the very grid being deleted. Arming a delete disarms an armed load, and every row
+      // disarms when the list closes (see the $watch on scope.open).
+      //
+      // `key` is the row's gridKey, not a name: a grid belongs to a race and the list also shows OTHER
+      // races' grids, so the pair has to be resolved through gridsByKey before addressing the server
+      // (ADR-0023 amendment 2026-07-27). The server echoes the updated list, which refreshes the rows and
+      // prunes this key everywhere it was held (see rebuildGridOpts) -- hence no hand-clearing here.
+      scope.deleteGrid = function (key, ev) {
+        if (ev) {
+          ev.stopPropagation();
+        }
+        var grid = scope.gridsByKey[key];
         if (!grid) {
           return;
         }
+        scope.armedLoad = '';
+        if (scope.armedDelete !== key) {
+          scope.armedDelete = key;
+          return;
+        }
+        scope.armedDelete = '';
         geLuaArgs('grid_delete', grid.race, grid.name);
-        scope.form.loadName = '';
       };
 
       scope.setDirection = function (direction) {
@@ -494,15 +576,34 @@ angular.module('beamng.apps')
         geCall('grid_remove_segment');
       };
 
+      // Reveal (or cancel) the Save name row. It deliberately does NOT touch form.saveName -- the opposite
+      // of the setup panel's preset row, which prefills at reveal time. Here the field is already seeded
+      // where the save target is decided: newGrid() puts a suggestion in it and loadGrid() the loaded grid's
+      // own name, and savedName plus the "Overwrites '<name>'" hint hang off it. Revealing shows what is
+      // already there; overwriting it on every reveal would destroy a name the admin typed and collapsed.
+      scope.toggleSave = function () {
+        scope.saveOpen = !scope.saveOpen;
+      };
+
+      // Non-empty AND no whitespace. A grid name has to survive `/race grid=<name>`, whose parser splits on
+      // whitespace, plus grid_save's own guard server-side -- a spaced name is unsaveable AND unaddressable.
+      // This now gates the revealed row's confirm (Save grid itself only reveals), and saveGrid re-checks it
+      // as the backstop that makes Enter on an invalid name inert.
       scope.canSave = function () {
         return scope.state.active && scope.form.saveName && !/\s/.test(scope.form.saveName);
       };
+
+      // Write the grid, then collapse the row -- but KEEP the name. It is the overwrite target from here on:
+      // savedName mirrors it (gating the default button and the overwrite hint), and a second save of the
+      // same session must not have to retype it. Optimistic like every other action in this panel: grid_save
+      // is fire-and-forget and the feedback already exists (the server chats the save and echoes the list).
       scope.saveGrid = function () {
         if (!scope.canSave()) {
           return;
         }
         geLuaArg('grid_save', scope.form.saveName);
         scope.savedName = scope.form.saveName;
+        scope.saveOpen = false;
       };
 
       // Make the active grid its race's default (ADR-0023 amendment): a grid belongs to the race it was
