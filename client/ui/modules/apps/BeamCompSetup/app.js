@@ -341,8 +341,14 @@ angular.module('beamng.apps')
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
-      scope.presetName = '';       // the name field for Save (ADR-0037 amendment)
-      scope.selectedPreset = '';   // the saved preset chosen in the dropdown, for Load / Delete
+      scope.presetName = '';       // the name field of the revealed Save row (ADR-0037 amendment)
+      scope.selectedPreset = '';   // the preset last loaded: marks its row and prefills the save name
+      // The Presets section is collapsed to its two buttons and reveals what each action needs (ADR-0037
+      // amendment 2026-07-30). The LOAD reveal is just `open === 'preset'` and needs no field of its own;
+      // the save row is not a dropdown, so it gets one. Neither flag lives in `form`, so no session
+      // restore and no loaded preset can ever open this section by itself.
+      scope.presetSaveOpen = false;  // the Save name row is revealed
+      scope.armedPreset = '';        // name of the preset whose row delete is armed for its confirming click
       scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
         rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
@@ -552,13 +558,18 @@ angular.module('beamng.apps')
       });
 
       // Authoritative saved-preset list from the server (ADR-0037 amendment): the panel reflects it as
-      // truth, not local state. Drop the current selection if it is gone (e.g. just deleted by anyone).
+      // truth, not local state. Drop the current selection if it is gone (e.g. just deleted by anyone) --
+      // and an armed row delete with it: a name that vanished and came back (deleted and re-saved by another
+      // admin while this list stayed open) would otherwise render already-armed and delete on ONE click.
       scope.$on('BeamCompSetupPresets', function (event, payload) {
         scope.$evalAsync(function () {
           scope.data.presets = (payload && payload.names) || [];
           rebuildPresetOpts();
           if (scope.selectedPreset && scope.data.presets.indexOf(scope.selectedPreset) === -1) {
             scope.selectedPreset = '';
+          }
+          if (scope.armedPreset && scope.data.presets.indexOf(scope.armedPreset) === -1) {
+            scope.armedPreset = '';
           }
         });
       });
@@ -685,30 +696,79 @@ angular.module('beamng.apps')
       // full AI setup incl. the named roster (ADR-0037/0047 amendments 2026-07-18; PRESET_EXCLUDE_KEYS is
       // now empty) -- as an opaque JSON blob GE relays to the server with the map. The server echoes the
       // updated name list (BeamCompSetupPresets), so the dropdown reflects server truth.
-      scope.presetLabel = function () {
-        return scope.selectedPreset || 'select preset…';
+      //
+      // Reveal-on-demand (amendment 2026-07-30): the section shows only Save + Load until one of them is
+      // pressed, because a name field matters only for a save and the list only for a load. The three
+      // actions, their GE entry points and their payloads are unchanged -- this is a rearrangement of the
+      // controls over them.
+
+      // Reveal (or cancel) the Save name row. The name is prefilled with the loaded preset's at REVEAL time
+      // only, not as a binding: updating the preset you just loaded is then one click on the confirm instead
+      // of retyping its name exactly, while typing over it stays free and no watcher can fight it.
+      scope.togglePresetSave = function () {
+        scope.presetSaveOpen = !scope.presetSaveOpen;
+        if (scope.presetSaveOpen) {
+          scope.presetName = scope.selectedPreset || '';
+        }
       };
-      scope.pickPreset = function (value) {
-        scope.selectedPreset = value;
-        scope.open = null;
-      };
+
+      // Write the preset, then collapse the row and clear the name. Optimistic on purpose: save_preset is
+      // fire-and-forget like every other action in this panel, so there is no ack to wait for -- and the
+      // feedback exists anyway (the server chats "saved preset '<name>'" and echoes the name list, so the
+      // new name shows up in the Load list by itself). The trim guard is the backstop behind the confirm
+      // button's ng-disabled, and it is what makes Enter on an empty field inert.
       scope.savePreset = function () {
         var name = (scope.presetName || '').trim();
         if (!name) {
           return;
         }
         geLuaArg('save_preset', JSON.stringify({ name: name, form: formJson(PRESET_EXCLUDE_KEYS) }));
+        scope.presetSaveOpen = false;
+        scope.presetName = '';
       };
-      scope.loadPreset = function () {
-        if (scope.selectedPreset) {
-          geLuaArg('load_preset', scope.selectedPreset);
+
+      // Clicking a name in the list loads it: select + dispatch + close, so a load is two clicks from
+      // collapsed (Load, then the name). There is no separate Load-the-selection step any more; the
+      // selection survives only to mark the row and to prefill the save name. The guard covers the
+      // 'no saved presets' placeholder row.
+      scope.pickPreset = function (value) {
+        if (!value) {
+          return;
         }
+        scope.selectedPreset = value;
+        scope.open = null;
+        geLuaArg('load_preset', value);
       };
-      scope.deletePreset = function () {
-        if (scope.selectedPreset) {
-          geLuaArg('delete_preset', scope.selectedPreset);
+
+      // Two-step delete on the row's own button: the first click ARMS that row (the button becomes "sure?"
+      // in the danger colour), only a second click on the armed button deletes. Deliberately unlike the
+      // one-click × on a tournament class -- that drops a form row you can re-add, this destroys a saved
+      // setup on the server with no undo, and it sits on a row that LOADS when clicked. Both clicks must
+      // stop the event, or the row's own ng-click would load the very preset being deleted. Arming a row
+      // disarms every other one for free, because the state is the armed NAME, not a flag per row.
+      scope.deletePreset = function (name, ev) {
+        if (ev) {
+          ev.stopPropagation();
         }
+        if (!name) {
+          return;
+        }
+        if (scope.armedPreset !== name) {
+          scope.armedPreset = name;
+          return;
+        }
+        scope.armedPreset = '';
+        geLuaArg('delete_preset', name);
       };
+
+      // Closing the list disarms every row: an armed delete left behind would fire on the FIRST click the
+      // next time the list opened. The list is closed from three places (toggle, pickPreset and the
+      // outside-click handler), so watch the state they all end up in instead of patching each one.
+      scope.$watch(function () { return scope.open; }, function (now) {
+        if (now !== 'preset') {
+          scope.armedPreset = '';
+        }
+      });
 
       // Prepare Race: send the structured request -- the race spawns + enters staging. Reveals Start Race.
       // While a championship is active, omit order= so the server applies the championship's grid order
