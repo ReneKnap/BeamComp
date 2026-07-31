@@ -109,9 +109,25 @@ local RACE_LOG_TAG = "beamcomp.race"
 -- nothing for HUD_ACK_STALE while a race wants the HUD up, it re-asserts visibility every
 -- HUD_RESHOW_EVERY, and if the surface is still silent at HUD_RELOAD_AFTER it escalates to a one-shot UI
 -- reload (recovers an engine/BeamMP UI reload that dropped our late-mounted app, ADR-0008/0012).
+--
+-- 0.39 recalibration (bug beamng-039-breakage round 3): after ANY in-game reload, 0.39 holds the entire
+-- UI boot until preloading is done (the CEF "holding UI boot" log line), so several seconds of heartbeat
+-- silence is NORMAL during the race-spawn churn -- and a rescue reload issued into that window makes the
+-- outage longer, not shorter (observed live 2026-07-31: Stage B fired 4s into a held boot that would
+-- have recovered on its own). Stage A stays snappy -- it is idempotent and nearly free under the
+-- ensure_visible dedup. Stage B gets a long fuse: 25s comfortably exceeds every observed held boot
+-- (incl. mod preloading) with margin, yet still recovers a genuinely dead HUD well within half a minute,
+-- once per race. The fuse is backed by the engine's onUiReady signal (M.onUiReady): every completed UI
+-- boot zeroes the gap, so Stage B only ever fires after 25 UNINTERRUPTED silent seconds during which no
+-- UI boot completed -- a real loss, not a slow boot.
 local HUD_ACK_STALE = 1.5
 local HUD_RESHOW_EVERY = 1.0
-local HUD_RELOAD_AFTER = 4.0
+local HUD_RELOAD_AFTER = 25.0
+-- After OUR OWN Stage-B reload the UI is by definition rebooting: silence accounting (and the pointless
+-- Stage-A re-adds -- the app remounts from the persisted layout on its own) is suspended until onUiReady
+-- announces the finished boot, capped here so a wedged boot that never announces cannot suspend the
+-- watchdog forever.
+local HUD_BOOT_SETTLE_MAX = 45.0
 
 local MARKER_RADIUS = 0.6
 
@@ -260,6 +276,7 @@ M.state = {
     hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
     hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle hud.show()
     hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
+    hud_boot_wait = 0,        -- seconds left of "the UI is (re)booting, silence is normal": armed to HUD_BOOT_SETTLE_MAX by our own Stage-B reload, ended early by onUiReady announcing the completed boot. Deliberately NOT reset with the per-race watchdog fields -- it tracks the UI lifecycle, not the race
     idle_info_shown = false,  -- whether the between-races series info box (ADR-0042) currently holds the HUD app up (lobby/free-roam, no race), so it is shown once and taken down when the series ends
     grid_list_target = nil,   -- routes the next gridList reply by its requester: nil = grid-editor console toast (default) | "setup" = race-setup panel grid dropdown (ADR-0037) | "gridui" = grid-editor panel saved-grid dropdown
     grid_seed_race = nil,     -- a race to pre-select when the grid-editor panel opens (carried from /raceui's "Grid bearbeiten" cross-open); consumed by push_grid_data
@@ -479,6 +496,8 @@ local function handle_race_start(payload)
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
+    -- hud_boot_wait is deliberately NOT reset: it tracks the UI lifecycle (a boot may span a race
+    -- boundary), and onUiReady / its cap end it on their own.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
     M.state.hud_reloaded = false
@@ -846,6 +865,8 @@ local function teardown_race_world()
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
     -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
+    -- hud_boot_wait is deliberately NOT reset: it tracks the UI lifecycle (a boot may span a race
+    -- boundary), and onUiReady / its cap end it on their own.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
     M.state.hud_reloaded = false
@@ -2173,6 +2194,19 @@ end
 -- reloads the UI. Public so the app can reach it as beamcomp_init.note_hud_alive (mirrors toggle_analysis).
 function M.note_hud_alive()
     M.state.hud_ack_gap = 0
+end
+
+-- Engine hook: the UI announces every COMPLETED boot here (ui/entrypoints/main/boot.js calls
+-- uiReady() in GE, ge/main.lua fires extensions.hook("onUiReady")) -- the initial boot, every
+-- engine/BeamMP reload, and our own Stage-B rescue. 0.39 holds the entire in-game UI boot until
+-- preloading is done, so heartbeat silence up to this moment is a booting UI, not a lost app: end
+-- any boot-suspension window and restart the watchdog's silence accounting from zero, giving the
+-- freshly booted UI a full fuse to mount the app and heartbeat before any escalation (bug
+-- beamng-039-breakage round 3).
+function M.onUiReady()
+    M.state.hud_boot_wait = 0
+    M.state.hud_ack_gap = 0
+    M.state.hud_reshow_wait = 0
 end
 
 -- Submit the race-setup panel's choices (UI -> GE -> server, ADR-0037). The panel serialises its form to
@@ -5709,8 +5743,25 @@ end
 -- present while a race wants it on screen. The app heartbeats via M.note_hud_alive; if that goes silent --
 -- an engine/BeamMP UI reload during the spawn churn can drop our server-delivered app (ADR-0008/0012) --
 -- re-assert visibility (Stage A), and if the surface stays silent escalate once to a full UI reload
--- (Stage B). Called from onUpdate in the visible phases only, so free-roam is never disturbed.
+-- (Stage B, long-fused for 0.39's held boots -- see the threshold block). Called from onUpdate in the
+-- visible phases only, so free-roam is never disturbed.
+--
+-- A setup-style "only count silence once heard alive" gate (setup_seen) was considered for Stage B and
+-- rejected: this watchdog's original worst case is precisely a HUD that never acks from mount because
+-- the whole UI died mid-spawn -- the gate would disable the only recovery for it. The long fuse plus
+-- the onUiReady gap reset cover the slow-boot false positive instead: a healthy-but-held boot always
+-- announces itself well inside the fuse.
 local function step_hud_watchdog(dt)
+    -- The UI is known to be (re)booting (our own Stage-B reload arms this; onUiReady ends it): 0.39
+    -- holds the whole boot until preloading is done, so silence is expected -- do not count it, and
+    -- skip the pointless re-adds (the app remounts from the persisted layout on its own). The cap
+    -- keeps a boot that never announces from suspending the watchdog forever.
+    if M.state.hud_boot_wait > 0 then
+        M.state.hud_boot_wait = math.max(0, M.state.hud_boot_wait - (dt or 0))
+        M.state.hud_ack_gap = 0
+        M.state.hud_reshow_wait = 0
+        return
+    end
     M.state.hud_ack_gap = M.state.hud_ack_gap + (dt or 0)
     if M.state.hud_ack_gap < HUD_ACK_STALE then
         -- App is heartbeating -- surface healthy, reset the re-show throttle.
@@ -5721,8 +5772,12 @@ local function step_hud_watchdog(dt)
     if M.state.hud_ack_gap >= HUD_RELOAD_AFTER and not M.state.hud_reloaded then
         M.state.hud_reloaded = true
         M.state.hud_reshow_wait = 0
-        log("W", RACE_LOG_TAG, "HUD app silent; reloading UI to recover the race overlay")
+        log("W", RACE_LOG_TAG, string.format(
+            "HUD app silent for %.0fs; reloading UI to recover the race overlay", M.state.hud_ack_gap))
         hud.reload_ui()
+        -- Our own reload re-enters a held 0.39 boot: suspend the silence accounting we would otherwise
+        -- immediately restart against the very outage we just caused (ended early by onUiReady).
+        M.state.hud_boot_wait = HUD_BOOT_SETTLE_MAX
         -- The full reload restores the saved-layout apps but faces the same stock-dashboard rebind race
         -- as a race start, so re-queue the rebind (longer settle: the UI must remount first). This is the
         -- secondary/contributing path called out in the bug's 1-investigation.md.
