@@ -259,6 +259,10 @@ local session = {
     tournament = nil,         -- active class-drop tournament {classes, order, standings, race_count, winner, ended} or nil (ADR-0042); session-scoped, survives reset_to_lobby like championship
     quali = nil,              -- active quali-then-race event {duration, lap_grace_deadline, done} or nil (ADR-0041); per-event, cleared by reset_to_lobby (unlike last_order/championship)
     owner_id = nil,           -- player id that issued the active race -- the prop + AI owner (ADR-0009/0036), or nil
+    staged_by = nil,          -- player id that prepared the race now waiting in staging (ADR-0021 amendment), or nil.
+                              -- Distinct from owner_id, which must outlive staging (props/AI): this one exists ONLY
+                              -- while staging, so that this specific admin leaving cancels the race nobody else will
+                              -- start. Seeded at the staging entry, dropped by enter_phase on any other phase.
     ai_roster = nil,          -- named AI roster for the active race (ADR-0047): [k] = {name, car?} for AI id "ai:<k>", sanitized from the panel's overrides.ai.roster; nil on the chat path (classic "AI <k>" labels). Per-race, cleared by reset_to_lobby
 }
 
@@ -1178,6 +1182,13 @@ end
 -- racePhase envelope. `duration` (seconds) is carried for timed phases so a client can render a
 -- synced countdown; pass nil for open-ended phases (lobby, racing).
 local function enter_phase(phase, duration, extra)
+    -- The staged race's preparer is only meaningful while staging (ADR-0021 amendment). Dropping it here
+    -- -- the one seam every transition passes -- means no exit can leave a stale id behind: not the
+    -- manual start, not /raceclear, not the abandon net, and not /raceend, which reaches `finished`
+    -- without going through reset_to_lobby.
+    if phase ~= PHASE.staging then
+        session.staged_by = nil
+    end
     session.phase = phase
     session.phase_duration = duration
     session.phase_started_at = now()
@@ -3657,10 +3668,22 @@ local function advance_spawning()
         log_info("beamcomp.race", "no players spawned; cancelling race")
         broadcast_chat("BeamComp: no players spawned -- race cancelled")
         reset_to_lobby()
+    elseif not MP.GetPlayers()[session.owner_id] then
+        -- The admin who prepared this race left during the spawn gate, so the field would come up
+        -- waiting for a host who is not there -- and the preparer-left rule below cannot help, since it
+        -- only watches disconnects that happen DURING staging. Same outcome, applied one seam earlier
+        -- (ADR-0021 amendment).
+        log_info("beamcomp.race", "race preparer left before staging; cancelling race")
+        broadcast_chat("BeamComp: the host who prepared the race left -- race cancelled")
+        reset_to_lobby()
     else
         -- nil duration = open-ended (like lobby and racing): no auto-start, and clients render a wait
         -- rather than a countdown, since duration is what they mirror as a clock.
         enter_phase(PHASE.staging, nil)
+        -- Remember who prepared this race, so their leaving can cancel a wait nobody else will end
+        -- (ADR-0021 amendment). This is the single staging entry, and both prepare routes -- /race and
+        -- the panel -- set owner_id in handle_race_start, so one assignment covers both.
+        session.staged_by = session.owner_id
     end
 end
 
@@ -5170,6 +5193,17 @@ local function on_player_disconnect(player_id)
     end
     if is_server_empty_without(player_id) then
         log_info("beamcomp.race", "all players gone; returning to lobby")
+        reset_to_lobby()
+        return
+    end
+    -- The admin who prepared this race left while the field is still waiting for them to start it
+    -- (ADR-0021 amendment). Nothing would ever start it, so discard the staged race now instead of
+    -- holding everyone frozen on the grid until the abandon window. Deliberately narrow: only the
+    -- recorded preparer triggers it, another admin being present does not prevent it. Ahead of the DNF
+    -- bookkeeping below -- there is no race left to settle.
+    if session.phase == PHASE.staging and player_id == session.staged_by then
+        log_info("beamcomp.race", "staging preparer " .. tostring(player_id) .. " left; clearing staged race")
+        broadcast_chat("BeamComp: the host who prepared the race left -- race cancelled")
         reset_to_lobby()
         return
     end
