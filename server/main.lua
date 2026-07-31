@@ -50,8 +50,9 @@
 --                 reason is posted to the admin, who can re-issue with force. While a race is already
 --                 running, an ok'd /race queues the new race and runs a short abort window before
 --                 restarting. Bare /race replies with usage.
---   /go /start /racestart  start the race now: end the staging wait early and begin the countdown
---                 (ADR-0021). Admin-gated like /race; only acts while a race is staging.
+--   /go /start /racestart  start the race now: end the staging wait and begin the countdown (ADR-0021).
+--                 Admin-gated like /race; only acts while a race is staging. Staging never starts by
+--                 itself -- this (or the panel's equivalent button) is the only way forward.
 --   /raceend      force the race straight to the finished/results screen, no despawn -- runs the same
 --                 finalize as a grace expiry from any active pre-finished phase (ADR-0038). Admin-gated.
 --   /raceclear    force the state machine back to lobby + cleanup/despawn (safety hatch; old /raceend).
@@ -178,7 +179,16 @@ local PHASE = {
 -- Phase durations in seconds. Editable server config (ADR-0006); not a runtime/in-game UI.
 local PHASE_DURATIONS = {
     spawning = 10.0,      -- max wait for spawn-ready acks before proceeding anyway (ADR-0006 amendment)
-    staging = 120.0,      -- pre-countdown staging wait; ends early on /go|/start|/racestart (ADR-0021)
+    -- Staging is NOT timed (ADR-0021 amendment, staging-waits-for-host): the staged field waits for the
+    -- host and only /go|/start|/racestart or the panel's raceGo starts it. This is the invisible
+    -- emergency exit -- after it the server discards the staged race by itself, so a race prepared and
+    -- then forgotten cannot hold everyone's car frozen on the grid forever. Deliberately far beyond any
+    -- legitimate wait (loading, a car swap, grid tweaks -- minutes at most): 2x the longest window
+    -- BeamComp ships (finished_hold, 15 min). Erring long is the safe direction -- firing too early
+    -- would kill a live race prep, firing late only extends a wait nobody is in. NOT applied as the
+    -- phase duration: that field is what makes a phase timed and clients mirror it as a visible
+    -- countdown, so this is checked against phase_elapsed() in the tick instead.
+    staging_abandon = 1800.0,
     countdown = 8.0,      -- pre-race countdown (ADR-0021: was 3.0)
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
     all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
@@ -3282,7 +3292,8 @@ local function regrid_by_pwr()
 end
 
 -- Leave staging for the countdown (ADR-0021), applying the pwr re-grid first when order=pwr (ADR-0033).
--- The single seam both the staging timeout and the manual /go route through.
+-- The single seam every non-quali start routes through -- /go|/start|/racestart and the panel's raceGo,
+-- which is the same handler (ADR-0021 amendment: there is no longer a staging timeout).
 local function enter_countdown_from_staging()
     regrid_by_pwr()
     -- The F1 light start applies only when this countdown leads to racing; for an order=quali event the
@@ -3630,8 +3641,9 @@ end
 -- Leave the spawning phase once every rostered player is accounted for -- acked via spawnReady or
 -- gone (pruned on disconnect) -- or the spawning timeout caps the wait (ADR-0006 amendment). If not a
 -- single client acked by then, the roster never spawned (all left or none ran the mod), so abort to
--- lobby instead of running an empty race until /raceclear; otherwise proceed to staging. A no-op until
--- the wait resolves, so it is safe to call every tick.
+-- lobby instead of running an empty race until /raceclear; otherwise proceed to staging, open-ended --
+-- the staged field waits for the host (ADR-0021 amendment). A no-op until the wait resolves, so it is
+-- safe to call every tick.
 local function advance_spawning()
     if not session.spawn_pending then
         return
@@ -3646,7 +3658,9 @@ local function advance_spawning()
         broadcast_chat("BeamComp: no players spawned -- race cancelled")
         reset_to_lobby()
     else
-        enter_phase(PHASE.staging, PHASE_DURATIONS.staging)
+        -- nil duration = open-ended (like lobby and racing): no auto-start, and clients render a wait
+        -- rather than a countdown, since duration is what they mirror as a clock.
+        enter_phase(PHASE.staging, nil)
     end
 end
 
@@ -4193,6 +4207,23 @@ local function tick()
         return
     end
 
+    -- staging waits for the host (ADR-0021 amendment, staging-waits-for-host): it is open-ended, so the
+    -- generic timed advance below never reaches it and there is no auto-start -- /go|/start|/racestart,
+    -- the panel's raceGo, and /raceclear are the only ways out. Handled here purely for the invisible
+    -- emergency exit, measured on phase_elapsed() rather than session.phase_duration: putting the window
+    -- in the phase duration would make the phase timed and clients would render a 30-minute clock.
+    if phase == PHASE.staging then
+        if phase_elapsed() >= PHASE_DURATIONS.staging_abandon then
+            -- %.0f, not %d: the durations are an editable server config (ADR-0006), and a fractional
+            -- one would make %d a runtime error inside the tick.
+            log_info("beamcomp.race", string.format("staged race abandoned -- no host start within %.0f s",
+                PHASE_DURATIONS.staging_abandon))
+            broadcast_chat("BeamComp: staged race abandoned -- nobody started it")
+            reset_to_lobby()
+        end
+        return
+    end
+
     -- quali-results runs the AI re-grid a lead time before the pause ends (ADR-0041 amendment), so the AI
     -- re-spawn hitch lands on the static results card rather than the race countdown. No return: the pause's
     -- own timed end (-> countdown) still fires via the generic advance below.
@@ -4205,19 +4236,7 @@ local function tick()
         return
     end
 
-    if phase == PHASE.staging then
-        -- Staged sprint quali (ADR-0044/Round3): NO global pre-quali countdown -- it confused testers -- so a
-        -- staged event goes straight from staging into the qualifying queue, where each driver gets their own
-        -- per-driver settle + start count at P1. The circuit quali (and every normal race) still runs the
-        -- global countdown via enter_countdown_from_staging.
-        if quali.is_staged() then
-            enter_phase(PHASE.qualifying, session.quali.duration)
-            broadcast_standings()
-            quali.start_session()
-        else
-            enter_countdown_from_staging()
-        end
-    elseif phase == PHASE.countdown then
+    if phase == PHASE.countdown then
         -- For a (circuit) quali event the first countdown gates the qualifying session, not the race
         -- (ADR-0041): the second countdown (after quali-results sets the grid) gates the race. Either way
         -- send the baseline standings (every participant at zero) so clients have a table from the start.
@@ -5016,8 +5035,10 @@ function champ.handle_command(player_id, player_name, argument)
         session.championship.points_preset, champ.order_label(session.championship.order)))
 end
 
--- /go, /start, /racestart: end the staging wait early and start the countdown (ADR-0021). Admin-gated
--- like /race; a no-op (with a notice) from any phase other than staging.
+-- /go, /start, /racestart: end the staging wait and start the countdown (ADR-0021). Admin-gated like
+-- /race; a no-op (with a notice) from any phase other than staging. Since the ADR-0021 amendment this
+-- is the ONLY way a staged race moves forward -- staging no longer times out -- and the panel's raceGo
+-- routes through here too (handle_race_go), so both host routes share one admin gate and one end state.
 local function handle_start_command(player_id, player_name)
     if not is_race_admin(player_name) then
         MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
@@ -5030,8 +5051,10 @@ local function handle_start_command(player_id, player_name)
         return
     end
     log_info("beamcomp.race", "manual start by " .. player_name)
-    -- Staged sprint quali (ADR-0044/Round4): a manual /go must ALSO skip the global countdown, exactly like
-    -- the staging-timeout path -- otherwise the 3-2-1 renders. Go straight into the staged queue instead.
+    -- Staged sprint quali (ADR-0044/Round4): the staged event skips the global countdown -- otherwise the
+    -- 3-2-1 renders -- and goes straight into the staged queue, where each driver gets their own
+    -- per-driver settle + start count at P1. The circuit quali and every normal race run the global
+    -- countdown via enter_countdown_from_staging.
     if quali.is_staged() then
         enter_phase(PHASE.qualifying, session.quali.duration)
         broadcast_standings()
