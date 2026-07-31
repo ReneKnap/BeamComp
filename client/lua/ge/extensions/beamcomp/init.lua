@@ -70,6 +70,11 @@ local placement = require("beamcomp/race/placement")
 local ai = require("beamcomp/race/ai")
 -- Rally staged sprint qualifying per-driver run state machine (ADR-0044); pure timing helpers.
 local qualisprint = require("beamcomp/race/qualisprint")
+-- BeamNG 0.39 UI-app layout compat (bug beamng-039-breakage): every panel show/remove goes through
+-- this seam since the Angular appContainer guihooks died in 0.39. Hung on M instead of a `local`
+-- to spare a slot under the 200-local ceiling (see the header) -- which also makes it reachable
+-- from the in-game console as beamcomp_init.uilayout for manual verification.
+M.uilayout = require("beamcomp/race/uilayout")
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -101,12 +106,25 @@ local LOG_TAG = "beamcomp.net"
 local RACE_LOG_TAG = "beamcomp.race"
 
 -- HUD self-healing watchdog thresholds (seconds). The app heartbeats ~1s (note_hud_alive); if GE hears
--- nothing for HUD_ACK_STALE while a race wants the HUD up, it re-asserts visibility every
--- HUD_RESHOW_EVERY, and if the surface is still silent at HUD_RELOAD_AFTER it escalates to a one-shot UI
--- reload (recovers an engine/BeamMP UI reload that dropped our late-mounted app, ADR-0008/0012).
+-- nothing for HUD_ACK_STALE while a race wants the HUD up, it re-asserts visibility (a dedup'd
+-- layout re-add via the 0.39 seam) on a doubling backoff: the first re-show comes HUD_RESHOW_EVERY
+-- after the stale mark, then the cadence doubles up to HUD_RESHOW_MAX.
+--
+-- There is NO Stage-B reloadUI escalation any more (bug beamng-039-breakage round 4). It existed for
+-- the pre-0.39 failure mode "an engine/BeamMP UI reload drops our late-mounted, server-delivered app
+-- and nothing brings it back" (ADR-0008/0012). Since 0.39 that is structurally impossible: our apps
+-- persist in the user's current layout FILE (round 1), and every completed UI boot re-renders the
+-- whole layout from disk (UiAppsOverlay mounts -> appLayoutsStore.loadInitialData -> render), so the
+-- app always returns on its own once the UI is up; a missing layout ENTRY is exactly what the Stage-A
+-- re-add repairs. Worse, Stage B mis-fired: 0.39 hides the entire HUD-apps layer in menu routes
+-- (uiApps.shown=false -> the overlay's v-if UNMOUNTS the hosted apps), so the heartbeat goes silent
+-- legitimately whenever the user sits in a menu -- and the "rescue" reloaded a perfectly healthy UI
+-- (observed live 2026-07-31, second session). The backoff keeps that legitimate-silence churn to one
+-- cheap layout check per HUD_RESHOW_MAX while staying just as fast on a real loss (first re-show
+-- ~HUD_ACK_STALE + HUD_RESHOW_EVERY after the last heartbeat).
 local HUD_ACK_STALE = 1.5
 local HUD_RESHOW_EVERY = 1.0
-local HUD_RELOAD_AFTER = 4.0
+local HUD_RESHOW_MAX = 15.0
 
 local MARKER_RADIUS = 0.6
 
@@ -185,15 +203,13 @@ local RESTAGE_MIN_DELTA = 0.2
 
 -- Stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): seconds to let a
 -- (re)seated car's VE streams settle after its jbeam is bindable before firing the one-shot rebind, so it
--- acts once the car is actually bindable rather than mid-churn. A longer wait is used after a HUD-watchdog
--- reloadUI (the whole UI must remount first), mirroring the deferred-restage readiness gate.
+-- acts once the car is actually bindable rather than mid-churn.
 local DASH_REFRESH_SETTLE = 0.75
-local DASH_REFRESH_AFTER_RELOAD = 2.0
 
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-editor-reveal-on-demand/2026-07-30"
+local BUILD_MARKER = "beamng-039-ui-compat-r4/2026-07-31"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -252,9 +268,9 @@ M.state = {
     ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
     ai_remote_ids = nil,      -- non-owner: set of local game ids resolved as AI cars from the relayed aiMap (ADR-0036), or nil
     ai_server_ids = nil,      -- non-owner: set of BeamMP server ids from the latest aiMap awaiting local resolution (ADR-0036), or nil
-    hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows / reloads the UI as this grows while a race wants the HUD up (ui-missing-for-some-clients-reload)
-    hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, to throttle ensureAppVisible
-    hud_reloaded = false,     -- whether the watchdog already escalated to a full UI reload this race (one reload per race; reset on teardown)
+    hud_ack_gap = 0,          -- seconds since the HUD app last acked it is alive; the onUpdate watchdog re-shows the app on a backoff while this grows and a race wants the HUD up (heartbeat silence is also legitimate: 0.39 unmounts the whole apps layer in menu routes)
+    hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, compared against the backoff interval below
+    hud_reshow_interval = HUD_RESHOW_EVERY,  -- current re-show cadence: starts at HUD_RESHOW_EVERY on each healthy heartbeat, doubles per silent re-show up to HUD_RESHOW_MAX (menu-hidden silence then costs one layout check per 15s)
     idle_info_shown = false,  -- whether the between-races series info box (ADR-0042) currently holds the HUD app up (lobby/free-roam, no race), so it is shown once and taken down when the series ends
     grid_list_target = nil,   -- routes the next gridList reply by its requester: nil = grid-editor console toast (default) | "setup" = race-setup panel grid dropdown (ADR-0037) | "gridui" = grid-editor panel saved-grid dropdown
     grid_seed_race = nil,     -- a race to pre-select when the grid-editor panel opens (carried from /raceui's "Grid bearbeiten" cross-open); consumed by push_grid_data
@@ -290,10 +306,10 @@ M.state = {
 }
 
 -- Queue a one-shot stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): armed
--- at every point the race car is (re)seated (race start + AI reseat, regrid, the racing GO boundary, and
--- after a HUD-watchdog reloadUI), it lets step_dashboard_refresh wait for the car's VE to be bindable and
--- then rebind the stock apps once. A plain state setter so it stays callable from the handlers above the
--- onUpdate step that consumes it; the optional wait overrides the default settle (longer after a reload).
+-- at every point the race car is (re)seated (race start + AI reseat, regrid, the racing GO boundary), it
+-- lets step_dashboard_refresh wait for the car's VE to be bindable and then rebind the stock apps once.
+-- A plain state setter so it stays callable from the handlers above the onUpdate step that consumes it;
+-- the optional wait overrides the default settle.
 local function arm_dashboard_refresh(wait)
     M.state.dash_refresh_pending = true
     M.state.dash_refresh_wait = wait or DASH_REFRESH_SETTLE
@@ -355,9 +371,7 @@ local function handle_race_start(payload)
         props.clear(M.state.grid_edit_prop_names or {})
         M.state.grid_edit_prop_names = nil
         M.state.grid_edit_checkpoint = nil
-        if guihooks then
-            guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
-        end
+        M.uilayout.remove("beamCompGridEditor")
     end
 
     local race, reason = race_start.prepare(payload)
@@ -475,10 +489,11 @@ local function handle_race_start(payload)
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
-    -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
+    -- Reset the HUD watchdog so the (re)started race gets a clean grace window and a fresh (fast)
+    -- re-show cadence.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
-    M.state.hud_reloaded = false
+    M.state.hud_reshow_interval = HUD_RESHOW_EVERY
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
@@ -842,10 +857,11 @@ local function teardown_race_world()
     -- Drop the qualifying live sector-delta tracker (feature: quali-live-sector-delta); it is re-armed
     -- in the qualifying phase for a circuit quali.
     M.state.sector_track = nil
-    -- Reset the HUD watchdog so the (re)started race gets a clean grace window and one reload budget.
+    -- Reset the HUD watchdog so the (re)started race gets a clean grace window and a fresh (fast)
+    -- re-show cadence.
     M.state.hud_ack_gap = 0
     M.state.hud_reshow_wait = 0
-    M.state.hud_reloaded = false
+    M.state.hud_reshow_interval = HUD_RESHOW_EVERY
     M.state.assist_armed = false
     M.state.assist_held = nil
     M.state.assist_arming = nil
@@ -1162,7 +1178,7 @@ local function begin_driving(plan, ai_laps)
     M.state.results_min = false
     M.state.analysis_open = false
     M.state.provisional_open = true
-    -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. ensureAppVisible dedups.
+    -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. The show dedups.
     hud.show()
 end
 
@@ -2172,6 +2188,19 @@ function M.note_hud_alive()
     M.state.hud_ack_gap = 0
 end
 
+-- Engine hook: the UI announces every COMPLETED boot here (ui/entrypoints/main/boot.js calls
+-- uiReady() in GE, ge/main.lua fires extensions.hook("onUiReady")) -- the initial boot and every
+-- engine/BeamMP reload. 0.39 holds the entire in-game UI boot until preloading is done, so
+-- heartbeat silence up to this moment is a booting UI, not a lost app: restart the watchdog's
+-- silence accounting from zero with a fresh (fast) re-show cadence, so the freshly booted UI gets
+-- its mount-and-heartbeat window without a pointless immediate re-add, while a REAL entry loss
+-- right after a boot is still repaired at full Stage-A speed (bug beamng-039-breakage rounds 3+4).
+function M.onUiReady()
+    M.state.hud_ack_gap = 0
+    M.state.hud_reshow_wait = 0
+    M.state.hud_reshow_interval = HUD_RESHOW_EVERY
+end
+
 -- Submit the race-setup panel's choices (UI -> GE -> server, ADR-0037). The panel serialises its form to
 -- a JSON string and calls this via bngApi.engineLua; we decode and relay it to the server as a structured
 -- startRace request that joins the same validation + start path as a typed /race. Public so the app can
@@ -2279,9 +2308,8 @@ end
 -- but an engine/BeamMP UI reload destroys it (and its Angular scope) without ever running that close,
 -- and our server-delivered app does not come back on its own (ADR-0008/0012). GE therefore remembers
 -- that the panel SHOULD be on screen and re-adds it once when the app's heartbeat goes silent. Same
--- mechanism as the HUD watchdog (M.note_hud_alive / step_hud_watchdog), reduced to its Stage A and
--- latched to a single shot per open: the user wants a lost panel back, not a panel that fights BeamNG's
--- own app-container X.
+-- mechanism as the HUD watchdog (M.note_hud_alive / step_hud_watchdog), latched to a single re-add
+-- per open: the user wants a lost panel back, not a panel that fights BeamNG's own app-container X.
 
 -- Seconds of heartbeat silence (the app beats ~1 s) after which the panel counts as lost. Two missed
 -- beats of tolerance: the loss is permanent when it is real (the app is gone until something re-adds
@@ -2316,7 +2344,8 @@ end
 -- the panel is used in the lobby and carries the race-stop controls mid-race (ADR-0038 amendment).
 -- Silence only counts once we have heard the app alive: a panel that has not linked yet is merely slow
 -- (this bug lives on laggy clients), and spending the single restore on that would leave a real loss
--- unrecovered. No Stage B -- unlike the HUD, this surface is not worth a full reloadUI.
+-- unrecovered. Re-add only -- a reload stage never existed here, and since round 4 the HUD watchdog
+-- has none either.
 function setup.step(dt)
     if M.state.setup_restored or not M.state.setup_seen then
         return
@@ -2327,18 +2356,10 @@ function setup.step(dt)
     end
     M.state.setup_restored = true
     log("I", RACE_LOG_TAG, "race-setup panel went silent -- re-adding it once")
-    -- Guarded + pcall-wrapped like race/hud.lua's trigger_ui: this runs from the onUpdate tick, so a
-    -- missing/failed engine call must never take the rest of the frame's work down with it. The latch is
-    -- already set above, so a failure costs the one restore rather than repeating every frame.
-    if not guihooks then
-        return
-    end
-    local ok, err = pcall(function()
-        guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
-    end)
-    if not ok then
-        log("W", RACE_LOG_TAG, "re-adding the race-setup panel failed: " .. tostring(err))
-    end
+    -- The compat seam self-guards and pcalls every engine call (race/uilayout.lua), so this onUpdate
+    -- tick can never be taken down. The latch is already set above, so a failure costs the one
+    -- restore rather than repeating every frame -- unchanged semantics.
+    M.uilayout.ensure_visible("beamCompSetup")
 end
 
 -- UI -> GE presence heartbeat from the open panel (mirrors note_hud_alive). Public so the app can reach
@@ -2348,10 +2369,10 @@ function M.note_setup_alive()
     M.state.setup_seen = true
 end
 
--- Remove the race-setup panel from the live layout (UI -> GE, ADR-0037), the close counterpart to the
--- setupOpen auto-add. Public so the panel's Close button can reach it as beamcomp_init.close_setup.
+-- Remove the race-setup panel from the current layout (UI -> GE, ADR-0037), the close counterpart to
+-- the setupOpen auto-add. Public so the panel's Close button can reach it as beamcomp_init.close_setup.
 function M.close_setup()
-    guihooks.trigger("appContainer:removeApp", "beamCompSetup")
+    M.uilayout.remove("beamCompSetup")
     -- The admin is done with the panel, so stop expecting it on screen (nothing re-adds it from here).
     setup.clear()
 end
@@ -2562,8 +2583,8 @@ end
 -- also pulls the dataset itself on link via request_setup_data -- the two together cover every timing.
 local function handle_setup_open(_payload)
     push_setup_data(false)
-    -- Ensure the panel app is on the live layout (ADR-0012 best-effort auto-add); dedups by appName.
-    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompSetup"}))
+    -- Ensure the panel app is on the current layout (ADR-0012 best-effort auto-add); dedups by appName.
+    M.uilayout.ensure_visible("beamCompSetup")
     -- Remember this (server-authorized) open, so a UI reload that drops the app can be recovered once.
     setup.arm()
     -- Auto-minimize the final standings card so the opening panel has a clear view. Only visible in the
@@ -2813,7 +2834,7 @@ local function handle_grid_setup_open(_payload)
     -- Re-spawn the reference scene if a session is still active on open (e.g. one started from the GE
     -- console) -- its props are otherwise only spawned when the session begins.
     refresh_grid_edit_scene()
-    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
+    M.uilayout.ensure_visible("beamCompGridEditor")
 end
 
 -- Pull the grid-editor dataset on demand (UI -> GE): the panel calls this on link (covers the freshly-added
@@ -2831,7 +2852,7 @@ function M.open_grid_editor_with_race(race)
     M.state.grid_seed_race = (type(race) == "string" and race ~= "") and race or nil
     push_grid_data()
     refresh_grid_edit_scene()
-    guihooks.trigger("appContainer:ensureAppVisible", jsonEncode({appName = "beamCompGridEditor"}))
+    M.uilayout.ensure_visible("beamCompGridEditor")
 end
 
 -- Start a fresh grid for `race` from the track's generated default (UI -> GE) and reflect the new session.
@@ -2995,7 +3016,7 @@ function M.close_grid_editor()
     M.state.grid_seed_race = nil
     -- Reuse the full teardown primitive (session + name + props + checkpoint + reflect); no duplication.
     M.clear_grid_editor()
-    guihooks.trigger("appContainer:removeApp", "beamCompGridEditor")
+    M.uilayout.remove("beamCompGridEditor")
 end
 
 -- Clear the grid-editor session (GE): end editing, drop the preview pillars + reference props, and reflect
@@ -5711,33 +5732,30 @@ local function step_start_countdown()
 end
 
 -- Self-healing HUD watchdog (ui-missing-for-some-clients-reload): keep the HUD/countdown app surface
--- present while a race wants it on screen. The app heartbeats via M.note_hud_alive; if that goes silent --
--- an engine/BeamMP UI reload during the spawn churn can drop our server-delivered app (ADR-0008/0012) --
--- re-assert visibility (Stage A), and if the surface stays silent escalate once to a full UI reload
--- (Stage B). Called from onUpdate in the visible phases only, so free-roam is never disturbed.
+-- present while a race wants it on screen. The app heartbeats via M.note_hud_alive; on silence the
+-- watchdog re-asserts visibility -- a dedup'd re-add of the layout ENTRY via the 0.39 seam -- on a
+-- doubling backoff. That is the ONLY stage: the historic Stage-B reloadUI escalation is retired,
+-- because 0.39 both made it unnecessary (apps persist in the layout file and every completed UI boot
+-- re-renders it -- the pre-0.39 "dropped app never comes back" case cannot happen) and made it harmful
+-- (menu routes unmount the whole apps layer, so silence is often a hidden-but-healthy UI, and the
+-- "rescue" reloaded it -- see the threshold block). Silence therefore means one of: menu open (re-add
+-- is a cheap dedup no-op, backoff keeps it rare), UI booting (the entry renders when the boot
+-- finishes; onUiReady resets the cadence), or the entry really got removed -- which the very first
+-- re-show repairs. Called from onUpdate in the visible phases only, so free-roam is never disturbed.
 local function step_hud_watchdog(dt)
     M.state.hud_ack_gap = M.state.hud_ack_gap + (dt or 0)
     if M.state.hud_ack_gap < HUD_ACK_STALE then
-        -- App is heartbeating -- surface healthy, reset the re-show throttle.
+        -- App is heartbeating -- surface healthy, reset the re-show throttle to the fast cadence.
         M.state.hud_reshow_wait = 0
+        M.state.hud_reshow_interval = HUD_RESHOW_EVERY
         return
     end
-    -- Stage B: re-showing has not brought the app back within the grace window; reload the UI once.
-    if M.state.hud_ack_gap >= HUD_RELOAD_AFTER and not M.state.hud_reloaded then
-        M.state.hud_reloaded = true
-        M.state.hud_reshow_wait = 0
-        log("W", RACE_LOG_TAG, "HUD app silent; reloading UI to recover the race overlay")
-        hud.reload_ui()
-        -- The full reload restores the saved-layout apps but faces the same stock-dashboard rebind race
-        -- as a race start, so re-queue the rebind (longer settle: the UI must remount first). This is the
-        -- secondary/contributing path called out in the bug's 1-investigation.md.
-        arm_dashboard_refresh(DASH_REFRESH_AFTER_RELOAD)
-        return
-    end
-    -- Stage A: re-assert app visibility, throttled, until it acks (or Stage B fires).
+    -- Re-assert app visibility on the backoff, until the app heartbeats again.
     M.state.hud_reshow_wait = M.state.hud_reshow_wait + (dt or 0)
-    if M.state.hud_reshow_wait >= HUD_RESHOW_EVERY then
+    if M.state.hud_reshow_wait >= (M.state.hud_reshow_interval or HUD_RESHOW_EVERY) then
         M.state.hud_reshow_wait = 0
+        M.state.hud_reshow_interval =
+            math.min((M.state.hud_reshow_interval or HUD_RESHOW_EVERY) * 2, HUD_RESHOW_MAX)
         hud.show()
     end
 end
@@ -5966,9 +5984,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         M.state.idle_info_shown = false
     end
     -- Keep the HUD/countdown app surface alive while a race wants it on screen
-    -- (ui-missing-for-some-clients-reload): the app heartbeats and this re-shows / reloads if it goes
-    -- silent. Covers staging (the countdown overlay arms there, ADR-0021) through finished; free-roam is
-    -- untouched.
+    -- (ui-missing-for-some-clients-reload): the app heartbeats and this re-shows the layout entry on
+    -- a backoff if it goes silent (no reload stage since 0.39, see step_hud_watchdog). Covers staging
+    -- (the countdown overlay arms there, ADR-0021) through finished; free-roam is untouched.
     if M.state.race and (M.state.phase == "staging" or M.state.phase == "countdown"
         or M.state.phase == "racing" or M.state.phase == "finished"
         or M.state.phase == "qualifying" or M.state.phase == "qualiResults") then
