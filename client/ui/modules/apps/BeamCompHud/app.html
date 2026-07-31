@@ -38,13 +38,14 @@
     .beamcomp-root .bc-cd-assist {
       font-size: 105px;
     }
+    /* The staging line carries the whole message now that there is no timer under it (ADR-0021
+       amendment), and it is twice as long as the old title -- so a little smaller, and nowrap so the
+       sentence never breaks mid-phrase on a narrow window. */
     .beamcomp-root .bc-cd-staging .bc-cd-staging-title {
-      font-size: 64px;
+      font-size: 56px;
+      white-space: nowrap;
     }
-    .beamcomp-root .bc-cd-staging .bc-cd-staging-time {
-      font-size: 105px;
-    }
-    /* F1 pre-procedure heads-up under the staging timer (ADR-0043): much smaller than the timer. */
+    /* F1 pre-procedure heads-up under the staging line (ADR-0043): much smaller. */
     .beamcomp-root .bc-cd-staging .bc-cd-staging-hint {
       font-size: 28px;
       opacity: 0.9;
@@ -1208,9 +1209,10 @@
     <div ng-switch-when="start">{{countdown.value}}</div>
     <div ng-switch-when="go">GO!</div>
     <div ng-switch-when="assist">{{countdown.label}} {{countdown.value}}</div>
+    <!-- Staging waits for the host (ADR-0021 amendment): no clock, because nothing counts down -- only
+         /go or the setup panel's Start Race moves the field on. -->
     <div ng-switch-when="staging">
-      <div class="bc-cd-staging-title">Race starting…</div>
-      <div class="bc-cd-staging-time">{{formatStaging(countdown.remaining)}}</div>
+      <div class="bc-cd-staging-title">Waiting for the host to start</div>
       <div class="bc-cd-staging-hint" ng-if="countdown.hint">{{countdown.hint}}</div>
     </div>
     <!-- F1 start lights (ADR-0043): 5 red lights fill (countdown.lit), hold, then all go out = GO (the

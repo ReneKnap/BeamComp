@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "beamng-039-ui-compat-r4/2026-07-31"
+local BUILD_MARKER = "staging-waits-for-host/2026-07-31"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -1261,7 +1261,9 @@ local function handle_race_phase(payload)
         -- overlay it hosts is present before the count starts (ADR-0021), and seed the staging indicator.
         lock.install({allow_replace = true})
         hud.show()
-        M.state.staging = {remaining = tonumber(payload.duration) or 0, last_shown = nil}
+        -- No clock: staging is open-ended and waits for the host (ADR-0021 amendment), so the server
+        -- sends no duration. Zero makes the first onUpdate paint the waiting line immediately.
+        M.state.staging = {repaint_in = 0}
         -- Seed the compliance revert target from the (guaranteed compliant) car we staged, so an over-cap
         -- swap can be reverted to it (ADR-0032). Mode 3 only; the race car's jbeam is loaded by staging, so
         -- the spec read is reliable. A later compliant swap moves the target forward (restage_swapped_car).
@@ -5685,28 +5687,29 @@ local function restage_swapped_car(dt_real)
     log("I", RACE_LOG_TAG, "re-placed staging car at grid slot as race car " .. tostring(own_id))
 end
 
--- Tick the staging-wait indicator in wall time (ADR-0021): count the local copy of the server's
--- auto-start window down and push the remaining whole seconds to the centered overlay only when the
--- shown second changes. The server stays authoritative on the actual staging->countdown transition.
+-- Keep the staging-wait line on the centered overlay (ADR-0021 amendment). There is nothing to count
+-- any more -- staging is open-ended and only the host starts it -- so this re-pushes the same payload on
+-- a slow cadence rather than ticking a clock; see countdown.STAGING_REPAINT_INTERVAL for why it repeats
+-- at all. The server stays authoritative on the actual staging->countdown transition.
 local function step_staging(dt_real)
     local staging = M.state.staging
     if not staging then
         return
     end
-    staging.remaining = math.max(0, staging.remaining - (dt_real or 0))
-    local shown = math.ceil(staging.remaining)
-    if shown ~= staging.last_shown then
-        staging.last_shown = shown
-        -- F1 light start (ADR-0043): a short pre-procedure heads-up during the staging wait, before the
-        -- lights begin. Reads the relayed start mode + penalty (the only consumer of those race fields).
-        local race = M.state.race
-        local hint = nil
-        if race and race.startMode == "f1" then
-            hint = "F1 light start -- hold until lights out (jump = +"
-                .. tostring(race.jumpPenaltySeconds or 15) .. "s)"
-        end
-        countdown.show_staging(shown, hint)
+    staging.repaint_in = staging.repaint_in - (dt_real or 0)
+    if staging.repaint_in > 0 then
+        return
     end
+    staging.repaint_in = countdown.STAGING_REPAINT_INTERVAL
+    -- F1 light start (ADR-0043): a short pre-procedure heads-up during the staging wait, before the
+    -- lights begin. Reads the relayed start mode + penalty (the only consumer of those race fields).
+    local race = M.state.race
+    local hint = nil
+    if race and race.startMode == "f1" then
+        hint = "F1 light start -- hold until lights out (jump = +"
+            .. tostring(race.jumpPenaltySeconds or 15) .. "s)"
+    end
+    countdown.show_staging(hint)
 end
 
 -- Tick the start countdown in wall time off the server-issued duration (ADR-0021): render each whole
@@ -5838,7 +5841,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         setup.step(dtReal)
     end
     if M.state.phase == "staging" and M.state.race then
-        -- Tick the staging-wait indicator on the centered overlay (ADR-0021).
+        -- Keep the staging-wait line up on the centered overlay (ADR-0021 amendment).
         step_staging(dtReal)
         -- Adopt a staging car swap as the new race car (re-freeze + bounce target + VE re-arm).
         restage_swapped_car(dtReal)
