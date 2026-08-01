@@ -29,6 +29,14 @@ local BEAT_SOUNDS = {
 }
 local GO_SOUND = "event:UI_CountdownGo"
 
+-- Seconds between repaints of the staging-wait line (ADR-0021 amendment). The payload is constant for
+-- the whole wait, so this is not a refresh but a recovery: the wait is open-ended now, and the HUD app
+-- mounts best-effort (ADR-0012 section 3), so a UI reload or a late add minutes into staging would
+-- otherwise leave that player with no overlay for the rest of it. Matches the rate the old per-second
+-- count effectively ran at. Lives here rather than as a top-level local in init.lua, which sits near
+-- LuaJIT's 200-local ceiling.
+M.STAGING_REPAINT_INTERVAL = 1.0
+
 
 -- Fire a UI hook defensively: a malformed payload or a missing surface must never break the phase
 -- handler / onUpdate tick that calls us. Mirrors race/hud.lua's trigger_ui.
@@ -79,11 +87,12 @@ function M.show_assist(label, value)
     trigger_ui({active = true, kind = "assist", label = label, value = value})
 end
 
--- Show the staging-wait indicator with the remaining auto-start seconds (ADR-0021). Ticked from
--- init.lua onUpdate during the staging phase. `hint` is an optional pre-procedure note (e.g. the F1
--- light-start heads-up, ADR-0043) shown under the timer; nil for a normal staging wait.
-function M.show_staging(remaining, hint)
-    trigger_ui({active = true, kind = "staging", remaining = remaining, hint = hint})
+-- Show the staging-wait indicator (ADR-0021 amendment): staging has no clock any more -- it waits for
+-- the host -- so this carries no number, just the standing "waiting" line the app renders. `hint` is an
+-- optional pre-procedure note (e.g. the F1 light-start heads-up, ADR-0043) shown underneath; nil for a
+-- normal staging wait. Re-pushed from init.lua onUpdate every STAGING_REPAINT_INTERVAL.
+function M.show_staging(hint)
+    trigger_ui({active = true, kind = "staging", hint = hint})
 end
 
 -- Hide the overlay (race end / reload / count finished). Idempotent.

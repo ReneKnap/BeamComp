@@ -119,8 +119,10 @@ angular.module('beamng.apps')
     return m + ':' + ss;
   }
 
-  // Staging-countdown remaining (seconds) -> "M:SS" in whole seconds (the GE side pushes ceil'd
-  // seconds, so centiseconds would only ever read .00). Placeholder when not a number.
+  // Whole-second remaining time (seconds) -> "M:SS" (the GE side pushes ceil'd seconds, so centiseconds
+  // would only ever read .00). Placeholder when not a number. Named for the staging countdown it was
+  // written for; that one is gone (ADR-0021 amendment) but the quali clock, the finish-lap grace and the
+  // quali->race settle timers all read the same way.
   function formatStaging(t) {
     if (typeof t !== 'number') {
       return '';
