@@ -3183,7 +3183,7 @@ local function on_server_event(data)
     handler(payload)
 end
 
--- Draw the grid editor's live preview poses as cyan pillars with P-slot labels, each with a red
+-- Draw the grid editor's live preview poses as cyan pillars with P-position labels, each with a red
 -- orientation line in the slot's facing (drive-up) direction (ADR-0023 + amendment). The active
 -- segment's pillars read bright and the rest are dimmed, so it is clear which slots the current knobs
 -- affect. Immediate-mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false)
@@ -3204,7 +3204,12 @@ local function draw_editor_grid()
         local top = vec3(p.x, p.y, p.z + GRID_COLUMN_HEIGHT)
         local color = (pose.segment == active_segment) and active_color or inactive_color
         debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, color)
-        debugDrawer:drawTextAdvanced(top, "P" .. (index - 1), label_fg, true, false, label_bg)
+        -- The label is in DISPLAY space (ADR-0023 amendment 2026-08-01): the admin reads grid positions
+        -- 1-based, so the front pillar is "P1", like every other P in this mod (the race HUD's P<pos>).
+        -- ipairs is 1-based and the GE slot is `index - 1`, so the label is `slot + 1` == `index` exactly.
+        -- Everything underneath -- pose.segment, the params, the wire, the spawn maths -- stays 0-based;
+        -- do not "correct" this back to the slot number.
+        debugDrawer:drawTextAdvanced(top, "P" .. index, label_fg, true, false, label_bg)
         -- A short red line in the slot's facing direction so the whole field's orientation reads at a
         -- glance (faceDir is always present -- gate-normal or the fallback heading). Drawn as a thin
         -- cylinder just above the ground (the confirmed draw API; no unverified drawLine).
@@ -6175,10 +6180,17 @@ end
 
 -- GE console command (intentionally global): select (or create) the segment starting at `start_slot`
 -- as the active one; the knobs then edit it (ADR-0023 amendment). Slot 0 selects the base segment.
+-- The ARGUMENT stays a 0-based GE slot -- it is this command's contract and the same number the editor
+-- stores. Only the feedback carries both numbers (see below).
 function beamcomp_grid_breakpoint(start_slot)
     local ok, applied = grideditor.select_segment(start_slot)
     if ok then
-        editor_feedback("editing segment from slot " .. tostring(applied))
+        -- The one place the two number spaces meet in one sentence (ADR-0023 amendment 2026-08-01), and
+        -- the only user-visible text that still shows a raw slot: `applied` is the 0-based slot, kept
+        -- legible for whoever typed it into the console, and the parenthesised P is the 1-based label the
+        -- preview pillars and the editor panel show for that same slot.
+        editor_feedback("editing segment from slot " .. tostring(applied)
+            .. " (P" .. tostring(applied + 1) .. ")")
     else
         editor_feedback(tostring(applied), "warning")
     end
