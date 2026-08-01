@@ -732,3 +732,147 @@ angular.module('beamng.apps').directive('bcGridFit', [function () {
     },
   };
 }]);
+
+// Hold-to-repeat for the panel's ± stepper buttons: the gesture and nothing else. This directive owns
+// the timing and the teardown and knows nothing about knobs, clamps or GE -- the accumulator that makes
+// a repeat actually climb lives in the panel above (see holdFor / advanceHold / scope.endHold).
+//
+//   bc-grid-hold="stepKnob(k, -0.05)"    the per-press action, re-evaluated on every repeat tick
+//   bc-grid-hold-end="endHold()"         run exactly once when the gesture ends
+//
+// A TAP IS EXACTLY ONE STEP: the press itself steps, and the repeat only starts HOLD_DELAY later. Which
+// is why the buttons carry no ng-click any more -- one owner for the whole gesture, so the classic
+// double step (ng-click fires AND the hold's first tick fires) cannot happen here by construction.
+//
+// The name is app-unique for the same reason bcGridFit's is (see its header): BeamCompSetup and
+// BeamCompGridEditor share the 'beamng.apps' module, so a generically named attribute directive would
+// also claim markup in the other panel.
+//
+// $parse and $timeout are INJECTED, unlike bngApi -- not an inconsistency with this file's header. That
+// rule is about bngApi specifically, a BeamNG-registered service whose absence would take the whole
+// late-loaded directive down. $parse and $timeout are AngularJS core and cannot be missing; both sibling
+// panels inject core services exactly like this (BeamCompHud/app.js, BeamCompSetup/app.js).
+angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', function ($parse, $timeout) {
+  var HOLD_DELAY = 400;   // ms the button must stay down before the repeat starts (a tap stays 1 step)
+  var RAMP_MS = 2000;     // ms over which the repeat accelerates from RATE_MIN to RATE_MAX
+  var RATE_MIN = 6;       // steps/s the moment the repeat starts
+  var RATE_MAX = 25;      // steps/s once the ramp is done
+
+  return {
+    restrict: 'A',
+    link: function (scope, element, attrs) {
+      // Parsed once, not $eval'd per tick -- this runs up to RATE_MAX times a second.
+      var step = $parse(attrs.bcGridHold);
+      var endGesture = $parse(attrs.bcGridHoldEnd);
+      var timer = null;
+      var repeatStart = 0;
+      // Is THIS button the one currently held? Not defensive noise -- see release().
+      var isHolding = false;
+
+      // The accelerating schedule. A rescheduling $timeout, not a fixed $interval: the delay is
+      // recomputed from how long the repeat has been running, so the rate ramps instead of stepping.
+      function nextDelay() {
+        var ramp = Math.min(1, (Date.now() - repeatStart) / RAMP_MS);
+        return 1000 / (RATE_MIN + (RATE_MAX - RATE_MIN) * ramp);
+      }
+
+      // Default invokeApply, deliberately NOT the sibling panels' invokeApply:false. Theirs is right
+      // because their timer touches no scope state; every tick here writes the bound number field, and
+      // repainting that number at the full repeat rate is the entire point of the feature.
+      function tick() {
+        step(scope);
+        timer = $timeout(tick, nextDelay());
+      }
+
+      // A native listener is not wrapped the way ng-click wraps a click, so the model write has to be
+      // applied by hand. The phase check is for a blur arriving from INSIDE a digest (anything that
+      // moves focus while Angular is running): an unguarded $apply would throw there and, in the CEF
+      // overlay, take the whole panel down.
+      function applyHandler(fn) {
+        if (scope.$root && scope.$root.$$phase) {
+          fn();
+        } else {
+          scope.$apply(fn);
+        }
+      }
+
+      function stopTimer() {
+        if (timer !== null) {
+          $timeout.cancel(timer);
+          timer = null;
+        }
+      }
+
+      // End the gesture. Idempotent, and a no-op unless THIS button is the one holding. That guard is
+      // load-bearing: pressing another stepper blurs this one as part of that press's own default
+      // action, so an unguarded blur handler would close the hold the new press had just opened. The
+      // symptom is subtle rather than obvious -- the very next repeat tick reopens the accumulator, so
+      // the number still climbs -- but it reopens it from the STALE echo, which costs one step and makes
+      // GE receive the same value twice.
+      function release() {
+        if (!isHolding) {
+          return;
+        }
+        isHolding = false;
+        stopTimer();
+        document.removeEventListener('mouseup', onDocumentUp, true);
+        endGesture(scope);
+      }
+
+      // Release on a mouseup ANYWHERE: one that lands outside the button would otherwise leave the
+      // repeat running forever. The listener exists only while a hold is open, so an idle panel carries
+      // no document listener at all -- and one at a time, not one per rendered stepper.
+      function onDocumentUp() {
+        applyHandler(release);
+      }
+
+      function onMouseDown(ev) {
+        if (ev.button !== 0 || isHolding) {
+          return;                        // a right-click has no left mouseup to ever end the repeat
+        }
+        isHolding = true;
+        repeatStart = Date.now() + HOLD_DELAY;
+        document.addEventListener('mouseup', onDocumentUp, true);
+        applyHandler(function () {
+          step(scope);                   // the press itself is the first step
+        });
+        timer = $timeout(tick, HOLD_DELAY);
+      }
+
+      function onRelease() {
+        applyHandler(release);
+      }
+
+      // Keyboard activation, restoring exactly what ng-click gave these buttons before the gesture took
+      // them over: Space or Enter on a focused stepper steps ONCE. Without this, dropping ng-click would
+      // have silently removed keyboard use of the panel altogether.
+      //
+      // Deliberately not a repeat -- the OS key-autorepeat (ev.repeat) is ignored, matching the brief's
+      // mouse-only scope. The hold is closed in the same breath, because a step that opens an
+      // accumulator nobody ever closes would leave that field frozen against the GE echo for good.
+      // A mouse click cannot reach here (it produces no keydown), so this cannot double-step.
+      // keyCode, not ev.key: the panel already reads keyCode for its Enter handling (app.html).
+      function onKeyDown(ev) {
+        if (isHolding || ev.repeat || (ev.keyCode !== 13 && ev.keyCode !== 32)) {
+          return;
+        }
+        applyHandler(function () {
+          step(scope);
+          endGesture(scope);
+        });
+      }
+
+      element.on('mousedown', onMouseDown);
+      element.on('mouseleave', onRelease);
+      element.on('blur', onRelease);
+      element.on('keydown', onKeyDown);
+
+      // $destroy is already inside a digest, so release() runs directly rather than through
+      // applyHandler. jqLite drops this element's own listeners with it; the timer and the document
+      // listener are ours to clear, and the final GE send still goes out through endGesture.
+      scope.$on('$destroy', function () {
+        release();
+      });
+    },
+  };
+}]);
