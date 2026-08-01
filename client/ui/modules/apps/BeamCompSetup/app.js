@@ -340,7 +340,7 @@ angular.module('beamng.apps')
         aiDefaults: null, assistHoldDefault: null };
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
-      scope.prepared = false;  // true after Prepare Race: the race is staging, so reveal Start Race
+      scope.prepared = false;  // true after Confirm & Build Grid: the race is staging, so reveal Start Race
       scope.presetName = '';       // the name field of the revealed Save row (ADR-0037 amendment)
       scope.selectedPreset = '';   // the preset last loaded: marks its row and prefills the save name
       // The Presets section is collapsed to its two buttons and reveals what each action needs (ADR-0037
@@ -770,7 +770,8 @@ angular.module('beamng.apps')
         }
       });
 
-      // Prepare Race: send the structured request -- the race spawns + enters staging. Reveals Start Race.
+      // Confirm & Build Grid (the button; this handler keeps the `prepare` name, see the label comment in
+      // app.html): send the structured request -- the race spawns + enters staging. Reveals Start Race.
       // While a championship is active, omit order= so the server applies the championship's grid order
       // (ADR-0040) instead of this panel's default; an explicit per-race order would otherwise win.
       scope.prepareRace = function () {
@@ -868,8 +869,8 @@ angular.module('beamng.apps')
       scope.$on('BeamCompSetupPhase', function (event, payload) {
         scope.$evalAsync(function () {
           scope.phase = (payload && payload.phase) || 'lobby';
-          // The Start Race button is revealed by Prepare Race (scope.prepared), which is link-time state
-          // -- so a panel restored after a UI reload would show a staged race with no way to start it.
+          // The Start Race button is revealed by Confirm & Build Grid (scope.prepared), which is link-time
+          // state -- so a panel restored after a UI reload would show a staged race with no way to start it.
           // The FIRST phase push after link (request_race_phase, pulled below) therefore seeds prepared
           // from server truth: a race already in staging IS prepared. One-shot, so a live panel behaves
           // exactly as before -- someone else's later prepare changes nothing here.
