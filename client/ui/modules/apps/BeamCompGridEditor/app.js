@@ -31,19 +31,46 @@ angular.module('beamng.apps')
   // +1 hovers the cars exactly 1 m above the ground; per segment, it does not chain into later
   // segments (blank on an older saved grid, which GE treats as 0). The internal split height anchor
   // (anchorHeight, auto-seeded on breakpoint creation) is deliberately NOT a knob.
+  //
+  // `min` mirrors the Lua constraint of the same name in race/grideditor.lua's own KNOBS table, because
+  // a held stepper clamps locally now (see clampKnob) instead of letting GE clamp and echo back.
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)' },
     { key: 'offsetLateral', label: 'Offset lateral (m)' },
     { key: 'headingDeg', label: 'Heading (deg)' },
-    { key: 'rowGap', label: 'Row gap (m)' },
-    { key: 'colGap', label: 'Col gap (m)' },
-    { key: 'rows', label: 'Rows', integer: true, auto: true },
-    { key: 'columns', label: 'Columns', integer: true, auto: true },
+    { key: 'rowGap', label: 'Row gap (m)', min: 0 },
+    { key: 'colGap', label: 'Col gap (m)', min: 0 },
+    { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1 },
+    { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1 },
     { key: 'offsetHeight', label: 'Height lift (m)' },
   ];
 
   var PREVIEW_MIN = 1;
   var PREVIEW_MAX = 32;
+
+  // A held stepper reaches GE at most this often (ms). Every send runs recompute() GE-side --
+  // grid.poses_segmented plus up to 32 ground raycasts -- so the displayed number moves at the full
+  // repeat rate while GE hears about it ~10x/s (plus the guaranteed final one, see scope.endHold).
+  var SEND_INTERVAL = 100;
+
+  // Clamp one accumulator tick exactly the way grideditor.set would clamp the same value (its KNOBS
+  // table plus M.set): integer knobs floor, `min` mirrors the Lua constraint of the same name, and
+  // continuous knobs round to 2 decimals so 0.05 steps do not accumulate float noise at 25 steps/s.
+  // This has to run PER TICK on the accumulator -- otherwise holding `-` on a gap runs it to -40 and
+  // then takes 40 steps to come back to where the field actually stops.
+  //
+  // There is deliberately NO upper bound. rows/columns declare `max = PREVIEW_COUNT` in grideditor.lua,
+  // but PREVIEW_COUNT is not a local in that file (its constants are DEFAULT_/MIN_/MAX_PREVIEW_COUNT),
+  // so it reads nil, M.set's `if constraint.max` branch never fires, and GE really will hold rows = 47.
+  // Mirroring the INTENDED 32 here would park the field at a bound GE does not enforce. That defect is
+  // the separate backlog item `grideditor-knobs-missing-upper-clamp` -- mirror reality until it is fixed.
+  function clampKnob(knob, value) {
+    var next = knob.integer ? Math.floor(value) : Math.round(value * 100) / 100;
+    if (knob.min !== undefined && next < knob.min) {
+      next = knob.min;
+    }
+    return next;
+  }
 
   // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
   // every further one "<EXTRA_GRID_PREFIX><n>". Both are prefills only -- the field stays freely editable,
@@ -248,19 +275,99 @@ angular.module('beamng.apps')
         }
       }
 
+      // ---- Hold-to-repeat accumulator (bcGridHold at the bottom of this file drives it) --------------
+      // Holding a ± button repeats its step, and every repeat tick has to advance a LOCAL value. It
+      // cannot recompute base + delta from scope.state the way a single click does: those fields are
+      // only written when GE echoes BeamCompGridState back, i.e. after an async round trip, so every
+      // tick would read the same stale base and the number would jitter by one step instead of climbing.
+      //
+      // A press therefore opens a HOLD: an optimistic accumulator seeded from the same authoritative
+      // source the single click read, advanced and clamped per tick, written into the bound field at the
+      // full repeat rate, and pushed to GE at most every SEND_INTERVAL ms. One hold at a time -- there is
+      // one mouse.
+      var hold = null;
+
+      // Is this scope.edit field currently owned by the accumulator instead of by the GE echo?
+      function isHeld(field) {
+        return hold !== null && hold.field === field;
+      }
+
+      // Open (or reuse) the hold on `field` and return it. `makeHold(arg)` runs only when a hold actually
+      // opens -- a repeat tick allocates nothing -- and yields the seed value, the per-tick clamp and the
+      // GE send (null for a field GE never sees). Stepping a different field finishes the previous hold
+      // properly first, so no accumulator is ever left open behind another one.
+      function holdFor(field, makeHold, arg) {
+        if (isHeld(field)) {
+          return hold;
+        }
+        scope.endHold();
+        var opened = makeHold(arg);
+        hold = { field: field, value: opened.base, clamp: opened.clamp, send: opened.send,
+          sentValue: null, sentAt: 0 };
+        return hold;
+      }
+
+      // One step: advance and clamp the accumulator, show it immediately, and let it through to GE at
+      // most every SEND_INTERVAL ms (leading edge -- scope.endHold is the trailing one, so there is no
+      // second timer to leak).
+      function advanceHold(held, delta) {
+        held.value = held.clamp(held.value + delta);
+        scope.edit[held.field] = held.value;
+        if (!held.send) {
+          return;
+        }
+        var now = Date.now();
+        if (now - held.sentAt >= SEND_INTERVAL) {
+          held.sentAt = now;
+          held.sentValue = held.value;
+          held.send(held.value);
+        }
+      }
+
+      // End the hold: the echo owns the field again from this instant, and GE ends up holding exactly
+      // the value the admin was last looking at. On the scope because bc-grid-hold-end fires it --
+      // bcGridHold owns every release path (mouseup anywhere, mouseleave, blur, $destroy).
+      //
+      // The final send is skipped when the throttle already sent this exact value. That is not an
+      // optimisation but a requirement: sending unconditionally would make an ordinary 120 ms tap -- any
+      // tap longer than SEND_INTERVAL -- cost two GE round trips for one step. Where it is skipped it is
+      // provably a no-op, so "the last value the admin saw is the value GE holds" stays unconditional.
+      scope.endHold = function () {
+        var held = hold;
+        if (held === null) {
+          return;
+        }
+        hold = null;
+        if (held.send && held.sentValue !== held.value) {
+          held.send(held.value);
+        }
+      };
+
       // Sync the editable number fields from the authoritative state, so the inputs show GE's clamped values
       // (and `columns` shows blank when auto/derived). The fields commit on blur, not per keystroke, so a
       // state push never lands mid-type to fight the cursor.
+      //
+      // A field with a hold open on it is skipped: its accumulator is ahead of the throttled echo, so
+      // writing an older value here would visibly yank the number backwards mid-hold. Every other part of
+      // the push still applies -- scope.state stays the authority for everything except that one field,
+      // and only until the button comes back up.
       function syncEditFromState() {
         var knobs = scope.state.knobs || {};
         KNOBS.forEach(function (k) {
+          if (isHeld(k.key)) {
+            return;
+          }
           var value = knobs[k.key];
           scope.edit[k.key] = (value === undefined || value === null) ? '' : value;
         });
-        scope.edit.previewCount = scope.state.previewCount;
+        if (!isHeld('previewCount')) {
+          scope.edit.previewCount = scope.state.previewCount;
+        }
         // The breakpoint field baselines on the active segment's start slot (a state push resets it, like
         // the knob fields); the admin retypes it to add/select a different breakpoint.
-        scope.edit.breakpointSlot = scope.state.activeStartSlot;
+        if (!isHeld('breakpointSlot')) {
+          scope.edit.breakpointSlot = scope.state.activeStartSlot;
+        }
       }
 
       scope.$on('BeamCompGridData', function (event, payload) {
@@ -472,24 +579,25 @@ angular.module('beamng.apps')
         geLuaArg('grid_set_direction', direction);
       };
 
-      // Stepper: nudge a knob by `delta` (a fine ±0.05 or coarse ±1.0 from the buttons) off the current
-      // value (auto/blank starts at 0). Continuous values round to 2 decimals so repeated 0.05 steps don't
-      // accumulate float noise; integer knobs clamp to >= 1.
+      // Where a knob's hold starts: the current authoritative value (auto/blank starts at 0) -- the GE
+      // echo, deliberately NOT scope.edit. A number typed into the field but never committed must not
+      // become the base a stepper counts from, which is the source the single click always used too.
+      function knobHold(knob) {
+        var current = scope.state.knobs ? scope.state.knobs[knob.key] : undefined;
+        return {
+          base: (current === undefined || current === null) ? 0 : Number(current),
+          clamp: function (value) { return clampKnob(knob, value); },
+          send: function (value) { geSetKnob(knob.key, value); },
+        };
+      }
+
+      // Stepper: nudge a knob by `delta` (a fine ±0.05 or coarse ±1.0 from the buttons). A tap is one
+      // step; holding the button repeats it against the accumulator instead of against the echo.
       scope.stepKnob = function (knob, delta) {
         if (!scope.state.active) {
           return;
         }
-        var current = scope.state.knobs ? scope.state.knobs[knob.key] : undefined;
-        var base = (current === undefined || current === null) ? 0 : Number(current);
-        var next = base + delta;
-        if (knob.integer) {
-          if (next < 1) {
-            next = 1;
-          }
-        } else {
-          next = Math.round(next * 100) / 100;
-        }
-        geSetKnob(knob.key, next);
+        advanceHold(holdFor(knob.key, knobHold, knob), delta);
       };
 
       // Mirror toggle: send the boolean to GE, which echoes it back through BeamCompGridState so the
@@ -528,13 +636,24 @@ angular.module('beamng.apps')
         geSetKnob(knob.key, value);
       };
 
+      // Where the preview count's hold starts, and how a tick is clamped: [PREVIEW_MIN, PREVIEW_MAX]
+      // after flooring, mirroring grideditor.set_preview_count. Clamping per tick is what makes a long
+      // hold park at 32 instead of running the accumulator to 900 and taking three seconds to come back.
+      function previewHold() {
+        return {
+          base: Number(scope.state.previewCount || PREVIEW_MIN),
+          clamp: function (value) {
+            return Math.max(PREVIEW_MIN, Math.min(PREVIEW_MAX, Math.floor(value)));
+          },
+          send: function (value) { geLuaNum('grid_set_preview', value); },
+        };
+      }
+
       scope.stepPreview = function (direction) {
         if (!scope.state.active) {
           return;
         }
-        var next = Number(scope.state.previewCount || PREVIEW_MIN) + direction;
-        next = Math.max(PREVIEW_MIN, Math.min(PREVIEW_MAX, next));
-        geLuaNum('grid_set_preview', next);
+        advanceHold(holdFor('previewCount', previewHold), direction);
       };
       scope.commitPreview = function () {
         if (!scope.state.active || scope.edit.previewCount === '' || scope.edit.previewCount === null) {
@@ -546,18 +665,26 @@ angular.module('beamng.apps')
       // Breakpoint / segment editing (ADR-0023 amendment). The GE session owns the segment list; the
       // panel only asks it to select/create/remove and reflects the echoed state.
 
-      // Nudge the breakpoint-slot field (does not apply -- the admin then presses Select / add). Clamped
-      // to >= 0 (slot 0 is the base segment).
-      scope.stepBreakpoint = function (delta) {
+      // Where the breakpoint-slot hold starts: this field is local and freely typed, so unlike the knobs
+      // it seeds off the field itself and falls back to the active segment's start slot. `send: null` --
+      // the value never reaches GE (the admin presses Select / add for that), so a held button here costs
+      // nothing but the repaint.
+      function breakpointHold() {
         var base = Number(scope.edit.breakpointSlot);
         if (!isFinite(base)) {
           base = scope.state.activeStartSlot || 0;
         }
-        var next = base + delta;
-        if (next < 0) {
-          next = 0;
-        }
-        scope.edit.breakpointSlot = next;
+        return {
+          base: base,
+          clamp: function (value) { return value < 0 ? 0 : value; },
+          send: null,
+        };
+      }
+
+      // Nudge the breakpoint-slot field (does not apply -- the admin then presses Select / add). Clamped
+      // to >= 0 (slot 0 is the base segment).
+      scope.stepBreakpoint = function (delta) {
+        advanceHold(holdFor('breakpointSlot', breakpointHold), delta);
       };
 
       // Select the segment starting at `slot`, or create one there seeded from the covering segment.
@@ -728,6 +855,150 @@ angular.module('beamng.apps').directive('bcGridFit', [function () {
             window.clearTimeout(pending);
           }
         }
+      });
+    },
+  };
+}]);
+
+// Hold-to-repeat for the panel's ± stepper buttons: the gesture and nothing else. This directive owns
+// the timing and the teardown and knows nothing about knobs, clamps or GE -- the accumulator that makes
+// a repeat actually climb lives in the panel above (see holdFor / advanceHold / scope.endHold).
+//
+//   bc-grid-hold="stepKnob(k, -0.05)"    the per-press action, re-evaluated on every repeat tick
+//   bc-grid-hold-end="endHold()"         run exactly once when the gesture ends
+//
+// A TAP IS EXACTLY ONE STEP: the press itself steps, and the repeat only starts HOLD_DELAY later. Which
+// is why the buttons carry no ng-click any more -- one owner for the whole gesture, so the classic
+// double step (ng-click fires AND the hold's first tick fires) cannot happen here by construction.
+//
+// The name is app-unique for the same reason bcGridFit's is (see its header): BeamCompSetup and
+// BeamCompGridEditor share the 'beamng.apps' module, so a generically named attribute directive would
+// also claim markup in the other panel.
+//
+// $parse and $timeout are INJECTED, unlike bngApi -- not an inconsistency with this file's header. That
+// rule is about bngApi specifically, a BeamNG-registered service whose absence would take the whole
+// late-loaded directive down. $parse and $timeout are AngularJS core and cannot be missing; both sibling
+// panels inject core services exactly like this (BeamCompHud/app.js, BeamCompSetup/app.js).
+angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', function ($parse, $timeout) {
+  var HOLD_DELAY = 400;   // ms the button must stay down before the repeat starts (a tap stays 1 step)
+  var RAMP_MS = 2000;     // ms over which the repeat accelerates from RATE_MIN to RATE_MAX
+  var RATE_MIN = 6;       // steps/s the moment the repeat starts
+  var RATE_MAX = 25;      // steps/s once the ramp is done
+
+  return {
+    restrict: 'A',
+    link: function (scope, element, attrs) {
+      // Parsed once, not $eval'd per tick -- this runs up to RATE_MAX times a second.
+      var step = $parse(attrs.bcGridHold);
+      var endGesture = $parse(attrs.bcGridHoldEnd);
+      var timer = null;
+      var repeatStart = 0;
+      // Is THIS button the one currently held? Not defensive noise -- see release().
+      var isHolding = false;
+
+      // The accelerating schedule. A rescheduling $timeout, not a fixed $interval: the delay is
+      // recomputed from how long the repeat has been running, so the rate ramps instead of stepping.
+      function nextDelay() {
+        var ramp = Math.min(1, (Date.now() - repeatStart) / RAMP_MS);
+        return 1000 / (RATE_MIN + (RATE_MAX - RATE_MIN) * ramp);
+      }
+
+      // Default invokeApply, deliberately NOT the sibling panels' invokeApply:false. Theirs is right
+      // because their timer touches no scope state; every tick here writes the bound number field, and
+      // repainting that number at the full repeat rate is the entire point of the feature.
+      function tick() {
+        step(scope);
+        timer = $timeout(tick, nextDelay());
+      }
+
+      // A native listener is not wrapped the way ng-click wraps a click, so the model write has to be
+      // applied by hand. The phase check is for a blur arriving from INSIDE a digest (anything that
+      // moves focus while Angular is running): an unguarded $apply would throw there and, in the CEF
+      // overlay, take the whole panel down.
+      function applyHandler(fn) {
+        if (scope.$root && scope.$root.$$phase) {
+          fn();
+        } else {
+          scope.$apply(fn);
+        }
+      }
+
+      function stopTimer() {
+        if (timer !== null) {
+          $timeout.cancel(timer);
+          timer = null;
+        }
+      }
+
+      // End the gesture. Idempotent, and a no-op unless THIS button is the one holding. That guard is
+      // load-bearing: pressing another stepper blurs this one as part of that press's own default
+      // action, so an unguarded blur handler would close the hold the new press had just opened. The
+      // symptom is subtle rather than obvious -- the very next repeat tick reopens the accumulator, so
+      // the number still climbs -- but it reopens it from the STALE echo, which costs one step and makes
+      // GE receive the same value twice.
+      function release() {
+        if (!isHolding) {
+          return;
+        }
+        isHolding = false;
+        stopTimer();
+        document.removeEventListener('mouseup', onDocumentUp, true);
+        endGesture(scope);
+      }
+
+      // Release on a mouseup ANYWHERE: one that lands outside the button would otherwise leave the
+      // repeat running forever. The listener exists only while a hold is open, so an idle panel carries
+      // no document listener at all -- and one at a time, not one per rendered stepper.
+      function onDocumentUp() {
+        applyHandler(release);
+      }
+
+      function onMouseDown(ev) {
+        if (ev.button !== 0 || isHolding) {
+          return;                        // a right-click has no left mouseup to ever end the repeat
+        }
+        isHolding = true;
+        repeatStart = Date.now() + HOLD_DELAY;
+        document.addEventListener('mouseup', onDocumentUp, true);
+        applyHandler(function () {
+          step(scope);                   // the press itself is the first step
+        });
+        timer = $timeout(tick, HOLD_DELAY);
+      }
+
+      function onRelease() {
+        applyHandler(release);
+      }
+
+      // Keyboard activation, restoring exactly what ng-click gave these buttons before the gesture took
+      // them over: Space or Enter on a focused stepper steps ONCE. Without this, dropping ng-click would
+      // have silently removed keyboard use of the panel altogether.
+      //
+      // Deliberately not a repeat -- the OS key-autorepeat (ev.repeat) is ignored, matching the brief's
+      // mouse-only scope. The hold is closed in the same breath, because a step that opens an
+      // accumulator nobody ever closes would leave that field frozen against the GE echo for good.
+      // A mouse click cannot reach here (it produces no keydown), so this cannot double-step.
+      // keyCode, not ev.key: the panel already reads keyCode for its Enter handling (app.html).
+      function onKeyDown(ev) {
+        if (isHolding || ev.repeat || (ev.keyCode !== 13 && ev.keyCode !== 32)) {
+          return;
+        }
+        applyHandler(function () {
+          step(scope);
+          endGesture(scope);
+        });
+      }
+
+      element.on('mousedown', onMouseDown);
+      element.on('mouseleave', onRelease);
+      element.on('blur', onRelease);
+      element.on('keydown', onKeyDown);
+
+      // $destroy is already inside a digest, so release() runs directly rather than through
+      // applyHandler. jqLite drops this element's own listeners with it; the timer and the document
+      // listener are ours to clear, and the final GE send still goes out through endGesture.
+      scope.$on('$destroy', function () {
+        release();
       });
     },
   };
