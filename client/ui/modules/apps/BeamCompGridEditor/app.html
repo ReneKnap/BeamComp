@@ -20,7 +20,8 @@
     .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
       color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
     .bc-hint { font-size: 11px; color: #9aa3ad; margin: 2px 0 4px; }
-    /* Stepper: [-1] [-] number [+] [+1] (coarse +-1.0, fine +-0.05). */
+    /* Stepper: [-1] [-] number [+] [+1] (coarse +-1.0, fine +-0.05). Every one of these buttons repeats
+       while it is held down (bc-grid-hold, see app.js) -- a tap is still exactly one step. */
     .bc-step { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; gap: 3px; }
     .bc-step input { flex: 1 1 auto; min-width: 0; text-align: center; }
     .bc-step button { flex: 0 0 22px; height: 22px; background: #355; color: #cde; border: none;
@@ -200,9 +201,9 @@
       <div class="bc-row">
         <span>Breakpoint slot</span>
         <div class="bc-step">
-          <button ng-click="stepBreakpoint(-1)" title="-1">&minus;</button>
+          <button bc-grid-hold="stepBreakpoint(-1)" bc-grid-hold-end="endHold()" title="-1">&minus;</button>
           <input type="number" min="0" ng-model="edit.breakpointSlot">
-          <button ng-click="stepBreakpoint(1)" title="+1">+</button>
+          <button bc-grid-hold="stepBreakpoint(1)" bc-grid-hold-end="endHold()" title="+1">+</button>
         </div>
       </div>
       <div class="bc-row">
@@ -233,20 +234,24 @@
       <div class="bc-row bc-knob" ng-repeat="k in knobs">
         <span>{{k.label}}</span>
         <div class="bc-step">
-          <button class="bc-coarse" ng-click="stepKnob(k, -1)" title="-1">&minus;1</button>
-          <button ng-if="!k.integer" ng-click="stepKnob(k, -0.05)" title="-0.05">&minus;</button>
+          <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()"
+            title="-1">&minus;1</button>
+          <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, -0.05)" bc-grid-hold-end="endHold()"
+            title="-0.05">&minus;</button>
           <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
             placeholder="{{k.auto ? 'auto' : knobHint(k)}}">
-          <button ng-if="!k.integer" ng-click="stepKnob(k, 0.05)" title="+0.05">+</button>
-          <button class="bc-coarse" ng-click="stepKnob(k, 1)" title="+1">+1</button>
+          <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, 0.05)" bc-grid-hold-end="endHold()"
+            title="+0.05">+</button>
+          <button class="bc-coarse" bc-grid-hold="stepKnob(k, 1)" bc-grid-hold-end="endHold()"
+            title="+1">+1</button>
         </div>
       </div>
       <div class="bc-row">
         <span>Preview count</span>
         <div class="bc-step">
-          <button ng-click="stepPreview(-1)">&minus;</button>
+          <button bc-grid-hold="stepPreview(-1)" bc-grid-hold-end="endHold()">&minus;</button>
           <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-blur="commitPreview()">
-          <button ng-click="stepPreview(1)">+</button>
+          <button bc-grid-hold="stepPreview(1)" bc-grid-hold-end="endHold()">+</button>
         </div>
       </div>
     </div>
