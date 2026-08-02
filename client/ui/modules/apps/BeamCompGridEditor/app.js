@@ -72,6 +72,38 @@ angular.module('beamng.apps')
     return next;
   }
 
+  // ---- The panel's two slot NUMBER SPACES (ADR-0023 amendment 2026-08-01) ------------------------
+  //
+  // GE, the stored params, the wire and the spawn maths are 0-based end to end: SLOT 0 is the front of
+  // the grid, and grideditor.lua / grid.lua / start.lua / beamcomp.grids.json never see anything else.
+  // Everything the ADMIN reads is 1-based, so the front slot is labelled "P1" -- matching every other P
+  // in this mod (the race HUD writes P{{position}} 1-based throughout). The grid editor used to be the
+  // only surface where P started at zero, and it is exactly the surface where an admin decides who lines
+  // up in front.
+  //
+  // These two functions are the ONLY conversion in the panel. No other site does its own + 1 / - 1, and
+  // nothing in display space is ever handed to GE: the one function that talks to GE about a slot
+  // (scope.selectSegment) stays in GE space, and the typed field gets its own entry point that converts
+  // exactly once (scope.selectTypedSegment). Do not "fix" the pillar/panel numbers back to the slot
+  // numbers -- the mismatch between them is the point.
+  //
+  // Both are plain arithmetic with no guards of their own -- the caller decides what an unusable value
+  // means, because the two callers want different things (the field's hold seeds from a fallback, the
+  // Select / add path declines). Note especially that AngularJS parses an EMPTY number input to `null`,
+  // not undefined, so displayToSlot(null) is a perfectly finite -1: whoever converts a field value has to
+  // rule that out FIRST (see scope.selectTypedSegment) instead of trusting geLuaNum's isFinite check.
+  function slotToDisplay(slot) {
+    return Number(slot) + 1;
+  }
+
+  function displayToSlot(display) {
+    return Number(display) - 1;
+  }
+
+  // The breakpoint field's floor. Slot 0 is the base segment, so the smallest number the admin can dial
+  // is its label -- expressed through the conversion rather than hard-coded, so the two cannot drift.
+  var SLOT_DISPLAY_MIN = slotToDisplay(0);
+
   // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
   // every further one "<EXTRA_GRID_PREFIX><n>". Both are prefills only -- the field stays freely editable,
   // and nothing downstream depends on a grid actually carrying one of these names.
@@ -196,13 +228,17 @@ angular.module('beamng.apps')
       scope.form = { race: '', loadName: '', saveName: '' };
       // The authoritative live session as last reflected by GE (BeamCompGridState). `segments` is the
       // ordered breakpoint boundaries ([{startSlot}]), `activeSegment` the 1-based index the knobs edit,
-      // `activeStartSlot` that segment's start slot (ADR-0023 amendment).
+      // `activeStartSlot` that segment's start slot (ADR-0023 amendment). Every slot in here is a GE SLOT
+      // (0-based) -- this payload is GE's, unchanged; only what is rendered from it is 1-based.
       // `knobDefaults` are the layout defaults GE falls back to for a knob a loaded block omits -- shown as
       // that field's placeholder (see scope.knobHint).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
         knobDefaults: null };
-      scope.edit = {};          // editable mirror of the knob number fields, synced from state on each push
+      // Editable mirror of the number fields, synced from state on each push. The knob entries hold GE's own
+      // values; `breakpointDisplay` alone is in DISPLAY space (see slotToDisplay above) -- which is why it
+      // is not called breakpointSlot.
+      scope.edit = {};
       scope.savedName = null;   // set after a save/load; gates the default button (it needs a saved grid)
       scope.open = null;        // name of the currently open dropdown, or null
       scope.opts = { race: [], loadName: [] };
@@ -364,9 +400,11 @@ angular.module('beamng.apps')
           scope.edit.previewCount = scope.state.previewCount;
         }
         // The breakpoint field baselines on the active segment's start slot (a state push resets it, like
-        // the knob fields); the admin retypes it to add/select a different breakpoint.
-        if (!isHeld('breakpointSlot')) {
-          scope.edit.breakpointSlot = scope.state.activeStartSlot;
+        // the knob fields); the admin retypes it to add/select a different breakpoint. state.activeStartSlot
+        // is a GE SLOT and the field is a DISPLAY number, so this is one of the two places that seed the
+        // field from a slot (the other is breakpointHold's fallback).
+        if (!isHeld('breakpointDisplay')) {
+          scope.edit.breakpointDisplay = slotToDisplay(scope.state.activeStartSlot);
         }
       }
 
@@ -665,34 +703,63 @@ angular.module('beamng.apps')
       // Breakpoint / segment editing (ADR-0023 amendment). The GE session owns the segment list; the
       // panel only asks it to select/create/remove and reflects the echoed state.
 
-      // Where the breakpoint-slot hold starts: this field is local and freely typed, so unlike the knobs
-      // it seeds off the field itself and falls back to the active segment's start slot. `send: null` --
-      // the value never reaches GE (the admin presses Select / add for that), so a held button here costs
-      // nothing but the repaint.
+      // Where the breakpoint field's hold starts: the field is local and freely typed, so unlike the knobs
+      // it seeds off the field itself -- already a DISPLAY number -- and falls back to the active segment's
+      // start slot, which is a GE SLOT and therefore converted (the second of the two places that seed the
+      // field from a slot). `send: null` -- the value never reaches GE (the admin presses Select / add for
+      // that), so a held button here costs nothing but the repaint.
       function breakpointHold() {
-        var base = Number(scope.edit.breakpointSlot);
+        var base = Number(scope.edit.breakpointDisplay);
         if (!isFinite(base)) {
-          base = scope.state.activeStartSlot || 0;
+          base = slotToDisplay(scope.state.activeStartSlot || 0);
         }
         return {
           base: base,
-          clamp: function (value) { return value < 0 ? 0 : value; },
+          clamp: function (value) { return value < SLOT_DISPLAY_MIN ? SLOT_DISPLAY_MIN : value; },
           send: null,
         };
       }
 
-      // Nudge the breakpoint-slot field (does not apply -- the admin then presses Select / add). Clamped
-      // to >= 0 (slot 0 is the base segment).
+      // Nudge the breakpoint field (does not apply -- the admin then presses Select / add). Clamped to the
+      // display floor: holding `-` parks at P1, the label of the base segment's slot 0. The clamp also has
+      // to hold that floor for a second reason -- the input's own min="1" validator blanks the model on any
+      // smaller value, so an unclamped hold would empty the field instead of stopping in it.
       scope.stepBreakpoint = function (delta) {
-        advanceHold(holdFor('breakpointSlot', breakpointHold), delta);
+        advanceHold(holdFor('breakpointDisplay', breakpointHold), delta);
       };
 
       // Select the segment starting at `slot`, or create one there seeded from the covering segment.
+      // `slot` is a GE SLOT (0-based) and goes to GE untouched -- the chips pass state.segments[i].startSlot
+      // straight through. Anything coming from the display side goes through selectTypedSegment instead.
       scope.selectSegment = function (slot) {
         if (!scope.state.active) {
           return;
         }
         geLuaNum('grid_select_segment', slot);
+      };
+
+      // The typed field's own way in. edit.breakpointDisplay is a DISPLAY number, so it is converted here,
+      // once, and handed on in GE space. Two entry points rather than one shared function is the whole
+      // point: feeding one function from two number spaces is precisely how an off-by-one ships.
+      //
+      // An unusable field does nothing at all, like commitKnob and commitPreview above. The guard is not
+      // decoration: AngularJS's number parser turns an EMPTY input into `null`, not undefined, and
+      // Number(null) is 0 -- so an unguarded conversion would quietly hand GE the slot -1. It is also
+      // where "there is no P0" lives in JS rather than only in the input's min attribute; a value below
+      // the floor is invalid there too and arrives here as undefined.
+      scope.selectTypedSegment = function () {
+        var display = Number(scope.edit.breakpointDisplay);
+        if (!isFinite(display) || display < SLOT_DISPLAY_MIN) {
+          return;
+        }
+        scope.selectSegment(displayToSlot(display));
+      };
+
+      // A slot's label as the admin reads it, and the panel's only formatter for one: the hint and the
+      // breakpoint chips both render a GE slot through this, so they cannot drift apart or away from the
+      // preview pillars (init.lua's draw_editor_grid writes the same label).
+      scope.slotLabel = function (slot) {
+        return 'P' + slotToDisplay(slot);
       };
 
       // Remove the active breakpoint (merges its slots into the previous segment). GE rejects segment 0.

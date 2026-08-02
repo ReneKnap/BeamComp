@@ -192,23 +192,30 @@
       <div class="bc-hint">Reverse is only saved if you edit it; a race with no reverse geometry is rejected.</div>
     </div>
 
-    <!-- Segment / breakpoint -->
+    <!-- Segment / breakpoint. Every slot number in this section is written the way the admin reads it on
+         the preview pillars -- 1-based, P-prefixed, front slot = P1 (ADR-0023 amendment 2026-08-01). The
+         numbers underneath (state.activeStartSlot, s.startSlot, and everything GE stores) stay 0-based;
+         app.js's slotToDisplay/displayToSlot pair is the only place the two spaces meet, and slotLabel is
+         the only formatter this template may use for a slot. "Editing segment N of M" is NOT part of that
+         -- state.activeSegment has always been 1-based. -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Segment</div>
-      <div class="bc-hint">Editing segment {{state.activeSegment}} of {{state.segments.length}} (from slot
-        {{state.activeStartSlot}}). The Layout knobs below apply to this segment; it stacks behind the
-        previous one, with its Offset forward as the gap.</div>
+      <div class="bc-hint">Editing segment {{state.activeSegment}} of {{state.segments.length}} (from
+        {{slotLabel(state.activeStartSlot)}}). The Layout knobs below apply to this segment; it stacks
+        behind the previous one, with its Offset forward as the gap.</div>
       <div class="bc-row">
-        <span>Breakpoint slot</span>
+        <span>Breakpoint at P</span>
         <div class="bc-step">
           <button bc-grid-hold="stepBreakpoint(-1)" bc-grid-hold-end="endHold()" title="-1">&minus;</button>
-          <input type="number" min="0" ng-model="edit.breakpointSlot">
+          <input type="number" min="1" ng-model="edit.breakpointDisplay">
           <button bc-grid-hold="stepBreakpoint(1)" bc-grid-hold-end="endHold()" title="+1">+</button>
         </div>
       </div>
       <div class="bc-row">
         <span></span>
-        <button class="bc-mini" ng-click="selectSegment(edit.breakpointSlot)">Select / add</button>
+        <!-- The typed field is in display space, so it gets its own handler that converts once; the chips
+             below hold real GE slots and go straight to selectSegment. Do not merge the two. -->
+        <button class="bc-mini" ng-click="selectTypedSegment()">Select / add</button>
         <button class="bc-mini bc-danger" ng-disabled="state.activeSegment <= 1"
           ng-click="removeSegment()">Remove</button>
       </div>
@@ -216,7 +223,7 @@
         <span>Breakpoints</span>
         <div class="bc-seg">
           <button ng-repeat="s in state.segments" ng-class="{on: ($index + 1) === state.activeSegment}"
-            ng-click="selectSegment(s.startSlot)">{{s.startSlot}}</button>
+            ng-click="selectSegment(s.startSlot)">{{slotLabel(s.startSlot)}}</button>
         </div>
       </div>
     </div>
