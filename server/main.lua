@@ -351,6 +351,10 @@ local grid_store = {
     -- write_grids, so an in-game save can never overwrite an unmigrated file with the empty store the
     -- rejection left behind (that file still holds the admin's authored grids).
     grids_legacy = false,
+    -- True only when load_grids ran all the way through -- i.e. past BOTH its early returns (no file /
+    -- unparseable, and the legacy map-keyed schema). The startup migration gates on it, so an unattended
+    -- write can never fire against a file we refused to read (ADR-0023 amendment 2026-08-02).
+    grids_clean = false,
 }
 
 -- Named race-setup presets (ADR-0037 amendment 2026-07-03). A preset is the setup panel's form JSON,
@@ -513,6 +517,7 @@ local function load_grids()
     grid_store.grids = {}
     grid_store.defaults = {}
     grid_store.grids_legacy = false
+    grid_store.grids_clean = false
 
     local data, path, err = read_grids()
     grid_store.grids_path = path
@@ -539,6 +544,9 @@ local function load_grids()
     if type(data.defaults) == "table" then
         grid_store.defaults = data.defaults
     end
+    -- Past both early returns: this file was read cleanly and the store mirrors it, so writing it back is
+    -- safe. Nothing else may set this flag (ADR-0023 amendment 2026-08-02).
+    grid_store.grids_clean = true
     log_info("beamcomp.grid", "loaded grids from " .. path)
 end
 
@@ -551,6 +559,12 @@ local function ensure_grids_loaded()
     end
     grid_store.grids_loaded = true
     load_grids()
+    -- Stamp the authored field size into records saved before that field existed, and write the file back
+    -- once (ADR-0023 amendment 2026-08-02). A FIELD lookup, resolved at call time on purpose:
+    -- stamp_preview_counts is declared further down the chunk because it must be able to call write_grids
+    -- (a local declared after this function), and nothing calls ensure_grids_loaded before the chunk has
+    -- finished loading. Harmless on the lazy re-load path -- a stamped store finds nothing to do.
+    grid_store.stamp_preview_counts()
 end
 
 -- The grid param record for a race start, or nil to fall back to the procedural grid (ADR-0023).
@@ -808,6 +822,58 @@ end
 -- reach a read path without one.
 function grid_store.preview_count_of(record)
     return grid_store.usable_preview_count(record) or grid_store.PREVIEW_COUNT_DEFAULT
+end
+
+-- Give every stored grid an explicit authored field size and persist it once (ADR-0023 amendment
+-- 2026-08-02). Grids saved before the field existed get the default; a record whose previewCount is
+-- unusable is repaired the same way. A record that already carries a usable one is left EXACTLY as it
+-- stands, even when it is not the default -- this migration only ever adds the key it is named after.
+-- Returns how many records were stamped. Called from ensure_grids_loaded, right after load_grids.
+--
+-- This is the first write to the grids file that no admin triggered, so it is fenced accordingly:
+--   * it goes through write_grids (atomic temp -> rename, and it refuses a legacy-schema file itself);
+--   * grids_clean gates it, so a missing/unparseable/legacy file -- for which load_grids returns early
+--     with a deliberately EMPTY store -- is never rewritten from that empty store. That would be data
+--     loss, and it is the whole reason the legacy guard exists (ADR-0023 amendment 2026-07-27);
+--   * nothing stamped means nothing written at all. That is what makes it idempotent -- and writing the
+--     grids file is itself what trips BeamMP's file watcher into re-running this chunk (see grid_store's
+--     grids_loaded note), so the run that follows the migration's own write MUST find nothing to do or
+--     the pair would write each other in a loop. It re-loads, finds every record stamped, and stops.
+-- Declared here (with the other post-write_grids grid_store helpers) because it calls write_grids, a
+-- local declared after load_grids -- see the call site in ensure_grids_loaded.
+function grid_store.stamp_preview_counts()
+    if not grid_store.grids_clean then
+        return 0
+    end
+
+    local stamped = 0
+    for _, map_grids in pairs(grid_store.grids) do
+        if type(map_grids) == "table" then
+            for _, race_grids in pairs(map_grids) do
+                if type(race_grids) == "table" then
+                    for _, record in pairs(race_grids) do
+                        if type(record) == "table" and not grid_store.usable_preview_count(record) then
+                            record.previewCount = grid_store.PREVIEW_COUNT_DEFAULT
+                            stamped = stamped + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if stamped == 0 then
+        return 0
+    end
+
+    local ok, path = write_grids()
+    if ok then
+        log_info("beamcomp.grid", string.format("stamped a preview count of %d into %d saved grid(s);"
+            .. " wrote %s", grid_store.PREVIEW_COUNT_DEFAULT, stamped, tostring(path)))
+    else
+        log_info("beamcomp.grid", string.format("stamped a preview count into %d saved grid(s) in memory"
+            .. " but could not write the grids file", stamped))
+    end
+    return stamped
 end
 
 -- Preset store helpers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200
