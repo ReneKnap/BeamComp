@@ -318,10 +318,16 @@ local GRIDS_CANDIDATE_PATHS = {
     "beamcomp.grids.json",
 }
 
--- grids[map][raceId][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
+-- grids[map][raceId][name] = {forward = <params>, reverse = <params>?, previewCount = <n>};
+-- defaults[map][raceId] = name.
 -- A grid belongs to a RACE, not to a map (ADR-0023 amendment 2026-07-27): the race id is the middle key,
 -- so grid names are unique per race and two races on one map may both own a grid called "Main". The
 -- record carries no `race` field -- it IS the key; gridData echoes the race back from the request.
+-- `previewCount` is the grid's authored FIELD SIZE (ADR-0023 amendment 2026-08-02): the editor's preview
+-- extent, and the size above which the race start warns the issuer. It is the ONE record field this
+-- server reads instead of relaying verbatim (the documented ADR-0005 exception) -- a meta number, never
+-- forward/reverse, never the geometry. It sits at the record's top level on purpose: the direction blocks
+-- are param sets the client feeds to its knob setter, which rejects unknown knobs.
 -- defaults stays the single source of truth for "which grid is this race's default" (no flag in the
 -- record); grid_store.ensure_default holds the one-default-per-race invariant.
 -- presets[map][name] = <race-setup form JSON string> is the named-preset store (ADR-0037 amendment
@@ -761,6 +767,47 @@ function grid_store.is_legacy_grids(grids)
         end
     end
     return false
+end
+
+-- The authored field size of a grid (ADR-0023 amendment 2026-08-02). These three mirror
+-- DEFAULT/MIN/MAX_PREVIEW_COUNT in the client's race/grideditor.lua; the server cannot require a client
+-- module (ADR-0004/0011), so this is a deliberate second copy -- keep them in step.
+grid_store.PREVIEW_COUNT_DEFAULT = 16
+grid_store.PREVIEW_COUNT_MIN = 1
+grid_store.PREVIEW_COUNT_MAX = 32
+
+-- The usable previewCount carried by a grid record (or by a gridSave payload -- both name the field the
+-- same), coerced tonumber -> floor -> clamp, or nil when the field is absent or unusable. Deliberately
+-- not called "stored": what comes back is the CLAMPED number, not the literal one in the file (a
+-- hand-written 999 reads as 32 and stays 999 on disk). The nil is what the migration keys on -- "this
+-- record has no usable count, stamp it"; every reader wants preview_count_of below.
+-- Reading this field is the server's ONE documented exception to relaying a grid record verbatim
+-- (ADR-0005): a meta number the editor writes for exactly this purpose, and nothing else in the record.
+function grid_store.usable_preview_count(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local number = tonumber(record.previewCount)
+    -- NaN survives tonumber and every comparison below, so it has to be rejected on its own.
+    if not number or number ~= number then
+        return nil
+    end
+    number = math.floor(number)
+    if number < grid_store.PREVIEW_COUNT_MIN then
+        return grid_store.PREVIEW_COUNT_MIN
+    end
+    if number > grid_store.PREVIEW_COUNT_MAX then
+        return grid_store.PREVIEW_COUNT_MAX
+    end
+    return number
+end
+
+-- The field size a grid was authored for, defaulting when it carries none. The startup migration stamps
+-- the field into every stored record, but this read-time default stays as the backstop: a legacy-schema
+-- file the migration correctly refused, a hand-added record, or a client on an older server can all still
+-- reach a read path without one.
+function grid_store.preview_count_of(record)
+    return grid_store.usable_preview_count(record) or grid_store.PREVIEW_COUNT_DEFAULT
 end
 
 -- Preset store helpers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200
@@ -5634,6 +5681,10 @@ local function handle_grid_save(player_id, payload)
     if type(payload.reverse) == "table" then
         record.reverse = payload.reverse
     end
+    -- The authored field size (ADR-0023 amendment 2026-08-02), coerced rather than relayed so the stored
+    -- number is always usable whatever a client sent -- and so a client too old to send one stores the
+    -- default instead of a record the migration would later have to fix.
+    record.previewCount = grid_store.preview_count_of(payload)
 
     local ok, path, promoted = save_grid(payload.map, payload.race, payload.name, record)
     if ok then
@@ -5746,6 +5797,10 @@ local function handle_grid_fetch(player_id, payload)
         forward = record.forward,
         reverse = record.reverse,
         race = payload.race,
+        -- The authored field size the editor restores (ADR-0023 amendment 2026-08-02). Defaulted here,
+        -- so a record that predates the field (or one the migration could not touch) reopens at 16
+        -- instead of arriving as nil.
+        previewCount = grid_store.preview_count_of(record),
     })
 end
 
