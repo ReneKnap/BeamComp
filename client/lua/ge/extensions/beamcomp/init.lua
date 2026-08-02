@@ -2471,6 +2471,10 @@ local function handle_grid_data(payload)
         forward = payload.forward,
         reverse = payload.reverse,
         race = payload.race,
+        -- The grid's authored field size (ADR-0023 amendment 2026-08-02). This rebuild names every field
+        -- it keeps, so the count has to be listed here or the reopened grid silently falls back to 16.
+        -- grideditor coerces it, so a missing or hand-edited value degrades instead of breaking.
+        previewCount = payload.previewCount,
     }, anchor_race)
     if ok then
         -- Remember the loaded name so the panel can offer overwrite (same-name save) + assign without
