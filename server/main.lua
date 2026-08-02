@@ -826,10 +826,12 @@ end
 
 -- Tell the player who started the race, once, when more cars line up than the resolved grid was authored
 -- for (ADR-0023 amendment 2026-08-02). Information, not an error, and deliberately private to the issuer:
--- they are the only person who can act on it, and the race is fine either way. Nothing is blocked,
--- clamped or adjusted -- the layout is count-independent, so the extra cars simply continue behind the
--- previewed rows. Silent for the procedural fallback (grid_params nil: no authored count exists) and at
--- or below the count; `starters` is #roster, which is one entry per grid slot, AI included (ADR-0036).
+-- they are the only person who can act on it, and the race is fine either way. It says what the ADMIN can
+-- do something about -- this grid is not tuned for a field this size -- rather than describing where the
+-- surplus cars end up, which is the layout's business and not a decision anyone has to make. Nothing is
+-- blocked, clamped or adjusted; the layout is count-independent and every pose is what it would have been.
+-- Silent for the procedural fallback (grid_params nil: no authored count exists) and at or below the
+-- count; `starters` is #roster, which is one entry per grid slot, AI included (ADR-0036).
 function grid_store.warn_over_capacity(owner_id, grid_params, starters)
     if owner_id == nil or type(grid_params) ~= "table" then
         return
@@ -838,8 +840,13 @@ function grid_store.warn_over_capacity(owner_id, grid_params, starters)
     if starters <= authored then
         return
     end
-    MP.SendChatMessage(owner_id, string.format("BeamComp: %d starters on a grid authored for %d"
-        .. " -- the extra cars line up behind the previewed rows", starters, authored))
+    -- "1 drivers" is reachable: MIN_PREVIEW_COUNT is 1 and a one-car grid is a legitimate thing to
+    -- author. `starters` is always plural here (it is strictly greater than an authored count of at
+    -- least 1), so only the second noun needs the singular.
+    local drivers = (authored == 1) and "driver" or "drivers"
+    MP.SendChatMessage(owner_id, string.format(
+        "BeamComp: %d starters -- this grid is not tuned for more than %d %s",
+        starters, authored, drivers))
     log_info("beamcomp.grid", string.format("field of %d exceeds the grid's authored %d; issuer notified",
         starters, authored))
 end
