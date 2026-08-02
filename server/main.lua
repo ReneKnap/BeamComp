@@ -824,6 +824,26 @@ function grid_store.preview_count_of(record)
     return grid_store.usable_preview_count(record) or grid_store.PREVIEW_COUNT_DEFAULT
 end
 
+-- Tell the player who started the race, once, when more cars line up than the resolved grid was authored
+-- for (ADR-0023 amendment 2026-08-02). Information, not an error, and deliberately private to the issuer:
+-- they are the only person who can act on it, and the race is fine either way. Nothing is blocked,
+-- clamped or adjusted -- the layout is count-independent, so the extra cars simply continue behind the
+-- previewed rows. Silent for the procedural fallback (grid_params nil: no authored count exists) and at
+-- or below the count; `starters` is #roster, which is one entry per grid slot, AI included (ADR-0036).
+function grid_store.warn_over_capacity(owner_id, grid_params, starters)
+    if owner_id == nil or type(grid_params) ~= "table" then
+        return
+    end
+    local authored = grid_store.preview_count_of(grid_params)
+    if starters <= authored then
+        return
+    end
+    MP.SendChatMessage(owner_id, string.format("BeamComp: %d starters on a grid authored for %d"
+        .. " -- the extra cars line up behind the previewed rows", starters, authored))
+    log_info("beamcomp.grid", string.format("field of %d exceeds the grid's authored %d; issuer notified",
+        starters, authored))
+end
+
 -- Give every stored grid an explicit authored field size and persist it once (ADR-0023 amendment
 -- 2026-08-02). Grids saved before the field existed get the default; a record whose previewCount is
 -- unusable is repaired the same way. A record that already carries a usable one is left EXACTLY as it
@@ -3541,6 +3561,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- clients lay out the procedural grid. The server relays the params verbatim, never interprets them,
     -- and never parses the race id -- it is a table key only (ADR-0005).
     local grid_params = resolve_grid(map, race_id or race_name, overrides.grid)
+    -- One heads-up to the issuer when the field outgrew what this grid was authored for (ADR-0023
+    -- amendment 2026-08-02). Reading that one meta number is the server's only exception to relaying a
+    -- grid record verbatim; everything below this line is unchanged -- same layout, same poses, same
+    -- gridParams on the wire.
+    grid_store.warn_over_capacity(owner_id, grid_params, #roster)
 
     session.race = race_name
     session.roster = roster
