@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grideditor-1based-slots/2026-08-01"
+local BUILD_MARKER = "grid-preview-count-persisted/2026-08-02"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2471,6 +2471,10 @@ local function handle_grid_data(payload)
         forward = payload.forward,
         reverse = payload.reverse,
         race = payload.race,
+        -- The grid's authored field size (ADR-0023 amendment 2026-08-02). This rebuild names every field
+        -- it keeps, so the count has to be listed here or the reopened grid silently falls back to 16.
+        -- grideditor coerces it, so a missing or hand-edited value degrades instead of breaking.
+        previewCount = payload.previewCount,
     }, anchor_race)
     if ok then
         -- Remember the loaded name so the panel can offer overwrite (same-name save) + assign without

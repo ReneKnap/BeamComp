@@ -318,10 +318,16 @@ local GRIDS_CANDIDATE_PATHS = {
     "beamcomp.grids.json",
 }
 
--- grids[map][raceId][name] = {forward = <params>, reverse = <params>?}; defaults[map][raceId] = name.
+-- grids[map][raceId][name] = {forward = <params>, reverse = <params>?, previewCount = <n>};
+-- defaults[map][raceId] = name.
 -- A grid belongs to a RACE, not to a map (ADR-0023 amendment 2026-07-27): the race id is the middle key,
 -- so grid names are unique per race and two races on one map may both own a grid called "Main". The
 -- record carries no `race` field -- it IS the key; gridData echoes the race back from the request.
+-- `previewCount` is the grid's authored FIELD SIZE (ADR-0023 amendment 2026-08-02): the editor's preview
+-- extent, and the size above which the race start warns the issuer. It is the ONE record field this
+-- server reads instead of relaying verbatim (the documented ADR-0005 exception) -- a meta number, never
+-- forward/reverse, never the geometry. It sits at the record's top level on purpose: the direction blocks
+-- are param sets the client feeds to its knob setter, which rejects unknown knobs.
 -- defaults stays the single source of truth for "which grid is this race's default" (no flag in the
 -- record); grid_store.ensure_default holds the one-default-per-race invariant.
 -- presets[map][name] = <race-setup form JSON string> is the named-preset store (ADR-0037 amendment
@@ -345,6 +351,10 @@ local grid_store = {
     -- write_grids, so an in-game save can never overwrite an unmigrated file with the empty store the
     -- rejection left behind (that file still holds the admin's authored grids).
     grids_legacy = false,
+    -- True only when load_grids ran all the way through -- i.e. past BOTH its early returns (no file /
+    -- unparseable, and the legacy map-keyed schema). The startup migration gates on it, so an unattended
+    -- write can never fire against a file we refused to read (ADR-0023 amendment 2026-08-02).
+    grids_clean = false,
 }
 
 -- Named race-setup presets (ADR-0037 amendment 2026-07-03). A preset is the setup panel's form JSON,
@@ -507,6 +517,7 @@ local function load_grids()
     grid_store.grids = {}
     grid_store.defaults = {}
     grid_store.grids_legacy = false
+    grid_store.grids_clean = false
 
     local data, path, err = read_grids()
     grid_store.grids_path = path
@@ -533,6 +544,9 @@ local function load_grids()
     if type(data.defaults) == "table" then
         grid_store.defaults = data.defaults
     end
+    -- Past both early returns: this file was read cleanly and the store mirrors it, so writing it back is
+    -- safe. Nothing else may set this flag (ADR-0023 amendment 2026-08-02).
+    grid_store.grids_clean = true
     log_info("beamcomp.grid", "loaded grids from " .. path)
 end
 
@@ -545,6 +559,12 @@ local function ensure_grids_loaded()
     end
     grid_store.grids_loaded = true
     load_grids()
+    -- Stamp the authored field size into records saved before that field existed, and write the file back
+    -- once (ADR-0023 amendment 2026-08-02). A FIELD lookup, resolved at call time on purpose:
+    -- stamp_preview_counts is declared further down the chunk because it must be able to call write_grids
+    -- (a local declared after this function), and nothing calls ensure_grids_loaded before the chunk has
+    -- finished loading. Harmless on the lazy re-load path -- a stamped store finds nothing to do.
+    grid_store.stamp_preview_counts()
 end
 
 -- The grid param record for a race start, or nil to fall back to the procedural grid (ADR-0023).
@@ -761,6 +781,126 @@ function grid_store.is_legacy_grids(grids)
         end
     end
     return false
+end
+
+-- The authored field size of a grid (ADR-0023 amendment 2026-08-02). These three mirror
+-- DEFAULT/MIN/MAX_PREVIEW_COUNT in the client's race/grideditor.lua; the server cannot require a client
+-- module (ADR-0004/0011), so this is a deliberate second copy -- keep them in step.
+grid_store.PREVIEW_COUNT_DEFAULT = 16
+grid_store.PREVIEW_COUNT_MIN = 1
+grid_store.PREVIEW_COUNT_MAX = 32
+
+-- The usable previewCount carried by a grid record (or by a gridSave payload -- both name the field the
+-- same), coerced tonumber -> floor -> clamp, or nil when the field is absent or unusable. Deliberately
+-- not called "stored": what comes back is the CLAMPED number, not the literal one in the file (a
+-- hand-written 999 reads as 32 and stays 999 on disk). The nil is what the migration keys on -- "this
+-- record has no usable count, stamp it"; every reader wants preview_count_of below.
+-- Reading this field is the server's ONE documented exception to relaying a grid record verbatim
+-- (ADR-0005): a meta number the editor writes for exactly this purpose, and nothing else in the record.
+function grid_store.usable_preview_count(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local number = tonumber(record.previewCount)
+    -- NaN survives tonumber and every comparison below, so it has to be rejected on its own.
+    if not number or number ~= number then
+        return nil
+    end
+    number = math.floor(number)
+    if number < grid_store.PREVIEW_COUNT_MIN then
+        return grid_store.PREVIEW_COUNT_MIN
+    end
+    if number > grid_store.PREVIEW_COUNT_MAX then
+        return grid_store.PREVIEW_COUNT_MAX
+    end
+    return number
+end
+
+-- The field size a grid was authored for, defaulting when it carries none. The startup migration stamps
+-- the field into every stored record, but this read-time default stays as the backstop: a legacy-schema
+-- file the migration correctly refused, a hand-added record, or a client on an older server can all still
+-- reach a read path without one.
+function grid_store.preview_count_of(record)
+    return grid_store.usable_preview_count(record) or grid_store.PREVIEW_COUNT_DEFAULT
+end
+
+-- Tell the player who started the race, once, when more cars line up than the resolved grid was authored
+-- for (ADR-0023 amendment 2026-08-02). Information, not an error, and deliberately private to the issuer:
+-- they are the only person who can act on it, and the race is fine either way. It says what the ADMIN can
+-- do something about -- this grid is not tuned for a field this size -- rather than describing where the
+-- surplus cars end up, which is the layout's business and not a decision anyone has to make. Nothing is
+-- blocked, clamped or adjusted; the layout is count-independent and every pose is what it would have been.
+-- Silent for the procedural fallback (grid_params nil: no authored count exists) and at or below the
+-- count; `starters` is #roster, which is one entry per grid slot, AI included (ADR-0036).
+function grid_store.warn_over_capacity(owner_id, grid_params, starters)
+    if owner_id == nil or type(grid_params) ~= "table" then
+        return
+    end
+    local authored = grid_store.preview_count_of(grid_params)
+    if starters <= authored then
+        return
+    end
+    -- "1 drivers" is reachable: MIN_PREVIEW_COUNT is 1 and a one-car grid is a legitimate thing to
+    -- author. `starters` is always plural here (it is strictly greater than an authored count of at
+    -- least 1), so only the second noun needs the singular.
+    local drivers = (authored == 1) and "driver" or "drivers"
+    MP.SendChatMessage(owner_id, string.format(
+        "BeamComp: %d starters -- this grid is not tuned for more than %d %s",
+        starters, authored, drivers))
+    log_info("beamcomp.grid", string.format("field of %d exceeds the grid's authored %d; issuer notified",
+        starters, authored))
+end
+
+-- Give every stored grid an explicit authored field size and persist it once (ADR-0023 amendment
+-- 2026-08-02). Grids saved before the field existed get the default; a record whose previewCount is
+-- unusable is repaired the same way. A record that already carries a usable one is left EXACTLY as it
+-- stands, even when it is not the default -- this migration only ever adds the key it is named after.
+-- Returns how many records were stamped. Called from ensure_grids_loaded, right after load_grids.
+--
+-- This is the first write to the grids file that no admin triggered, so it is fenced accordingly:
+--   * it goes through write_grids (atomic temp -> rename, and it refuses a legacy-schema file itself);
+--   * grids_clean gates it, so a missing/unparseable/legacy file -- for which load_grids returns early
+--     with a deliberately EMPTY store -- is never rewritten from that empty store. That would be data
+--     loss, and it is the whole reason the legacy guard exists (ADR-0023 amendment 2026-07-27);
+--   * nothing stamped means nothing written at all. That is what makes it idempotent -- and writing the
+--     grids file is itself what trips BeamMP's file watcher into re-running this chunk (see grid_store's
+--     grids_loaded note), so the run that follows the migration's own write MUST find nothing to do or
+--     the pair would write each other in a loop. It re-loads, finds every record stamped, and stops.
+-- Declared here (with the other post-write_grids grid_store helpers) because it calls write_grids, a
+-- local declared after load_grids -- see the call site in ensure_grids_loaded.
+function grid_store.stamp_preview_counts()
+    if not grid_store.grids_clean then
+        return 0
+    end
+
+    local stamped = 0
+    for _, map_grids in pairs(grid_store.grids) do
+        if type(map_grids) == "table" then
+            for _, race_grids in pairs(map_grids) do
+                if type(race_grids) == "table" then
+                    for _, record in pairs(race_grids) do
+                        if type(record) == "table" and not grid_store.usable_preview_count(record) then
+                            record.previewCount = grid_store.PREVIEW_COUNT_DEFAULT
+                            stamped = stamped + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if stamped == 0 then
+        return 0
+    end
+
+    local ok, path = write_grids()
+    if ok then
+        log_info("beamcomp.grid", string.format("stamped a preview count of %d into %d saved grid(s);"
+            .. " wrote %s", grid_store.PREVIEW_COUNT_DEFAULT, stamped, tostring(path)))
+    else
+        log_info("beamcomp.grid", string.format("stamped a preview count into %d saved grid(s) in memory"
+            .. " but could not write the grids file", stamped))
+    end
+    return stamped
 end
 
 -- Preset store helpers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200
@@ -3428,6 +3568,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- clients lay out the procedural grid. The server relays the params verbatim, never interprets them,
     -- and never parses the race id -- it is a table key only (ADR-0005).
     local grid_params = resolve_grid(map, race_id or race_name, overrides.grid)
+    -- One heads-up to the issuer when the field outgrew what this grid was authored for (ADR-0023
+    -- amendment 2026-08-02). Reading that one meta number is the server's only exception to relaying a
+    -- grid record verbatim; everything below this line is unchanged -- same layout, same poses, same
+    -- gridParams on the wire.
+    grid_store.warn_over_capacity(owner_id, grid_params, #roster)
 
     session.race = race_name
     session.roster = roster
@@ -5634,6 +5779,10 @@ local function handle_grid_save(player_id, payload)
     if type(payload.reverse) == "table" then
         record.reverse = payload.reverse
     end
+    -- The authored field size (ADR-0023 amendment 2026-08-02), coerced rather than relayed so the stored
+    -- number is always usable whatever a client sent -- and so a client too old to send one stores the
+    -- default instead of a record the migration would later have to fix.
+    record.previewCount = grid_store.preview_count_of(payload)
 
     local ok, path, promoted = save_grid(payload.map, payload.race, payload.name, record)
     if ok then
@@ -5746,6 +5895,10 @@ local function handle_grid_fetch(player_id, payload)
         forward = record.forward,
         reverse = record.reverse,
         race = payload.race,
+        -- The authored field size the editor restores (ADR-0023 amendment 2026-08-02). Defaulted here,
+        -- so a record that predates the field (or one the migration could not touch) reopens at 16
+        -- instead of arriving as nil.
+        previewCount = grid_store.preview_count_of(record),
     })
 end
 
