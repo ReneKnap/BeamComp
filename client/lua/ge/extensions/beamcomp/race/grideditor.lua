@@ -9,7 +9,8 @@
 -- current map; the editor anchors a PREVIEW_COUNT-car grid to that race's real start line (via
 -- race/start.anchor) and recomputes the preview poses with race/grid as the knobs are tuned over the GE
 -- console or the panel. Separate forward/reverse blocks are accumulated; reverse is only authored if the
--- admin switches to it. M.snapshot() hands the blocks to init.lua, which ships them to the server (gridSave).
+-- admin switches to it. M.snapshot() hands the blocks -- plus the authored preview count, part of the grid
+-- since the ADR-0023 amendment 2026-08-02 -- to init.lua, which ships them to the server (gridSave).
 --
 -- Segmented grids (ADR-0023 amendment): each direction is modelled as an ORDERED SEGMENT LIST -- segment 0
 -- is the base param set, and a breakpoint at a chosen slot adds a further segment (seeded from the covering
@@ -33,11 +34,13 @@ local maps = require("beamcomp/race/maps")
 
 local LOG_TAG = "beamcomp.grid"
 
--- The editor previews a fixed 16-slot field by default so a large grid reads clearly while tuning, even
--- with fewer (or no) players present. This is a VIEW default only, deliberately DECOUPLED from the grid's
--- layout capacity (grid.LAYOUT_CAPACITY, currently 8): the layout is count-independent, so grid.poses grows
--- the field above the capacity to fill the previewed slots. The count is tunable (M.set_preview_count,
--- clamped to [MIN_PREVIEW_COUNT, MAX_PREVIEW_COUNT]) so an admin can preview a larger or smaller field.
+-- How big a field this grid was AUTHORED for (ADR-0023 amendment 2026-08-02). It is saved with the grid
+-- and restored when the grid is opened, and it has exactly two jobs: it is the slot count the editor
+-- previews, and it is the threshold above which the race start warns the admin who started the race.
+-- It is NOT an input to the layout -- the layout stays count-independent (grid.poses grows the field
+-- above grid.LAYOUT_CAPACITY to fill whatever count arrives), so this number never moves a spawned pose.
+-- A brand-new grid starts at 16 so a large grid reads clearly while tuning, even with no players present;
+-- the count is tunable (M.set_preview_count, clamped to [MIN_PREVIEW_COUNT, MAX_PREVIEW_COUNT]).
 local DEFAULT_PREVIEW_COUNT = 16
 local MIN_PREVIEW_COUNT = 1
 local MAX_PREVIEW_COUNT = 32
@@ -93,6 +96,19 @@ local function copy_params(params)
     return copy
 end
 
+-- Coerce a preview count to a usable slot count: tonumber -> floor -> clamp to [MIN, MAX], falling back
+-- to DEFAULT_PREVIEW_COUNT when it is absent or unusable. THE single coercion, shared by the editing
+-- surface (M.set_preview_count) and by the stored count a saved grid brings back (enter), so a
+-- hand-edited grids file is exactly as safe as a typed number and the two paths cannot drift apart.
+local function coerce_preview_count(count)
+    local number = tonumber(count)
+    -- NaN survives tonumber and every comparison below, so it has to be rejected on its own.
+    if not number or number ~= number then
+        return DEFAULT_PREVIEW_COUNT
+    end
+    return math.max(MIN_PREVIEW_COUNT, math.min(MAX_PREVIEW_COUNT, math.floor(number)))
+end
+
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
@@ -103,7 +119,7 @@ M.state = {
     segment = 1,       -- 1-based index of the active segment (the one the knobs edit) in the active direction
     anchors = nil,     -- cached {forward = {base_pose, gate_normal}, reverse = ...} per direction
     poses = nil,       -- current preview poses for the active direction (drawn by init.lua)
-    preview_count = DEFAULT_PREVIEW_COUNT,  -- how many grid slots the preview shows (M.set_preview_count)
+    preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
 }
 
 -- The active direction's ordered segment list, or nil when not editing.
@@ -180,10 +196,13 @@ local function seed_segment_anchor(new_segment)
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given STORED blocks
--- (each is expanded into its ordered segment list), and preview. The stored race is always the canonical
--- id (start.anchor resolves it), so a later assign is keyed the same way the server resolves it at race
--- start (ADR-0023). Returns true + the canonical id, or nil + a reason. Replaces any prior session.
-local function enter(race_name_or_id, blocks)
+-- (each is expanded into its ordered segment list) and the grid's STORED preview count, and preview. The
+-- stored race is always the canonical id (start.anchor resolves it), so a later assign is keyed the same
+-- way the server resolves it at race start (ADR-0023). `preview_count` is the saved authored field size
+-- (ADR-0023 amendment 2026-08-02); nil -- a brand-new grid, or a record from before the field existed --
+-- coerces to DEFAULT_PREVIEW_COUNT. Returns true + the canonical id, or nil + a reason. Replaces any
+-- prior session.
+local function enter(race_name_or_id, blocks, preview_count)
     local map = maps.current()
     if not map then
         return nil, "no map loaded"
@@ -208,7 +227,7 @@ local function enter(race_name_or_id, blocks)
     M.state.blocks = segment_blocks
     M.state.segment = 1
     M.state.anchors = {forward = anchor}
-    M.state.preview_count = DEFAULT_PREVIEW_COUNT
+    M.state.preview_count = coerce_preview_count(preview_count)
     recompute()
     return true, anchor.raceId
 end
@@ -229,7 +248,9 @@ end
 -- params are RELATIVE to a start line (ADR-0023), so `anchor_race` re-targets them onto a chosen race's
 -- start line -- loading a grid authored for race A onto race B previews B's start as the new origin. Absent
 -- an override, falls back to the race the grid was authored against (record.race). A loaded reverse block
--- is preserved (set_direction won't overwrite it). Returns true + the canonical id, or nil + a reason.
+-- is preserved (set_direction won't overwrite it). The record's authored preview count is restored too
+-- (ADR-0023 amendment 2026-08-02) -- coerced, so a hand-edited or missing one degrades to the default
+-- rather than breaking the session. Returns true + the canonical id, or nil + a reason.
 function M.open(record, anchor_race)
     if type(record) ~= "table" or type(record.forward) ~= "table" or type(record.race) ~= "string" then
         return nil, "saved grid is missing its race or params"
@@ -239,7 +260,7 @@ function M.open(record, anchor_race)
         blocks.reverse = record.reverse
     end
     local target = (type(anchor_race) == "string" and anchor_race ~= "") and anchor_race or record.race
-    local ok, race_id = enter(target, blocks)
+    local ok, race_id = enter(target, blocks, record.previewCount)
     if ok then
         log("I", LOG_TAG, "editing saved grid for '" .. race_id .. "'")
     end
@@ -440,24 +461,26 @@ function M.segment_bounds()
     return bounds
 end
 
--- Set how many grid slots the preview shows (independent of the saved params -- the layout is
--- count-independent, ADR-0023). `count` is coerced to an integer and clamped to [MIN, MAX]. Returns true +
--- the applied value, or nil + a reason when not editing / non-numeric.
+-- Set the authored field size: how many grid slots the preview shows, and (once saved) the size above
+-- which the race start warns the issuer. It never feeds the layout -- that stays count-independent
+-- (ADR-0023). `count` is coerced to an integer and clamped to [MIN, MAX]. Returns true + the applied
+-- value, or nil + a reason when not editing / non-numeric.
 function M.set_preview_count(count)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
     end
-    local number = tonumber(count)
-    if not number then
+    -- A non-numeric value is REJECTED here rather than defaulted: this is the typed surface (the GE
+    -- console and the panel), where the caller wants to hear about a typo. Only the stored path defaults.
+    if not tonumber(count) then
         return nil, "value must be a number"
     end
-    number = math.max(MIN_PREVIEW_COUNT, math.min(MAX_PREVIEW_COUNT, math.floor(number)))
+    local number = coerce_preview_count(count)
     M.state.preview_count = number
     recompute()
     return true, number
 end
 
--- The current preview slot count.
+-- The current authored field size (previewed slots + the start's warn threshold).
 function M.preview_count()
     return M.state.preview_count
 end
@@ -477,8 +500,9 @@ function M.current_scene()
 end
 
 -- The current edit as a save payload: the map, the anchored race (which OWNS the saved grid -- re-anchoring
--- a loaded grid and saving it moves it to that race, ADR-0023 amendment 2026-07-27) and the authored blocks
--- (reverse only if it was edited). `name` is supplied by the caller (the save command). Nil when not editing.
+-- a loaded grid and saving it moves it to that race, ADR-0023 amendment 2026-07-27), the authored blocks
+-- (reverse only if it was edited) and the authored field size. `name` is supplied by the caller (the save
+-- command). Nil when not editing.
 function M.snapshot(name)
     if not M.state.active then
         return nil
@@ -491,6 +515,12 @@ function M.snapshot(name)
         race = M.state.race,
         forward = grid.segments_to_block(M.state.blocks.forward),
         reverse = M.state.blocks.reverse and grid.segments_to_block(M.state.blocks.reverse) or nil,
+        -- ONE number per grid, at the record's TOP LEVEL -- deliberately not inside forward/reverse
+        -- (ADR-0023 amendment 2026-08-02). Those are param sets: they flow through block_to_segments
+        -- into M.set, which rejects unknown knobs, so a previewCount in there would be a layout param,
+        -- which is exactly what this must never become. The editor's count is session-level (switching
+        -- direction keeps it), and one number per record is the faithful mirror of that.
+        previewCount = M.state.preview_count,
     }
 end
 
