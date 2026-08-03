@@ -122,9 +122,12 @@ angular.module('beamng.apps')
     // not known (no race picked, still being looked up, or a race that cannot be parsed) the panel sends
     // no mode at all and the game decides at the start -- which is what this says.
     mode: function (scope) {
-      var recommended = scope.recommendedMode();
       var base = 'Sprint runs the route once and finishes at the end. Circuit runs laps and finishes back '
         + 'at the start line. ';
+      if (!scope.form.race) {
+        return base + 'Pick a race and the one it is built as is filled in for you.';
+      }
+      var recommended = scope.recommendedMode();
       if (!recommended) {
         return base + 'This track has not said which it is, so the game decides when the race starts.';
       }
