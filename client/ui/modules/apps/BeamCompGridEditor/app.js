@@ -39,74 +39,97 @@ angular.module('beamng.apps')
   // explanation belong together, and the repeat then renders ONE text instead of one per row.
   var KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)',
-      tip: 'How far behind the start line the whole field sits. Larger moves everyone back; the stock '
-        + 'grid sits 15 m back.' },
+      tip: 'How far behind the start line the whole field sits. Higher moves everyone further back.' },
     { key: 'offsetLateral', label: 'Offset lateral (m)',
-      tip: 'Shifts the whole field sideways, positive to the right. Use it to centre a grid on a wide '
-        + 'road or push it clear of a wall.' },
+      tip: 'Moves the whole field sideways, plus to the right. Use it to centre the cars on a wide road '
+        + 'or get them clear of a wall.' },
     { key: 'headingDeg', label: 'Heading (deg)',
-      tip: 'Rotates the whole grid, cars included, around the vertical. Use it to line a grid up with a '
-        + 'road the start line does not quite point along.' },
+      tip: 'Turns the whole grid, cars and all. Use it when the cars do not point along the road.' },
     { key: 'rowGap', label: 'Row gap (m)', min: 0,
-      tip: 'Distance between one row of cars and the next. It also sets the stagger, because each column '
-        + 'is set back by an even share of this gap.' },
+      tip: 'Distance from one row of cars to the next. It also sets how far the columns are staggered.' },
     { key: 'colGap', label: 'Col gap (m)', min: 0,
-      tip: 'Sideways distance between neighbouring cars in a row.' },
+      tip: 'Distance between two cars standing side by side.' },
     { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1,
-      tip: 'Pin the number of rows and let the width follow the field size. Pinning this clears Columns, '
-        + 'since only one of the two can be fixed.' },
+      tip: 'Fix how many rows there are and let the width follow the number of cars. Setting this clears '
+        + 'Columns -- only one of the two can be fixed.' },
     { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1,
-      tip: 'Pin how many cars stand side by side and let the rows follow the field size. Pinning this '
-        + 'clears Rows, since only one of the two can be fixed.' },
+      tip: 'Fix how many cars stand side by side and let the rows follow the number of cars. Setting this '
+        + 'clears Rows -- only one of the two can be fixed.' },
     { key: 'offsetHeight', label: 'Height lift (m)',
-      tip: 'Raises the cars above the ground AFTER they are dropped onto it, so +1 hovers them one metre '
-        + 'up. Applies to this segment only. Use a little of it where cars would otherwise clip terrain.' },
+      tip: 'Lifts the cars off the ground after they are dropped onto it, so +1 leaves them hovering a '
+        + 'metre up. Only this part of the grid. Use a little where cars sink into the terrain.' },
   ];
+
+  // The name of `raceId`'s default grid in a {name, race, isDefault} list, or '' when it has none. The
+  // server holds the one-default-per-race invariant (grid_store.ensure_default), so at most one matches.
+  function defaultGridName(grids, raceId) {
+    var list = grids || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].race === raceId && list[i].isDefault) {
+        return list[i].name;
+      }
+    }
+    return '';
+  }
 
   // ----- Hover help copy (ADR-0049) -----------------------------------------------------------------
   // One entry per control that is not a layout knob (those carry their own text in KNOBS above), rendered
   // by bcGridTip at the bottom of this file after a deliberate hover. The markup carries only the key.
   //
-  // Style: WHAT the control does, plus the non-obvious consequence or lock. Every line is written from
-  // the code that implements it (this file, race/grideditor.lua, race/grid.lua); where behaviour could
-  // not be pinned down with confidence the narrower true sentence is written instead of the helpful
-  // guess, because a tooltip that asserts something false is worse than none -- people believe it.
+  // STYLE, tightened after the first in-game round: short everyday words; say what the control does and
+  // what changes if you touch it; then stop. No mechanism, and no sentence whose job is to justify a
+  // design decision -- this is read by an admin standing in the game.
+  //
+  // Every line is still written from the code that implements it (this file, race/grideditor.lua,
+  // race/grid.lua). An entry may be a FUNCTION of the scope where the useful answer depends on live
+  // state (see scope.tip).
   var TIPS = {
-    refresh: 'Re-read the race list and the saved grids from the game. Use it if you saved a grid '
-      + 'elsewhere and it is not showing up here.',
-    race: 'Which race this grid is being built for. A grid belongs to its race, so this also decides '
-      + 'which saved grids count as "this race" in the list below.',
-    newGrid: 'Start a fresh grid from the track default for the selected race. Needs a race picked '
-      + 'first, and it discards whatever is currently being edited.',
+    refresh: 'Re-read the races and saved grids from the game. Use it if a grid you saved elsewhere is '
+      + 'not showing up.',
+    race: 'The race this grid is for. A grid belongs to its race, so this also decides which saved grids '
+      + 'count as "this race" below.',
+    newGrid: 'Start a fresh grid from the track default. Needs a race picked, and it throws away whatever '
+      + 'you are editing.',
     load: 'Show the grids saved on this map.',
-    gridRow: 'Load this grid for editing. While a session is running this asks twice, because loading '
-      + 'throws away the edits you have not saved.',
+    gridRow: 'Load this grid for editing. While you are editing it asks twice, because loading throws '
+      + 'away unsaved changes.',
     gridDelete: 'Delete this saved grid. Click twice -- there is no undo.',
 
-    direction: 'Which way round the track this layout is for. Forward and reverse are stored '
-      + 'separately, and reverse is only saved once you actually edit it.',
+    direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
 
-    breakpoint: 'The starting position at which a new section of the grid begins. Type a number here, '
-      + 'then press Add breakpoint -- typing alone changes nothing.',
-    addBreakpoint: 'Split the grid at the position in the field on the left, so everything from there '
-      + 'back gets its own layout. If a section already starts there, this just selects it.',
-    removeSegment: 'Merge the selected section back into the one in front of it. The first section '
-      + 'cannot be removed -- it is the base layout.',
-    segmentChips: 'The sections this grid is split into, labelled by the position each one starts at. '
-      + 'Click one to edit its layout with the knobs below.',
+    breakpoint: 'The starting position where a new part of the grid begins. Type a number, then press Add '
+      + 'breakpoint -- typing alone does nothing.',
+    addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
+      + 'own layout.',
+    removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
+    segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
+      + 'one to edit it with the knobs below.',
 
-    mirror: 'Flip the grid to the other side of the road, so the front position swaps between left and '
-      + 'right.',
-    previewCount: 'How many cars are drawn in the preview -- and the field size above which starting a '
-      + 'race warns you that the grid was not built for this many. It never changes the layout itself, '
-      + 'and it is saved with the grid.',
+    mirror: 'Flip the grid to the other side of the road, so the front car swaps between left and right.',
+    previewCount: 'How many cars the preview draws. It is also the field size above which starting a race '
+      + 'warns you, and it never changes the layout itself.',
 
-    saveGrid: 'Reveal the name field to store this grid for the race being edited.',
-    saveName: 'What to call this grid. No spaces -- a grid name has to survive being typed as an '
-      + 'argument, so a spaced name cannot be saved or used.',
+    saveGrid: 'Show the name field, to store this grid for the race you are editing.',
+    saveName: 'What to call this grid. No spaces -- a grid name has to work as an argument, so a spaced '
+      + 'name cannot be saved or used.',
     saveConfirm: 'Save the grid under this name, replacing any grid of that name on this race.',
-    makeDefault: 'Point this race at this grid, so races that do not name one use it. Needs the grid to '
-      + 'be saved first.',
+    // Says which grid this race starts on TODAY, which is the one thing the button's own label cannot.
+    // All three answers come off the same saved-grid list the dropdown above is built from.
+    makeDefault: function (scope) {
+      if (!scope.savedName) {
+        return 'Makes this race start on the grid you are editing. Save or load a grid first.';
+      }
+      var current = defaultGridName(scope.data.grids, scope.form.race);
+      if (current === scope.savedName) {
+        return 'This race already starts on "' + current + '", so this changes nothing.';
+      }
+      if (!current) {
+        return 'This race has no grid of its own yet, so the game lines the cars up by itself. This makes '
+          + 'it start on "' + scope.savedName + '".';
+      }
+      return 'This race starts on "' + current + '" today. This makes it start on "' + scope.savedName
+        + '" instead.';
+    },
     close: 'Close the editor and clear the preview. Unsaved changes are lost.',
   };
 
