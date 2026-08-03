@@ -89,7 +89,7 @@ angular.module('beamng.apps')
   //
   // Both are plain arithmetic with no guards of their own -- the caller decides what an unusable value
   // means, because the two callers want different things (the field's hold seeds from a fallback, the
-  // Select / add path declines). Note especially that AngularJS parses an EMPTY number input to `null`,
+  // Add breakpoint path declines). Note especially that AngularJS parses an EMPTY number input to `null`,
   // not undefined, so displayToSlot(null) is a perfectly finite -1: whoever converts a field value has to
   // rule that out FIRST (see scope.selectTypedSegment) instead of trusting geLuaNum's isFinite check.
   function slotToDisplay(slot) {
@@ -706,8 +706,8 @@ angular.module('beamng.apps')
       // Where the breakpoint field's hold starts: the field is local and freely typed, so unlike the knobs
       // it seeds off the field itself -- already a DISPLAY number -- and falls back to the active segment's
       // start slot, which is a GE SLOT and therefore converted (the second of the two places that seed the
-      // field from a slot). `send: null` -- the value never reaches GE (the admin presses Select / add for
-      // that), so a held button here costs nothing but the repaint.
+      // field from a slot). `send: null` -- the value never reaches GE (the admin presses Add breakpoint
+      // for that), so a held button here costs nothing but the repaint.
       function breakpointHold() {
         var base = Number(scope.edit.breakpointDisplay);
         if (!isFinite(base)) {
@@ -720,10 +720,10 @@ angular.module('beamng.apps')
         };
       }
 
-      // Nudge the breakpoint field (does not apply -- the admin then presses Select / add). Clamped to the
-      // display floor: holding `-` parks at P1, the label of the base segment's slot 0. The clamp also has
-      // to hold that floor for a second reason -- the input's own min="1" validator blanks the model on any
-      // smaller value, so an unclamped hold would empty the field instead of stopping in it.
+      // Nudge the breakpoint field (does not apply -- the admin then presses Add breakpoint). Clamped to
+      // the display floor: holding `-` parks at P1, the label of the base segment's slot 0. The clamp
+      // also has to hold that floor for a second reason -- the input's own min="1" validator blanks the
+      // model on any smaller value, so an unclamped hold would empty the field instead of stopping in it.
       scope.stepBreakpoint = function (delta) {
         advanceHold(holdFor('breakpointDisplay', breakpointHold), delta);
       };
