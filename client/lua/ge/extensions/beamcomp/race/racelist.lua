@@ -185,4 +185,31 @@ function M.options(loaded_map, include_deprecated)
     return optsort.by_display(options, "label", "id")
 end
 
+-- The track metadata the race-setup panel needs for ONE race (ADR-0037/0013): currently just `closed`,
+-- the flag that decides whether a race is a lap race or a point-to-point run. Returns nil when the race
+-- cannot be resolved or cannot be parsed (a branching track, a missing file) -- the panel then keeps its
+-- "track type unknown" state rather than being told something false.
+--
+-- Deliberately NOT folded into M.options, which parses no geometry on purpose: that list is rebuilt on
+-- every panel open, refresh and form restore, and a map can carry well over a hundred races, so parsing
+-- them all for one boolean about one race would be absurd. The panel asks for the race it has actually
+-- selected, exactly the way it asks for one car model's configs (init.lua request_car_configs).
+--
+-- Deprecated races are included: the panel can select one (with its "incl. deprecated" toggle), so
+-- refusing to describe it would leave that selection stuck on the unknown fallback.
+function M.meta_for(loaded_map, race_id)
+    if type(race_id) ~= "string" or race_id == "" then
+        return nil
+    end
+    local locator = discovery.resolve(race_id, loaded_map, true)
+    if not locator then
+        return nil
+    end
+    local race = parser.parse(locator)
+    if not race or not race.meta then
+        return nil
+    end
+    return {closed = race.meta.closed and true or false}
+end
+
 return M

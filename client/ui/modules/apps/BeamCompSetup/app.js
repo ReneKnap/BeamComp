@@ -529,8 +529,15 @@ angular.module('beamng.apps')
       // aiDefaults / assistHoldDefault carry the GE-side default values behind the optional number fields
       // (see defaultHint): aiDefaults = {presets: {<preset>: {aggr, skill, rubber}}, fallback: '<preset>'}
       // from race/ai.lua, assistHoldDefault = the recover/repair hold seconds from race/start.lua.
+      // assistKeys = {repair, recover} -- the KEYBOARD keys BeamNG's two recovery actions are bound to on
+      // this machine (race/lock.lua assist_controls). Either field may be missing, in which case the help
+      // names the command and no key: a guessed key would be worse than none.
       scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [],
-        aiDefaults: null, assistHoldDefault: null };
+        aiDefaults: null, assistHoldDefault: null, assistKeys: {} };
+      // raceId -> {closed} for races GE has described, filled lazily as races are selected (see raceMeta
+      // below). A race that is absent here has NOT been reported as open -- it has not been asked about
+      // yet, or GE could not parse it -- and the panel must not act as if it knew.
+      scope.raceMetaById = {};
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
       scope.prepared = false;  // true after Confirm & Build Grid: the race is staging, so reveal Start Race
@@ -677,6 +684,9 @@ angular.module('beamng.apps')
         // deleted meanwhile) has to go -- but only once a grid list is actually on hand (see
         // rebuildGridOpts); otherwise the pending list push does it.
         rebuildGridOpts();
+        // The restored race needs describing too, or the Mode row would sit on its unknown fallback for
+        // the whole session after a panel reopen.
+        requestRaceMeta(scope.form.race);
         // Re-sync the race list to the restored include-deprecated flag, then fetch, as one deduplicated
         // batch, the configs every restored car needs: the race's own model (so its config dropdown +
         // label resolve without clearing the stored config), each class row's car (ADR-0042) and each
@@ -712,6 +722,9 @@ angular.module('beamng.apps')
           if (payload && payload.assistHoldDefault !== undefined && payload.assistHoldDefault !== null) {
             scope.data.assistHoldDefault = payload.assistHoldDefault;
           }
+          // Kept on a miss like the palette above: an older GE that does not send the keys must leave the
+          // ones we already have alone rather than blanking them back to "no key known".
+          scope.data.assistKeys = (payload && payload.assistKeys) || scope.data.assistKeys || {};
           rebuildRaceCarOpts();
           // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
           // harmless (labelFor falls back) and re-fetched on the next model change.
@@ -779,6 +792,18 @@ angular.module('beamng.apps')
         });
       });
 
+      // One race's track metadata, answering a requestRaceMeta (ADR-0013 amendment). `closed` decides
+      // sprint vs circuit, so it is only cached when GE actually reported a boolean -- a race GE could not
+      // parse leaves the entry absent, and "absent" means unknown, never "open".
+      scope.$on('BeamCompRaceMeta', function (event, payload) {
+        scope.$evalAsync(function () {
+          if (!payload || !payload.id || typeof payload.closed !== 'boolean') {
+            return;
+          }
+          scope.raceMetaById[payload.id] = { closed: payload.closed };
+        });
+      });
+
       scope.$on('BeamCompSetupCars', function (event, payload) {
         scope.$evalAsync(function () {
           if (!payload || !payload.model) {
@@ -819,6 +844,7 @@ angular.module('beamng.apps')
         if (field === 'race') {
           // Grids are per race: the new race has its own set, and the old race's pick is no longer valid.
           rebuildGridOpts();
+          requestRaceMeta(value);
         }
       };
 
@@ -839,6 +865,15 @@ angular.module('beamng.apps')
       scope.$on('$destroy', function () {
         document.removeEventListener('click', closeOnOutsideClick, false);
       });
+
+      // Ask GE to describe one race's track, unless it already has. Lazy per race, exactly like the
+      // per-model config fetch below: the race list carries no geometry on purpose, and parsing a whole
+      // map of races to learn one flag about one of them would be absurd.
+      function requestRaceMeta(raceId) {
+        if (raceId && !scope.raceMetaById[raceId]) {
+          geLuaArg('request_race_meta', raceId);
+        }
+      }
 
       // Car model changed: clear the stale config and lazily fetch this model's configs from GE. The
       // 'random' sentinel is not a real model (no configs to fetch, no Config row), so skip the fetch.
