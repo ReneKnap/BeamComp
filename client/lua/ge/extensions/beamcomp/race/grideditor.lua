@@ -349,9 +349,10 @@ end
 -- Select (or create) the segment that starts at `start_slot`, making it the active one the knobs edit
 -- (ADR-0023 amendment). Slot 0 (or below) is always the base segment. If a segment already starts at the
 -- slot it is activated; otherwise a new segment is created, SEEDED from the params of the segment that
--- currently covers the slot (so it starts as a copy you then tune), inserted in slot order, and its
--- internal anchorHeight auto-seeded from the ground at its first slot (seed_segment_anchor -- creation
--- only, a re-select never re-seeds). Returns true + the applied start slot, or nil + a reason.
+-- currently covers the slot (a copy you then tune, with every CHAINING field zeroed -- see the seed
+-- block below), inserted in slot order, and its internal anchorHeight auto-seeded from the ground at
+-- its first slot (seed_segment_anchor -- creation only, a re-select never re-seeds). Returns true +
+-- the applied start slot, or nil + a reason.
 function M.select_segment(start_slot)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
@@ -386,18 +387,25 @@ function M.select_segment(start_slot)
             prev_index = index
         end
     end
-    -- Seed a fresh breakpoint from the covering segment so it inherits the layout (columns/rowGap/colGap/
-    -- headingDeg/mirror), but zero its position offsets so it CONTINUES the previous segment seamlessly out
-    -- of the box: offsetForward is then a pure additional gap the admin dials in (0 = seamless).
-    -- The internal anchorHeight is zeroed like the chain offsets (the covering segment's anchor is
-    -- already in the inherited chain z -- copying it would apply it twice) and then auto-seeded from the
-    -- real surface below. The offsetHeight LIFT is inherited as-is like the layout knobs: it does not
-    -- chain, so keeping the covering segment's hover means the split does not visibly move the field.
+    -- Seed a fresh breakpoint from the covering segment, then zero every field that CHAINS. That one
+    -- rule decides this whole block. A chaining value is ALREADY baked into the frame this segment
+    -- starts from -- compute_segment hands the next segment its shifted, rotated and lifted frame
+    -- (grid.lua) -- so copying it would apply it a SECOND time.
+    --   Zeroed, because they chain:
+    --     * offsetForward / offsetLateral, so the segment CONTINUES the previous one seamlessly out of
+    --       the box: offsetForward is then a pure additional gap the admin dials in (0 = seamless).
+    --     * headingDeg, so the tail keeps the direction it already points in. Inheriting it turned the
+    --       whole tail by the covering segment's angle a second time, with the knob reading a value the
+    --       admin never dialled in (bug grideditor-breakpoint-label-and-heading-reset).
+    --     * the internal anchorHeight, which is then auto-seeded from the real surface below.
+    --   Inherited, because they do NOT chain: columns/rows/rowGap/colGap/mirror, so a split never
+    --   reshapes the field, and the offsetHeight LIFT, so it never visibly moves it either.
     -- Only breakpoint segments are zeroed here; segment 0 keeps its own offsetForward (the setback from
-    -- the line).
+    -- the line) and its own heading.
     local seeded = copy_params(segments[prev_index].params)
     seeded.offsetForward = 0
     seeded.offsetLateral = 0
+    seeded.headingDeg = 0
     seeded.anchorHeight = 0
     local new_segment = {startSlot = number, params = seeded}
     table.insert(segments, prev_index + 1, new_segment)
