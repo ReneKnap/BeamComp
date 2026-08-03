@@ -211,7 +211,12 @@
           </div>
         </div>
       </div>
-      <label class="bc-row" bc-setup-tip="tip('laps')">
+      <!-- A lap count only means something on a circuit; a sprint runs the route once (ADR-0013). The
+           value is KEPT when the row hides, so switching mode back and forth does not eat a typed
+           number, and the relayed payload is unchanged either way -- a sprint ignores laps GE-side.
+           ng-if is safe here: the model is an object path (form.laps), not the bare primitive that the
+           child scope would swallow. -->
+      <label class="bc-row" ng-if="form.mode === 'circuit'" bc-setup-tip="tip('laps')">
         <span>Laps</span>
         <input type="number" min="1" ng-model="form.laps" placeholder="auto">
       </label>
