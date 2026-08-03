@@ -610,27 +610,53 @@ angular.module('beamng.apps')
         // sentinel (resolved at spawn) plus the installed models.
         scope.opts.rosterCar = [{ v: 'host', label: "host's car" }].concat(cars);
       }
+      // The name of the race's default grid among `raceGrids`, or '' if it has none. The server holds the
+      // one-default-per-race invariant (grid_store.ensure_default), so at most one entry carries the flag.
+      function defaultGridName(raceGrids) {
+        for (var i = 0; i < raceGrids.length; i++) {
+          if (raceGrids[i].isDefault) {
+            return raceGrids[i].name;
+          }
+        }
+        return '';
+      }
+
       // Grids belong to a race, so the dropdown shows only the SELECTED race's grids (the GE push carries
       // the whole map as {name, race, isDefault}, so a race change re-filters locally -- no round-trip).
-      // 'default' stays the first entry and means "whatever this race's default grid is"; the grid that
-      // actually is that default is labelled as such. A selection that the new race does not have is
-      // dropped back to 'default', otherwise a grid of the previously selected race would be submitted.
-      // Only prune once a list has actually arrived: before that, `data.grids` is empty for want of data,
-      // not because the race has no grids, and pruning would wipe a restored form's grid choice.
+      //
+      // There is no 'default' entry any more. It was a second way of saying the same thing: the server
+      // resolves an omitted grid through defaults[map][race], which is exactly the grid already listed and
+      // labelled '(default)', so both selections ended at the identical record. Now the default grid is
+      // simply PRESELECTED and reads "<name> (default)"; a race with no saved grid at all offers the one
+      // honest entry, "auto generated grid", which submits nothing and lands on the procedural layout.
+      // The submitted grid= is therefore unchanged for every selection that still exists.
+      //
+      // A selection the new race does not have falls back to that race's default rather than being
+      // dropped, otherwise a grid of the previously selected race would be submitted. An explicit pick is
+      // never overwritten -- which does mean a pick is now a pin: re-pointing the race's default in the
+      // editor no longer moves a panel that already holds a name.
+      //
+      // Only prune or preselect once a list has actually arrived: before that, `data.grids` is empty for
+      // want of data, not because the race has no grids, and acting would wipe a restored form's choice.
       function rebuildGridOpts() {
         var raceGrids = (scope.data.grids || []).filter(function (g) {
           return g && g.race === scope.form.race;
         });
-        scope.opts.grid = [{ v: '', label: 'default' }].concat(
-          raceGrids.map(function (g) {
+        scope.opts.grid = raceGrids.length
+          ? raceGrids.map(function (g) {
             return { v: g.name, label: g.isDefault ? g.name + ' (default)' : g.name };
-          }));
-        if (!gridsLoaded || !scope.form.grid) {
+          })
+          : [{ v: '', label: 'auto generated grid' }];
+        if (!gridsLoaded) {
+          return;
+        }
+        if (!raceGrids.length) {
+          scope.form.grid = '';
           return;
         }
         var stillValid = raceGrids.some(function (g) { return g.name === scope.form.grid; });
         if (!stillValid) {
-          scope.form.grid = '';
+          scope.form.grid = defaultGridName(raceGrids) || raceGrids[0].name;
         }
       }
       // The mode the SELECTED track itself declares (ADR-0013): a closed loop is a circuit, anything else
