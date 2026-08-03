@@ -609,8 +609,17 @@ angular.module('beamng.apps')
       // Hover help text by key (ADR-0049), read by bc-grid-tip. The layout knobs do not come through
       // here -- they carry their own text on the KNOBS entry. An unknown key yields '' and the directive
       // then shows nothing at all, which is a far better failure than an empty box on a control.
+      //
+      // A TIPS entry may be a FUNCTION of the scope instead of a fixed string (ADR-0049 amendment), for
+      // help that only makes sense against live state -- the Default button has to say which grid this
+      // race starts on today. The directive evaluates its expression inside the hover delay, not at link
+      // time, so a function entry is re-read on every hover and can never go stale.
       scope.tip = function (key) {
-        return TIPS[key] || '';
+        var entry = TIPS[key];
+        if (typeof entry === 'function') {
+          entry = entry(scope);
+        }
+        return entry || '';
       };
 
       // Re-pull races + saved grids from GE (Refresh button and on link).

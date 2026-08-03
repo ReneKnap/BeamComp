@@ -892,8 +892,18 @@ angular.module('beamng.apps')
       // Hover help text by key (ADR-0049), read by bc-setup-tip. An unknown key yields '' and the
       // directive then shows nothing at all -- a missing tooltip is a far better failure than an empty
       // box hanging off a control.
+      //
+      // A TIPS entry may be a FUNCTION of the scope instead of a fixed string (ADR-0049 amendment): some
+      // help only makes sense against live state -- which mode the track recommends, which grid the race
+      // currently starts on, which key the assists are actually bound to. The directive evaluates its
+      // expression inside the hover delay, not at link time, so a function entry is re-read on every
+      // hover and can never go stale. No watcher is involved, so an idle panel still costs nothing.
       scope.tip = function (key) {
-        return TIPS[key] || '';
+        var entry = TIPS[key];
+        if (typeof entry === 'function') {
+          entry = entry(scope);
+        }
+        return entry || '';
       };
 
       // Re-pull the option lists from GE (Refresh button, the include-deprecated toggle, and on link). The
