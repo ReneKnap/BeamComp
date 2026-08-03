@@ -1,6 +1,11 @@
 <div class="bc-setup">
   <style scoped>
+    /* position: relative makes this box the containing block the hover tooltip is positioned and
+       clamped against (bcSetupTip, ADR-0049). It moves nothing that exists: the only absolutely
+       positioned boxes in this panel are .bc-dd-list and .bc-dd-head::after, and both already
+       resolve against .bc-dd (itself relative), so neither ever reached this element. */
     .bc-setup { display: flex; flex-direction: column; height: 100%; box-sizing: border-box;
+      position: relative;
       font-family: 'Roboto', sans-serif; font-size: 13px; color: #f0f0f0;
       background: rgba(20, 22, 26, 0.92); border-radius: 4px; overflow: hidden; }
     .bc-toolbar { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; padding: 6px 10px;
@@ -146,6 +151,18 @@
     .bc-row > span.bc-roster-carshown { flex: 1 1 auto; min-width: 0; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
     .bc-swatch-inline { display: inline-block; vertical-align: middle; width: 14px; height: 14px; }
+    /* Hover help (bcSetupTip, ADR-0049). Native title= renders NOTHING in BeamNG -- the UI is drawn in an
+       off-screen CEF and native tooltips are painted by browser chrome an off-screen renderer does not
+       have -- so the help text is a box in our own DOM instead. One per panel, reused, positioned by the
+       directive in root-local coordinates and flipped/shifted to stay inside .bc-setup (which clips with
+       overflow: hidden, so an unclamped tooltip is not ugly but unreadable).
+       pointer-events: none is load-bearing, not polish: it is what guarantees the layer can never swallow
+       a click or block the control it describes. z-index clears .bc-dd-list's 50. */
+    .bc-tip { position: absolute; z-index: 100; display: none; pointer-events: none;
+      max-width: min(320px, calc(100% - 20px)); padding: 5px 8px;
+      background: #10131a; color: #e8eef5; border: 1px solid rgba(143, 211, 255, 0.35);
+      border-radius: 3px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+      font-size: 12px; line-height: 1.35; white-space: normal; }
   </style>
 
   <!-- Settings popover (setup-settings-menu): a gear on the right of the toolbar reuses the .bc-dd
@@ -155,10 +172,16 @@
        ng-change="refresh()") and "Force" toggles. -->
   <div class="bc-toolbar">
     <div class="bc-dd bc-settings">
-      <button type="button" class="bc-dd-head bc-settings-head" ng-click="toggle('settings')" title="Settings">&#x2699;</button>
+      <button type="button" class="bc-dd-head bc-settings-head" ng-click="toggle('settings')" bc-setup-tip="tip('settings')">&#x2699;</button>
       <div class="bc-dd-list bc-settings-list" ng-if="open === 'settings'">
-        <label class="bc-tog bc-settings-item"><input type="checkbox" ng-model="form.includeDeprecated" ng-change="refresh()"><span>incl. deprecated</span></label>
-        <label class="bc-tog bc-settings-item"><input type="checkbox" ng-model="form.force"><span>Force (ignore mismatch)</span></label>
+        <label class="bc-tog bc-settings-item" bc-setup-tip="tip('includeDeprecated')"><input type="checkbox" ng-model="form.includeDeprecated" ng-change="refresh()"><span>incl. deprecated</span></label>
+        <label class="bc-tog bc-settings-item" bc-setup-tip="tip('force')"><input type="checkbox" ng-model="form.force"><span>Force (ignore mismatch)</span></label>
+        <!-- The hover-help switch (ADR-0049). ng-model binds an OBJECT property (ui.tooltips), never a
+             bare primitive: this list is under an ng-if, so a primitive would be written onto that child
+             scope and lost on every menu close -- see the .bc-preset-name row below for the same trap.
+             It governs the grid editor too (shared localStorage key, same origin), which is why that
+             panel has no menu of its own. -->
+        <label class="bc-tog bc-settings-item" bc-setup-tip="tip('tooltips')"><input type="checkbox" ng-model="ui.tooltips" ng-change="setTooltips()"><span>Show tooltips</span></label>
       </div>
     </div>
   </div>
@@ -168,7 +191,7 @@
     <!-- Basics -->
     <div class="bc-section">
       <div class="bc-section-title">Basics</div>
-      <div class="bc-row">
+      <div class="bc-row" bc-setup-tip="tip('race')">
         <span>Race</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('race')">{{labelFor('race')}}</button>
@@ -178,7 +201,7 @@
           </div>
         </div>
       </div>
-      <div class="bc-row">
+      <div class="bc-row" bc-setup-tip="tip('mode')">
         <span>Mode</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('mode')">{{labelFor('mode')}}</button>
@@ -188,17 +211,17 @@
           </div>
         </div>
       </div>
-      <label class="bc-row">
+      <label class="bc-row" bc-setup-tip="tip('laps')">
         <span>Laps</span>
         <input type="number" min="1" ng-model="form.laps" placeholder="auto">
       </label>
-      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
+      <label class="bc-row bc-check" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
     </div>
 
     <!-- Vehicles -->
     <div class="bc-section">
       <div class="bc-section-title">Vehicles</div>
-      <div class="bc-row">
+      <div class="bc-row" bc-setup-tip="tip('carModel')">
         <span>Car (all)</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carModel')">{{labelFor('carModel')}}</button>
@@ -208,7 +231,7 @@
           </div>
         </div>
       </div>
-      <div class="bc-row" ng-if="form.carModel && form.carModel !== 'random'">
+      <div class="bc-row" ng-if="form.carModel && form.carModel !== 'random'" bc-setup-tip="tip('carConfig')">
         <span>Config</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carConfig')">{{labelFor('carConfig')}}</button>
@@ -222,52 +245,52 @@
            section). Trim toggles stock vs random config variant; Exclude big vehicles drops buses/trucks/vans
            by curb weight. Both default ON (freshForm). -->
       <div ng-if="form.carModel === 'random'">
-        <label class="bc-row bc-check"><input type="checkbox" ng-model="form.carRandomTrim"><span>Random trim variant</span></label>
-        <label class="bc-row bc-check"><input type="checkbox" ng-model="form.carNoBigCars"><span>Exclude big vehicles</span></label>
+        <label class="bc-row bc-check" bc-setup-tip="tip('carRandomTrim')"><input type="checkbox" ng-model="form.carRandomTrim"><span>Random trim variant</span></label>
+        <label class="bc-row bc-check" bc-setup-tip="tip('carNoBigCars')"><input type="checkbox" ng-model="form.carNoBigCars"><span>Exclude big vehicles</span></label>
       </div>
       <!-- Vehicle restrictions toggle: the car-limiting caps (hp / hp per kg / weight range) declutter the
            default view -- off by default, so a fresh panel hides them. app.js auto-reveals it when a restored
            form/preset carries any cap value, so an active restriction is never hidden. Shown for "keep own"
            and for car=random (which composes with the caps), but not for a fixed car -- see showRestrictions. -->
-      <label class="bc-row bc-check" ng-if="showRestrictions()"><input type="checkbox" ng-model="form.restrictVehicles"><span>Vehicle restrictions</span></label>
-      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
+      <label class="bc-row bc-check" ng-if="showRestrictions()" bc-setup-tip="tip('restrictVehicles')"><input type="checkbox" ng-model="form.restrictVehicles"><span>Vehicle restrictions</span></label>
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles" bc-setup-tip="tip('maxhp')">
         <span>Max hp</span>
         <input type="number" min="0" ng-model="form.maxhp" placeholder="off">
       </label>
-      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles" bc-setup-tip="tip('maxpwr')">
         <span>Max hp/kg</span>
         <input type="number" min="0" step="0.001" ng-model="form.maxpwr" placeholder="off">
       </label>
-      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles" bc-setup-tip="tip('minkg')">
         <span>Min kg</span>
         <input type="number" min="0" ng-model="form.minkg" placeholder="off">
       </label>
-      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles">
+      <label class="bc-row" ng-if="showRestrictions() && form.restrictVehicles" bc-setup-tip="tip('maxkg')">
         <span>Max kg</span>
         <input type="number" min="0" ng-model="form.maxkg" placeholder="off">
       </label>
       <div class="bc-row">
-        <span>Start order</span>
+        <span bc-setup-tip="tip('orderMode')">Start order</span>
         <!-- While a championship (ADR-0040) or class-drop tournament (ADR-0042) is active it sets the grid,
              so the per-race picker is disabled and the race request omits order= (see prepareRace) -- the
              server then applies the active format's order. -->
-        <div class="bc-dd" ng-if="!championship.active && !tournament.active">
+        <div class="bc-dd" ng-if="!championship.active && !tournament.active" bc-setup-tip="tip('orderMode')">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('orderMode')">{{labelFor('orderMode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'orderMode'">
             <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.orderMode" ng-class="{sel: o.v === form.orderMode}"
               ng-click="pick('orderMode', o.v)">{{o.label}}</div>
           </div>
         </div>
-        <span class="bc-champ-status bc-order-locked" ng-if="championship.active">by championship ({{championship.order}})</span>
-        <span class="bc-champ-status bc-order-locked" ng-if="!championship.active && tournament.active">by tournament (class handicap)</span>
+        <span class="bc-champ-status bc-order-locked" ng-if="championship.active" bc-setup-tip="tip('orderLockedChampionship')">by championship ({{championship.order}})</span>
+        <span class="bc-champ-status bc-order-locked" ng-if="!championship.active && tournament.active" bc-setup-tip="tip('orderLockedTournament')">by tournament (class handicap)</span>
       </div>
       <!-- Qualifying's own start order (ADR-0044 amendment): only for order=quali. The base order used
            INSIDE the quali -- random (default) or the previous race's finishing order. In a staged sprint
            quali the spawn slot then predicts the launch sequence (P2 launches first, P3 next, ...). -->
       <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">
-        <span>Qualifying start</span>
+        <span bc-setup-tip="tip('qualiStart')">Qualifying start</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('qualiStart')">{{labelFor('qualiStart')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit bc-setup-tip="tip('qualiStart')" ng-click="toggle('qualiStart')">{{labelFor('qualiStart')}}</button>
           <div class="bc-dd-list" ng-if="open === 'qualiStart'">
             <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.qualiStart" ng-class="{sel: o.v === form.qualiStart}"
               ng-click="pick('qualiStart', o.v)">{{o.label}}</div>
@@ -277,40 +300,40 @@
       <!-- Qualifying length (ADR-0041): only for order=quali; a short session sets the grid by best lap.
            A free minute value plus preset quick-buttons. -->
       <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">
-        <span>Qualifying length</span>
+        <span bc-setup-tip="tip('qualiMinutes')">Qualifying length</span>
         <span class="bc-quali-len">
-          <input type="number" min="1" max="30" ng-model="form.qualiMinutes"> min
-          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
+          <input type="number" min="1" max="30" ng-model="form.qualiMinutes" bc-setup-tip="tip('qualiMinutes')"> min
+          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets" bc-setup-tip="tip('qualiPreset')"
             ng-class="{sel: form.qualiMinutes === m}" ng-click="form.qualiMinutes = m">{{m}}</button>
         </span>
       </div>
       <label class="bc-row bc-check"
              ng-if="!championship.active && !tournament.active && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
-        <input type="checkbox" ng-model="form.orderRev"><span>Reverse order (handicap)</span>
+        <input type="checkbox" ng-model="form.orderRev"><span bc-setup-tip="tip('orderRev')">Reverse order (handicap)</span>
       </label>
       <div class="bc-row">
-        <span>Grid</span>
-        <div class="bc-dd">
+        <span bc-setup-tip="tip('grid')">Grid</span>
+        <div class="bc-dd" bc-setup-tip="tip('grid')">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('grid')">{{labelFor('grid')}}</button>
           <div class="bc-dd-list" ng-if="open === 'grid'">
             <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.grid" ng-class="{sel: o.v === form.grid}"
               ng-click="pick('grid', o.v)">{{o.label}}</div>
           </div>
         </div>
-        <button class="bc-refresh" ng-disabled="!form.race" ng-click="editGrid()" title="Open the grid editor for the selected race">Edit…</button>
+        <button class="bc-refresh" ng-disabled="!form.race" ng-click="editGrid()" bc-setup-tip="tip('editGrid')">Edit…</button>
       </div>
     </div>
 
     <!-- Assists -->
     <div class="bc-section">
       <div class="bc-section-title">Assists</div>
-      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.recover"><span>Recover</span></label>
-      <label class="bc-row" ng-if="form.recover">
+      <label class="bc-row bc-check" bc-setup-tip="tip('recover')"><input type="checkbox" ng-model="form.recover"><span>Recover</span></label>
+      <label class="bc-row" ng-if="form.recover" bc-setup-tip="tip('recoverSecs')">
         <span>Recover hold (sec)</span>
         <input type="number" min="0" ng-model="form.recoverSecs" placeholder="{{holdHint()}}">
       </label>
-      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.repair"><span>Repair</span></label>
-      <label class="bc-row" ng-if="form.repair">
+      <label class="bc-row bc-check" bc-setup-tip="tip('repair')"><input type="checkbox" ng-model="form.repair"><span>Repair</span></label>
+      <label class="bc-row" ng-if="form.repair" bc-setup-tip="tip('repairSecs')">
         <span>Repair hold (sec)</span>
         <input type="number" min="0" ng-model="form.repairSecs" placeholder="{{holdHint()}}">
       </label>
@@ -320,8 +343,8 @@
          configurable time penalty. Off = the default lock countdown. -->
     <div class="bc-section">
       <div class="bc-section-title">Start</div>
-      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.f1Start"><span>F1 light start</span></label>
-      <label class="bc-row" ng-if="form.f1Start">
+      <label class="bc-row bc-check" bc-setup-tip="tip('f1Start')"><input type="checkbox" ng-model="form.f1Start"><span>F1 light start</span></label>
+      <label class="bc-row" ng-if="form.f1Start" bc-setup-tip="tip('jumpPenalty')">
         <span>Jump-start penalty (sec)</span>
         <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="15">
       </label>
@@ -330,9 +353,9 @@
     <!-- AI -->
     <div class="bc-section">
       <div class="bc-section-title">AI</div>
-      <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiEnabled"><span>AI opponents</span></label>
+      <label class="bc-row bc-check" bc-setup-tip="tip('aiEnabled')"><input type="checkbox" ng-model="form.aiEnabled"><span>AI opponents</span></label>
       <div ng-if="form.aiEnabled">
-        <label class="bc-row">
+        <label class="bc-row" bc-setup-tip="tip('aiCount')">
           <span>Count</span>
           <!-- The count is live like the rest of the AI block (ADR-0047 live amendment, round 2): fewer AI
                drop tail entries, more AI roll new ones in. ng-change debounces (~500 ms) rather than acting
@@ -343,7 +366,7 @@
             ng-change="rosterCountTyped()"
             ng-blur="applyRosterCount()" ng-keydown="$event.keyCode === 13 && applyRosterCount()">
         </label>
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('aiPreset')">
           <span>Preset</span>
           <div class="bc-dd">
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiPreset')">{{labelFor('aiPreset')}}</button>
@@ -353,7 +376,7 @@
             </div>
           </div>
         </div>
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('aiCar')">
           <span>AI car</span>
           <div class="bc-dd">
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiCar')">{{labelFor('aiCar')}}</button>
@@ -366,8 +389,8 @@
         <!-- Composable random-AI axes: only meaningful when the AI car is "random". Trim toggles stock vs
              random config variant; Exclude big vehicles drops buses/trucks/vans by curb weight. -->
         <div ng-if="form.aiCar === 'random'">
-          <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiRandomTrim"><span>Random trim variant</span></label>
-          <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiNoBigCars"><span>Exclude big vehicles</span></label>
+          <label class="bc-row bc-check" bc-setup-tip="tip('aiRandomTrim')"><input type="checkbox" ng-model="form.aiRandomTrim"><span>Random trim variant</span></label>
+          <label class="bc-row bc-check" bc-setup-tip="tip('aiNoBigCars')"><input type="checkbox" ng-model="form.aiNoBigCars"><span>Exclude big vehicles</span></label>
         </div>
         <!-- Named AI roster (ADR-0047, live since the 2026-07-29 amendment): the roster fields itself when
              "AI opponents" is ticked and the three AI-car settings above re-roll its cars, so there is no
@@ -380,9 +403,9 @@
                everywhere. Do not "fix" the mismatch by renaming the identifiers -- aiRoster is persisted in
                saved presets and the session blob, and overrides.ai.roster is the ADR-0047 wire contract, so
                a rename means a data migration plus a lockstep client+server deploy. -->
-          <span>AI lineup</span>
+          <span bc-setup-tip="tip('rosterToggle')">AI lineup</span>
           <span class="bc-roster-actions">
-            <button type="button" class="bc-refresh"
+            <button type="button" class="bc-refresh" bc-setup-tip="tip('rosterToggle')"
               ng-click="toggleRoster()">{{rosterOpen ? 'Hide' : 'Edit…'}}</button>
           </span>
         </div>
@@ -392,10 +415,10 @@
                the entries that are there, so this is the one control that replaces the names -- and with
                them the spawn/grid slots and the identities keyed off them. -->
           <div class="bc-row">
-            <span>All AI</span>
+            <span bc-setup-tip="tip('rollAll')">All AI</span>
             <span class="bc-roster-actions">
               <button type="button" class="bc-refresh" ng-click="rollAllRoster()"
-                title="Roll a completely fresh AI lineup -- new names, cars and colours">Roll all</button>
+                bc-setup-tip="tip('rollAll')">Roll all</button>
             </span>
           </div>
           <!-- Compact all-AI editor (ADR-0047 amendment R2/R3): every AI is listed; each expands its own
@@ -407,36 +430,36 @@
                use rosterIndexOf(e) (the real data index) instead. -->
           <div class="bc-roster-entry" ng-repeat="e in form.aiRoster | orderBy:nameSortKey">
             <div class="bc-row">
-              <span>#{{rosterIndexOf(e) + 1}} Name</span>
+              <span bc-setup-tip="tip('rosterName')">#{{rosterIndexOf(e) + 1}} Name</span>
               <div class="bc-dd">
-                <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterName' + rosterIndexOf(e))">{{e.name || 'pick name…'}}</button>
+                <button type="button" class="bc-dd-head" bc-setup-fit bc-setup-tip="tip('rosterName')" ng-click="toggle('rosterName' + rosterIndexOf(e))">{{e.name || 'pick name…'}}</button>
                 <div class="bc-dd-list" ng-if="open === 'rosterName' + rosterIndexOf(e)">
                   <div class="bc-dd-opt" bc-setup-fit ng-repeat="nm in rosterNameOpts(e)" ng-class="{sel: nm === e.name}"
                     ng-click="pickRosterName(e, nm)">{{nm}}</div>
                 </div>
               </div>
               <button type="button" class="bc-preset" ng-click="rerollRosterName(e)"
-                title="Draw a random name from the pool">Roll</button>
+                bc-setup-tip="tip('rosterNameRoll')">Roll</button>
             </div>
             <!-- Read-only summary (R3: two lines so it never overflows) -- line 1 = car model (change D:
                  model only) + inline colour swatch + Change; line 2 = the type (config). -->
             <div class="bc-row" ng-if="!e._open">
-              <span>Car</span>
-              <span class="bc-roster-carshown">{{rosterCarLabel(e)}} <span class="bc-swatch bc-swatch-inline"
-                ng-style="rosterSwatchStyle(e.color)" title="{{e.color}}"></span></span>
+              <span bc-setup-tip="tip('rosterCarShown')">Car</span>
+              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterCarShown')">{{rosterCarLabel(e)}} <span class="bc-swatch bc-swatch-inline"
+                ng-style="rosterSwatchStyle(e.color)"></span></span>
               <button type="button" class="bc-preset" ng-click="toggleRosterEntry(e)"
-                title="Edit this AI's car, type and colour">Change…</button>
+                bc-setup-tip="tip('rosterChange')">Change…</button>
             </div>
             <div class="bc-row" ng-if="!e._open && rosterModelOf(e) && rosterModelOf(e) !== 'host'">
-              <span>Type</span>
-              <span class="bc-roster-carshown">{{rosterConfigLabel(e)}}</span>
+              <span bc-setup-tip="tip('rosterTypeShown')">Type</span>
+              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterTypeShown')">{{rosterConfigLabel(e)}}</span>
             </div>
             <!-- Expanded edit panel: Car / Type / Colour, each with its own dropdown/palette + a Roll, then
                  one Save & Done (R3): persists this name's preferred and collapses -- closing always saves. -->
             <div ng-if="e._open">
               <div class="bc-row">
-                <span>Car</span>
-                <div class="bc-dd">
+                <span bc-setup-tip="tip('rosterCar')">Car</span>
+                <div class="bc-dd" bc-setup-tip="tip('rosterCar')">
                   <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCar' + rosterIndexOf(e))">{{rosterCarLabel(e)}}</button>
                   <div class="bc-dd-list" ng-if="open === 'rosterCar' + rosterIndexOf(e)">
                     <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.rosterCar" ng-class="{sel: o.v === rosterModelOf(e)}"
@@ -444,11 +467,11 @@
                   </div>
                 </div>
                 <button type="button" class="bc-preset" ng-click="rerollRosterCar(e)"
-                  title="Roll a random car under the current settings">Roll</button>
+                  bc-setup-tip="tip('rosterCarRoll')">Roll</button>
               </div>
               <div class="bc-row" ng-if="rosterModelOf(e) && rosterModelOf(e) !== 'host'">
-                <span>Type</span>
-                <div class="bc-dd">
+                <span bc-setup-tip="tip('rosterConfig')">Type</span>
+                <div class="bc-dd" bc-setup-tip="tip('rosterConfig')">
                   <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('rosterCfg' + rosterIndexOf(e))">{{rosterConfigLabel(e)}}</button>
                   <div class="bc-dd-list" ng-if="open === 'rosterCfg' + rosterIndexOf(e)">
                     <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in rosterConfigOpts(e)" ng-class="{sel: o.v === rosterConfigOf(e)}"
@@ -456,23 +479,23 @@
                   </div>
                 </div>
                 <button type="button" class="bc-preset" ng-click="rerollRosterConfig(e)"
-                  title="Roll a random type for this car">Roll</button>
+                  bc-setup-tip="tip('rosterConfigRoll')">Roll</button>
               </div>
               <div class="bc-row">
-                <span>Colour</span>
-                <span class="bc-swatches">
+                <span bc-setup-tip="tip('rosterColor')">Colour</span>
+                <span class="bc-swatches" bc-setup-tip="tip('rosterColor')">
                   <button type="button" class="bc-swatch" ng-repeat="hex in data.aiPalette"
                     ng-class="{sel: hex === e.color}" ng-style="rosterSwatchStyle(hex)"
-                    ng-click="pickRosterColor(e, hex)" title="{{hex}}"></button>
+                    ng-click="pickRosterColor(e, hex)"></button>
                 </span>
                 <button type="button" class="bc-preset" ng-click="rerollRosterColor(e)"
-                  title="Roll a random colour">Roll</button>
+                  bc-setup-tip="tip('rosterColorRoll')">Roll</button>
               </div>
               <div class="bc-row">
                 <span></span>
                 <span class="bc-roster-actions">
                   <button type="button" class="bc-preset" ng-click="doneRosterEntry(e)"
-                    title="Close this AI's editor (car, type and colour apply to this race only)">Done</button>
+                    bc-setup-tip="tip('rosterDone')">Done</button>
                 </span>
               </div>
             </div>
@@ -480,9 +503,9 @@
         </div>
         <!-- Separate the AI-car / random-pool cluster above from the advanced tuning cluster below. -->
         <div class="bc-subdivider"></div>
-        <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAdvanced"><span>Advanced AI settings</span></label>
+        <label class="bc-row bc-check" bc-setup-tip="tip('aiAdvanced')"><input type="checkbox" ng-model="form.aiAdvanced"><span>Advanced AI settings</span></label>
         <div ng-if="form.aiAdvanced">
-          <div class="bc-row">
+          <div class="bc-row" bc-setup-tip="tip('aiRoute')">
             <span>Route</span>
             <div class="bc-dd">
               <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiRoute')">{{labelFor('aiRoute')}}</button>
@@ -494,10 +517,10 @@
           </div>
           <!-- The three placeholders name the value the SELECTED preset would apply (aiParamHint), so they
                change with the Preset dropdown above. -->
-          <label class="bc-row"><span>Aggression</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiAggr" placeholder="{{aiParamHint('aggr')}}"></label>
-          <label class="bc-row"><span>Skill</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiSkill" placeholder="{{aiParamHint('skill')}}"></label>
-          <label class="bc-row"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="{{aiParamHint('rubber')}}"></label>
-          <label class="bc-row bc-check"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
+          <label class="bc-row" bc-setup-tip="tip('aiAggr')"><span>Aggression</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiAggr" placeholder="{{aiParamHint('aggr')}}"></label>
+          <label class="bc-row" bc-setup-tip="tip('aiSkill')"><span>Skill</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiSkill" placeholder="{{aiParamHint('skill')}}"></label>
+          <label class="bc-row" bc-setup-tip="tip('aiRubber')"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="{{aiParamHint('rubber')}}"></label>
+          <label class="bc-row bc-check" bc-setup-tip="tip('aiAvoid')"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
         </div>
       </div>
     </div>
@@ -507,7 +530,7 @@
          admin-gated server-side. Sits directly above the Presets section (the panel's last section). -->
     <div class="bc-section">
       <div class="bc-section-title">Tournament</div>
-      <div class="bc-row">
+      <div class="bc-row" bc-setup-tip="tip('tourMode')">
         <span>Mode</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourMode')">{{labelFor('tourMode')}}</button>
@@ -520,12 +543,12 @@
 
       <!-- Points championship (ADR-0040): points accrue across races; the standings drive the next grid. -->
       <div ng-if="form.tourMode === 'championship'">
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('champStatus')">
           <span>Status</span>
           <span class="bc-champ-status" ng-if="championship.active">{{championship.preset}} · {{championship.order}} · {{championship.raceCount}} races</span>
           <span class="bc-champ-status" ng-if="!championship.active">none active</span>
         </div>
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('champPreset')">
           <span>Points</span>
           <div class="bc-dd">
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
@@ -535,7 +558,7 @@
             </div>
           </div>
         </div>
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('champOrder')">
           <span>Grid order</span>
           <div class="bc-dd">
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
@@ -547,25 +570,25 @@
         </div>
         <!-- Qualifying length for a championship whose grid is "quali" (ADR-0041). -->
         <div class="bc-row" ng-if="form.champOrder === 'quali'">
-          <span>Qualifying length</span>
+          <span bc-setup-tip="tip('champQualiMinutes')">Qualifying length</span>
           <span class="bc-quali-len">
-            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes"
+            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes" bc-setup-tip="tip('champQualiMinutes')"
               ng-blur="championshipLive()" ng-keydown="$event.keyCode === 13 && championshipLive()"> min
-            <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
+            <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets" bc-setup-tip="tip('qualiPreset')"
               ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m; championshipLive()">{{m}}</button>
           </span>
         </div>
         <!-- No Start/Apply: the Mode selector activates the championship and every option live-applies. The one
              button restarts the standings while it stays active; Mode=off fully stops it. -->
         <div class="bc-row bc-champ-actions" ng-if="championship.active">
-          <button class="bc-refresh bc-champ-reset" ng-click="championshipRestart()">Reset points</button>
+          <button class="bc-refresh bc-champ-reset" ng-click="championshipRestart()" bc-setup-tip="tip('champReset')">Reset points</button>
         </div>
       </div>
 
       <!-- Class-drop tournament (ADR-0042): an ordered fast->slow list of classes, each a fixed car or a power
            cap. The winner of each race drops one class; the tournament ends when someone wins the slowest. -->
       <div ng-if="form.tourMode === 'classdrop'">
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('tourStatus')">
           <span>Status</span>
           <span class="bc-champ-status" ng-if="tournament.active && !tournament.ended">{{tournament.classCount}} classes · race {{tournament.raceCount}}</span>
           <span class="bc-champ-status" ng-if="tournament.active && tournament.ended">won by {{tournament.winner}}</span>
@@ -573,14 +596,14 @@
         </div>
         <div class="bc-tour-class" ng-repeat="cls in form.tourClasses">
           <div class="bc-row bc-tour-class-head">
-            <span>Class {{$index + 1}}<span class="bc-champ-meta" ng-if="$index === 0"> (fastest)</span><span class="bc-champ-meta" ng-if="$index === form.tourClasses.length - 1 && form.tourClasses.length > 1"> (slowest)</span></span>
+            <span bc-setup-tip="tip('classHead')">Class {{$index + 1}}<span class="bc-champ-meta" ng-if="$index === 0"> (fastest)</span><span class="bc-champ-meta" ng-if="$index === form.tourClasses.length - 1 && form.tourClasses.length > 1"> (slowest)</span></span>
             <span>
-              <button type="button" class="bc-preset" ng-class="{sel: cls.kind === 'car'}" ng-click="setClassKind($index, 'car')">Car</button>
-              <button type="button" class="bc-preset" ng-class="{sel: cls.kind === 'cap'}" ng-click="setClassKind($index, 'cap')">Cap</button>
-              <button type="button" class="bc-preset bc-champ-reset" ng-if="form.tourClasses.length > 2" ng-click="removeClass($index)" title="Remove this class">×</button>
+              <button type="button" class="bc-preset" ng-class="{sel: cls.kind === 'car'}" ng-click="setClassKind($index, 'car')" bc-setup-tip="tip('classKindCar')">Car</button>
+              <button type="button" class="bc-preset" ng-class="{sel: cls.kind === 'cap'}" ng-click="setClassKind($index, 'cap')" bc-setup-tip="tip('classKindCap')">Cap</button>
+              <button type="button" class="bc-preset bc-champ-reset" ng-if="form.tourClasses.length > 2" ng-click="removeClass($index)" bc-setup-tip="tip('classRemove')">×</button>
             </span>
           </div>
-          <div class="bc-row" ng-if="cls.kind === 'car'">
+          <div class="bc-row" ng-if="cls.kind === 'car'" bc-setup-tip="tip('classCar')">
             <span>Car</span>
             <div class="bc-dd">
               <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourCar' + $index)">{{classCarLabel(cls)}}</button>
@@ -590,7 +613,7 @@
               </div>
             </div>
           </div>
-          <div class="bc-row" ng-if="cls.kind === 'car'">
+          <div class="bc-row" ng-if="cls.kind === 'car'" bc-setup-tip="tip('classConfig')">
             <span>Config</span>
             <div class="bc-dd">
               <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourCfg' + $index)">{{classConfigLabel(cls)}}</button>
@@ -600,21 +623,21 @@
               </div>
             </div>
           </div>
-          <label class="bc-row" ng-if="cls.kind === 'cap'">
+          <label class="bc-row" ng-if="cls.kind === 'cap'" bc-setup-tip="tip('classMaxhp')">
             <span>Max hp</span>
             <input type="number" min="0" ng-model="cls.maxhp" placeholder="off"
               ng-blur="tournamentLive()" ng-keydown="$event.keyCode === 13 && tournamentLive()">
           </label>
-          <label class="bc-row" ng-if="cls.kind === 'cap'">
+          <label class="bc-row" ng-if="cls.kind === 'cap'" bc-setup-tip="tip('classMaxpwr')">
             <span>Max hp/kg</span>
             <input type="number" min="0" step="0.001" ng-model="cls.maxpwr" placeholder="off"
               ng-blur="tournamentLive()" ng-keydown="$event.keyCode === 13 && tournamentLive()">
           </label>
         </div>
         <div class="bc-row">
-          <button class="bc-refresh" ng-if="form.tourClasses.length < 6" ng-click="addClass()">Add class</button>
+          <button class="bc-refresh" ng-if="form.tourClasses.length < 6" ng-click="addClass()" bc-setup-tip="tip('addClass')">Add class</button>
         </div>
-        <div class="bc-row">
+        <div class="bc-row" bc-setup-tip="tip('tourOrder')">
           <span>Grid order</span>
           <div class="bc-dd">
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourOrder')">{{labelFor('tourOrder')}}</button>
@@ -627,7 +650,7 @@
         <!-- No Start/Apply: selecting the mode + a valid class list activates it, and every edit live-applies.
              The one button restarts progression while it stays active; Mode=off fully stops it. -->
         <div class="bc-row bc-champ-actions" ng-if="tournament.active">
-          <button class="bc-refresh bc-champ-reset" ng-click="tournamentRestart()">Reset progress</button>
+          <button class="bc-refresh bc-champ-reset" ng-click="tournamentRestart()" bc-setup-tip="tip('tourReset')">Reset progress</button>
         </div>
       </div>
     </div>
@@ -648,30 +671,30 @@
       <div class="bc-section-title">Presets</div>
       <div class="bc-dd">
         <div class="bc-row bc-preset-actions">
-          <button class="bc-refresh" ng-click="togglePresetSave()" title="Save the current setup under a name">Save</button>
+          <button class="bc-refresh" ng-click="togglePresetSave()" bc-setup-tip="tip('presetSave')">Save</button>
           <!-- Nothing saved -> nothing to open. The `open` clause keeps the button live while the list IS
                open, so it can always close what it opened: deleting the last preset empties the list under
                an open dropdown, and a greyed-out toggle over a visible list reads as broken. -->
-          <button class="bc-refresh" ng-disabled="!opts.preset.length && open !== 'preset'" ng-click="toggle('preset')" title="Show this map's saved presets">Load</button>
+          <button class="bc-refresh" ng-disabled="!opts.preset.length && open !== 'preset'" ng-click="toggle('preset')" bc-setup-tip="tip('presetLoad')">Load</button>
         </div>
         <!-- ng-show, NOT ng-if: ng-if would give this row its own child scope, and ng-model="presetName" is
              a bare primitive -- the typed name would be assigned onto THAT scope, while savePreset() reads
              the directive scope and would keep saving the prefilled (or empty) name for ever. Same trap the
              roster's toggleRoster comment describes in app.js. Do not convert this to ng-if. -->
         <div class="bc-row bc-preset-name" ng-show="presetSaveOpen">
-          <span>Name</span>
-          <input type="text" ng-model="presetName" placeholder="preset name"
+          <span bc-setup-tip="tip('presetName')">Name</span>
+          <input type="text" ng-model="presetName" placeholder="preset name" bc-setup-tip="tip('presetName')"
             ng-keydown="$event.keyCode === 13 && savePreset()">
           <button type="button" class="bc-preset-ok" ng-disabled="!presetName.trim()" ng-click="savePreset()"
-            title="Save under this name">&#x2713;</button>
+            bc-setup-tip="tip('presetConfirm')">&#x2713;</button>
         </div>
         <div class="bc-dd-list" ng-if="open === 'preset'">
           <div class="bc-dd-opt bc-preset-opt" ng-repeat="o in opts.preset" ng-class="{sel: o.v === selectedPreset}"
-            ng-click="pickPreset(o.v)" title="Load this preset">
-            <span class="bc-preset-opt-name" bc-setup-fit>{{o.label}}</span>
+            ng-click="pickPreset(o.v)">
+            <span class="bc-preset-opt-name" bc-setup-fit bc-setup-tip="tip('presetRow')">{{o.label}}</span>
             <button type="button" class="bc-preset-del" ng-class="{armed: armedPreset === o.v}"
               ng-click="deletePreset(o.v, $event)"
-              title="Delete this preset (click twice)">{{armedPreset === o.v ? 'sure?' : '&#215;'}}</button>
+              bc-setup-tip="tip('presetDelete')">{{armedPreset === o.v ? 'sure?' : '&#215;'}}</button>
           </div>
           <div class="bc-dd-opt" bc-setup-fit ng-if="!opts.preset.length">no saved presets</div>
         </div>
@@ -689,16 +712,16 @@
          Keep labels in this row short: .bc-actions button has no nowrap/overflow/text-overflow, so a label
          that does not fit WRAPS and makes the row two lines tall. Measured worst case for this one (360px
          panel min-width, all three buttons showing): 118px of label in a 155px button. -->
-    <button class="bc-prepare" ng-disabled="!form.race" ng-click="prepareRace()">Confirm &amp; Build Grid</button>
-    <button class="bc-start" ng-if="prepared" ng-click="startRaceGo()">Start Race</button>
-    <button class="bc-close" ng-click="close()">Close</button>
+    <button class="bc-prepare" ng-disabled="!form.race" ng-click="prepareRace()" bc-setup-tip="tip('prepare')">Confirm &amp; Build Grid</button>
+    <button class="bc-start" ng-if="prepared" ng-click="startRaceGo()" bc-setup-tip="tip('startRace')">Start Race</button>
+    <button class="bc-close" ng-click="close()" bc-setup-tip="tip('close')">Close</button>
   </div>
 
   <!-- Race control (ADR-0038 amendment): stop the running race straight from the panel. Always present, but
        phase-gated -- Cancel is live in any non-lobby phase (incl. finished, to clear results + despawn);
        End & score only during racing. One-click, no confirm. The server still admin-gates and guards. -->
   <div class="bc-actions bc-rc-actions">
-    <button class="bc-cancel" ng-disabled="!canCancel()" ng-click="cancelRace()" title="Discard the race + despawn cars/props/results (no scoring)">Cancel race</button>
-    <button class="bc-end" ng-disabled="phase !== 'racing'" ng-click="endRace()" title="Force the finish and show final standings (cars stay)">End &amp; score</button>
+    <button class="bc-cancel" ng-disabled="!canCancel()" ng-click="cancelRace()" bc-setup-tip="tip('cancelRace')">Cancel race</button>
+    <button class="bc-end" ng-disabled="phase !== 'racing'" ng-click="endRace()" bc-setup-tip="tip('endRace')">End &amp; score</button>
   </div>
 </div>

@@ -54,6 +54,166 @@ angular.module('beamng.apps')
       { v: 'direct', label: 'direct (exact)' }],
   };
 
+  // ----- Hover help copy (ADR-0049) -----------------------------------------------------------------
+  // One entry per control, rendered by bcSetupTip at the bottom of this file after a deliberate hover.
+  // The markup carries only the key (bc-setup-tip="tip('startOrder')"), so these read as a set and can be
+  // proof-read as one.
+  //
+  // Style: WHAT the control does, plus the non-obvious consequence or lock -- never a restatement of the
+  // label, and never a full enumeration of a dropdown's values. Every line is written from the code that
+  // implements it (buildOverrides here, race/*.lua, server/main.lua); where behaviour could not be pinned
+  // down with confidence the narrower true sentence is written instead of the helpful guess, because a
+  // tooltip that asserts something false is worse than none -- people believe it.
+  var TIPS = {
+    // --- Toolbar ---
+    settings: 'Panel-wide options that are not part of the race itself.',
+    includeDeprecated: 'Also list races from the old quickrace source. They still work but are no longer '
+      + 'maintained, so they are hidden by default. Reloads the race list.',
+    force: 'Start even when the pre-flight check rejects the race -- typically a mode or direction the '
+      + 'track geometry does not support. Use it when you know better than the check; the race may still '
+      + 'behave oddly.',
+    tooltips: 'Show these help texts after resting the mouse on a control. Also governs the grid editor, '
+      + 'and is remembered between sessions.',
+
+    // --- Basics ---
+    race: 'Which track this race runs on. Everything below is applied to it, and the grid list follows '
+      + 'your choice.',
+    mode: 'Sprint finishes at the end of the route, circuit runs laps. Auto takes whatever the track '
+      + 'itself declares, which is almost always what you want.',
+    laps: 'Lap count for a circuit race. Left empty the track decides; it has no effect on a sprint.',
+    reverse: 'Drive the route backwards. Only tracks that ship reverse geometry accept this -- the others '
+      + 'are refused by the pre-flight check unless you also set Force.',
+
+    // --- Vehicles ---
+    carModel: 'What everyone drives. "keep own" leaves each player in their current vehicle; a fixed car '
+      + 'puts the whole field in the same one and OVERRIDES the power and weight limits below.',
+    carConfig: 'Which factory trim of that car to spawn. "default" is the stock configuration.',
+    carRandomTrim: 'Roll a random factory trim of each drawn car instead of always taking its stock one.',
+    carNoBigCars: 'Keep buses, trucks and vans out of the random draw, judged by curb weight.',
+    restrictVehicles: 'Limit which vehicles may race by power and weight. Only meaningful for "keep own" '
+      + 'and random cars -- a fixed car ignores these limits entirely.',
+    maxhp: 'Reject vehicles above this power. Leave empty for no limit.',
+    maxpwr: 'Reject vehicles above this power-to-weight ratio in hp per kilogram -- the fairer limit of '
+      + 'the two, since it catches light cars a raw hp cap lets through. Leave empty for no limit.',
+    minkg: 'Reject vehicles lighter than this. Leave empty for no limit.',
+    maxkg: 'Reject vehicles heavier than this. Leave empty for no limit.',
+    orderMode: 'Who lines up where on the grid. Locked while a championship or class-drop tournament is '
+      + 'running -- those formats set the order themselves from the standings.',
+    orderLockedChampionship: 'The running championship sets the grid from its standings, so the per-race '
+      + 'order picker does not apply. Switch Tournament mode to off to get it back.',
+    orderLockedTournament: 'The running class-drop tournament sets the grid from each entered class, '
+      + 'so the per-race order picker does not apply. Switch Tournament mode to off to get it back.',
+    qualiStart: 'The order drivers start the qualifying session in -- not the race grid, which the '
+      + 'qualifying result decides. On a staged sprint track this also predicts who launches first.',
+    qualiMinutes: 'How long the qualifying session runs. The server clamps very short or very long values.',
+    qualiPreset: 'A common qualifying length, in minutes.',
+    orderRev: 'Flip the computed order so the fastest start at the back. Turns a results-based grid into '
+      + 'a handicap.',
+    grid: 'Which saved start grid to spawn on. "default" uses whatever grid this race is currently '
+      + 'pointed at; build or rename grids with Edit.',
+    editGrid: 'Open the grid editor for the selected race. This panel stays open, and you need a race '
+      + 'picked before it does anything.',
+
+    // --- Assists ---
+    recover: 'Let drivers reset a stuck or flipped car back onto the track during the race.',
+    recoverSecs: 'How long the recover key must be held before it triggers, so a stray tap costs nothing.',
+    repair: 'Let drivers repair damage during the race without leaving their position.',
+    repairSecs: 'How long the repair key must be held before it triggers, so a stray tap costs nothing.',
+
+    // --- Start ---
+    f1Start: 'Replace the plain countdown with F1 starting lights. Moving before lights out is a jump '
+      + 'start and costs the penalty below.',
+    jumpPenalty: 'Seconds added to the final time of anyone who moves before lights out.',
+
+    // --- AI ---
+    aiEnabled: 'Fill the field with computer drivers. Ticking this builds a lineup straight away, and '
+      + 'unticking leaves that lineup untouched for next time.',
+    aiCount: 'How many AI drivers race, 1 to 16. Lowering it drops the LAST entries and keeps the rest '
+      + 'exactly as they are; raising it rolls in only the new ones.',
+    aiPreset: 'The difficulty band. It fills in the aggression, skill and rubberband values under '
+      + 'Advanced, and does not change which cars the AI drive.',
+    aiCar: 'What the AI drive. "default" gives each driver the car they prefer; changing this re-rolls the '
+      + 'cars of the whole lineup while keeping their names and colours.',
+    aiRandomTrim: 'Roll a random factory trim for each AI car instead of always taking its stock one.',
+    aiNoBigCars: 'Keep buses, trucks and vans out of the AI draw, judged by curb weight.',
+    rosterToggle: 'Show the lineup so individual drivers can be changed. The list never opens by itself.',
+    rollAll: 'Replace the whole lineup -- new names, cars and colours. Names carry the grid slots, so '
+      + 'this reshuffles who starts where; the settings above only ever re-roll cars.',
+    rosterName: 'Pick this driver from the name pool. A name brings its own preferred car and colour, so '
+      + 'picking one replaces both. Names already used by another entry are not offered.',
+    rosterNameRoll: 'Draw a different unused name, with the car and colour that belong to it.',
+    rosterCarShown: 'The car this driver will spawn in. Use Change to pick a different one.',
+    rosterChange: 'Open the car, trim and colour of this driver. Anything set here applies to this race '
+      + 'only and is overwritten if you re-roll the lineup from the settings above.',
+    rosterTypeShown: 'The factory trim this car spawns as.',
+    rosterCar: 'The car for this one driver, overriding what the AI car setting picked.',
+    rosterCarRoll: 'Roll a fresh car for this driver under the current settings. Deliberately ignores the '
+      + 'preferred car of the name, so it can actually give you something new.',
+    rosterConfig: 'The factory trim of the car this driver has.',
+    rosterConfigRoll: 'Roll a different trim of the car this driver already has.',
+    rosterColor: 'The paint this driver spawns in, so you can tell them apart on track and in the '
+      + 'standings.',
+    rosterColorRoll: 'Roll a different colour from the palette.',
+    rosterDone: 'Collapse this driver again. Nothing is discarded -- the car, trim and colour stay as set '
+      + 'for this race.',
+    aiAdvanced: 'Show the driving-behaviour values behind the difficulty preset.',
+    aiRoute: 'How the AI find their way round. "snap" holds them to the road network, "direct" follows the '
+      + 'race line exactly -- useful where a track has no usable road graph.',
+    aiAggr: 'How hard the AI fight for position, 0 to 1. Empty uses the value the difficulty preset '
+      + 'supplies, shown greyed out in the field.',
+    aiSkill: 'How cleanly and quickly the AI drive, 0 to 1. Empty uses the value the difficulty preset '
+      + 'supplies, shown greyed out in the field.',
+    aiRubber: 'How strongly the AI speed up when behind and ease off when ahead, 0 to 1. Higher keeps the '
+      + 'field together; empty uses the value from the preset.',
+    aiAvoid: 'Let the AI steer around other cars rather than driving their line through them.',
+
+    // --- Tournament ---
+    tourMode: 'Run several races as one contest. The two formats are mutually exclusive, and choosing off '
+      + 'genuinely ENDS the running one rather than just hiding it.',
+    champStatus: 'The championship currently running on the server, if any.',
+    champPreset: 'How finishing positions convert into points.',
+    champOrder: 'How the next grid is built from the championship standings. Applies immediately, and '
+      + 'overrides the per-race Start order.',
+    champQualiMinutes: 'How long the qualifying session runs before each championship race.',
+    champReset: 'Wipe the points table and start scoring again from zero. The championship itself keeps '
+      + 'running -- to stop it entirely, set Mode to off.',
+    tourStatus: 'The class-drop tournament currently running on the server, if any.',
+    classHead: 'One rung of the ladder, fastest at the top. Whoever wins a race drops one rung; winning '
+      + 'in the slowest class wins the tournament.',
+    classKindCar: 'Define this class by a specific car everyone in it drives.',
+    classKindCap: 'Define this class by a power limit instead of a fixed car, so drivers keep variety.',
+    classRemove: 'Remove this rung. The ladder needs at least two.',
+    classCar: 'The car everyone in this class drives.',
+    classConfig: 'Which factory trim of the class car to spawn.',
+    classMaxhp: 'Power ceiling for this class. Leave empty to fall back to the power-to-weight limit.',
+    classMaxpwr: 'Power-to-weight ceiling for this class, in hp per kilogram.',
+    addClass: 'Add another rung below the current ones, up to six.',
+    tourOrder: 'How the grid is built for each tournament race. The class handicap already does the '
+      + 'balancing, so a plain random order is usually enough.',
+    tourReset: 'Put everyone back in the fastest class and start the ladder again. The tournament itself '
+      + 'keeps running -- to stop it entirely, set Mode to off.',
+
+    // --- Presets ---
+    presetSave: 'Store this entire setup -- race, format and the full AI lineup -- under a name you can '
+      + 'load again later.',
+    presetLoad: 'Show the setups saved for this map.',
+    presetName: 'What to call this setup. Saving under a name that already exists replaces it.',
+    presetConfirm: 'Save the setup under this name.',
+    presetRow: 'Load this setup. It fills in every field but starts nothing, so you can still adjust '
+      + 'before confirming.',
+    presetDelete: 'Delete this saved setup from the server. Click twice -- there is no undo.',
+
+    // --- Footer ---
+    prepare: 'Commit every setting on this panel and spawn the field on the grid. Drivers are held in '
+      + 'place afterwards until you press Start Race.',
+    startRace: 'Release the field -- the countdown runs and the race begins. Closes this panel.',
+    close: 'Hide this panel. Your settings are kept and come back when you reopen it.',
+    cancelRace: 'Abandon the race: results are discarded, nobody is scored, and the cars and props are '
+      + 'removed. Use this when a race has gone wrong.',
+    endRace: 'Finish the race now and score it as it stands, showing the final standings. The cars stay '
+      + 'on the map. Use this when the race is effectively over.',
+  };
+
   // One class-drop class row in the panel (ADR-0042): either a fixed car (kind 'car' + model[:config]) or a
   // power cap (kind 'cap' + maxhp/maxpwr). The Add-class button defaults to a cap row -- a cap needs no car
   // lookup, so growing a ladder by hand stays simplest there.
@@ -152,6 +312,39 @@ angular.module('beamng.apps')
   }
   function classModels(classes) {
     return (classes || []).map(function (c) { return c && c.car; });
+  }
+
+  // ----- The tooltip help switch (ADR-0049) --------------------------------------------------------
+  // Persisted in localStorage rather than through GE, and that choice was verified before it was made:
+  // BeamNG's CEF keeps a disk-backed leveldb for the local:// origin (BeamMP's own chat history lives
+  // there across restarts), and the engine's own UI apps in this very Angular module -- SimpleTrip,
+  // IndicatedAirspeed -- persist their preferences exactly this way, under exactly this key shape.
+  //
+  // Both BeamComp panels run at the same origin, so this ONE key governs both and the grid editor needs
+  // no relay, no message channel and no GE state. This key MUST stay in step with STORAGE_KEY in
+  // bcSetupTip at the bottom of this file and in the grid editor's bcGridTip.
+  //
+  // Known limit, accepted: the CEF profile lives under the user folder's temp/, which the game's own
+  // userFolderCleanupFilters.json marks deleteDuringCleanup, and each game version gets a fresh folder.
+  // A cache clear or a version bump therefore forgets the choice -- and lands on ON, the helpful state.
+  var TOOLTIP_KEY = 'apps:beamComp.tooltips';
+
+  // Absent means ON: a fresh profile, or one whose CEF cache was just cleared, gets help rather than
+  // silence. Only the explicit '0' turns it off.
+  function readTooltipPref() {
+    try {
+      return window.localStorage.getItem(TOOLTIP_KEY) !== '0';
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function writeTooltipPref(enabled) {
+    try {
+      window.localStorage.setItem(TOOLTIP_KEY, enabled ? '1' : '0');
+    } catch (e) {
+      // A CEF without usable storage just does not remember the choice; everything else still works.
+    }
   }
 
   // Run a Lua command on the GE side, with the single string argument safely embedded (single-quoted, so
@@ -356,6 +549,18 @@ angular.module('beamng.apps')
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
       scope.phase = 'lobby';                   // latest GE-pushed race phase, gates the race-stop controls (ADR-0038)
+      // The hover-help switch (ADR-0049), restored from localStorage so it survives a game restart.
+      //
+      // An OBJECT property, and that is load-bearing rather than stylistic: the gear menu's contents sit
+      // inside an ng-if (open === 'settings'), which gives them their own CHILD SCOPE. An ng-model on a
+      // bare primitive would be written onto that child scope, shadow this one, and be thrown away with
+      // the menu on every close -- the same trap app.html documents for the preset name row and
+      // toggleRoster documents below. The two toggles beside it are safe only because form.* is a path.
+      //
+      // Deliberately NOT in `form`: that object is serialised into the session blob and into
+      // server-persisted race presets, and a per-player display preference does not belong in a per-race
+      // payload (and must not join the $$hashKey-sensitive blob).
+      scope.ui = { tooltips: readTooltipPref() };
 
       // Session-autosave state. The panel links with freshForm() and only THEN pulls the remembered blob
       // (request_setup_form -> BeamCompSetupForm, async), so the form watcher must stay muted until that
@@ -675,6 +880,20 @@ angular.module('beamng.apps')
         var presets = defaults.presets || {};
         var preset = presets[scope.form.aiPreset || defaults.fallback] || {};
         return defaultHint(preset[key], '-');
+      };
+
+      // The gear menu's hover-help switch. Writing straight through on change (rather than on close) is
+      // what makes it reach an already-open grid editor at once: that panel re-reads the stored flag on
+      // every hover, so there is nothing to notify.
+      scope.setTooltips = function () {
+        writeTooltipPref(scope.ui.tooltips);
+      };
+
+      // Hover help text by key (ADR-0049), read by bc-setup-tip. An unknown key yields '' and the
+      // directive then shows nothing at all -- a missing tooltip is a far better failure than an empty
+      // box hanging off a control.
+      scope.tip = function (key) {
+        return TIPS[key] || '';
       };
 
       // Re-pull the option lists from GE (Refresh button, the include-deprecated toggle, and on link). The
@@ -1740,6 +1959,196 @@ angular.module('beamng.apps').directive('bcSetupFit', [function () {
           } else {
             window.clearTimeout(pending);
           }
+        }
+      });
+    },
+  };
+}]);
+
+// Hover help: a delayed, in-DOM tooltip for one control (ADR-0049).
+//
+//   bc-setup-tip="tip('startOrder')"    an Angular expression that yields the help text
+//
+// NATIVE title= IS DEAD IN BEAMNG. The UI renders in an off-screen CEF and native tooltips are painted by
+// the browser chrome, which an off-screen renderer does not have -- the same reason native <select> does
+// not open here. This panel and the grid editor together carried 33 title= attributes with careful copy;
+// not one was ever visible to a player. Do not reintroduce them: their existence proved nothing.
+//
+// The attribute is an EXPRESSION, parsed once and evaluated only on hover, so no watcher is created and an
+// idle panel costs nothing (the bcSetupFit cost model). The copy itself lives in the TIPS table at the top
+// of this file rather than in the markup, where ~70 multi-sentence strings would bury the template and
+// could not be proof-read as a set.
+//
+// The name is app-unique for the reason bcSetupFit's and bcGridHold's are (see their headers): the two
+// panels share the 'beamng.apps' module, so a generically named attribute directive would also claim the
+// other panel's markup -- and being registered twice on one module, Angular would apply BOTH definitions
+// to every match. BeamCompGridEditor carries the same logic under bcGridTip; the two apps share no code by
+// design (kept in ES5 to match the surrounding CEF/AngularJS file).
+//
+// $parse and $timeout are INJECTED -- core services that cannot be missing, exactly like bcGridHold's.
+// That is not in tension with this file's header: the never-inject rule is about bngApi specifically, a
+// BeamNG-registered service whose absence would take the whole late-loaded directive down.
+angular.module('beamng.apps').directive('bcSetupTip', ['$parse', '$timeout', function ($parse, $timeout) {
+  var SHOW_DELAY = 1200;   // ms of DELIBERATE rest before help appears; crossing the panel shows nothing
+  var GAP = 6;             // px between the control and its tooltip
+  var EDGE_PAD = 8;        // px of clearance the tooltip keeps from the panel edge
+  var ROOT_CLASS = 'bc-setup';
+  // Shared with the grid editor: both apps run at the same local:// origin, so ONE key governs both
+  // panels with no relay. Naming follows the engine's own UI apps (ui/modules/apps/SimpleTrip/app.js,
+  // IndicatedAirspeed/app.js), which persist their preferences as 'apps:<appName>.<pref>'.
+  var STORAGE_KEY = 'apps:beamComp.tooltips';
+
+  // The tooltip currently on screen ({root, el, anchor}), or null. Shared across every instance of this
+  // directive, which is what makes "only one at a time" true by construction rather than by bookkeeping:
+  // every show hides whatever was up, so moving to a neighbouring control restarts the delay cleanly.
+  var visible = null;
+
+  // Read at SHOW time, deliberately not cached at link time: that is what lets the gear-menu switch reach
+  // an already-open grid editor instantly, with no message channel. A getItem costs nanoseconds and only
+  // runs on a real hover. Guarded and defaulting to ON -- if storage is unavailable, help is the safe way
+  // to fail.
+  function tooltipsEnabled() {
+    try {
+      return window.localStorage.getItem(STORAGE_KEY) !== '0';
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function panelRootOf(node) {
+    while (node && node !== document) {
+      if (node.classList && node.classList.contains(ROOT_CLASS)) {
+        return node;
+      }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  // The panel's single reused tooltip box, created on first use and parked on the root node. It is a
+  // CHILD of the root, so it dies with the panel and needs no teardown of its own.
+  function tipBoxOf(root) {
+    if (!root.bcTipBox) {
+      var box = document.createElement('div');
+      box.className = 'bc-tip';
+      root.appendChild(box);
+      root.bcTipBox = box;
+    }
+    return root.bcTipBox;
+  }
+
+  function hideTip() {
+    if (!visible) {
+      return;
+    }
+    visible.el.style.display = 'none';
+    document.removeEventListener('scroll', hideTip, true);
+    visible = null;
+  }
+
+  // Put the box under the control, left edges aligned, then keep it INSIDE the panel: flip above when it
+  // would cross the bottom edge, shift left when it would cross the right one, and clamp so it can never
+  // start off the left edge either. This is functional, not cosmetic -- .bc-setup clips with
+  // overflow: hidden, so an unclamped tooltip is not merely ugly, it is cut off and unreadable.
+  function place(root, box, anchor) {
+    var rootRect = root.getBoundingClientRect();
+    var anchorRect = anchor.getBoundingClientRect();
+    var width = box.offsetWidth;
+    var height = box.offsetHeight;
+
+    var left = anchorRect.left - rootRect.left;
+    var maxLeft = root.clientWidth - width - EDGE_PAD;
+    if (left > maxLeft) {
+      left = maxLeft;
+    }
+    if (left < EDGE_PAD) {
+      left = EDGE_PAD;
+    }
+
+    var top = anchorRect.bottom - rootRect.top + GAP;
+    if (top + height + EDGE_PAD > root.clientHeight) {
+      var above = anchorRect.top - rootRect.top - height - GAP;
+      // Above only when it genuinely fits there; a tooltip taller than the space on both sides parks at
+      // the bottom edge instead of hanging off the top.
+      top = above >= EDGE_PAD ? above : Math.max(EDGE_PAD, root.clientHeight - height - EDGE_PAD);
+    }
+
+    box.style.left = Math.round(left) + 'px';
+    box.style.top = Math.round(top) + 'px';
+  }
+
+  function showTip(anchor, text) {
+    var root = panelRootOf(anchor);
+    if (!root) {
+      return;
+    }
+    hideTip();
+    var box = tipBoxOf(root);
+    // textContent, never innerHTML: the copy is plain prose and must stay unable to inject markup.
+    box.textContent = text;
+    // Lay it out invisibly first -- the box has to have a size before it can be measured, and its
+    // measured size is exactly what the flip decision needs.
+    box.style.visibility = 'hidden';
+    box.style.display = 'block';
+    place(root, box, anchor);
+    box.style.visibility = 'visible';
+    visible = { root: root, el: box, anchor: anchor };
+    // The panel body scrolls (.bc-setup-scroll) while the box is anchored to the non-scrolling root, so a
+    // scroll would leave the tooltip pointing at nothing. Capture phase: the scroll fires on that inner
+    // element and does not bubble to document.
+    document.addEventListener('scroll', hideTip, true);
+  }
+
+  return {
+    restrict: 'A',
+    link: function (scope, element, attrs) {
+      var textOf = $parse(attrs.bcSetupTip);
+      var timer = null;
+
+      function cancel() {
+        if (timer !== null) {
+          $timeout.cancel(timer);
+          timer = null;
+        }
+      }
+
+      function dismiss() {
+        cancel();
+        hideTip();
+      }
+
+      function arm() {
+        cancel();
+        // invokeApply false: showing the box is a pure DOM side effect that touches no scope state, so it
+        // must not kick off a digest -- this panel carries a deep watcher over the whole form, and paying
+        // for it on every hover would be absurd.
+        timer = $timeout(function () {
+          timer = null;
+          if (!tooltipsEnabled()) {
+            return;
+          }
+          var text = textOf(scope);
+          if (text) {
+            showTip(element[0], String(text));
+          }
+        }, SHOW_DELAY, false);
+      }
+
+      // A DISABLED button still fires these (verified in Chrome: only click is suppressed on a disabled
+      // control), which is what lets a greyed-out Cancel race / Start Race explain why it is locked --
+      // the case where help matters most.
+      element.on('mouseenter', arm);
+      element.on('mouseleave', dismiss);
+      element.on('mousedown', dismiss);
+      element.on('click', dismiss);
+
+      // jqLite drops this element's own listeners with it; the pending timer is ours to clear. The
+      // tooltip is only taken down if THIS element is the one it describes -- the panel churns ng-if
+      // rows constantly, and an unrelated row disappearing must not dismiss the help someone is reading.
+      scope.$on('$destroy', function () {
+        cancel();
+        if (visible && visible.anchor === element[0]) {
+          hideTip();
         }
       });
     },
