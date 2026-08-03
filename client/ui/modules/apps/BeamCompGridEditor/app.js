@@ -114,12 +114,17 @@ angular.module('beamng.apps')
       + 'name cannot be saved or used.',
     saveConfirm: 'Save the grid under this name, replacing any grid of that name on this race.',
     // Says which grid this race starts on TODAY, which is the one thing the button's own label cannot.
-    // All three answers come off the same saved-grid list the dropdown above is built from.
+    // All three answers come off the saved-grid list the panel already holds.
+    //
+    // Keyed on state.race -- the race the RUNNING SESSION belongs to -- because that is what makeDefault
+    // assigns to. It is deliberately not form.race: re-picking the dropdown re-anchors which grids count
+    // as "this race's" but does NOT move where the session saves or assigns (see scope.pick). Reading the
+    // dropdown here would name the wrong race's grid in exactly that case.
     makeDefault: function (scope) {
-      if (!scope.savedName) {
+      if (!scope.savedName || !scope.state.race) {
         return 'Makes this race start on the grid you are editing. Save or load a grid first.';
       }
-      var current = defaultGridName(scope.data.grids, scope.form.race);
+      var current = defaultGridName(scope.data.grids, scope.state.race);
       if (current === scope.savedName) {
         return 'This race already starts on "' + current + '", so this changes nothing.';
       }
