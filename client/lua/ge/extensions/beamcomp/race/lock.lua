@@ -265,6 +265,58 @@ function M.remove()
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
 end
 
+-- The KEYBOARD control currently bound to `action`, or nil. Reads BeamNG's own binding table
+-- (core_input_bindings.bindings: one entry per device, each with contents.devicetype and
+-- contents.bindings = {{action, control}, ...}; controls are normalized to lower case by the engine).
+--
+-- Keyboard only, on purpose. The engine's own core_input_bindings.getControlForAction returns whichever
+-- device it happens to reach first, so with a gamepad attached it answers things like "button31" -- true,
+-- but useless to read in a tooltip and worse than showing no key at all. `unused` marks a binding the
+-- engine has disabled for the seated vehicle, so those are skipped too.
+--
+-- Guarded like every other engine-version-coupled touchpoint in this file (ADR-0017): a renamed or
+-- restructured binding table degrades to "no key known", never to an error.
+local function keyboard_control_for(action)
+    local bindings = core_input_bindings and core_input_bindings.bindings
+    if type(bindings) ~= "table" then
+        return nil
+    end
+    for _, device in ipairs(bindings) do
+        local contents = type(device) == "table" and device.contents or nil
+        if type(contents) == "table" and contents.devicetype == "keyboard"
+            and type(contents.bindings) == "table" then
+            for _, binding in ipairs(contents.bindings) do
+                if type(binding) == "table" and binding.action == action
+                    and not binding.unused and binding.active ~= false
+                    and type(binding.control) == "string" and binding.control ~= "" then
+                    return binding.control
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- The keys the two in-race assists actually sit on, for the race-setup panel's hover help (ADR-0049
+-- amendment). Returns {repair = <control>?, recover = <control>?} -- either field absent when the action
+-- carries no keyboard binding, so the panel can name the command without inventing a key.
+--
+-- The mapping is INVERTED and that is not a typo: the plain recover key is the repair assist, the
+-- alternate one is the recover assist (ADR-0017 decision 3, and the VE forwarder that implements it).
+function M.assist_controls()
+    local ok, controls = pcall(function()
+        return {
+            repair = keyboard_control_for("recover_vehicle"),
+            recover = keyboard_control_for("recover_vehicle_alt"),
+        }
+    end)
+    if not ok then
+        log("W", LOG_TAG, "could not read input bindings: " .. tostring(controls))
+        return {}
+    end
+    return controls
+end
+
 -- True (once) if the player replaced their car since the last call: the swap-allowed pass-through sets
 -- replace_seen, this consumes it. init.lua polls it each staging frame to re-stage the swapped car.
 function M.consume_replace()

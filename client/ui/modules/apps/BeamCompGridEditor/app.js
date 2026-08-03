@@ -34,16 +34,109 @@ angular.module('beamng.apps')
   //
   // `min` mirrors the Lua constraint of the same name in race/grideditor.lua's own KNOBS table, because
   // a held stepper clamps locally now (see clampKnob) instead of letting GE clamp and echo back.
+  // `tip` is the knob's hover help (ADR-0049), rendered by bc-grid-tip straight off this entry. It lives
+  // here rather than in the ng-repeat markup for the same reason `label` and `min` do: a knob and its
+  // explanation belong together, and the repeat then renders ONE text instead of one per row.
   var KNOBS = [
-    { key: 'offsetForward', label: 'Offset forward (m)' },
-    { key: 'offsetLateral', label: 'Offset lateral (m)' },
-    { key: 'headingDeg', label: 'Heading (deg)' },
-    { key: 'rowGap', label: 'Row gap (m)', min: 0 },
-    { key: 'colGap', label: 'Col gap (m)', min: 0 },
-    { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1 },
-    { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1 },
-    { key: 'offsetHeight', label: 'Height lift (m)' },
+    { key: 'offsetForward', label: 'Offset forward (m)',
+      tip: 'How far behind the start line the whole field sits. Higher moves everyone further back.' },
+    { key: 'offsetLateral', label: 'Offset lateral (m)',
+      tip: 'Moves the whole field sideways, plus to the right. Use it to centre the cars on a wide road '
+        + 'or get them clear of a wall.' },
+    { key: 'headingDeg', label: 'Heading (deg)',
+      tip: 'Turns the whole grid, cars and all. Use it when the cars do not point along the road.' },
+    { key: 'rowGap', label: 'Row gap (m)', min: 0,
+      tip: 'Distance from one row of cars to the next. It also sets how far the columns are staggered.' },
+    { key: 'colGap', label: 'Col gap (m)', min: 0,
+      tip: 'Distance between two cars standing side by side.' },
+    { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1,
+      tip: 'Fix how many rows there are and let the width follow the number of cars. Setting this clears '
+        + 'Columns -- only one of the two can be fixed.' },
+    { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1,
+      tip: 'Fix how many cars stand side by side and let the rows follow the number of cars. Setting this '
+        + 'clears Rows -- only one of the two can be fixed.' },
+    { key: 'offsetHeight', label: 'Height lift (m)',
+      tip: 'Lifts the cars off the ground after they are dropped onto it, so +1 leaves them hovering a '
+        + 'metre up. Only this part of the grid. Use a little where cars sink into the terrain.' },
   ];
+
+  // The name of `raceId`'s default grid in a {name, race, isDefault} list, or '' when it has none. The
+  // server holds the one-default-per-race invariant (grid_store.ensure_default), so at most one matches.
+  function defaultGridName(grids, raceId) {
+    var list = grids || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].race === raceId && list[i].isDefault) {
+        return list[i].name;
+      }
+    }
+    return '';
+  }
+
+  // ----- Hover help copy (ADR-0049) -----------------------------------------------------------------
+  // One entry per control that is not a layout knob (those carry their own text in KNOBS above), rendered
+  // by bcGridTip at the bottom of this file after a deliberate hover. The markup carries only the key.
+  //
+  // STYLE, tightened after the first in-game round: short everyday words; say what the control does and
+  // what changes if you touch it; then stop. No mechanism, and no sentence whose job is to justify a
+  // design decision -- this is read by an admin standing in the game.
+  //
+  // Every line is still written from the code that implements it (this file, race/grideditor.lua,
+  // race/grid.lua). An entry may be a FUNCTION of the scope where the useful answer depends on live
+  // state (see scope.tip).
+  var TIPS = {
+    refresh: 'Re-read the races and saved grids from the game. Use it if a grid you saved elsewhere is '
+      + 'not showing up.',
+    race: 'The race this grid is for. A grid belongs to its race, so this also decides which saved grids '
+      + 'count as "this race" below.',
+    newGrid: 'Start a fresh grid from the track default. Needs a race picked, and it throws away whatever '
+      + 'you are editing.',
+    load: 'Show the grids saved on this map.',
+    gridRow: 'Load this grid for editing. While you are editing it asks twice, because loading throws '
+      + 'away unsaved changes.',
+    gridDelete: 'Delete this saved grid. Click twice -- there is no undo.',
+
+    direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
+
+    breakpoint: 'The starting position where a new part of the grid begins. Type a number, then press Add '
+      + 'breakpoint -- typing alone does nothing.',
+    addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
+      + 'own layout.',
+    removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
+    segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
+      + 'one to edit it with the knobs below.',
+
+    mirror: 'Flip the grid to the other side of the road, so the front car swaps between left and right.',
+    previewCount: 'How many cars the preview draws. It is also the field size above which starting a race '
+      + 'warns you, and it never changes the layout itself.',
+
+    saveGrid: 'Show the name field, to store this grid for the race you are editing.',
+    saveName: 'What to call this grid. No spaces -- a grid name has to work as an argument, so a spaced '
+      + 'name cannot be saved or used.',
+    saveConfirm: 'Save the grid under this name, replacing any grid of that name on this race.',
+    // Says which grid this race starts on TODAY, which is the one thing the button's own label cannot.
+    // All three answers come off the saved-grid list the panel already holds.
+    //
+    // Keyed on state.race -- the race the RUNNING SESSION belongs to -- because that is what makeDefault
+    // assigns to. It is deliberately not form.race: re-picking the dropdown re-anchors which grids count
+    // as "this race's" but does NOT move where the session saves or assigns (see scope.pick). Reading the
+    // dropdown here would name the wrong race's grid in exactly that case.
+    makeDefault: function (scope) {
+      if (!scope.savedName || !scope.state.race) {
+        return 'Makes this race start on the grid you are editing. Save or load a grid first.';
+      }
+      var current = defaultGridName(scope.data.grids, scope.state.race);
+      if (current === scope.savedName) {
+        return 'This race already starts on "' + current + '", so this changes nothing.';
+      }
+      if (!current) {
+        return 'This race has no grid of its own yet, so the game lines the cars up by itself. This makes '
+          + 'it start on "' + scope.savedName + '".';
+      }
+      return 'This race starts on "' + current + '" today. This makes it start on "' + scope.savedName
+        + '" instead.';
+    },
+    close: 'Close the editor and clear the preview. Unsaved changes are lost.',
+  };
 
   var PREVIEW_MIN = 1;
   var PREVIEW_MAX = 32;
@@ -540,6 +633,22 @@ angular.module('beamng.apps')
       scope.$on('$destroy', function () {
         document.removeEventListener('click', closeOnOutsideClick, false);
       });
+
+      // Hover help text by key (ADR-0049), read by bc-grid-tip. The layout knobs do not come through
+      // here -- they carry their own text on the KNOBS entry. An unknown key yields '' and the directive
+      // then shows nothing at all, which is a far better failure than an empty box on a control.
+      //
+      // A TIPS entry may be a FUNCTION of the scope instead of a fixed string (ADR-0049 amendment), for
+      // help that only makes sense against live state -- the Default button has to say which grid this
+      // race starts on today. The directive evaluates its expression inside the hover delay, not at link
+      // time, so a function entry is re-read on every hover and can never go stale.
+      scope.tip = function (key) {
+        var entry = TIPS[key];
+        if (typeof entry === 'function') {
+          entry = entry(scope);
+        }
+        return entry || '';
+      };
 
       // Re-pull races + saved grids from GE (Refresh button and on link).
       scope.refresh = function () {
@@ -1066,6 +1175,191 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
       // listener are ours to clear, and the final GE send still goes out through endGesture.
       scope.$on('$destroy', function () {
         release();
+      });
+    },
+  };
+}]);
+
+// Hover help: a delayed, in-DOM tooltip for one control (ADR-0049).
+//
+//   bc-grid-tip="tip('mirror')"    an Angular expression that yields the help text
+//   bc-grid-tip="k.tip"            the layout knobs carry their own, straight off the KNOBS entry
+//
+// NATIVE title= IS DEAD IN BEAMNG. The UI renders in an off-screen CEF and native tooltips are painted by
+// the browser chrome, which an off-screen renderer does not have -- the same reason native <select> does
+// not open here. This panel and the setup panel together carried 33 title= attributes with careful copy;
+// not one was ever visible to a player. Do not reintroduce them: their existence proved nothing.
+//
+// The attribute is an EXPRESSION, parsed once and evaluated only on hover, so no watcher is created and an
+// idle panel costs nothing (the bcGridFit cost model). Static copy lives in the TIPS table at the top of
+// this file; the eight layout knobs keep their text on the knob object beside key/label/min, so a knob and
+// its explanation move together and the ng-repeat renders one text rather than one per row.
+//
+// The name is app-unique for the reason bcGridFit's and bcGridHold's are (see their headers): the two
+// panels share the 'beamng.apps' module, so a generically named attribute directive would also claim the
+// other panel's markup -- and being registered twice on one module, Angular would apply BOTH definitions
+// to every match. BeamCompSetup carries the same logic under bcSetupTip; the two apps share no code by
+// design (kept in ES5 to match the surrounding CEF/AngularJS file).
+angular.module('beamng.apps').directive('bcGridTip', ['$parse', '$timeout', function ($parse, $timeout) {
+  var SHOW_DELAY = 1200;   // ms of DELIBERATE rest before help appears; crossing the panel shows nothing
+  var GAP = 6;             // px between the control and its tooltip
+  var EDGE_PAD = 8;        // px of clearance the tooltip keeps from the panel edge
+  var ROOT_CLASS = 'bc-grid';
+  // Shared with the setup panel: both apps run at the same local:// origin, so ONE key governs both
+  // panels and the setup gear menu's switch is the only writer. Naming follows the engine's own UI apps
+  // (ui/modules/apps/SimpleTrip/app.js, IndicatedAirspeed/app.js): 'apps:<appName>.<pref>'.
+  var STORAGE_KEY = 'apps:beamComp.tooltips';
+
+  // The tooltip currently on screen ({root, el, anchor}), or null. Shared across every instance of this
+  // directive, which is what makes "only one at a time" true by construction rather than by bookkeeping:
+  // every show hides whatever was up, so moving to a neighbouring control restarts the delay cleanly.
+  var visible = null;
+
+  // Read at SHOW time, deliberately not cached at link time: the switch lives in the OTHER panel, so a
+  // toggle there has to reach this one, and reading per hover is what achieves that with no message
+  // channel. Guarded and defaulting to ON -- if storage is unavailable, help is the safe way to fail.
+  function tooltipsEnabled() {
+    try {
+      return window.localStorage.getItem(STORAGE_KEY) !== '0';
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function panelRootOf(node) {
+    while (node && node !== document) {
+      if (node.classList && node.classList.contains(ROOT_CLASS)) {
+        return node;
+      }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  // The panel's single reused tooltip box, created on first use and parked on the root node. It is a
+  // CHILD of the root, so it dies with the panel and needs no teardown of its own.
+  function tipBoxOf(root) {
+    if (!root.bcTipBox) {
+      var box = document.createElement('div');
+      box.className = 'bc-tip';
+      root.appendChild(box);
+      root.bcTipBox = box;
+    }
+    return root.bcTipBox;
+  }
+
+  function hideTip() {
+    if (!visible) {
+      return;
+    }
+    visible.el.style.display = 'none';
+    document.removeEventListener('scroll', hideTip, true);
+    visible = null;
+  }
+
+  // Put the box under the control, left edges aligned, then keep it INSIDE the panel: flip above when it
+  // would cross the bottom edge, shift left when it would cross the right one, and clamp so it can never
+  // start off the left edge either. This is functional, not cosmetic -- .bc-grid clips with
+  // overflow: hidden, so an unclamped tooltip is not merely ugly, it is cut off and unreadable.
+  function place(root, box, anchor) {
+    var rootRect = root.getBoundingClientRect();
+    var anchorRect = anchor.getBoundingClientRect();
+    var width = box.offsetWidth;
+    var height = box.offsetHeight;
+
+    var left = anchorRect.left - rootRect.left;
+    var maxLeft = root.clientWidth - width - EDGE_PAD;
+    if (left > maxLeft) {
+      left = maxLeft;
+    }
+    if (left < EDGE_PAD) {
+      left = EDGE_PAD;
+    }
+
+    var top = anchorRect.bottom - rootRect.top + GAP;
+    if (top + height + EDGE_PAD > root.clientHeight) {
+      var above = anchorRect.top - rootRect.top - height - GAP;
+      // Above only when it genuinely fits there; a tooltip taller than the space on both sides parks at
+      // the bottom edge instead of hanging off the top.
+      top = above >= EDGE_PAD ? above : Math.max(EDGE_PAD, root.clientHeight - height - EDGE_PAD);
+    }
+
+    box.style.left = Math.round(left) + 'px';
+    box.style.top = Math.round(top) + 'px';
+  }
+
+  function showTip(anchor, text) {
+    var root = panelRootOf(anchor);
+    if (!root) {
+      return;
+    }
+    hideTip();
+    var box = tipBoxOf(root);
+    // textContent, never innerHTML: the copy is plain prose and must stay unable to inject markup.
+    box.textContent = text;
+    // Lay it out invisibly first -- the box has to have a size before it can be measured, and its
+    // measured size is exactly what the flip decision needs.
+    box.style.visibility = 'hidden';
+    box.style.display = 'block';
+    place(root, box, anchor);
+    box.style.visibility = 'visible';
+    visible = { root: root, el: box, anchor: anchor };
+    // The panel body scrolls (.bc-scroll) while the box is anchored to the non-scrolling root, so a
+    // scroll would leave the tooltip pointing at nothing. Capture phase: the scroll fires on that inner
+    // element and does not bubble to document.
+    document.addEventListener('scroll', hideTip, true);
+  }
+
+  return {
+    restrict: 'A',
+    link: function (scope, element, attrs) {
+      var textOf = $parse(attrs.bcGridTip);
+      var timer = null;
+
+      function cancel() {
+        if (timer !== null) {
+          $timeout.cancel(timer);
+          timer = null;
+        }
+      }
+
+      function dismiss() {
+        cancel();
+        hideTip();
+      }
+
+      function arm() {
+        cancel();
+        // invokeApply false: showing the box is a pure DOM side effect that touches no scope state, so it
+        // must not kick off a digest on every hover.
+        timer = $timeout(function () {
+          timer = null;
+          if (!tooltipsEnabled()) {
+            return;
+          }
+          var text = textOf(scope);
+          if (text) {
+            showTip(element[0], String(text));
+          }
+        }, SHOW_DELAY, false);
+      }
+
+      // A DISABLED button still fires these (verified in Chrome: only click is suppressed on a disabled
+      // control), which is what lets a greyed-out New grid / Remove explain why it is locked -- the case
+      // where help matters most.
+      element.on('mouseenter', arm);
+      element.on('mouseleave', dismiss);
+      element.on('mousedown', dismiss);
+      element.on('click', dismiss);
+
+      // jqLite drops this element's own listeners with it; the pending timer is ours to clear. The
+      // tooltip is only taken down if THIS element is the one it describes -- the panel churns ng-if
+      // sections constantly, and an unrelated one disappearing must not dismiss help someone is reading.
+      scope.$on('$destroy', function () {
+        cancel();
+        if (visible && visible.anchor === element[0]) {
+          hideTip();
+        }
       });
     },
   };

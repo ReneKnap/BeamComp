@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grideditor-breakpoint-heading-reset/2026-08-03"
+local BUILD_MARKER = "ui-setting-tooltips-r2/2026-08-04"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2305,6 +2305,22 @@ function M.request_car_configs(model)
     guihooks.trigger("BeamCompSetupCars", {model = model, configs = carlist.options(model).configs})
 end
 
+-- Push ONE race's track metadata to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this
+-- when the selected race changes; it needs `closed` to preselect sprint vs circuit and to decide whether a
+-- lap count means anything (ADR-0013 amendment).
+--
+-- Lazy per race for the same reason configs are lazy per model: racelist.options deliberately parses no
+-- geometry, and a map can carry well over a hundred races. `closed` is nil when the race cannot be resolved
+-- or parsed -- the panel then keeps its "track type unknown" fallback instead of being told something
+-- false. Public so the app can reach it as beamcomp_init.request_race_meta.
+function M.request_race_meta(race_id)
+    if type(race_id) ~= "string" then
+        return
+    end
+    local meta = racelist.meta_for(maps.current(), race_id)
+    guihooks.trigger("BeamCompRaceMeta", {id = race_id, closed = meta and meta.closed})
+end
+
 -- ===== race-setup panel presence (bug setup-panel-settings-survive-ui-reload) =====================
 -- The panel is put on screen by the admin-gated /raceui relay and taken down by its own Close button --
 -- but an engine/BeamMP UI reload destroys it (and its Angular scope) without ever running that close,
@@ -2573,6 +2589,10 @@ local function push_setup_data(include_deprecated)
         -- hold seconds (race/start.lua, a constant).
         aiDefaults = ai.preset_defaults(),
         assistHoldDefault = race_start.assist_hold_default(),
+        -- The keyboard keys the recover/repair assists actually sit on right now (ADR-0017/0049), so the
+        -- panel's hover help can name the real key instead of a hardcoded guess. Either field is absent
+        -- when the action has no keyboard binding; the panel then names the command and no key.
+        assistKeys = lock.assist_controls(),
     })
     -- The driver NAME list for the panel's roster name picker (ADR-0048): sourced from the mod-bundled
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
