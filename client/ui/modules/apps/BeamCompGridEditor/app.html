@@ -1,6 +1,11 @@
 <div class="bc-grid">
   <style scoped>
+    /* position: relative makes this box the containing block the hover tooltip is positioned and clamped
+       against (bcGridTip, ADR-0049). It moves nothing that exists: the only absolutely positioned boxes
+       in this panel are .bc-dd-list and .bc-dd-head::after, and both already resolve against .bc-dd
+       (itself relative), so neither ever reached this element. */
     .bc-grid { display: flex; flex-direction: column; height: 100%; box-sizing: border-box;
+      position: relative;
       font-family: 'Roboto', sans-serif; font-size: 13px; color: #f0f0f0;
       background: rgba(20, 22, 26, 0.92); border-radius: 4px; overflow: hidden; }
     .bc-toolbar { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; padding: 6px 10px;
@@ -121,11 +126,23 @@
     .bc-actions button { flex: 1 1 auto; padding: 6px 0; border: none; border-radius: 3px;
       font-weight: 700; cursor: pointer; }
     .bc-close { background: #444; color: #ddd; }
+    /* Hover help (bcGridTip, ADR-0049). Native title= renders NOTHING in BeamNG -- the UI is drawn in an
+       off-screen CEF and native tooltips are painted by browser chrome an off-screen renderer does not
+       have -- so the help text is a box in our own DOM instead. One per panel, reused, positioned by the
+       directive in root-local coordinates and flipped/shifted to stay inside .bc-grid (which clips with
+       overflow: hidden, so an unclamped tooltip is not ugly but unreadable).
+       pointer-events: none is load-bearing, not polish: it is what guarantees the layer can never swallow
+       a click or block the control it describes. z-index clears .bc-dd-list's 50. */
+    .bc-tip { position: absolute; z-index: 100; display: none; pointer-events: none;
+      max-width: min(320px, calc(100% - 20px)); padding: 5px 8px;
+      background: #10131a; color: #e8eef5; border: 1px solid rgba(143, 211, 255, 0.35);
+      border-radius: 3px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+      font-size: 12px; line-height: 1.35; white-space: normal; }
   </style>
 
   <div class="bc-toolbar">
     <span class="bc-title">Grid Editor</span>
-    <button class="bc-mini" ng-click="refresh()">Refresh</button>
+    <button class="bc-mini" ng-click="refresh()" bc-grid-tip="tip('refresh')">Refresh</button>
   </div>
 
   <div class="bc-scroll">
@@ -133,7 +150,7 @@
     <!-- Anchor -->
     <div class="bc-section">
       <div class="bc-section-title">Anchor</div>
-      <div class="bc-row">
+      <div class="bc-row" bc-grid-tip="tip('race')">
         <span>Race</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-grid-fit ng-click="toggle('race')">{{labelFor('race', 'select…')}}</button>
@@ -153,25 +170,24 @@
       <div class="bc-dd">
         <div class="bc-row bc-grid-actions">
           <button class="bc-mini" ng-disabled="!form.race" ng-click="newGrid()"
-            title="Start a fresh grid from this race's track default">New grid</button>
+            bc-grid-tip="tip('newGrid')">New grid</button>
           <!-- Nothing saved -> nothing to open. The `open` clause keeps the button live while the list IS
                open, so it can always close what it opened: deleting the last grid empties the list under an
                open dropdown, and a greyed-out toggle over a visible list reads as broken. -->
           <button class="bc-mini" ng-disabled="!opts.loadName.length && open !== 'loadName'"
-            ng-click="toggle('loadName')" title="Show this map's saved grids">Load</button>
+            ng-click="toggle('loadName')" bc-grid-tip="tip('load')">Load</button>
         </div>
         <div class="bc-dd-list" ng-if="open === 'loadName'">
           <div class="bc-dd-opt bc-grid-opt" ng-repeat="o in opts.loadName"
-            ng-class="{sel: o.v === form.loadName, 'bc-dd-sep': o.separator}" ng-click="pickGrid(o)"
-            title="{{o.separator ? '' : (state.active ? 'Load this grid -- click twice, it replaces the current edits' : 'Load this grid')}}">
-            <span class="bc-grid-opt-name" bc-grid-fit>{{o.label}}</span>
+            ng-class="{sel: o.v === form.loadName, 'bc-dd-sep': o.separator}" ng-click="pickGrid(o)">
+            <span class="bc-grid-opt-name" bc-grid-fit bc-grid-tip="o.separator ? '' : tip('gridRow')">{{o.label}}</span>
             <!-- Armed for load: only reachable while a session is running, where a load is two-step. The
                  state.active clause is what it says -- a session cancelled from the console with this list
                  open would otherwise leave a stale "replace?" over a row that now loads on one click. -->
             <span class="bc-grid-replace" ng-if="state.active && armedLoad === o.v">replace?</span>
             <button type="button" class="bc-grid-del" ng-if="!o.separator"
               ng-class="{armed: armedDelete === o.v}" ng-click="deleteGrid(o.v, $event)"
-              title="Delete this grid (click twice)">{{armedDelete === o.v ? 'sure?' : '&#215;'}}</button>
+              bc-grid-tip="tip('gridDelete')">{{armedDelete === o.v ? 'sure?' : '&#215;'}}</button>
           </div>
           <div class="bc-dd-opt" ng-if="!opts.loadName.length">no saved grids</div>
         </div>
@@ -185,7 +201,7 @@
     <!-- Direction -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Direction</div>
-      <div class="bc-seg">
+      <div class="bc-seg" bc-grid-tip="tip('direction')">
         <button ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
         <button ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
       </div>
@@ -203,25 +219,25 @@
       <div class="bc-hint">Editing segment {{state.activeSegment}} of {{state.segments.length}} (from
         {{slotLabel(state.activeStartSlot)}}). The Layout knobs below apply to this segment; it stacks
         behind the previous one, with its Offset forward as the gap.</div>
-      <div class="bc-row">
+      <div class="bc-row" bc-grid-tip="tip('breakpoint')">
         <span>Breakpoint at P</span>
         <div class="bc-step">
-          <button bc-grid-hold="stepBreakpoint(-1)" bc-grid-hold-end="endHold()" title="-1">&minus;</button>
+          <button bc-grid-hold="stepBreakpoint(-1)" bc-grid-hold-end="endHold()">&minus;</button>
           <input type="number" min="1" ng-model="edit.breakpointDisplay">
-          <button bc-grid-hold="stepBreakpoint(1)" bc-grid-hold-end="endHold()" title="+1">+</button>
+          <button bc-grid-hold="stepBreakpoint(1)" bc-grid-hold-end="endHold()">+</button>
         </div>
       </div>
       <div class="bc-row">
         <span></span>
         <!-- The typed field is in display space, so it gets its own handler that converts once; the chips
              below hold real GE slots and go straight to selectSegment. Do not merge the two. -->
-        <button class="bc-mini" ng-click="selectTypedSegment()">Add breakpoint</button>
+        <button class="bc-mini" ng-click="selectTypedSegment()" bc-grid-tip="tip('addBreakpoint')">Add breakpoint</button>
         <button class="bc-mini bc-danger" ng-disabled="state.activeSegment <= 1"
-          ng-click="removeSegment()">Remove</button>
+          ng-click="removeSegment()" bc-grid-tip="tip('removeSegment')">Remove</button>
       </div>
       <div class="bc-row" ng-if="state.segments.length > 1">
-        <span>Breakpoints</span>
-        <div class="bc-seg">
+        <span bc-grid-tip="tip('segmentChips')">Breakpoints</span>
+        <div class="bc-seg" bc-grid-tip="tip('segmentChips')">
           <button ng-repeat="s in state.segments" ng-class="{on: ($index + 1) === state.activeSegment}"
             ng-click="selectSegment(s.startSlot)">{{slotLabel(s.startSlot)}}</button>
         </div>
@@ -231,32 +247,28 @@
     <!-- Knobs -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Layout</div>
-      <div class="bc-row bc-knob">
+      <div class="bc-row bc-knob" bc-grid-tip="tip('mirror')">
         <span>Mirror</span>
         <div class="bc-seg">
           <button ng-class="{on: !state.knobs.mirror}" ng-click="setMirror(false)">Off</button>
           <button ng-class="{on: state.knobs.mirror}" ng-click="setMirror(true)">On</button>
         </div>
       </div>
-      <div class="bc-row bc-knob" ng-repeat="k in knobs">
+      <div class="bc-row bc-knob" ng-repeat="k in knobs" bc-grid-tip="k.tip">
         <span>{{k.label}}</span>
         <div class="bc-step">
-          <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()"
-            title="-1">&minus;1</button>
-          <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, -0.05)" bc-grid-hold-end="endHold()"
-            title="-0.05">&minus;</button>
+          <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()">&minus;1</button>
+          <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, -0.05)" bc-grid-hold-end="endHold()">&minus;</button>
           <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
             placeholder="{{k.auto ? 'auto' : knobHint(k)}}">
-          <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, 0.05)" bc-grid-hold-end="endHold()"
-            title="+0.05">+</button>
-          <button class="bc-coarse" bc-grid-hold="stepKnob(k, 1)" bc-grid-hold-end="endHold()"
-            title="+1">+1</button>
+          <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, 0.05)" bc-grid-hold-end="endHold()">+</button>
+          <button class="bc-coarse" bc-grid-hold="stepKnob(k, 1)" bc-grid-hold-end="endHold()">+1</button>
         </div>
       </div>
       <!-- The number is saved WITH the grid and has two jobs since the ADR-0023 amendment 2026-08-02, so
            the label names both: it is the previewed field, and it is the size above which the race start
            warns the admin who started the race. It still never feeds the layout. -->
-      <div class="bc-row" title="Saved with the grid: the previewed field size, and the number of starters above which the start warns you.">
+      <div class="bc-row" bc-grid-tip="tip('previewCount')">
         <span>Preview / warn above</span>
         <div class="bc-step">
           <button bc-grid-hold="stepPreview(-1)" bc-grid-hold-end="endHold()">&minus;</button>
@@ -281,15 +293,15 @@
       <div class="bc-section-title">Save</div>
       <div class="bc-row bc-grid-actions">
         <button class="bc-mini" ng-click="toggleSave()"
-          title="Save this grid for the race being edited">Save grid</button>
+          bc-grid-tip="tip('saveGrid')">Save grid</button>
       </div>
       <div class="bc-grid-save" ng-show="saveOpen">
         <div class="bc-row">
-          <span>Name</span>
-          <input type="text" ng-model="form.saveName" placeholder="no spaces"
+          <span bc-grid-tip="tip('saveName')">Name</span>
+          <input type="text" ng-model="form.saveName" placeholder="no spaces" bc-grid-tip="tip('saveName')"
             ng-keydown="$event.keyCode === 13 && saveGrid()">
           <button type="button" class="bc-grid-ok" ng-disabled="!canSave()" ng-click="saveGrid()"
-            title="Save under this name">&#x2713;</button>
+            bc-grid-tip="tip('saveConfirm')">&#x2713;</button>
         </div>
         <div class="bc-hint" ng-if="savedName && form.saveName === savedName">Overwrites '{{savedName}}'.</div>
       </div>
@@ -302,7 +314,7 @@
         becomes its default automatically; use this to point the default at another one.</div>
       <div class="bc-row">
         <span></span>
-        <button class="bc-mini" ng-disabled="!savedName" ng-click="makeDefault()">
+        <button class="bc-mini" ng-disabled="!savedName" ng-click="makeDefault()" bc-grid-tip="tip('makeDefault')">
           Make {{savedName ? "'" + savedName + "'" : 'this grid'}} the default of this race</button>
       </div>
       <div class="bc-hint" ng-if="!savedName">Save (or load) a grid first.</div>
@@ -311,6 +323,6 @@
   </div>
 
   <div class="bc-actions">
-    <button class="bc-close" ng-click="close()">Close</button>
+    <button class="bc-close" ng-click="close()" bc-grid-tip="tip('close')">Close</button>
   </div>
 </div>
