@@ -28,9 +28,20 @@ angular.module('beamng.apps')
   // apply immediately, so this only bounds how long a purely typed change waits.
   var ROSTER_COUNT_DELAY = 500;
 
+  // The two race modes (ADR-0013). There is no 'auto' entry any more: the panel learns the track's own
+  // type (BeamCompRaceMeta) and preselects the matching mode, marked '(recommended)' by rebuildModeOpts.
+  // A preselection, not a lock -- the other mode stays pickable, which is the only thing that makes the
+  // word "recommended" mean anything.
+  var MODE_OPTS = [{ v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }];
+
+  // What a dropdown head shows when the form holds a value no option carries. 'race' has never been
+  // picked yet; 'mode' is the deliberate unknown-track fallback, where the empty value still means what
+  // it has always meant on the wire -- send no mode and let the client derive it at start.
+  var HEAD_FALLBACK = { race: 'select…', mode: 'track default' };
+
   // Static enum options (value + label). Dynamic lists (race/car/grid/config) are built from GE pushes.
   var STATIC_OPTS = {
-    mode: [{ v: '', label: 'auto' }, { v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }],
+    mode: MODE_OPTS,
     orderMode: [{ v: 'entry', label: 'entry' }, { v: 'random', label: 'random' },
       { v: 'last', label: 'last result' }, { v: 'pwr', label: 'power/weight' },
       { v: 'quali', label: 'qualifying' }],
@@ -622,6 +633,37 @@ angular.module('beamng.apps')
           scope.form.grid = '';
         }
       }
+      // The mode the SELECTED track itself declares (ADR-0013): a closed loop is a circuit, anything else
+      // a sprint. Empty while the track type is unknown -- no race picked, its description still in
+      // flight, or a race GE could not parse. Never guessed: calling an unknown track a sprint would turn
+      // a lap race into a single pass without anyone noticing.
+      scope.recommendedMode = function () {
+        var meta = scope.raceMetaById[scope.form.race];
+        if (!meta) {
+          return '';
+        }
+        return meta.closed ? 'circuit' : 'sprint';
+      };
+
+      // Mark the track's own mode in the dropdown. Rebuilt rather than watched, so the label is a plain
+      // string the existing labelFor renders in the head for free.
+      function rebuildModeOpts() {
+        var recommended = scope.recommendedMode();
+        scope.opts.mode = MODE_OPTS.map(function (o) {
+          return { v: o.v, label: o.v === recommended ? o.label + ' (recommended)' : o.label };
+        });
+      }
+
+      // Preselect the track's own mode, but only into an EMPTY choice: an explicit pick -- or one restored
+      // from the session or a preset -- is the admin's and is never overwritten. Picking a different race
+      // clears the field (see pick), which is what lets the new track's own mode land.
+      function applyRecommendedMode() {
+        rebuildModeOpts();
+        if (!scope.form.mode) {
+          scope.form.mode = scope.recommendedMode();
+        }
+      }
+
       function rebuildConfigOpts() {
         scope.opts.carConfig = [{ v: '', label: 'default' }].concat(
           (scope.data.configs || []).map(function (c) { return { v: c.config, label: c.name }; }));
@@ -685,8 +727,11 @@ angular.module('beamng.apps')
         // rebuildGridOpts); otherwise the pending list push does it.
         rebuildGridOpts();
         // The restored race needs describing too, or the Mode row would sit on its unknown fallback for
-        // the whole session after a panel reopen.
+        // the whole session after a panel reopen. A restored mode is kept as it stands -- applyRecommended
+        // Mode only fills an empty one, which is what upgrades a form stored before this panel derived
+        // the mode itself.
         requestRaceMeta(scope.form.race);
+        applyRecommendedMode();
         // Re-sync the race list to the restored include-deprecated flag, then fetch, as one deduplicated
         // batch, the configs every restored car needs: the race's own model (so its config dropdown +
         // label resolve without clearing the stored config), each class row's car (ADR-0042) and each
@@ -801,6 +846,9 @@ angular.module('beamng.apps')
             return;
           }
           scope.raceMetaById[payload.id] = { closed: payload.closed };
+          if (payload.id === scope.form.race) {
+            applyRecommendedMode();
+          }
         });
       });
 
@@ -832,7 +880,7 @@ angular.module('beamng.apps')
             return list[i].label;
           }
         }
-        return field === 'race' ? 'select…' : value;
+        return HEAD_FALLBACK[field] || value;
       };
 
       scope.pick = function (field, value) {
@@ -844,7 +892,11 @@ angular.module('beamng.apps')
         if (field === 'race') {
           // Grids are per race: the new race has its own set, and the old race's pick is no longer valid.
           rebuildGridOpts();
+          // A mode chosen for the previous track says nothing about this one, so hand the choice back to
+          // the new track. Its own mode lands here if it is already known, otherwise when GE answers.
+          scope.form.mode = '';
           requestRaceMeta(value);
+          applyRecommendedMode();
         }
       };
 
@@ -1891,6 +1943,9 @@ angular.module('beamng.apps')
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
       // asks GE for the lists itself (BeamCompSetupData arrives back via the $on above). Also pull the
       // remembered form (BeamCompSetupForm) so a reopen restores the last race's settings.
+      // Own the mode option list from link on, so nothing ever reads the shared MODE_OPTS array. A fresh
+      // form has no race yet, so this simply renders the two modes unmarked.
+      rebuildModeOpts();
       scope.refresh();
       geCall('request_setup_form');
       geCall('request_championship');
