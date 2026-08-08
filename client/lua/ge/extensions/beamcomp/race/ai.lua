@@ -420,19 +420,40 @@ end
 -- them -- a straight-line interpolation lands off-road and findClosestRoad then jumps to unrelated roads,
 -- wrecking the route (tried, reverted). Tightening the lap-seam line needs the authored calcAIPath line
 -- (Etappe B), not denser navgraph snapping.
+-- Also returns the WORLD POSITION of each resolved waypoint (map.getMap().nodes[name].pos, the same
+-- lookup BeamNG's own race AI uses), 1:1 with the names -- the circuit route checks measure the field
+-- against the real drive targets, and a snapped node can sit a full navgraph edge away from the route
+-- point it came from (findClosestRoad returns the closest EDGE's endpoints, not the closest node). The
+-- position list is all-or-nothing: it comes back empty when any lookup fails, so a caller can only ever
+-- read a complete list or none at all.
 local function resolve_waypoint_names(route)
-    local names = {}
+    local names, positions = {}, {}
     if type(map) ~= "table" or type(map.findClosestRoad) ~= "function" then
-        return names
+        return names, positions
     end
+    local graph_nodes = nil
+    if type(map.getMap) == "function" then
+        local ok, graph = pcall(map.getMap)
+        graph_nodes = (ok and type(graph) == "table") and graph.nodes or nil
+    end
+    local positions_complete = graph_nodes ~= nil
     for _, point in ipairs(route) do
         local p = point.pos
         local ok, n1 = pcall(map.findClosestRoad, vec3(p.x, p.y, p.z))
         if ok and type(n1) == "string" and n1 ~= "" and names[#names] ~= n1 then
             names[#names + 1] = n1
+            local node = graph_nodes and graph_nodes[n1]
+            if node and node.pos then
+                positions[#names] = {x = node.pos.x, y = node.pos.y, z = node.pos.z}
+            else
+                positions_complete = false
+            end
         end
     end
-    return names
+    if not positions_complete then
+        positions = {}
+    end
+    return names, positions
 end
 
 -- The optional difficulty-parameter VE calls beyond aggression (SPIKE, ADR-0036 Etappe B). skill,
@@ -489,16 +510,207 @@ local function append_waypoint(names, name)
     end
 end
 
--- Lay the resolved single-lap waypoint sequence out across `lap_count` laps (ADR-0036). The
--- first lap drives the full resolved route -- lap_names[1] is the start/finish node the car is
--- spawned on. Every later lap drops that leading start/finish node, so the AI never steers back
+-- ===== loop / circuit drive targets =============================================================
+--
+-- TWO INDEPENDENT FACTS decide the shape of the target list, and conflating them is what produced both
+-- bugs this module has had:
+--   * the ROUTE shape -- a LOOP repeats its first drive target as its last one (the engine's linear path
+--     repeats a closed path's start node, race/parser.lua build_route_points keeps that repeat);
+--   * how the RACE is SCORED -- `closed` = circuit (lap the loop, finish on the line) vs. sprint (every
+--     checkpoint once, finish on the LAST one).
+-- They are independent: a closed-loop track started with the `sprint` mode override is a loop route scored
+-- as a sprint. Its finish is its last route node, NOT the start/finish line -- race/parser.lua
+-- build_checkpoints drops the repeated start node for exactly that reason, so the AI route must drop it
+-- too instead of driving an extra leg back to the line and extrapolating its overshoot past THAT.
+--
+-- The ends also need geometry the middle does not: the field is NOT staged on the first drive target
+-- (race/grid.lua lays the grid out relative to the race's start POSE, and a custom grid -- ADR-0023 -- may
+-- put it anywhere relative to the start/finish node), and the last target must lie PAST the finish,
+-- because ai.driveUsingPath brakes to a stop on it.
+--
+-- One namespace table carries the helpers so they cost a single top-level local (the 200-local ceiling,
+-- CLAUDE.md). A genuinely point-to-point route reaches none of this -- its drive path stays exactly as it is.
+local circuit = {}
+
+-- How far (metres) a car must sit beyond a drive target along that target's own direction of travel before
+-- the target counts as already driven past. Large enough that a car standing essentially on a target does
+-- not drop it, small enough to catch a grid staged in front of the start/finish node.
+local PASSED_MARGIN = 2.0
+
+-- How close two route points must be to count as the SAME point, i.e. as a route that closes on itself.
+-- The closing repeat is literally the same path node, so this only absorbs float noise; a genuinely
+-- distinct final node this close to the start would be an authoring degeneracy.
+local LOOP_EPSILON = 0.25
+
+-- Whether the route closes on itself: its last point is its first point again (the parser's closing
+-- repeat). Positional, because that is what the shape actually is -- and it is the one signal both route
+-- variants and the finish extrapolation can agree on.
+function circuit.closes_loop(route)
+    if #route < 3 then
+        return false
+    end
+    local first, last = route[1].pos, route[#route].pos
+    if type(first) ~= "table" or type(last) ~= "table" then
+        return false
+    end
+    local dx, dy, dz = last.x - first.x, last.y - first.y, last.z - first.z
+    return dx * dx + dy * dy + dz * dz <= LOOP_EPSILON * LOOP_EPSILON
+end
+
+-- A COPY of `route` without its closing repeat, for a loop route scored as a sprint: there the finish is
+-- the route's own last node, not the start/finish line. Trimming the route itself (rather than the
+-- resolved target list) is what keeps the finish overshoot honest -- append_overshoot_waypoint
+-- extrapolates past the route's last segment, so a route still carrying the repeat would put the overshoot
+-- past the START line, back into the beginning of the lap.
+--
+-- Never mutates the input: `route` is the race state's own routePoints table and is reused by every later
+-- ai.drive call (each staged-quali launch is one).
+function circuit.without_closing_repeat(route)
+    local trimmed = {}
+    for i = 1, #route - 1 do
+        trimmed[i] = route[i]
+    end
+    return trimmed
+end
+
+-- Whether the navgraph has a path between two waypoints. A single unreachable consecutive pair makes
+-- ai.driveUsingPath's route builder abort the WHOLE list (verified in BeamNG lua/vehicle/ai.lua: on an
+-- empty getPath it returns without ever setting currentRoute, and its input validation is one-shot, so it
+-- never retries) -- the car then stands still for the entire race. Any SYNTHETIC target we invent is
+-- therefore checked before it is appended. Unavailable API -> true, i.e. today's unchecked behaviour.
+function circuit.reachable(from, to)
+    if type(map) ~= "table" or type(map.getPath) ~= "function" then
+        return true
+    end
+    local ok, path = pcall(map.getPath, from, to)
+    if not ok then
+        return true
+    end
+    return type(path) == "table" and #path > 1
+end
+
+-- The unit direction of travel at target `i`: towards the next target that is a real distance away (so
+-- coincident points are stepped over). nil when nothing usable follows.
+function circuit.direction_at(positions, index)
+    local from = positions[index]
+    if not from then
+        return nil
+    end
+    for i = index + 1, #positions do
+        local to = positions[i]
+        local dx, dy, dz = to.x - from.x, to.y - from.y, to.z - from.z
+        local length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length >= 0.01 then
+            return {x = dx / length, y = dy / length, z = dz / length}
+        end
+    end
+    return nil
+end
+
+-- Whether ANY car of the field already sits beyond `point` along `dir` -- i.e. whether making `point` the
+-- first drive target would send at least one AI backwards. Checked against the whole field, so the target
+-- lap 1 starts on is ahead of every car, not just of the pole. "Beyond" also requires the car to be inside
+-- a 45-degree cone in front of the target: a car that projects past a target but lies far off to the side
+-- (a hairpin right after the line, a parallel straight) has not driven past it -- it is somewhere else on
+-- the track, and dropping that target would cut the route.
+function circuit.passed(point, dir, starts)
+    for _, start in ipairs(starts) do
+        local dx, dy, dz = start.x - point.x, start.y - point.y, start.z - point.z
+        local ahead = dx * dir.x + dy * dir.y + dz * dir.z
+        if ahead > PASSED_MARGIN then
+            local ox, oy, oz = dx - ahead * dir.x, dy - ahead * dir.y, dz - ahead * dir.z
+            if ahead * ahead >= ox * ox + oy * oy + oz * oz then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- The field's actual starting positions at the gun: each car's live world position, falling back to the
+-- grid pose it was staged on. This is what the route is measured against.
+function circuit.start_positions(cars)
+    local starts = {}
+    for _, car in ipairs(cars) do
+        local veh = be and be:getObjectByID(car.veh_id)
+        local position = nil
+        if veh then
+            local ok, live = pcall(function() return veh:getPosition() end)
+            if ok and live and live.x then
+                position = {x = live.x, y = live.y, z = live.z}
+            end
+        end
+        if not position and type(car.pose) == "table" and type(car.pose.pos) == "table" then
+            position = car.pose.pos
+        end
+        if position then
+            starts[#starts + 1] = position
+        end
+    end
+    return starts
+end
+
+-- How many LEADING drive targets the field has already driven past, so lap 1 starts at the first target
+-- ahead of the grid instead of steering back to one behind it -- the AI-side mirror of the player plan's
+-- "omit the start line at the gun" rule (race/checkpoints.lua M.plan, ADR-0013). Walks from the front and
+-- stops at the first target that is still ahead. An implausible result (more than half the lap read as
+-- passed) means the geometry was misread, so the full route is kept. 0 when there is nothing to measure.
+function circuit.lead_skip(positions, starts)
+    if #positions < 3 or #starts == 0 then
+        return 0
+    end
+    local skip = 0
+    while skip < #positions - 2 do
+        local point = positions[skip + 1]
+        local dir = circuit.direction_at(positions, skip + 1)
+        if not dir or not circuit.passed(point, dir, starts) then
+            break
+        end
+        skip = skip + 1
+    end
+    if skip > math.floor(#positions / 2) then
+        log("W", LOG_TAG, string.format(
+            "circuit start: %d of %d route targets read as behind the grid; keeping the full route",
+            skip, #positions))
+        return 0
+    end
+    if skip > 0 then
+        log("I", LOG_TAG, string.format(
+            "circuit start: skipping %d leading route target(s) the grid already sits past", skip))
+    end
+    return skip
+end
+
+-- The closed-route finish drive-through (snap variant), the circuit counterpart of the open route's
+-- append_overshoot_waypoint: after the last lap, aim at the start/finish waypoint and then at the one
+-- AFTER it, so ai.driveUsingPath brakes on a target PAST the line and the AI's final crossing is a real
+-- swept crossing the detector can score (race/checkpoints.lua segment_hits_checkpoint). A closed route's
+-- point list already ends on its start node (the engine's linear path repeats it, race/parser.lua), so
+-- append_waypoint drops the first of the two and the usual result is one extra target; with a point list
+-- that does not repeat it, both are appended and pin the route through the line. This is the light form of
+-- what BeamNG's own race AI does -- gameplay/race/race.lua startAiVehicle appends aiPath[1] and drives a
+-- whole extra lap on a closed path; we stop one node past the line instead of one lap past it.
+function circuit.append_drive_through(names, lap_names)
+    if #names == 0 or #lap_names < 2 then
+        return
+    end
+    append_waypoint(names, lap_names[1])
+    append_waypoint(names, lap_names[2])
+    log("I", LOG_TAG, string.format("circuit finish drive-through: '%s' past the line", lap_names[2]))
+end
+
+-- Lay the resolved single-lap waypoint sequence out across `lap_count` laps (ADR-0036). Lap 1 starts at
+-- `first_index` (default 1, the full resolved route). The car is NOT staged on lap_names[1]: the grid is
+-- laid out relative to the race's start POSE (race/grid.lua) and a custom grid (ADR-0023) may put the field
+-- in front of the start/finish node, so on a circuit the caller passes the first target ahead of the field
+-- (circuit.lead_skip). Every later lap drops the leading start/finish node, so the AI never steers back
 -- to the start line at the lap seam: it crosses the line naturally on the racing line between the
--- previous lap's last node and this lap's first corner. laps=1 is byte-for-byte the proven
--- single-lap path. Consecutive duplicates are dropped throughout. Pure; returns the name list.
-local function lay_out_lap_waypoints(lap_names, lap_count)
+-- previous lap's last node and this lap's first corner. first_index 1 with laps=1 is byte-for-byte the
+-- proven single-lap path. Consecutive duplicates are dropped throughout. Pure; returns the name list.
+local function lay_out_lap_waypoints(lap_names, lap_count, first_index)
     local names = {}
-    for _, name in ipairs(lap_names) do
-        append_waypoint(names, name)
+    for i = first_index or 1, #lap_names do
+        append_waypoint(names, lap_names[i])
     end
     for _ = 2, lap_count do
         for i = 2, #lap_names do
@@ -557,11 +769,16 @@ end
 -- Append the open-route finish-overshoot waypoint (snap variant): extrapolate OVERSHOOT_DISTANCE past
 -- the finish along the final route segment, snap that ONE point to the navgraph, and append it once as
 -- the final drive target -- so the AI crosses the finish line at speed and brakes only behind it
--- instead of stopping short of the last checkpoint's trigger radius. If the snap lands back on the
--- current route end (the finish node), the distance is doubled and retried once; still no distinct
--- node -> no overshoot (logged), i.e. the prior brake-on-the-line behaviour. NOTE: this extrapolates
--- exactly ONE point BEHIND the finish -- it never interpolates between route nodes (see
--- resolve_waypoint_names: interpolated snapping wrecks the route; tried, reverted).
+-- instead of stopping short of the last checkpoint's trigger radius. NOTE: this extrapolates exactly ONE
+-- point BEHIND the finish -- it never interpolates between route nodes (see resolve_waypoint_names:
+-- interpolated snapping wrecks the route; tried, reverted).
+--
+-- This is the one target we INVENT rather than read off the route, so it is the one that can be
+-- unreachable -- and an unreachable target does not merely fail, it aborts the entire drive and leaves the
+-- car motionless for the whole race (circuit.reachable). It is therefore both distinct-checked and
+-- reachability-checked; a failure doubles the distance and retries once, and a second failure means no
+-- overshoot at all (logged) -- the AI then brake on the line, which is the pre-overshoot behaviour and
+-- still a racing car rather than a parked one.
 local function append_overshoot_waypoint(names, route)
     if #names == 0 then
         return
@@ -582,34 +799,45 @@ local function append_overshoot_waypoint(names, route)
             log("W", LOG_TAG, "no finish overshoot: navgraph snap behind the finish failed")
             return
         end
-        if name ~= names[#names] then
+        if name ~= names[#names] and circuit.reachable(names[#names], name) then
             names[#names + 1] = name
             log("I", LOG_TAG, string.format(
                 "finish overshoot waypoint '%s' (%.0f m past the finish)", name, distance))
             return
         end
+        if name ~= names[#names] then
+            log("W", LOG_TAG, string.format(
+                "finish overshoot '%s' has no navgraph path from '%s'; retrying farther out",
+                name, tostring(names[#names])))
+        end
         distance = distance * 2
     end
-    log("I", LOG_TAG, "no distinct navgraph node behind the finish; AI will brake on the line")
+    log("I", LOG_TAG, "no usable navgraph node behind the finish; AI will brake on the line")
 end
 
 -- The wpTargetList node-index sequence across `lap_count` laps. The custom graph has one node per route
--- point (1..node_count); a lap drives them in order, every lap repeated in full. The car spawns ON node 1
--- (the start line), and ai.driveUsingPath's getPointNodePath(ego.pos -> node 1) then returns a 1-node path
--- that newManualPath crashes on (it needs path[2]); so the FIRST lap starts at node 2 -- node 1 still lies
--- on the initial car->node-2 path, so it is driven, just not listed as an explicit target. Later laps run
--- the full node list, and on a closed loop index 1 is appended once more so the AI drives THROUGH the
--- finish (the closing edge n->1 carries it). Returns a list of 1-based node indices.
-local function lay_out_node_indices(node_count, lap_count, closed)
+-- point (1..node_count); a lap drives them in order, every lap repeated in full. Lap 1 starts at
+-- `first_index`, clamped to >= 2 for two independent reasons: the car is NOT staged on node 1 (the grid
+-- sits wherever race/grid.lua and a custom grid put it relative to the start/finish node, so on a circuit
+-- the caller passes the first node ahead of the field -- circuit.lead_skip), and ai.driveUsingPath's
+-- getPointNodePath(ego.pos -> node 1) degenerates to a 1-node path when the car does sit on node 1, which
+-- newManualPath cannot plan from (it needs path[2]). A skipped node 1 still lies on the initial
+-- car->node-2 path, so it is driven, just not listed as an explicit target. Later laps run the full node
+-- list. On a closed loop the sequence ends with index 1 AND index 2: the closing edge n->1 carries the AI
+-- across the finish and node 2 is the first node PAST it, so driveUsingPath brakes behind the line instead
+-- of on it. Returns a list of 1-based node indices.
+local function lay_out_node_indices(node_count, lap_count, closed, first_index)
     local seq = {}
+    local first_lap_start = math.max(2, first_index or 2)
     for lap = 1, lap_count do
-        local first = (lap == 1) and 2 or 1
+        local first = (lap == 1) and first_lap_start or 1
         for i = first, node_count do
             seq[#seq + 1] = i
         end
     end
     if closed and node_count > 1 then
         seq[#seq + 1] = 1
+        seq[#seq + 1] = 2
     end
     return seq
 end
@@ -618,8 +846,9 @@ end
 -- OVERSHOOT_DISTANCE past the finish along the final segment, radius inherited from the finish node,
 -- targeted exactly once after the last lap -- the same crossing-at-speed intent as
 -- append_overshoot_waypoint. Mutates `nodes` (the custom map gains the node and its N->N+1 link) and
--- `index_sequence` (the one extra final target). Closed loops never come here -- their closing edge
--- already carries the AI through the finish (lay_out_node_indices).
+-- `index_sequence` (the one extra final target). Closed loops never come here -- a circuit needs no
+-- synthetic node, because the node past its finish line already exists in the route (the closing edge
+-- plus node 2, see lay_out_node_indices).
 local function append_overshoot_node(nodes, index_sequence)
     if #nodes < 2 then
         return
@@ -724,11 +953,23 @@ end
 -- ai.driveUsingPath{wpTargetList} (off-road capable, no road snap); an empty result spans the road
 -- network so the car still drives. The lap sequence is laid out over the lap count (full-lap repeat +
 -- closed-loop finish drive-through), then the drive command -- built from the resolved difficulty `params`
--- -- is queued to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses). `closed` (a
--- circuit) adds the closing edge + drive-through; an OPEN route instead gets one overshoot target
--- ~OVERSHOOT_DISTANCE behind the finish (both variants) so the AI crosses the line at speed and brakes
--- only behind it -- ai.driveUsingPath brakes to a stop ON its final target, which otherwise parks the car
--- short of the last checkpoint's trigger radius. pcall-guarded. A nil `params` uses the default preset.
+-- -- is queued to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses).
+--
+-- Both route ends are geometry, not assumption. ai.driveUsingPath plans from the car to its FIRST target
+-- (backwards, if that target is behind the field), brakes to a stop ON its LAST one (verified in BeamNG
+-- lua/vehicle/ai.lua: the speed planner sets the final path node's speed to 0 when no node follows it),
+-- and refuses to build ANY route -- leaving the car motionless all race -- if a single consecutive pair of
+-- targets has no navgraph path. `closed` says how the race is SCORED; whether the ROUTE is a loop is a
+-- separate question (see the circuit namespace), and the three real combinations are:
+--   * loop + circuit -- drop the leading targets the field already sits past (circuit.lead_skip) and end
+--     one node PAST the finish line (the closing edge plus the node behind it, both variants);
+--   * loop + sprint (the `sprint` mode override on a closed path) -- the finish is the route's LAST node,
+--     not the line, so the closing repeat is dropped and the usual overshoot is extrapolated past that
+--     last node instead of past the start/finish node;
+--   * point-to-point + sprint -- unchanged: the full route plus one synthetic overshoot target
+--     ~OVERSHOOT_DISTANCE behind the finish (both variants).
+-- Either way the AI accelerate away from the grid and cross their finish at speed instead of parking short
+-- of the last checkpoint's trigger radius. pcall-guarded. A nil `params` uses the default preset.
 -- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph was installed (the
 -- caller restores the real one at teardown via M.restore_map).
 function M.drive(cars, route, laps, params, closed)
@@ -739,16 +980,35 @@ function M.drive(cars, route, laps, params, closed)
     params = type(params) == "table" and params or M.resolve_params(nil, nil)
     local lap_count = math.max(1, math.floor(tonumber(laps) or 1))
 
+    -- A loop route scored as a SPRINT finishes on its own last node, not on the start/finish line, so its
+    -- closing repeat goes before anything else reads the route: it decides the last drive target AND the
+    -- point the finish overshoot is extrapolated past. A circuit keeps it (it is the finish crossing), and
+    -- a point-to-point route has none.
+    local loop = circuit.closes_loop(route)
+    if loop and not closed then
+        route = circuit.without_closing_repeat(route)
+        log("I", LOG_TAG, string.format(
+            "loop route scored as a sprint: dropped the closing repeat, %d route point(s) remain -- the "
+            .. "AI finish on the last one, not on the start/finish line", #route))
+    end
+
     local source, command, per_lap, total
     local custom_map = false
+    local first_target, last_target
+    -- The route-end checks measure the drive targets against where the field actually stands.
+    local starts = circuit.start_positions(cars)
     if params.route == "direct" then
         local nodes = build_route_nodes(route)
-        local index_sequence = lay_out_node_indices(#nodes, lap_count, closed)
+        -- The custom map's nodes ARE the route points, so the leading-target check runs on them directly.
+        local skip = closed and circuit.lead_skip(nodes, starts) or 0
+        local index_sequence = lay_out_node_indices(#nodes, lap_count, closed, 1 + skip)
         -- perLap counts the real route nodes; the overshoot node below is a drive aid, not a lap stop.
         per_lap = #nodes
         if not closed then
             append_overshoot_node(nodes, index_sequence)
         end
+        first_target = index_sequence[1] and ("bc" .. index_sequence[1]) or nil
+        last_target = index_sequence[#index_sequence] and ("bc" .. index_sequence[#index_sequence]) or nil
         if install_custom_race_map(nodes, closed) then
             command = drive_command_wptargets(index_sequence, params)
             source = "direct"
@@ -759,11 +1019,17 @@ function M.drive(cars, route, laps, params, closed)
         end
         total = #index_sequence
     else
-        local lap_names = resolve_waypoint_names(route)
-        local names = lay_out_lap_waypoints(lap_names, lap_count)
-        if not closed then
+        -- The drive targets are the SNAPPED navgraph nodes, so the leading-target check runs on their own
+        -- positions -- a snap can land a full edge away from the route point it came from.
+        local lap_names, lap_positions = resolve_waypoint_names(route)
+        local skip = closed and circuit.lead_skip(lap_positions, starts) or 0
+        local names = lay_out_lap_waypoints(lap_names, lap_count, 1 + skip)
+        if closed then
+            circuit.append_drive_through(names, lap_names)
+        else
             append_overshoot_waypoint(names, route)
         end
+        first_target, last_target = names[1], names[#names]
         local quoted = {}
         for _, name in ipairs(names) do
             quoted[#quoted + 1] = string.format("%q", name)
@@ -776,6 +1042,13 @@ function M.drive(cars, route, laps, params, closed)
     log("I", LOG_TAG, string.format(
         "AI route source=%s: %d node(s)/lap from %d route point(s), %d lap(s) -> %d total",
         source, per_lap, #route, lap_count, total))
+    -- The route ends, spelled out: the two things that decide the target list (how the race is SCORED vs.
+    -- what the ROUTE looks like) plus the first and last target the AI actually get. A standing-still or
+    -- reversing AI is diagnosable from this one line -- no guessing from the outside.
+    log("I", LOG_TAG, string.format(
+        "AI route ends: scored as %s, loop route=%s, first target=%s, last target=%s",
+        closed and "circuit" or "sprint", tostring(loop and true or false),
+        tostring(first_target), tostring(last_target)))
     for _, car in ipairs(cars) do
         local veh = be and be:getObjectByID(car.veh_id)
         if veh then
