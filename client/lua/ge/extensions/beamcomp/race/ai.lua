@@ -617,6 +617,24 @@ function circuit.lead_skip(positions, starts)
     return skip
 end
 
+-- The closed-route finish drive-through (snap variant), the circuit counterpart of the open route's
+-- append_overshoot_waypoint: after the last lap, aim at the start/finish waypoint and then at the one
+-- AFTER it, so ai.driveUsingPath brakes on a target PAST the line and the AI's final crossing is a real
+-- swept crossing the detector can score (race/checkpoints.lua segment_hits_checkpoint). A closed route's
+-- point list already ends on its start node (the engine's linear path repeats it, race/parser.lua), so
+-- append_waypoint drops the first of the two and the usual result is one extra target; with a point list
+-- that does not repeat it, both are appended and pin the route through the line. This is the light form of
+-- what BeamNG's own race AI does -- gameplay/race/race.lua startAiVehicle appends aiPath[1] and drives a
+-- whole extra lap on a closed path; we stop one node past the line instead of one lap past it.
+function circuit.append_drive_through(names, lap_names)
+    if #names == 0 or #lap_names < 2 then
+        return
+    end
+    append_waypoint(names, lap_names[1])
+    append_waypoint(names, lap_names[2])
+    log("I", LOG_TAG, string.format("circuit finish drive-through: '%s' past the line", lap_names[2]))
+end
+
 -- Lay the resolved single-lap waypoint sequence out across `lap_count` laps (ADR-0036). Lap 1 starts at
 -- `first_index` (default 1, the full resolved route). The car is NOT staged on lap_names[1]: the grid is
 -- laid out relative to the race's start POSE (race/grid.lua) and a custom grid (ADR-0023) may put the field
@@ -731,8 +749,9 @@ end
 -- getPointNodePath(ego.pos -> node 1) degenerates to a 1-node path when the car does sit on node 1, which
 -- newManualPath cannot plan from (it needs path[2]). A skipped node 1 still lies on the initial
 -- car->node-2 path, so it is driven, just not listed as an explicit target. Later laps run the full node
--- list, and on a closed loop index 1 is appended once more so the AI drives THROUGH the
--- finish (the closing edge n->1 carries it). Returns a list of 1-based node indices.
+-- list. On a closed loop the sequence ends with index 1 AND index 2: the closing edge n->1 carries the AI
+-- across the finish and node 2 is the first node PAST it, so driveUsingPath brakes behind the line instead
+-- of on it. Returns a list of 1-based node indices.
 local function lay_out_node_indices(node_count, lap_count, closed, first_index)
     local seq = {}
     local first_lap_start = math.max(2, first_index or 2)
@@ -744,6 +763,7 @@ local function lay_out_node_indices(node_count, lap_count, closed, first_index)
     end
     if closed and node_count > 1 then
         seq[#seq + 1] = 1
+        seq[#seq + 1] = 2
     end
     return seq
 end
@@ -752,8 +772,9 @@ end
 -- OVERSHOOT_DISTANCE past the finish along the final segment, radius inherited from the finish node,
 -- targeted exactly once after the last lap -- the same crossing-at-speed intent as
 -- append_overshoot_waypoint. Mutates `nodes` (the custom map gains the node and its N->N+1 link) and
--- `index_sequence` (the one extra final target). Closed loops never come here -- their closing edge
--- already carries the AI through the finish (lay_out_node_indices).
+-- `index_sequence` (the one extra final target). Closed loops never come here -- a circuit needs no
+-- synthetic node, because the node past its finish line already exists in the route (the closing edge
+-- plus node 2, see lay_out_node_indices).
 local function append_overshoot_node(nodes, index_sequence)
     if #nodes < 2 then
         return
@@ -860,12 +881,15 @@ end
 -- closed-loop finish drive-through), then the drive command -- built from the resolved difficulty `params`
 -- -- is queued to each car's VE (queueLuaCommand, the channel vehicles.set_vehicle_frozen uses).
 --
--- ai.driveUsingPath plans from the car to its FIRST target, so a `closed` route (a circuit) drops the
--- leading targets the field already sits past (circuit.lead_skip) instead of steering back to them.
--- `closed` also adds the closing edge + drive-through; an OPEN route instead gets one overshoot target
--- ~OVERSHOOT_DISTANCE behind the finish (both variants) so the AI crosses the line at speed and brakes
--- only behind it -- ai.driveUsingPath brakes to a stop ON its final target, which otherwise parks the car
--- short of the last checkpoint's trigger radius. pcall-guarded. A nil `params` uses the default preset.
+-- Both route ends are geometry, not assumption. ai.driveUsingPath plans from the car to its FIRST target
+-- (backwards, if that target is behind the field) and brakes to a stop ON its LAST one (verified in
+-- BeamNG lua/vehicle/ai.lua: the speed planner sets the final path node's speed to 0 when no node follows
+-- it). So a `closed` route (a circuit) drops the leading targets the field already sits past
+-- (circuit.lead_skip) and ends one node PAST the finish line -- the closing edge plus the node behind it,
+-- in both variants -- while an OPEN route keeps its full route and instead gets one synthetic overshoot
+-- target ~OVERSHOOT_DISTANCE behind the finish (both variants). Either way the AI accelerates away from
+-- the grid and crosses the line at speed instead of parking short of the last checkpoint's trigger radius.
+-- pcall-guarded. A nil `params` uses the default preset.
 -- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph was installed (the
 -- caller restores the real one at teardown via M.restore_map).
 function M.drive(cars, route, laps, params, closed)
@@ -905,7 +929,9 @@ function M.drive(cars, route, laps, params, closed)
         local lap_names, lap_positions = resolve_waypoint_names(route)
         local skip = closed and circuit.lead_skip(lap_positions, starts) or 0
         local names = lay_out_lap_waypoints(lap_names, lap_count, 1 + skip)
-        if not closed then
+        if closed then
+            circuit.append_drive_through(names, lap_names)
+        else
             append_overshoot_waypoint(names, route)
         end
         local quoted = {}
