@@ -2,8 +2,8 @@
 --
 -- Lives at lua/ge/extensions/beamcomp/race/ai.lua inside the client mod zip. Target: client GE
 -- (LuaJIT 5.1). Stateless and reload-safe: this module holds no file-scope mutable state -- the caller
--- (init.lua) owns the tracked AI-car list + remote id sets in its reload-surviving M.state and passes
--- them back in, exactly like race/cones.lua.
+-- (init.lua) owns the tracked AI-car list, the remote id sets and the rolling-route-window store in its
+-- reload-surviving M.state and passes them back in, exactly like race/cones.lua.
 --
 -- An AI opponent is "a cone that drives itself" (ADR-0036): only the race owner (the /race issuer,
 -- flagged with aiSlots in its raceStart) spawns the AI cars, BeamMP propagates them to every other
@@ -699,27 +699,6 @@ function circuit.append_drive_through(names, lap_names)
     log("I", LOG_TAG, string.format("circuit finish drive-through: '%s' past the line", lap_names[2]))
 end
 
--- Lay the resolved single-lap waypoint sequence out across `lap_count` laps (ADR-0036). Lap 1 starts at
--- `first_index` (default 1, the full resolved route). The car is NOT staged on lap_names[1]: the grid is
--- laid out relative to the race's start POSE (race/grid.lua) and a custom grid (ADR-0023) may put the field
--- in front of the start/finish node, so on a circuit the caller passes the first target ahead of the field
--- (circuit.lead_skip). Every later lap drops the leading start/finish node, so the AI never steers back
--- to the start line at the lap seam: it crosses the line naturally on the racing line between the
--- previous lap's last node and this lap's first corner. first_index 1 with laps=1 is byte-for-byte the
--- proven single-lap path. Consecutive duplicates are dropped throughout. Pure; returns the name list.
-local function lay_out_lap_waypoints(lap_names, lap_count, first_index)
-    local names = {}
-    for i = first_index or 1, #lap_names do
-        append_waypoint(names, lap_names[i])
-    end
-    for _ = 2, lap_count do
-        for i = 2, #lap_names do
-            append_waypoint(names, lap_names[i])
-        end
-    end
-    return names
-end
-
 -- The race route as a list of {x, y, z, r?} nodes (ADR-0036 Step-3b): each route point's position plus its
 -- corridor radius. These become the nodes of the custom race navgraph the AI drives over
 -- (install_custom_race_map) -- the exact authored line, no road snap, off-road capable. Pure geometry,
@@ -815,41 +794,15 @@ local function append_overshoot_waypoint(names, route)
     log("I", LOG_TAG, "no usable navgraph node behind the finish; AI will brake on the line")
 end
 
--- The wpTargetList node-index sequence across `lap_count` laps. The custom graph has one node per route
--- point (1..node_count); a lap drives them in order, every lap repeated in full. Lap 1 starts at
--- `first_index`, clamped to >= 2 for two independent reasons: the car is NOT staged on node 1 (the grid
--- sits wherever race/grid.lua and a custom grid put it relative to the start/finish node, so on a circuit
--- the caller passes the first node ahead of the field -- circuit.lead_skip), and ai.driveUsingPath's
--- getPointNodePath(ego.pos -> node 1) degenerates to a 1-node path when the car does sit on node 1, which
--- newManualPath cannot plan from (it needs path[2]). A skipped node 1 still lies on the initial
--- car->node-2 path, so it is driven, just not listed as an explicit target. Later laps run the full node
--- list. On a closed loop the sequence ends with index 1 AND index 2: the closing edge n->1 carries the AI
--- across the finish and node 2 is the first node PAST it, so driveUsingPath brakes behind the line instead
--- of on it. Returns a list of 1-based node indices.
-local function lay_out_node_indices(node_count, lap_count, closed, first_index)
-    local seq = {}
-    local first_lap_start = math.max(2, first_index or 2)
-    for lap = 1, lap_count do
-        local first = (lap == 1) and first_lap_start or 1
-        for i = first, node_count do
-            seq[#seq + 1] = i
-        end
-    end
-    if closed and node_count > 1 then
-        seq[#seq + 1] = 1
-        seq[#seq + 1] = 2
-    end
-    return seq
-end
-
 -- Append the open-route finish-overshoot node (direct variant): one synthetic custom-map node
 -- OVERSHOOT_DISTANCE past the finish along the final segment, radius inherited from the finish node,
 -- targeted exactly once after the last lap -- the same crossing-at-speed intent as
--- append_overshoot_waypoint. Mutates `nodes` (the custom map gains the node and its N->N+1 link) and
--- `index_sequence` (the one extra final target). Closed loops never come here -- a circuit needs no
--- synthetic node, because the node past its finish line already exists in the route (the closing edge
--- plus node 2, see lay_out_node_indices).
-local function append_overshoot_node(nodes, index_sequence)
+-- append_overshoot_waypoint. Mutates `nodes` (the custom map gains the node, so this must run BEFORE the
+-- map is installed) and appends the new node's index to `appended`, which the caller turns into the
+-- sequence's end decoration. Closed loops never come here -- a circuit needs no synthetic node, because
+-- the node past its finish line already exists in the route (the closing edge plus node 2, see
+-- window.append_lap).
+local function append_overshoot_node(nodes, appended)
     if #nodes < 2 then
         return
     end
@@ -860,7 +813,7 @@ local function append_overshoot_node(nodes, index_sequence)
     end
     position.r = nodes[#nodes].r
     nodes[#nodes + 1] = position
-    index_sequence[#index_sequence + 1] = #nodes
+    appended[#appended + 1] = #nodes
 end
 
 local DEFAULT_NODE_RADIUS = 4.0  -- corridor half-width when a route point ships none
@@ -925,26 +878,521 @@ end
 -- The map is complete (map.reset built it), so no field patching is needed -- BeamNG's planner handles
 -- curvature/speed/lanes. The Etappe-B difficulty params ride as guarded trailing calls. With no targets it
 -- spans the road network so the car still drives. noOfLaps is not used (the lap sequence is baked into the
--- wpTargetList).
-local function drive_command_wptargets(index_sequence, params)
+-- wpTargetList). `names` are the custom-map node names ("bc7"), quoted verbatim -- byte-identical to the
+-- "'bc%d'" formatting this builder used while it took node indices.
+local function drive_command_wptargets(names, params)
     local extras = optional_param_calls(params)
     if extras ~= "" then
         extras = "; " .. extras
     end
-    if #index_sequence == 0 then
+    if #names == 0 then
         return string.format(
             "ai.setMode('manual'); ai.setAggression(%.2f); ai.setMode('span')%s",
             params.aggression, extras)
     end
     local quoted = {}
-    for _, idx in ipairs(index_sequence) do
-        quoted[#quoted + 1] = string.format("'bc%d'", idx)
+    for _, name in ipairs(names) do
+        quoted[#quoted + 1] = string.format("'%s'", name)
     end
     return string.format(
         "ai.setMode('manual'); ai.setAggression(%.2f); "
         .. "ai.driveUsingPath({wpTargetList={%s},aggression=%.2f})%s",
         params.aggression, table.concat(quoted, ","), params.aggression, extras)
 end
+
+-- ===== the rolling route window =================================================================
+--
+-- ai.driveUsingPath arms a target list ONCE and brakes to a stop on its last target, so arming a whole
+-- race in one call forced two bad trades at the same time: a circuit QUALIFYING session could only give
+-- the AI the RACE lap count (on a one-lap race they set one time and then idled through the rest of a
+-- 480 s window), and any long route armed laps x targets-per-lap per car in a single command.
+--
+-- The window decouples the armed length from the route length. WHAT the sequence is does not change --
+-- the same helpers still decide it, ends included -- but at most BLOCK_TARGETS of it are armed at a time
+-- and each car is topped up while it still has REFILL margin left. The sequence itself is materialised
+-- one lap at a time, so a 60-lap qualifying supply costs nothing until it is actually driven.
+--
+-- The refill is SEAMLESS where it can be made to hold, and BeamNG lets it hold for both variants:
+--   * ai.setPath only sets `manualPath` (lua/vehicle/ai.lua setPath) -- it never touches setState/setMode,
+--     so `currentRoute` and the running plan survive and the next manual-mode tick calls
+--     pathExtend(currentRoute.path, manualPath).
+--   * pathExtend has a hard, SILENT contract: it does nothing at all unless the new path starts on the
+--     exact node the live path currently ends on. That node is knowable from here -- driveUsingPath
+--     builds its path by concatenating mapData:getPath(target_i, target_i+1), so the live path ends on
+--     the LAST TARGET WE ARMED, and each pathExtend moves that end to the last target of the block it
+--     appended. The engine's own path clean-up only ever trims the FRONT, so the joint chains.
+--   * ai.driveUsingPath, by contrast, is a hard reset (setState -> setMode -> resetMapAndRoute) and makes
+--     the car re-plan from its live position. That is why it is the fallback and not the mechanism.
+--
+-- One namespace table carries the whole thing, so it costs a single top-level local (the 200-local
+-- ceiling, CLAUDE.md).
+local window = {}
+
+-- Drive targets armed at a time, and the target of a full block on whose arrival the next one is
+-- fetched. The five-target margin is what makes the refill seamless: at racing speed that is hundreds of
+-- metres, enough for a failed extension to be retried on the next tick AND still fall back to a full
+-- re-arm before the car runs out of route. Deliberately counted in TARGETS, not laps -- a 60-checkpoint
+-- lap must not cost more to arm than an 8-checkpoint one. No UI knob (user decision 2026-08-08).
+local BLOCK_TARGETS = 25
+local REFILL_AT = 20
+
+-- How much armed route (metres) a car keeps ahead of it, on top of the target-count rule above. This is
+-- not a second policy, it is what makes the count rule safe on a densely authored route: BeamNG's speed
+-- planner puts a target speed of ZERO on the last node of the path once its plan reaches it
+-- (lua/vehicle/ai.lua: `lastNode.speed = lastNode.manSpeed or 0` when `route.path[lastNode.pathidx+1]` is
+-- nil), and the plan looks up to 550 m ahead (getMinPlanLen's own clamp). So an AI starts braking for the
+-- end of its block as soon as that end comes within braking distance. Where route points are far apart,
+-- five targets of margin is far more than 550 m and the count rule fires first; where they are close
+-- together it is not, and without this the AI would lift at every block seam. Above the engine's own 550 m
+-- plan ceiling the planner cannot see the end of the block at all.
+local REFILL_DISTANCE = 600.0
+
+-- The distance rule only ever tops a car up while a block's worth of targets or fewer is still ahead of
+-- it, and a refill adds a whole block -- so a car never holds more than 2 x BLOCK_TARGETS unreached
+-- targets, however close together the route's points are. That is the bound that keeps this a WINDOW.
+local MAX_TOPUP_AHEAD = BLOCK_TARGETS
+
+-- How close (metres) a car has to come to a drive target, or how far it must project past that target
+-- along the target's own direction of travel (while staying within REACH_LATERAL of that line), before
+-- the host counts the target as reached. Deliberately permissive: a cursor that STALLS starves the car of
+-- route, while a cursor that runs ahead costs nothing -- an extension always appends after the ARMED end
+-- rather than after the cursor, and the re-arm fallback re-derives what lies behind the car from the
+-- car's own position (window.drop_passed).
+local REACH_RADIUS = 10.0
+local REACH_LATERAL = 30.0
+
+-- A route-supply descriptor: the recipe the window materialises the drive-target sequence from, one lap
+-- at a time. Plain data -- no closures, no engine handles -- so it can live in the caller's
+-- reload-surviving state, and it is shared by reference between the cars of one arming (they all drive
+-- the same route with the same field-wide leading skip). Fields:
+--   variant/closed/route -- what the end decoration is (see window.append_tail)
+--   lap / lap_pos        -- one lap's drive targets and their world positions (false = unmeasurable)
+--   first / rest_start   -- where lap 1 and every later lap start inside `lap`
+--   dedup                -- funnel appends through append_waypoint (snap) or append verbatim (direct)
+--   laps / back_laps     -- the drive supply's lap count, and the cap the give-up fallback uses
+--   tail / params        -- the precomputed direct-variant end decoration, and the difficulty params
+--   built / built_pos    -- the materialised prefix; body/total are set once the tail has been appended
+function window.new(fields)
+    fields.built = {}
+    fields.built_pos = {}
+    fields.laps_built = 0
+    fields.tail_built = false
+    return fields
+end
+
+-- Append lap `n` of the sequence to `out` (and its positions to `out_pos`). The ONLY place the lap layout
+-- lives, and it keeps the two shapes the variants have always had:
+--   * snap -- lap 1 runs lap[first..#lap] and every later lap drops the leading start/finish node
+--     (lap[2..#lap]), so the AI never steers back to the line at a lap seam: it crosses the line
+--     naturally between the previous lap's last node and this lap's first corner. Every append goes
+--     through append_waypoint, because ai.driveUsingPath dislikes two identical consecutive targets.
+--   * direct -- the custom graph has one node per route point, so a later lap runs the FULL node list
+--     (1..#lap): its node 1 is a real node the closing edge leads back to, not a repeat of the previous
+--     lap's last target.
+-- Lap 1 starts at `first` in both variants: the car is NOT staged on the first drive target -- race/grid
+-- lays the field out relative to the race's start POSE and an ADR-0023 custom grid may put it past the
+-- start/finish node -- so the caller passes the first target ahead of the field (circuit.lead_skip). For
+-- `direct` that index is additionally clamped to >= 2 by the caller, because ai.driveUsingPath's
+-- getPointNodePath(ego.pos -> node 1) degenerates to a 1-node path when the car sits on node 1, which
+-- newManualPath cannot plan from; the skipped node still lies on the initial car->node-2 path.
+function window.append_lap(seq, n, out, out_pos)
+    local from = (n == 1) and seq.first or seq.rest_start
+    for i = from, #seq.lap do
+        local before = #out
+        if seq.dedup then
+            append_waypoint(out, seq.lap[i])
+        else
+            out[#out + 1] = seq.lap[i]
+        end
+        if #out > before then
+            out_pos[#out] = seq.lap_pos[i] or false
+        end
+    end
+end
+
+-- Append the sequence's END DECORATION to `out` -- settled work from ADR-0036's two amendments, delivered
+-- in the last block and exactly once: the closed route's finish drive-through, or the open route's
+-- overshoot past the finish. `snap` runs the existing helpers on the output list itself, so their dedup
+-- and reachability base stays the list's last real target (which is lap[#lap] for every lap count) and
+-- the ends land exactly where they always have. `direct`'s decoration was fixed at descriptor time --
+-- its open-route overshoot is a synthetic node that has to exist in the custom map BEFORE the map is
+-- installed. Tail targets carry no position: they are the last targets of the whole sequence, and once
+-- they are armed there is nothing left to refill.
+function window.append_tail(seq, out, out_pos)
+    if #out == 0 then
+        return
+    end
+    local before = #out
+    if seq.variant == "direct" then
+        for _, name in ipairs(seq.tail) do
+            out[#out + 1] = name
+        end
+    elseif seq.closed then
+        circuit.append_drive_through(out, seq.lap)
+    else
+        append_overshoot_waypoint(out, seq.route)
+    end
+    for i = before + 1, #out do
+        out_pos[i] = false
+    end
+end
+
+-- Materialise the shared sequence up to at least `upto` targets: whole laps until the count is reached or
+-- the lap budget runs out, and -- only once it has run out -- the end decoration, which is what pins
+-- `body` (the last real target) and `total`. Nothing beyond `upto` is ever built, so a qualifying supply
+-- of 60 laps never costs more than the blocks actually in flight.
+function window.ensure(seq, upto)
+    while #seq.built < upto and seq.laps_built < seq.laps do
+        seq.laps_built = seq.laps_built + 1
+        window.append_lap(seq, seq.laps_built, seq.built, seq.built_pos)
+    end
+    if seq.laps_built >= seq.laps and not seq.tail_built then
+        seq.tail_built = true
+        seq.body = #seq.built
+        window.append_tail(seq, seq.built, seq.built_pos)
+        seq.total = #seq.built
+    end
+end
+
+-- The nominal total the sequence would reach, for the route log line and the owner's chat notice while
+-- the real total is still unknown (nothing past the first block has been materialised yet). Exact unless
+-- a lap seam de-duplicates, which on a real route it does not.
+function window.estimate(seq)
+    local first_lap = math.max(0, #seq.lap - seq.first + 1)
+    local later_lap = math.max(0, #seq.lap - seq.rest_start + 1)
+    local tail = seq.tail and #seq.tail or (seq.closed and 2 or 1)
+    return first_lap + (seq.laps - 1) * later_lap + tail
+end
+
+-- The sequence's LAST drive target -- the one the AI brakes on -- for the route diagnostic line. Exact
+-- once the sequence has been materialised to its end; before that it is the PLANNED last target, which is
+-- exact for every case except an open route driven over several laps (its overshoot waypoint is only
+-- snapped when the final block is built, so the last real route target is reported instead).
+function window.final_target(seq)
+    if seq.total then
+        return seq.built[seq.total]
+    end
+    if seq.variant == "direct" and seq.tail and #seq.tail > 0 then
+        return seq.tail[#seq.tail]
+    end
+    if seq.closed and #seq.lap >= 2 then
+        return seq.lap[2]
+    end
+    return seq.lap[#seq.lap]
+end
+
+-- The variant's drive command for a target list -- built by the UNCHANGED builders, so a sequence that
+-- fits inside a single block emits exactly the string this module emitted before the window existed.
+function window.command(seq, targets)
+    if seq.variant == "direct" then
+        return drive_command_wptargets(targets, seq.params)
+    end
+    local quoted = {}
+    for _, name in ipairs(targets) do
+        quoted[#quoted + 1] = string.format("%q", name)
+    end
+    return drive_command(table.concat(quoted, ", "), seq.params)
+end
+
+-- One AI car's live world position, or nil when its vehicle is gone. Live only (unlike
+-- circuit.start_positions, which may fall back to the grid pose): the window measures where the car
+-- actually is, and a stale grid pose would freeze the cursor at the start line.
+function window.car_position(car)
+    local veh = be and be:getObjectByID(car.veh_id)
+    if not veh then
+        return nil
+    end
+    local ok, live = pcall(function() return veh:getPosition() end)
+    if ok and live and live.x then
+        return {x = live.x, y = live.y, z = live.z}
+    end
+    return nil
+end
+
+-- The unit vector from `a` to `b`, or nil when the two (nearly) coincide and carry no direction.
+function window.unit_between(a, b)
+    local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+    local length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length < 0.01 then
+        return nil
+    end
+    return {x = dx / length, y = dy / length, z = dz / length}
+end
+
+-- The unit direction of travel at target `index`: towards the next measurable target that is a real
+-- distance away, or -- at the end of the list -- away from the previous one. nil when nothing usable
+-- exists. Tolerates the `false` holes the tail leaves, unlike circuit.direction_at.
+function window.dir_at(positions, count, index)
+    local from = positions[index]
+    if not from then
+        return nil
+    end
+    for i = index + 1, count do
+        if positions[i] then
+            local dir = window.unit_between(from, positions[i])
+            if dir then
+                return dir
+            end
+        end
+    end
+    for i = index - 1, 1, -1 do
+        if positions[i] then
+            local dir = window.unit_between(positions[i], from)
+            if dir then
+                return dir
+            end
+        end
+    end
+    return nil
+end
+
+-- Whether a car at `position` counts as having reached drive target `index`: within REACH_RADIUS of it,
+-- or projected past it along its own direction of travel while staying within REACH_LATERAL of that
+-- line. An unmeasurable target (no position) counts as reached -- never let a car starve on a target the
+-- host cannot see.
+function window.reached(position, positions, count, index)
+    local target = positions[index]
+    if not target then
+        return true
+    end
+    local dx, dy, dz = position.x - target.x, position.y - target.y, position.z - target.z
+    local squared = dx * dx + dy * dy + dz * dz
+    if squared <= REACH_RADIUS * REACH_RADIUS then
+        return true
+    end
+    local dir = window.dir_at(positions, count, index)
+    if not dir then
+        return false
+    end
+    local ahead = dx * dir.x + dy * dir.y + dz * dir.z
+    if ahead <= 0 then
+        return false
+    end
+    return squared - ahead * ahead <= REACH_LATERAL * REACH_LATERAL
+end
+
+-- Walk a car's cursor forward over every armed target it has reached since the last tick.
+function window.advance(entry, position)
+    local seq = entry.seq
+    while entry.cursor < entry.armed
+        and window.reached(position, seq.built_pos, entry.armed, entry.cursor + 1) do
+        entry.cursor = entry.cursor + 1
+    end
+end
+
+-- The length (metres) of the armed route still ahead of a car: the path along its unreached targets.
+-- Walks at most MAX_TOPUP_AHEAD positions, and skips the tail's position-less targets.
+function window.armed_distance(entry)
+    local positions = entry.seq.built_pos
+    local total, prev = 0, nil
+    for i = math.max(1, entry.cursor), entry.armed do
+        local point = positions[i]
+        if point then
+            if prev then
+                local dx, dy, dz = point.x - prev.x, point.y - prev.y, point.z - prev.z
+                total = total + math.sqrt(dx * dx + dy * dy + dz * dz)
+            end
+            prev = point
+        end
+    end
+    return total
+end
+
+-- Whether this car needs a top-up now: a retry is pending, only the refill margin is still armed ahead of
+-- it (for a full block that is exactly "reached target REFILL_AT of BLOCK_TARGETS"), or -- on a route
+-- whose targets sit close together -- less than REFILL_DISTANCE of armed route is left while no more than
+-- a block is still ahead. That last clause is the window's bound: a refill adds one block, so a car never
+-- holds more than two blocks of unreached targets.
+function window.needs_refill(entry)
+    if entry.retry ~= nil then
+        return true
+    end
+    local ahead = entry.armed - entry.cursor
+    if ahead <= (BLOCK_TARGETS - REFILL_AT) then
+        return true
+    end
+    if ahead > MAX_TOPUP_AHEAD then
+        return false
+    end
+    return window.armed_distance(entry) < REFILL_DISTANCE
+end
+
+-- Queue one VE command on a car. Returns true, or false plus the reason.
+function window.queue(car, command)
+    local veh = be and be:getObjectByID(car.veh_id)
+    if not veh then
+        return false, "vehicle is gone"
+    end
+    local ok, err = pcall(function() veh:queueLuaCommand(command) end)
+    if not ok then
+        return false, tostring(err)
+    end
+    return true
+end
+
+-- Expand a block of drive targets into the CONTIGUOUS node path ai.setPath needs, starting on `from` --
+-- the node the live route currently ends on (see the namespace header). The expansion runs GE-side with
+-- the same pathfinder and the same parameters the VE would have used (map.getPath, drivability cutoff 0,
+-- no direction penalty), so the appended path is the path ai.driveUsingPath would have built for those
+-- targets. Every segment is verified rather than assumed: getFilteredPath returns a 1-element path for an
+-- unreachable pair, and an unreachable pair is exactly what leaves an AI standing. Returns the node path,
+-- or nil plus a reason -- never a partial one.
+function window.expand(from, targets)
+    if type(from) ~= "string" or from == "" then
+        return nil, "no armed target to extend from"
+    end
+    if type(map) ~= "table" or type(map.getPath) ~= "function" then
+        return nil, "navgraph API unavailable"
+    end
+    local path = {from}
+    local prev = from
+    for _, target in ipairs(targets) do
+        local ok, segment = pcall(map.getPath, prev, target)
+        if not ok or type(segment) ~= "table" or #segment < 2
+            or segment[1] ~= prev or segment[#segment] ~= target then
+            return nil, string.format("no navgraph path '%s' -> '%s'", tostring(prev), tostring(target))
+        end
+        for i = 2, #segment do
+            path[#path + 1] = segment[i]
+        end
+        prev = target
+    end
+    return path
+end
+
+-- How many leading targets of a re-arm list this car already sits past -- the per-car form of
+-- circuit.lead_skip. An ai.driveUsingPath re-arm plans from the car to its FIRST target, so a first
+-- target BEHIND the car makes it turn around; the block cursor is a permissive estimate, so the reset
+-- re-derives this from the car's own position instead of trusting it. Stops at the first target that is
+-- still ahead (or carries no position), and never drops the last one -- the car must keep something to
+-- drive to.
+function window.drop_passed(targets, positions, position)
+    local skip = 0
+    while skip < #targets - 1 do
+        local point = positions[skip + 1]
+        if not point then
+            break
+        end
+        local dir = window.dir_at(positions, #targets, skip + 1)
+        if not dir or not circuit.passed(point, dir, {position}) then
+            break
+        end
+        skip = skip + 1
+    end
+    return skip
+end
+
+-- The rest of a degraded car's sequence from `from`, as a FRESH list (targets + positions). Built into a
+-- scratch list on purpose: the descriptor is shared, so one car's give-up must never truncate another
+-- car's supply. Capped at back_laps -- the race lap count -- so a degraded car in a 60-lap qualifying
+-- supply gets today's pre-window behaviour (run the race distance, then idle) instead of the
+-- laps x targets runaway the window exists to avoid. The cap is never allowed to hand the car less than
+-- one more full lap from where it stands.
+function window.remaining(seq, from)
+    local per_lap = math.max(1, #seq.lap)
+    local budget = per_lap * math.max(1, seq.back_laps or seq.laps)
+    window.ensure(seq, from + budget)
+    local body = seq.body or #seq.built
+    local upto = math.min(from + budget, body)
+    local out, out_pos = {}, {}
+    for i = from + 1, upto do
+        out[#out + 1] = seq.built[i]
+        out_pos[#out] = seq.built_pos[i]
+    end
+    -- Only a list that really runs to the end of the sequence carries the finish decoration.
+    if upto >= body and seq.tail_built then
+        window.append_tail(seq, out, out_pos)
+    end
+    return out, out_pos
+end
+
+-- The give-up fallback (R4, user decision): re-arm this ONE car with ai.driveUsingPath over its entire
+-- remaining route and stop refilling it -- i.e. hand it today's pre-window behaviour. driveUsingPath is a
+-- hard reset that re-plans from the car's live position, which is exactly what makes it survive a joint
+-- that could not be extended. An AI is never left without a route; that is the single most important rule
+-- in this feature, so this path sends something in every case it can and says loudly when it cannot.
+function window.rearm(car, entry, position, reason)
+    local seq = entry.seq
+    entry.done = true
+    entry.retry = nil
+    local rest, rest_pos = window.remaining(seq, entry.cursor)
+    if #rest == 0 then
+        log("W", LOG_TAG, string.format(
+            "AI '%s' route refill failed (%s) and nothing is left to re-arm; keeping its current route",
+            tostring(car.label), tostring(reason)))
+        return
+    end
+    local skip = window.drop_passed(rest, rest_pos, position)
+    local targets = {}
+    for i = skip + 1, #rest do
+        targets[#targets + 1] = rest[i]
+    end
+    local sent, err = window.queue(car, window.command(seq, targets))
+    if not sent then
+        log("W", LOG_TAG, string.format("AI '%s' route re-arm could not be queued: %s",
+            tostring(car.label), tostring(err)))
+        return
+    end
+    entry.armed = entry.cursor + #rest
+    log("W", LOG_TAG, string.format(
+        "AI '%s' route refill gave up (%s): re-armed the whole remaining route with %d target(s) "
+        .. "('%s' -> '%s', %d leading target(s) already passed) and stopped refilling it",
+        tostring(car.label), tostring(reason), #targets, tostring(targets[1]),
+        tostring(targets[#targets]), skip))
+end
+
+-- Top one car's armed route up by one block, seamlessly. Failure never sends a partial command: it
+-- returns to the caller, which retries once on the next tick (the navgraph can legitimately be unready
+-- for a frame after a reset) and then falls back to the full re-arm above.
+function window.refill(car, entry, position)
+    local seq = entry.seq
+    window.ensure(seq, entry.armed + BLOCK_TARGETS)
+    local upto = math.min(entry.armed + BLOCK_TARGETS, #seq.built)
+    if upto <= entry.armed then
+        -- Supply exhausted: the final block -- drive-through / overshoot included -- is already armed, and
+        -- nothing may be armed after it. This is what makes the race stop exactly on its last lap.
+        entry.done = true
+        return
+    end
+    local block = {}
+    for i = entry.armed + 1, upto do
+        block[#block + 1] = seq.built[i]
+    end
+    local path, reason = window.expand(seq.built[entry.armed], block)
+    if path then
+        local quoted = {}
+        for _, node in ipairs(path) do
+            quoted[#quoted + 1] = string.format("%q", node)
+        end
+        local sent, err = window.queue(car,
+            string.format("ai.setPath({%s})", table.concat(quoted, ", ")))
+        if sent then
+            entry.block = entry.block + 1
+            log("I", LOG_TAG, string.format(
+                "AI '%s' route refill: block %d, targets %d-%d of %s, '%s' -> '%s' (extend from '%s', "
+                .. "%d node(s))",
+                tostring(car.label), entry.block, entry.armed + 1, upto,
+                seq.total and tostring(seq.total) or "an open supply",
+                tostring(block[1]), tostring(block[#block]), tostring(seq.built[entry.armed]), #path))
+            entry.armed = upto
+            entry.retry = nil
+            if seq.total and entry.armed >= seq.total then
+                entry.done = true
+            end
+            return
+        end
+        reason = err
+    end
+    if not entry.retry then
+        -- One retry on the next tick before giving up on the seamless path.
+        entry.retry = reason
+        log("W", LOG_TAG, string.format("AI '%s' route refill failed (%s); retrying next tick",
+            tostring(car.label), tostring(reason)))
+        return
+    end
+    window.rearm(car, entry, position, reason)
+end
+-- ===== end the rolling route window =============================================================
 
 -- Arm BeamNG's vehicle AI to drive each car along the race route (ADR-0036 Step-3b). The route variant is
 -- `params.route`: "snap" (default) routes over the per-point navgraph snap (resolve_waypoint_names +
@@ -970,14 +1418,26 @@ end
 --     ~OVERSHOOT_DISTANCE behind the finish (both variants).
 -- Either way the AI accelerate away from the grid and cross their finish at speed instead of parking short
 -- of the last checkpoint's trigger radius. pcall-guarded. A nil `params` uses the default preset.
+--
+-- The target list is armed in a ROLLING WINDOW (see the window namespace): at most BLOCK_TARGETS targets
+-- go out now, and M.step_window tops each car up as it drives. `opts` carries that:
+--   * opts.store      -- the caller's per-race window table keyed by AI id (init.lua M.state.ai_window).
+--                        Without it nothing is registered and the whole sequence is armed at once.
+--   * opts.backLaps   -- the lap count the give-up fallback caps a degraded car's route at (the RACE lap
+--                        count; a qualifying supply is far longer than the race, and a fallback must not
+--                        re-create the runaway the window exists to avoid).
+-- A sequence that fits inside a single block is armed exactly as it was before the window existed, byte
+-- for byte, and registers no window entry.
+--
 -- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph was installed (the
 -- caller restores the real one at teardown via M.restore_map).
-function M.drive(cars, route, laps, params, closed)
+function M.drive(cars, route, laps, params, closed, opts)
     if type(cars) ~= "table" then
         return
     end
     route = type(route) == "table" and route or {}
     params = type(params) == "table" and params or M.resolve_params(nil, nil)
+    opts = type(opts) == "table" and opts or {}
     local lap_count = math.max(1, math.floor(tonumber(laps) or 1))
 
     -- A loop route scored as a SPRINT finishes on its own last node, not on the start/finish line, so its
@@ -992,52 +1452,88 @@ function M.drive(cars, route, laps, params, closed)
             .. "AI finish on the last one, not on the start/finish line", #route))
     end
 
-    local source, command, per_lap, total
-    local custom_map = false
-    local first_target, last_target
+    local source, per_lap, seq
+    local custom_map, span_only = false, false
     -- The route-end checks measure the drive targets against where the field actually stands.
     local starts = circuit.start_positions(cars)
     if params.route == "direct" then
         local nodes = build_route_nodes(route)
         -- The custom map's nodes ARE the route points, so the leading-target check runs on them directly.
         local skip = closed and circuit.lead_skip(nodes, starts) or 0
-        local index_sequence = lay_out_node_indices(#nodes, lap_count, closed, 1 + skip)
         -- perLap counts the real route nodes; the overshoot node below is a drive aid, not a lap stop.
         per_lap = #nodes
-        if not closed then
-            append_overshoot_node(nodes, index_sequence)
+        -- The end decoration is fixed here, before the map is installed: on a closed loop the closing edge
+        -- n->1 carries the AI across the finish and node 2 is the first node PAST it, and on an open route
+        -- the overshoot is a SYNTHETIC node that has to be in the map by the time map.reset runs.
+        local tail = {}
+        if closed and #nodes > 1 then
+            tail = {"bc1", "bc2"}
+        elseif not closed then
+            local appended = {}
+            append_overshoot_node(nodes, appended)
+            if appended[1] then
+                tail = {"bc" .. appended[1]}
+            end
         end
-        first_target = index_sequence[1] and ("bc" .. index_sequence[1]) or nil
-        last_target = index_sequence[#index_sequence] and ("bc" .. index_sequence[#index_sequence]) or nil
-        if install_custom_race_map(nodes, closed) then
-            command = drive_command_wptargets(index_sequence, params)
+        local lap_names, lap_positions = {}, {}
+        for i = 1, per_lap do
+            lap_names[i] = "bc" .. i
+            lap_positions[i] = nodes[i]
+        end
+        seq = window.new({
+            variant = "direct", closed = closed, route = route, params = params,
+            lap = lap_names, lap_pos = lap_positions,
+            first = math.max(2, 1 + skip), rest_start = 1, dedup = false,
+            laps = lap_count, back_laps = tonumber(opts.backLaps) or lap_count, tail = tail,
+        })
+        if not install_custom_race_map(nodes, closed) then
+            -- No custom navgraph, no bc nodes to drive: span the road network so the car still moves.
+            span_only = true
+            source = "span"
+        else
             source = "direct"
             custom_map = true
-        else
-            command = drive_command_wptargets({}, params)
-            source = "span"
         end
-        total = #index_sequence
     else
         -- The drive targets are the SNAPPED navgraph nodes, so the leading-target check runs on their own
         -- positions -- a snap can land a full edge away from the route point it came from.
         local lap_names, lap_positions = resolve_waypoint_names(route)
         local skip = closed and circuit.lead_skip(lap_positions, starts) or 0
-        local names = lay_out_lap_waypoints(lap_names, lap_count, 1 + skip)
-        if closed then
-            circuit.append_drive_through(names, lap_names)
-        else
-            append_overshoot_waypoint(names, route)
+        per_lap = #lap_names
+        -- No target positions means no progress trigger, so no window either: cap the supply at the race
+        -- lap count and arm it in one call, exactly as before, rather than a route nothing can refill.
+        local measurable = (#lap_positions > 0) or (#lap_names == 0)
+        if not measurable then
+            log("W", LOG_TAG, "AI route window disabled: the drive targets carry no navgraph positions to "
+                .. "measure progress against; arming the route in one call")
+            lap_count = math.min(lap_count, math.max(1, tonumber(opts.backLaps) or lap_count))
         end
-        first_target, last_target = names[1], names[#names]
-        local quoted = {}
-        for _, name in ipairs(names) do
-            quoted[#quoted + 1] = string.format("%q", name)
-        end
-        command = drive_command(table.concat(quoted, ", "), params)
-        source = #names > 0 and "navgraph-snap" or "span"
-        per_lap, total = #lap_names, #names
+        seq = window.new({
+            variant = "snap", closed = closed, route = route, params = params,
+            lap = lap_names, lap_pos = lap_positions,
+            first = 1 + skip, rest_start = 2, dedup = true, no_window = not measurable,
+            laps = lap_count, back_laps = tonumber(opts.backLaps) or lap_count,
+        })
+        source = "navgraph-snap"
     end
+
+    -- Materialise one block plus one target: the least that answers "does the whole sequence fit inside a
+    -- single block?", and also what keeps a qualifying supply from being built up front.
+    window.ensure(seq, seq.no_window and math.huge or (BLOCK_TARGETS + 1))
+    local windowed = not span_only and not seq.no_window
+        and (seq.total == nil or seq.total > BLOCK_TARGETS)
+    local armed = windowed and BLOCK_TARGETS or (seq.total or #seq.built)
+    local targets = {}
+    if not span_only then
+        for i = 1, armed do
+            targets[i] = seq.built[i]
+        end
+    end
+    local command = window.command(seq, targets)
+    if #targets == 0 then
+        source = "span"
+    end
+    local total = seq.total or window.estimate(seq)
 
     log("I", LOG_TAG, string.format(
         "AI route source=%s: %d node(s)/lap from %d route point(s), %d lap(s) -> %d total",
@@ -1048,8 +1544,20 @@ function M.drive(cars, route, laps, params, closed)
     log("I", LOG_TAG, string.format(
         "AI route ends: scored as %s, loop route=%s, first target=%s, last target=%s",
         closed and "circuit" or "sprint", tostring(loop and true or false),
-        tostring(first_target), tostring(last_target)))
+        tostring(seq.built[1]), tostring(window.final_target(seq))))
+    if windowed then
+        log("I", LOG_TAG, string.format(
+            "AI route window: %d of %s target(s) armed per car, refilled at %d target(s) or %.0f m of "
+            .. "route still ahead", armed, seq.total and tostring(seq.total) or "an open supply",
+            BLOCK_TARGETS - REFILL_AT, REFILL_DISTANCE))
+    end
+    local store = type(opts.store) == "table" and opts.store or nil
     for _, car in ipairs(cars) do
+        -- Drop any window this car carried from an earlier arming FIRST (a staged-quali relaunch re-arms
+        -- one car at a time), so it can never be refilled against the route it drove on its last run.
+        if store then
+            store[car.id] = nil
+        end
         local veh = be and be:getObjectByID(car.veh_id)
         if veh then
             local ok, err = pcall(function() veh:queueLuaCommand(command) end)
@@ -1059,11 +1567,70 @@ function M.drive(cars, route, laps, params, closed)
             else
                 log("I", LOG_TAG, "armed AI drive on '" .. tostring(car.label) .. "'")
             end
+            -- A sequence that fits inside one block needs no entry: there is nothing to refill.
+            if store and windowed then
+                store[car.id] = {seq = seq, armed = armed, cursor = 0, block = 1, done = false}
+            end
         end
     end
     -- Summary for the owner's race-start chat notice (which route variant the AI actually got); customMap
     -- tells the caller a custom navgraph is live so it restores the real one at teardown (M.restore_map).
     return {source = source, perLap = per_lap, total = total, laps = lap_count, customMap = custom_map}
+end
+
+-- Per-frame, host only: walk each AI's progress through its armed block and top it up before it runs out
+-- (the rolling route window). Called from the client tick in the racing and qualifying phases; inert
+-- without a window store -- a non-host has none, and a route that fitted in a single block registers no
+-- entry.
+--
+-- `held` is the qualifying hold set (init.lua M.state.quali_ai_held): once an AI's session is over it is
+-- parked for the rest of the window (ADR-0041, bug quali-end-ai-not-frozen), so it is never refilled.
+-- At most ONE car refills per call: a block expansion costs BLOCK_TARGETS shortest-path queries, and the
+-- refill margin is hundreds of metres at racing speed, so spreading the work over frames is free.
+function M.step_window(cars, store, held)
+    if type(cars) ~= "table" or type(store) ~= "table" then
+        return
+    end
+    local refilled = false
+    for _, car in ipairs(cars) do
+        local entry = store[car.id]
+        if entry and not (held and held[car.id]) then
+            local position = window.car_position(car)
+            if position then
+                window.advance(entry, position)
+                if not entry.done and not refilled and window.needs_refill(entry) then
+                    refilled = true
+                    window.refill(car, entry, position)
+                end
+            end
+        end
+    end
+end
+
+-- The engine reported one vehicle's AI route done (init.lua M.onAiRouteDone, fired by the VE when the car
+-- stops at the end of its path). For a windowed AI that is a FAILURE signal: reaching the end of a block
+-- means the seamless extension did not take, and pathExtend is silent when its joint does not line up --
+-- exactly the failure that looks like "the NPC just stopped". Re-arm the rest of its route and say so.
+-- No-op for a car with no window, one that is already done (its race really is over), or a held one.
+function M.route_done(cars, store, held, veh_id)
+    if type(cars) ~= "table" or type(store) ~= "table" then
+        return
+    end
+    for _, car in ipairs(cars) do
+        if car.veh_id == veh_id then
+            local entry = store[car.id]
+            if entry and not entry.done and not (held and held[car.id]) then
+                local position = window.car_position(car)
+                if position then
+                    log("W", LOG_TAG, string.format(
+                        "AI '%s' ran its armed route out at target %d of %d -- the seamless refill did not "
+                        .. "hold", tostring(car.label), entry.cursor, entry.armed))
+                    window.rearm(car, entry, position, "armed route ran out")
+                end
+            end
+            return
+        end
+    end
 end
 
 -- Stop the AI before despawn so a half-driven car does not lurch on teardown (best-effort). No-op on a
