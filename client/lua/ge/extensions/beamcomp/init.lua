@@ -1317,11 +1317,12 @@ local function handle_race_phase(payload)
         end
     elseif phase == "qualifying" then
         -- Qualifying session (ADR-0041): release the lock and lap the unbounded quali plan to set lap
-        -- times; the grid is set afterwards from quali pace. The AI drive too (so the session is populated),
-        -- but only for the real race lap count -- ai.drive bakes every lap into the waypoint list (noOfLaps
-        -- does not loop, ADR-0036), so the unbounded quali lap count would build a runaway path; they run the
-        -- race distance, set a time, then idle; the grid is then set from quali pace. Seed the quali clock from the phase
-        -- duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs server-side.
+        -- times; the grid is set afterwards from quali pace. The AI drive the SAME unbounded plan (feature
+        -- ai-rolling-route-window): ai.drive arms only a rolling block of drive targets and refills it per
+        -- car, so the quali lap count no longer builds a runaway waypoint list and the AI lap the session
+        -- for its full length instead of running the race distance and idling. Seed the quali clock from
+        -- the phase duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs
+        -- server-side.
         local quali_state = M.state.race and M.state.race.quali
         M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
         -- Fresh session: nobody has finished their graced lap yet (ADR-0041 amendment).
@@ -1375,7 +1376,11 @@ local function handle_race_phase(payload)
             -- quali-end-ai-not-frozen).
             M.state.quali_ai_held = {}
             M.state.quali_ai_reassert = {}
-            begin_driving(quali_state and quali_state.plan, M.state.race and M.state.race.laps)
+            -- The AI drive the quali plan's own lap count, not the race's: that is what makes them lap the
+            -- session instead of parking after the race distance. The plan is sized so the clock runs out
+            -- first (race/start.lua quali_for), and the rolling window keeps the armed part constant.
+            begin_driving(quali_state and quali_state.plan,
+                (quali_state and quali_state.laps) or (M.state.race and M.state.race.laps))
             -- Arm the live sector-delta tracker (feature: quali-live-sector-delta): a circuit quali laps the
             -- unbounded plan, so each scored crossing closes a per-checkpoint sector the HUD diffs against the
             -- chosen reference. cps == #checkpoints (ADR-0013 circuit plan). Sprint quali has no repeated laps
