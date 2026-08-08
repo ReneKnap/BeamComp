@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ui-setting-tooltips-r2/2026-08-04"
+local BUILD_MARKER = "quali-end-ai-not-frozen/2026-08-08"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -299,6 +299,13 @@ M.state = {
     quali_ai_runs = nil,      -- host only: {[ai id] = per-driver run} for AI currently counting at the ramp, or nil
     quali_clear_sent = false, -- local driver has reported clearing the ramp (>=15 m) for its current run (Round 4)
     quali_ai_cleared = nil,   -- host only: {[ai id] = true} once a launched AI has reported clearing the ramp
+    -- The AI-side mirror of hold.is_held() (bug quali-end-ai-not-frozen). BOTH quali modes: {[ai id] = true}
+    -- while that AI is frozen and must STAY frozen -- staged (queued on its slot / counting at the ramp /
+    -- done) and circuit (its lap closed inside the finish-your-lap grace). Host only (nil elsewhere; ai_cars
+    -- is nil on a non-host, ADR-0036). Drives quali.step_ai_hold's per-frame re-assert, which is what the
+    -- player already gets from hold.sync() + rearm_staged_car_on_reload and the AI never had.
+    quali_ai_held = nil,
+    quali_ai_reassert = nil,  -- host only: {[ai id] = os.clockhp of the last re-assert}, the per-car cooldown
     -- The qualifying HOLD (bug quali-hold-reset-and-repaint-leak, ADR-0017 amendment). hold.is_held() is
     -- the single truth; these two carry the state it cannot derive from the fields above.
     quali_lap_done = false,    -- circuit quali: the local driver's lap closed inside the finish-your-lap grace, so their session is over and the car is held (ADR-0041 amendment)
@@ -1336,6 +1343,15 @@ local function handle_race_phase(payload)
                 M.state.sector_track = nil
             end
             M.state.quali_ai_runs = {}
+            -- Every AI starts this session queued and frozen on its holding slot (they were frozen through
+            -- staging and nothing releases them here), so seed them all as held (bug quali-end-ai-not-frozen).
+            -- quali.launch_ai clears the one AI that is actually driving. Host only -- ai_cars is nil on a
+            -- non-host, which leaves an empty set and a net that no-ops (ADR-0036).
+            M.state.quali_ai_held = {}
+            M.state.quali_ai_reassert = {}
+            for _, car in ipairs(M.state.ai_cars or {}) do
+                M.state.quali_ai_held[car.id] = true
+            end
             M.state.results_min = false
             M.state.analysis_open = false
             countdown.clear()
@@ -1344,6 +1360,11 @@ local function handle_race_phase(payload)
         else
             -- Circuit all-at-once quali (ADR-0041): release everyone and lap the unbounded plan (unchanged).
             M.state.quali_staged = false
+            -- Nothing is held yet -- every AI is about to be released to lap. They are parked one at a time
+            -- as their own lap closes inside the finish-your-lap grace (step_ai_detections, bug
+            -- quali-end-ai-not-frozen).
+            M.state.quali_ai_held = {}
+            M.state.quali_ai_reassert = {}
             begin_driving(quali_state and quali_state.plan, M.state.race and M.state.race.laps)
             -- Arm the live sector-delta tracker (feature: quali-live-sector-delta): a circuit quali laps the
             -- unbounded plan, so each scored crossing closes a per-checkpoint sector the HUD diffs against the
@@ -1371,6 +1392,8 @@ local function handle_race_phase(payload)
         M.state.quali_ai_runs = nil
         M.state.quali_clear_sent = false
         M.state.quali_ai_cleared = nil
+        M.state.quali_ai_held = nil
+        M.state.quali_ai_reassert = nil
         M.state.quali_lap_done = false
         -- Stop qualifying sector tracking; the race scores the real plan (feature: quali-live-sector-delta).
         M.state.sector_track = nil
@@ -1395,6 +1418,10 @@ local function handle_race_phase(payload)
         M.state.quali_ai_runs = nil
         M.state.quali_clear_sent = false
         M.state.quali_ai_cleared = nil
+        -- The AI are despawned a few lines below, so there is nothing left to hold (bug
+        -- quali-end-ai-not-frozen).
+        M.state.quali_ai_held = nil
+        M.state.quali_ai_reassert = nil
         M.state.quali_lap_done = false
         -- Qualifying over -- drop the sector-delta tracker (feature: quali-live-sector-delta).
         M.state.sector_track = nil
@@ -1702,6 +1729,33 @@ end
 -- to give the next driver more room behind the one launching.
 quali.STAGE_CLEAR_DIST = 15.0
 
+-- The AI hold net (bug quali-end-ai-not-frozen). A held AI that is measurably moving has lost its freeze,
+-- so re-assert it. Both live on the quali table, not as top-level locals (200-local ceiling).
+--   * CREEP_SPEED: m/s above which a held car counts as actually moving rather than settling on its springs.
+--     Same value F1_JUMP_SPEED uses for "this car really moved" (~2.5 km/h).
+--   * REASSERT_EVERY: seconds between re-asserts for one car, so a car that keeps rolling (on a slope, or
+--     while its VE is still coming back up) costs at most one command pair + one log line per second.
+quali.HOLD_CREEP_SPEED = 0.7
+quali.HOLD_REASSERT_EVERY = 1.0
+
+-- Mark / unmark one AI as held for the qualifying session (bug quali-end-ai-not-frozen). The AI mirror of
+-- the player's hold.is_held(): "this car is frozen right now and must stay frozen". Set wherever an AI is
+-- frozen (quali.stage_ai, quali.hold_ai, the circuit grace park), cleared where it is legitimately released
+-- (quali.launch_ai). Host only -- the table is nil on a non-host, so this no-ops there.
+function quali.set_ai_held(ai_id, held)
+    if held then
+        M.state.quali_ai_held = M.state.quali_ai_held or {}
+        M.state.quali_ai_held[ai_id] = true
+        return
+    end
+    if M.state.quali_ai_held then
+        M.state.quali_ai_held[ai_id] = nil
+    end
+    if M.state.quali_ai_reassert then
+        M.state.quali_ai_reassert[ai_id] = nil
+    end
+end
+
 -- The dedicated P1 start ramp pose (ADR-0044/Round4), split off the front of the grid so P1 is empty at the
 -- start; the active driver is teleported here for their run. nil for a normal race / circuit quali.
 function quali.ramp_pose()
@@ -1791,6 +1845,10 @@ function quali.stage_ai(ai_id, count)
         pcall(function() vehicles.place_at_grid(veh, pose) end)
         pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
     end
+    -- Still held: the car sits frozen on the ramp until GO, exactly like the player's staged state, so the
+    -- re-assert net keeps it there if the ramp teleport's VE churn drops the freeze (bug
+    -- quali-end-ai-not-frozen).
+    quali.set_ai_held(car.id, true)
     M.state.quali_ai_runs = M.state.quali_ai_runs or {}
     M.state.quali_ai_runs[car.id] = qualisprint.new_run(os.clockhp(), count)
     log("I", RACE_LOG_TAG, string.format("staged quali: AI '%s' staged at the ramp", tostring(car.label)))
@@ -1807,6 +1865,10 @@ function quali.launch_ai(car_id)
     if not car or not M.state.race then
         return
     end
+    -- GO: the one AI state that is free (the mirror of the player's "running"). Drop the hold BEFORE the
+    -- release, so the per-frame net cannot re-freeze the car we are about to launch (bug
+    -- quali-end-ai-not-frozen).
+    quali.set_ai_held(car.id, false)
     ai.set_frozen({car}, false)
     local params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
     ai.drive({car}, M.state.race.routePoints or M.state.race.checkpoints,
@@ -1821,11 +1883,23 @@ end
 
 -- Owner: stop an AI + hold it (ADR-0044/Round4). stop=true -> freeze in place (a done AI at the window's
 -- end); else -> re-place it at its OWN fixed holding slot (car.pose, its spawned grid position) and freeze.
+--
+-- Used by BOTH quali modes (bug quali-end-ai-not-frozen): the staged sprint reaches it through the server's
+-- qualiHold, the circuit through step_ai_detections when an AI closes its lap inside the finish-your-lap
+-- grace. It is the ONE place an AI is parked -- the mirror of hold.circuit_run for the player -- so the
+-- semantics (ai.stop + freeze in place, no teleport) can only ever be defined once.
 function quali.hold_ai(ai_id, stop)
     local car = quali.find_ai(ai_id)
     if not car then
+        -- Not a silent drop: an unknown id here means a hold was routed for an AI this owner does not have,
+        -- which is exactly the kind of failure that looks like "the NPC just keeps driving".
+        log("W", RACE_LOG_TAG, "quali hold: no AI car for id " .. tostring(ai_id))
         return
     end
+    -- Held from here until this AI is launched again (or the session ends): the per-frame net re-asserts the
+    -- freeze if a VE reload throws it off -- controller.setFreeze is a soft per-VE flag that init/reset clear
+    -- (bug quali-hold-reset-and-repaint-leak, same failure family).
+    quali.set_ai_held(car.id, true)
     pcall(function() ai.stop({car}) end)
     if M.state.ai_detections then
         M.state.ai_detections[car.id] = nil
@@ -1838,12 +1912,20 @@ function quali.hold_ai(ai_id, stop)
     end
     local veh = be and be:getObjectByID(car.veh_id)
     if not veh then
+        log("W", RACE_LOG_TAG, string.format(
+            "quali hold: AI '%s' has no vehicle to hold", tostring(car.label)))
         return
     end
     if not stop and car.pose then
         pcall(function() vehicles.place_at_grid(veh, car.pose) end)
     end
     pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
+    -- The single place an AI is parked, so this one line answers the first live question for BOTH modes:
+    -- did the hold reach this client at all? If it is missing while an AI drives on, the hold was never
+    -- sent/routed; if it is present and the car still moves, the freeze is being thrown off -- which the
+    -- re-assert net then reports separately (bug quali-end-ai-not-frozen).
+    log("I", RACE_LOG_TAG, string.format("quali hold: AI '%s' held (%s)", tostring(car.label),
+        stop and "stopped in place" or "returned to its holding slot"))
 end
 
 -- "You're up" (server qualiStage, ADR-0044/Round4): a player payload -> stage the local car at the ramp; an
@@ -1965,6 +2047,54 @@ function quali.step_clearing()
                 if dist and dist >= quali.STAGE_CLEAR_DIST then
                     M.state.quali_ai_cleared[car.id] = true
                     send_to_server("qualiCleared", {aiId = car.id})
+                end
+            end
+        end
+    end
+end
+
+-- Host only: keep every HELD AI actually held, once per qualifying frame (bug quali-end-ai-not-frozen).
+-- This is the AI's half of what hold.sync() + rearm_staged_car_on_reload do for the player, and the piece
+-- the AI side never had.
+--
+-- Why it is needed at all: vehicles.set_vehicle_frozen queues controller.setFreeze, and in the game's own
+-- vehicleController that is a soft per-VE flag (`isFrozen`, applied as `M.brake = 1`) which init() and
+-- reset() set straight back to false. Any VE reload -- a config respawn, a BeamMP re-sync, a reset -- drops
+-- the hold silently, and the parked car rolls away. The player is netted out against exactly this; an AI
+-- was not, so a one-shot freeze was the only thing holding it.
+--
+-- Gated on real movement rather than re-pushed blindly: a queueLuaCommand per AI per frame is genuine VE
+-- traffic, whereas one velocity read per held car is nearly free. It also makes every re-assert a POSITIVE
+-- OBSERVATION of the defect -- the log line below is the live diagnosis for the staged path, which cannot be
+-- reproduced outside a real session. Per-car cooldown so a car that keeps rolling costs at most one command
+-- pair and one log line per second.
+function quali.step_ai_hold()
+    local held = M.state.quali_ai_held
+    local cars = M.state.ai_cars
+    if not held or not cars then
+        return  -- non-host (ai_cars nil, ADR-0036), or nothing held
+    end
+    local now = os.clockhp()
+    for _, car in ipairs(cars) do
+        if held[car.id] then
+            local veh = be and be:getObjectByID(car.veh_id)
+            if veh then
+                local ok, speed = pcall(function() return veh:getVelocity():length() end)
+                if ok and speed and speed > quali.HOLD_CREEP_SPEED then
+                    M.state.quali_ai_reassert = M.state.quali_ai_reassert or {}
+                    local last = M.state.quali_ai_reassert[car.id] or 0
+                    if now - last >= quali.HOLD_REASSERT_EVERY then
+                        M.state.quali_ai_reassert[car.id] = now
+                        -- Same two calls quali.hold_ai makes, in the same order, on the same car: stop the AI
+                        -- (which zeroes its inputs and drops its route) and re-freeze IN PLACE. Never a
+                        -- teleport -- the user's binding decision is that a parked AI stays where it stopped.
+                        pcall(function() ai.stop({car}) end)
+                        pcall(function() vehicles.set_vehicle_frozen(veh, true) end)
+                        log("I", RACE_LOG_TAG, string.format(
+                            "quali hold: AI '%s' moved at %.1f m/s while held (%s quali) -- re-froze in place",
+                            tostring(car.label), speed,
+                            M.state.quali_staged and "staged" or "circuit"))
+                    end
                 end
             end
         end
@@ -4083,9 +4213,16 @@ local function step_ai_detections(dt_sim)
             -- the report; the report then carries this AI's best lap + run-up so the server stores them by
             -- proxy exactly like a player (ADR-0036/0022). Both stay nil on a sprint -> harmless.
             local ai_lt = laptimers and laptimers[car.id]
+            -- Circuit quali (bug quali-end-ai-not-frozen): does this crossing end the AI's session? The exact
+            -- predicate on_checkpoint_reached uses for the player -- a scored start/finish crossing that
+            -- closes a lap while the finish-your-lap grace is running. The park itself happens AFTER the
+            -- report below, which still has to read the live detector (detection.plan.count) and carry this
+            -- lap's best time, just as the player's report does.
+            local session_over = false
             if event then
                 if ai_lt and ai_lt.start_cp and event.index == ai_lt.start_cp.index then
                     laptimer.complete_lap(ai_lt, event.time)
+                    session_over = M.state.phase == "qualifying" and M.state.grace ~= nil
                 end
                 send_to_server("checkpoint", {
                     -- Proxy tag (ADR-0036): the server records this crossing into the AI slot's progress,
@@ -4102,10 +4239,19 @@ local function step_ai_detections(dt_sim)
                 })
                 log("I", RACE_LOG_TAG, string.format("AI '%s' checkpoint seq %d @ %.2fs",
                     tostring(car.label), event.seq, event.time))
+                if session_over then
+                    -- The AI's qualifying session is over: park it exactly as hold.circuit_run parks the
+                    -- player -- ai.stop + freeze IN PLACE, no teleport (user decision 2026-08-08) -- and mark
+                    -- it held so quali.step_ai_hold keeps it there. quali.hold_ai drops this AI's detector, so
+                    -- nothing further is scored or reported for it, mirroring the player's `detection = nil`.
+                    -- It logs the park itself, right after the crossing line above -- no second line here.
+                    quali.hold_ai(car.id, true)
+                end
             end
             -- Swept run-up test after the detector, mirroring step_detection's trailing laptimer.step: the
-            -- first start/finish crossing arms run_up (gun -> line); a no-op once armed.
-            if ai_lt then
+            -- first start/finish crossing arms run_up (gun -> line); a no-op once armed. Skipped for an AI
+            -- just parked -- its session is over, and its detector is gone.
+            if ai_lt and not session_over then
                 laptimer.step(ai_lt, veh_pos, detection.elapsed)
             end
         end
@@ -5897,6 +6043,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- if a future queue path forgets to. Costs one boolean compare -- the engine call only fires on an
         -- actual edge.
         hold.sync()
+        -- The AI's half of the same net (bug quali-end-ai-not-frozen): re-assert the freeze on any parked AI
+        -- that has started moving again. Covers BOTH quali modes -- the staged queue/ramp/done holds and the
+        -- circuit "closed its lap in the grace window" park -- and no-ops on a non-host.
+        quali.step_ai_hold()
         step_detection(dtSim)
         step_ai_detections(dtSim)
         -- Recover/repair work in qualifying exactly as in the race (ADR-0017): drive the held assist
