@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "circuit-ai-route-offset-r2/2026-08-08"
+local BUILD_MARKER = "ai-route-start-geometric-r2/2026-08-09"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -263,6 +263,7 @@ M.state = {
     ai_policy = nil,          -- host only: the vehicle policy used for the AI car chain (ADR-0032), kept so a quali re-grid can re-spawn fresh AI (ADR-0041), or nil
     ai_custom_map = nil,      -- host only: true while the script-variant custom race navgraph is live (ADR-0036 Step-3b); teardown restores the real one
 
+    ai_window = nil,          -- host only: per-AI rolling-route-window state keyed by AI id (race/ai.lua owns the shape; this module owns the storage, like ai_cars). Present only while a route is longer than one block; race/ai.lua M.step_window tops each car up from it. nil off-race / on a non-host
     ai_detections = nil,      -- host only: per-AI checkpoint-detection state keyed by AI id, armed on racing (ADR-0036), or nil
     ai_laptimers = nil,       -- host only: per-AI circuit lap clock keyed by AI id, armed alongside ai_detections; feeds the proxy best-lap + run-up report (ADR-0036/0022/0041), or nil
     ai_map_pending = false,   -- host only: the aiMap (AI server ids) still has unresolved cars to broadcast (ADR-0036)
@@ -426,6 +427,7 @@ local function handle_race_start(payload)
         M.state.ai_cars = nil
         M.state.ai_config = nil
         M.state.ai_detections = nil
+        M.state.ai_window = nil
         M.state.ai_laptimers = nil
         M.state.ai_map_pending = false
         M.state.ai_remote_ids = nil
@@ -573,6 +575,7 @@ local function handle_race_start(payload)
     M.state.ai_cars = nil
     M.state.ai_config = nil
     M.state.ai_detections = nil
+    M.state.ai_window = nil
     M.state.ai_laptimers = nil
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
@@ -811,6 +814,7 @@ local function teardown_race_world()
     M.state.ai_cars = nil
     M.state.ai_config = nil
     M.state.ai_detections = nil
+    M.state.ai_window = nil
     M.state.ai_laptimers = nil
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
@@ -1146,9 +1150,15 @@ local function begin_driving(plan, ai_laps)
             ai.set_frozen(M.state.ai_cars, false)
         end
         local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
+        -- Rolling route window: the AI get at most one block of drive targets now and are topped up per
+        -- car from the client tick (step_ai_window), so a qualifying session can be lapped for its whole
+        -- length without arming laps x targets up front. `backLaps` is the RACE lap count -- the cap the
+        -- window's give-up fallback uses so a degraded car cannot re-create that runaway.
+        M.state.ai_window = {}
         local ai_route = ai.drive(M.state.ai_cars,
             M.state.race.routePoints or M.state.race.checkpoints, ai_laps or M.state.race.laps, ai_params,
-            M.state.race.mode == "circuit")
+            M.state.race.mode == "circuit",
+            {store = M.state.ai_window, backLaps = M.state.race.laps})
         M.state.ai_custom_map = ai_route and ai_route.customMap or nil
         if ai_route then
             send_to_server("aiRouteNotice", ai_route)
@@ -1307,11 +1317,12 @@ local function handle_race_phase(payload)
         end
     elseif phase == "qualifying" then
         -- Qualifying session (ADR-0041): release the lock and lap the unbounded quali plan to set lap
-        -- times; the grid is set afterwards from quali pace. The AI drive too (so the session is populated),
-        -- but only for the real race lap count -- ai.drive bakes every lap into the waypoint list (noOfLaps
-        -- does not loop, ADR-0036), so the unbounded quali lap count would build a runaway path; they run the
-        -- race distance, set a time, then idle; the grid is then set from quali pace. Seed the quali clock from the phase
-        -- duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs server-side.
+        -- times; the grid is set afterwards from quali pace. The AI drive the SAME unbounded plan (feature
+        -- ai-rolling-route-window): ai.drive arms only a rolling block of drive targets and refills it per
+        -- car, so the quali lap count no longer builds a runaway waypoint list and the AI lap the session
+        -- for its full length instead of running the race distance and idling. Seed the quali clock from
+        -- the phase duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs
+        -- server-side.
         local quali_state = M.state.race and M.state.race.quali
         M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
         -- Fresh session: nobody has finished their graced lap yet (ADR-0041 amendment).
@@ -1365,7 +1376,11 @@ local function handle_race_phase(payload)
             -- quali-end-ai-not-frozen).
             M.state.quali_ai_held = {}
             M.state.quali_ai_reassert = {}
-            begin_driving(quali_state and quali_state.plan, M.state.race and M.state.race.laps)
+            -- The AI drive the quali plan's own lap count, not the race's: that is what makes them lap the
+            -- session instead of parking after the race distance. The plan is sized so the clock runs out
+            -- first (race/start.lua quali_for), and the rolling window keeps the armed part constant.
+            begin_driving(quali_state and quali_state.plan,
+                (quali_state and quali_state.laps) or (M.state.race and M.state.race.laps))
             -- Arm the live sector-delta tracker (feature: quali-live-sector-delta): a circuit quali laps the
             -- unbounded plan, so each scored crossing closes a per-checkpoint sector the HUD diffs against the
             -- chosen reference. cps == #checkpoints (ADR-0013 circuit plan). Sprint quali has no repeated laps
@@ -1453,6 +1468,7 @@ local function handle_race_phase(payload)
         end
         M.state.ai_cars = nil
         M.state.ai_detections = nil
+        M.state.ai_window = nil
         M.state.ai_laptimers = nil
     elseif phase == "finished" then
         -- Race over, but the results + props stay up for the long free-roam window (ADR-0006/0017
@@ -1871,8 +1887,12 @@ function quali.launch_ai(car_id)
     quali.set_ai_held(car.id, false)
     ai.set_frozen({car}, false)
     local params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
+    -- Same rolling window as the race start, for this one car: ai.drive replaces (or clears) only this
+    -- car's entry, so a relaunch never refills against the route it drove on its previous run.
+    M.state.ai_window = M.state.ai_window or {}
     ai.drive({car}, M.state.race.routePoints or M.state.race.checkpoints,
-        M.state.race.laps, params, false)
+        M.state.race.laps, params, false,
+        {store = M.state.ai_window, backLaps = M.state.race.laps})
     M.state.ai_detections = M.state.ai_detections or {}
     if M.state.race.plan then
         M.state.ai_detections[car.id] = checkpoints.new(M.state.race.plan)
@@ -1903,6 +1923,12 @@ function quali.hold_ai(ai_id, stop)
     pcall(function() ai.stop({car}) end)
     if M.state.ai_detections then
         M.state.ai_detections[car.id] = nil
+    end
+    -- A held AI's route is over: drop its rolling window so nothing tops it up while it is parked. The
+    -- per-frame step also skips every held car, so this is the second of the two layers -- the same
+    -- belt-and-braces the freeze net uses (bug quali-end-ai-not-frozen).
+    if M.state.ai_window then
+        M.state.ai_window[car.id] = nil
     end
     if M.state.quali_ai_runs then
         M.state.quali_ai_runs[car.id] = nil
@@ -4014,6 +4040,16 @@ function M.onVehicleResetted(vehicleId)
     rearm_staged_car_on_reload(vehicleId)
 end
 
+-- BeamNG fires this GE hook (lua/vehicle/ai.lua queues onAiRouteDone(<id>) when a car stops at the end of
+-- its AI path; lua/ge/main.lua dispatches it to every extension) -- the engine telling us an AI ran out of
+-- route. For a car on a rolling route window that is a FAILURE report: the seamless refill extends the
+-- live path, and pathExtend does nothing at all -- silently -- if its joint does not line up, which looks
+-- exactly like "the NPC just stopped". race/ai.lua re-arms the rest of that car's route and logs why; it
+-- no-ops for a car whose race really is over, one that is held, and every non-AI vehicle.
+function M.onAiRouteDone(vehicleId)
+    ai.route_done(M.state.ai_cars, M.state.ai_window, M.state.quali_ai_held, vehicleId)
+end
+
 -- Send a typed { type, payload } envelope to the server -- the client->server mirror of the server's
 -- send_event (ADR-0004, ADR-0011). Encode via the shared module (the client already loads it for
 -- decode), then ship the string with TriggerServerEvent, a GE global present only inside an MP
@@ -6047,6 +6083,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- that has started moving again. Covers BOTH quali modes -- the staged queue/ramp/done holds and the
         -- circuit "closed its lap in the grace window" park -- and no-ops on a non-host.
         quali.step_ai_hold()
+        -- Host only: keep each AI's rolling route window topped up so they lap the whole session instead
+        -- of running out of route (feature ai-rolling-route-window). Held AI are skipped -- their session
+        -- is over. Inert on a non-host and for a route that fitted in a single block.
+        ai.step_window(M.state.ai_cars, M.state.ai_window, M.state.quali_ai_held)
         step_detection(dtSim)
         step_ai_detections(dtSim)
         -- Recover/repair work in qualifying exactly as in the race (ADR-0017): drive the held assist
@@ -6070,6 +6110,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         end
     elseif M.state.phase == "racing" and M.state.race then
         step_detection(dtSim)
+        -- Host only: top each AI's rolling route window up before it runs out of armed targets (feature
+        -- ai-rolling-route-window). The counting is against the total sequence, so the final block ends
+        -- exactly on the finish and nothing is armed after it. Inert otherwise.
+        ai.step_window(M.state.ai_cars, M.state.ai_window, nil)
         -- Host only: step the AI detectors + proxy-report their crossings (ADR-0036). Inert otherwise.
         step_ai_detections(dtSim)
         -- F1 light start (ADR-0043): release the AI on their staggered reaction delay, and measure + report
