@@ -421,11 +421,27 @@ end
 -- wrecking the route (tried, reverted). Tightening the lap-seam line needs the authored calcAIPath line
 -- (Etappe B), not denser navgraph snapping.
 -- Also returns the WORLD POSITION of each resolved waypoint (map.getMap().nodes[name].pos, the same
--- lookup BeamNG's own race AI uses), 1:1 with the names -- the circuit route checks measure the field
--- against the real drive targets, and a snapped node can sit a full navgraph edge away from the route
--- point it came from (findClosestRoad returns the closest EDGE's endpoints, not the closest node). The
--- position list is all-or-nothing: it comes back empty when any lookup fails, so a caller can only ever
--- read a complete list or none at all.
+-- lookup BeamNG's own race AI uses), 1:1 with the names -- the route checks measure the field against the
+-- real drive targets, not against the route points they came from. The position list is all-or-nothing: it
+-- comes back empty when any lookup fails, so a caller can only ever read a complete list or none at all.
+--
+-- KNOWN DEFECT, deliberately not fixed here (diagnosed 2026-08-09, engine-verified):
+-- `map.findClosestRoad(pos)` returns the two endpoints of the closest EDGE -- `lua/ge/map.lua`
+-- findClosestRoad ranks candidates by `pos:squaredDistanceToLineSegment(n1.pos, n2.pos)` and returns
+-- `n1id, n2id` in the graph's own edge order, with NO relation to which endpoint is nearer to `pos`. We
+-- keep `n1` unconditionally, so a route point lying near the far end of a long edge resolves to a drive
+-- target up to a full edge length away -- on a start straight that is the ~100 m backwards jump the AI
+-- were seen making. BeamNG's OWN race path builder does not do this: `gameplay/race/path.lua` computes
+-- `xnorm = nodePos:xnormOnLine(a.pos, b.pos)` and swaps to `name_b` when `xnorm > 0.5`, i.e. it always
+-- keeps the NEARER endpoint (and searches with `max(40, node.radius)` rather than the 200 m default).
+--
+-- It is left alone on purpose. The nearer-endpoint rule changes the resolved target of EVERY route point
+-- on EVERY track, including the circuits the user has just confirmed good in game, and the symptom it
+-- caused is already neutralised at the route's start by the geometric circuit.lead_skip (which now runs
+-- for every route shape). What it does NOT cover is a mis-snap in the MIDDLE of a route -- lead_skip only
+-- walks the front -- which would show as a short backwards jink mid-lap. Recommended follow-up: adopt the
+-- xnorm swap plus the tighter search radius as its own item, with a before/after target diff on a real
+-- track, so the change is inspected where its effect can actually be seen.
 local function resolve_waypoint_names(route)
     local names, positions = {}, {}
     if type(map) ~= "table" or type(map.findClosestRoad) ~= "function" then
@@ -655,6 +671,13 @@ end
 -- "omit the start line at the gun" rule (race/checkpoints.lua M.plan, ADR-0013). Walks from the front and
 -- stops at the first target that is still ahead. An implausible result (more than half the lap read as
 -- passed) means the geometry was misread, so the full route is kept. 0 when there is nothing to measure.
+--
+-- Runs for EVERY route shape, not just a circuit (bug: the AI reversed ~100 m on a closed track run as a
+-- SPRINT). Where the field stands relative to the first drive target is geometry; how the race is scored
+-- is a separate question, and keying the skip on the scored mode is the same conflation ADR-0036's round-2
+-- amendment already recorded for the route's END. It never drops a target that is still ahead -- it stops
+-- at the first one -- so a genuine point-to-point sprint, whose field stands behind its first target,
+-- skips nothing and is byte-identical.
 function circuit.lead_skip(positions, starts)
     if #positions < 3 or #starts == 0 then
         return 0
@@ -670,13 +693,13 @@ function circuit.lead_skip(positions, starts)
     end
     if skip > math.floor(#positions / 2) then
         log("W", LOG_TAG, string.format(
-            "circuit start: %d of %d route targets read as behind the grid; keeping the full route",
+            "route start: %d of %d drive targets read as behind the grid; keeping the full route",
             skip, #positions))
         return 0
     end
     if skip > 0 then
         log("I", LOG_TAG, string.format(
-            "circuit start: skipping %d leading route target(s) the grid already sits past", skip))
+            "route start: skipping %d leading drive target(s) the grid already sits past", skip))
     end
     return skip
 end
@@ -1407,15 +1430,23 @@ end
 -- (backwards, if that target is behind the field), brakes to a stop ON its LAST one (verified in BeamNG
 -- lua/vehicle/ai.lua: the speed planner sets the final path node's speed to 0 when no node follows it),
 -- and refuses to build ANY route -- leaving the car motionless all race -- if a single consecutive pair of
--- targets has no navgraph path. `closed` says how the race is SCORED; whether the ROUTE is a loop is a
--- separate question (see the circuit namespace), and the three real combinations are:
---   * loop + circuit -- drop the leading targets the field already sits past (circuit.lead_skip) and end
---     one node PAST the finish line (the closing edge plus the node behind it, both variants);
+-- targets has no navgraph path.
+--
+-- The START of the route is pure GEOMETRY and belongs to every shape: circuit.lead_skip drops the leading
+-- drive targets the field already sits past, whatever the race is scored as. `closed` says how the race is
+-- SCORED and decides only the route's END; whether the ROUTE is a loop is a third, separate question (see
+-- the circuit namespace). Keying the start on the scored mode is what made the AI reverse ~100 m on a
+-- closed track run as a sprint -- the same conflation ADR-0036's round-2 amendment recorded for the finish.
+-- The three real combinations differ only in their END:
+--   * loop + circuit -- end one node PAST the finish line (the closing edge plus the node behind it, both
+--     variants), because a circuit finishes ON the line and driveUsingPath brakes to a stop on its last
+--     target;
 --   * loop + sprint (the `sprint` mode override on a closed path) -- the finish is the route's LAST node,
 --     not the line, so the closing repeat is dropped and the usual overshoot is extrapolated past that
 --     last node instead of past the start/finish node;
---   * point-to-point + sprint -- unchanged: the full route plus one synthetic overshoot target
---     ~OVERSHOOT_DISTANCE behind the finish (both variants).
+--   * point-to-point + sprint -- the full route plus one synthetic overshoot target ~OVERSHOOT_DISTANCE
+--     behind the finish (both variants). Its field stands behind its first target, so the geometric start
+--     skip finds nothing to drop and the emitted command is unchanged.
 -- Either way the AI accelerate away from the grid and cross their finish at speed instead of parking short
 -- of the last checkpoint's trigger radius. pcall-guarded. A nil `params` uses the default preset.
 --
@@ -1459,7 +1490,8 @@ function M.drive(cars, route, laps, params, closed, opts)
     if params.route == "direct" then
         local nodes = build_route_nodes(route)
         -- The custom map's nodes ARE the route points, so the leading-target check runs on them directly.
-        local skip = closed and circuit.lead_skip(nodes, starts) or 0
+        -- Geometry, so it runs for every route shape -- see the header.
+        local skip = circuit.lead_skip(nodes, starts)
         -- perLap counts the real route nodes; the overshoot node below is a drive aid, not a lap stop.
         per_lap = #nodes
         -- The end decoration is fixed here, before the map is installed: on a closed loop the closing edge
@@ -1496,9 +1528,11 @@ function M.drive(cars, route, laps, params, closed, opts)
         end
     else
         -- The drive targets are the SNAPPED navgraph nodes, so the leading-target check runs on their own
-        -- positions -- a snap can land a full edge away from the route point it came from.
+        -- positions -- a snap can land a full edge away from the route point it came from, in EITHER
+        -- direction (see resolve_waypoint_names). Geometry, so it runs for every route shape -- and on a
+        -- sprint it is the only thing standing between a mis-snapped first target and a reversing AI.
         local lap_names, lap_positions = resolve_waypoint_names(route)
-        local skip = closed and circuit.lead_skip(lap_positions, starts) or 0
+        local skip = circuit.lead_skip(lap_positions, starts)
         per_lap = #lap_names
         -- No target positions means no progress trigger, so no window either: cap the supply at the race
         -- lap count and arm it in one call, exactly as before, rather than a route nothing can refill.
