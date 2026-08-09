@@ -2990,6 +2990,35 @@ function M.reroll_ai_car(json)
     guihooks.trigger("BeamCompAiRosterCar", {index = index, car = car, carLabel = ai.car_label(car)})
 end
 
+-- Vet a RESTORED roster's cars and re-roll the ones that are no longer race cars (UI -> GE, ADR-0047
+-- amendment 2026-08-09): payload {token, entries = [{name, car}], ai, policy}. The panel calls this from
+-- applyStoredForm, i.e. on every session restore and preset load, because a preset saved before the
+-- vehicle filter can carry a token for a model BeamComp no longer offers (a simplified-traffic car being
+-- the case that prompted this).
+--
+-- GE is the arbiter on purpose. The panel's own valid-model list (scope.opts.rosterCar) is filled
+-- asynchronously from carlist.options, so a panel-side check could run against an empty list and
+-- "repair" a perfectly good roster; core_vehicles is readable here and now, so there is no window in
+-- which the answer can be wrong. The reply carries only the CHANGED rows, each with the `from` token that
+-- was vetted, so the panel can refuse to overwrite a row the admin edited in the meantime. `token` is
+-- echoed untouched for the same last-request-wins rule the roll replies use.
+-- Result pushed via BeamCompAiRosterRepair. Public as beamcomp_init.repair_ai_roster.
+function M.repair_ai_roster(json)
+    local ok, request = pcall(jsonDecode, json)
+    if not ok or type(request) ~= "table" then
+        log("W", RACE_LOG_TAG, "repair_ai_roster: bad payload")
+        return
+    end
+    local entries = ai.repair_roster_cars(request.entries, request.ai, request.policy)
+    -- Silence is the answer for a healthy roster, which is the overwhelmingly common case: nothing to
+    -- apply, and an EMPTY Lua table crosses the CEF bridge as a JSON object ({}), not an array -- so not
+    -- sending it also keeps the panel from ever seeing a non-iterable `entries`.
+    if #entries == 0 then
+        return
+    end
+    guihooks.trigger("BeamCompAiRosterRepair", {token = request.token, entries = entries})
+end
+
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on
 -- the current map (deprecated included -- a grid can be authored for any race) and the race to pre-seed
 -- (carried from the race-setup panel's cross-open), plus an async request for the map's saved grids (routed
