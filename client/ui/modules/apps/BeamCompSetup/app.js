@@ -816,12 +816,14 @@ angular.module('beamng.apps')
         prefetchConfigs([scope.form.carModel].concat(
           classModels(scope.form.tourClasses), rosterModels(scope.form.aiRoster)));
         // Record the restored AI settings as already-acted-on before the digest reaches the live watcher
-        // (see aiLive), so the restore itself can never re-roll. Then run the ONE deliberate exception by
+        // (see aiLive), so the restore itself can never re-roll. Then run the TWO deliberate exceptions by
         // hand: a form that enables AI but carries no roster -- an old preset saved before the roster
         // existed, or before Create was ever pressed -- gets one rolled now, so "AI opponents ticked"
-        // means the same thing after a load as it does after a click.
+        // means the same thing after a load as it does after a click; and a restored roster whose car is
+        // no longer a race car gets that ONE car re-rolled (see repairRosterCars).
         syncAiLive();
         fieldRosterIfEmpty();
+        repairRosterCars();
       }
 
       // GE pushes the dynamic lists on open AND on every refresh (the include-deprecated toggle, the Refresh
@@ -1851,6 +1853,74 @@ angular.module('beamng.apps')
           // so the type cannot be changed at all (bug setup-dropdowns-sort-by-display-name). On 'extend'
           // only the new entries need it -- the kept ones were fetched when they were rolled.
           prefetchConfigs(rosterModels(entries));
+        });
+      });
+
+      // ----- Restored rosters: re-roll a car that is no longer offered (ADR-0047 amendment 2026-08-09) --
+      // A preset (or the session blob) saved before the vehicle filter can carry a roster car BeamComp no
+      // longer offers -- a simplified-traffic model is the case that prompted this. ADR-0047's rule is that
+      // a stored roster is restored VERBATIM and never rolled; this is the one carved-out exception to it,
+      // and it is as narrow as it can be: only a token GE reports as a KNOWN non-race model is replaced,
+      // through the same roll chain a normal roll uses, so the repaired row is an ordinary rolled row.
+      //
+      // GE decides, not the panel, and that is the whole design. scope.opts.rosterCar arrives
+      // asynchronously from the carlist.options reply, so a membership test here could run against a list
+      // that has not landed yet and "repair" every entry of a hand-tuned roster. GE reads the engine
+      // synchronously, so there is no window in which the answer can be wrong and nothing to sequence.
+      //
+      // Runs on EVERY applyStoredForm, and deliberately regardless of aiEnabled: an unticked roster is
+      // still persisted and still spawns the moment the box is ticked again (ticking never re-rolls a
+      // non-empty roster), so a stale token there is just as live. In memory only -- the stored preset is
+      // left alone and the fix persists on the admin's next Save.
+      var rosterRepairToken = 0;
+
+      function repairRosterCars() {
+        var entries = (scope.form.aiRoster || [])
+          .filter(function (e) { return e && e.name && e.car; })
+          .map(function (e) { return { name: e.name, car: e.car }; });
+        if (!entries.length) {
+          return;
+        }
+        rosterRepairToken += 1;
+        var spec = rosterRollSpec();
+        spec.token = rosterRepairToken;
+        spec.entries = entries;
+        geLuaArg('repair_ai_roster', JSON.stringify(spec));
+      }
+
+      // Apply a repair reply: it carries ONLY the rows GE actually replaced. Matched by NAME like
+      // applyRosterCars, and applied only while the row still holds the exact token GE vetted (`from`) --
+      // a manual pick or a per-row roll that landed in between owns the row now. Names and colours are
+      // never touched: this fixes a car, it does not re-field the roster.
+      scope.$on('BeamCompAiRosterRepair', function (event, payload) {
+        scope.$evalAsync(function () {
+          if (!payload || payload.token !== rosterRepairToken) {
+            return;
+          }
+          // GE sends this event only when it has repairs, so a list is expected -- but an empty Lua table
+          // would cross the bridge as {} rather than [], and asking is cheaper than trusting that.
+          if (!angular.isArray(payload.entries)) {
+            return;
+          }
+          var fixByName = {};
+          payload.entries.forEach(function (e) {
+            if (e && e.name) { fixByName[e.name] = e; }
+          });
+          var changed = [];
+          (scope.form.aiRoster || []).forEach(function (entry) {
+            var fix = entry.name && fixByName[entry.name];
+            if (!fix || !fix.car || fix.from !== entry.car) {
+              return;
+            }
+            entry.car = fix.car;
+            entry.carLabel = fix.carLabel;
+            changed.push(entry);
+          });
+          if (changed.length) {
+            // The replacement is a model this panel may never have probed -- same rule as every other
+            // car-changing path (bug setup-dropdowns-sort-by-display-name).
+            prefetchConfigs(rosterModels(changed));
+          }
         });
       });
 

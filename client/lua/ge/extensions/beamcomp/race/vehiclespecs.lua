@@ -30,11 +30,25 @@ local WEIGHT_FIELDS = {"Weight", "weight", "Weight (kg)"}
 -- The walking unicycle is never a race car (mirrors race/vehicles.lua); kept out of every listing/search.
 local EXCLUDED_MODELS = {unicycle = true}
 
--- Model Types that are not drivable race cars -- props (cones, barriers, …) and trailers are spawnable
--- jbeam "vehicles" but must never back an AI opponent (ADR-0036 Etappe B). Used by list_car_models to keep
--- them out of the random AI pool. The Type is read from model metadata (unverified under BeamMP like the
--- power fields); an unreadable Type counts as a car, so the filter only ever removes a KNOWN non-car.
-local NON_CAR_TYPES = {Prop = true, Trailer = true}
+-- Model Types that are not drivable race cars, the ONE denylist behind every vehicle list BeamComp offers
+-- (ADR-0032 amendment 2026-08-09). Props (cones, barriers, …) and trailers are spawnable jbeam "vehicles"
+-- that must never back an AI opponent (ADR-0036 Etappe B); Traffic is BeamNG's low-detail traffic filler
+-- (`simple_traffic`, ~90 stripped-down look-alike configs) and Debug its crush-test rig
+-- (`roof_crush_tester`) -- neither is a race car, and BeamNG hides both from its own selector.
+--
+-- A stock install's 122 models type as Prop 67 / Car 28 / Trailer 13 / Truck 10 / Heavy Machinery 2 /
+-- Traffic 1 / Debug 1, so these four entries drop the props, the trailers and exactly those two models.
+-- Truck and Heavy Machinery stay drivable -- the BIG_CAR_MAX_WEIGHT heuristic handles buses/semis.
+--
+-- A DENYLIST, never an allowlist, and that is load-bearing for modded vehicles: BeamNG's own "usable car"
+-- checks (core/funstuff.lua, backgroundActivities/g2g.lua, dragRace/generateDragOpponents.lua) test
+-- `Type == "Car" or Type == "Truck"`, which would hide every mod with a custom Type ("Kart", "Bus",
+-- "Race Car", …). Here an unreadable, absent or unknown Type counts as a CAR, so the filter only ever
+-- removes a KNOWN non-race type. The engine backs that up: a model whose info.json carries no Type is
+-- given "Unknown" (core/vehicles.lua), and a vehicle folder without an info.json at all is back-filled
+-- as "Car". Accepted consequence: a mod that types a genuinely drivable car as Traffic or Debug is
+-- hidden -- deliberate, since those are BeamNG's own meanings for those values.
+local NON_CAR_TYPES = {Prop = true, Trailer = true, Traffic = true, Debug = true}
 
 -- Big-vehicle curb-weight ceiling (kg) for the "exclude big vehicles" AI filter (max_weight axis). A
 -- config heavier than this is treated as a big vehicle and excluded. 3500 kg keeps every passenger car,
@@ -47,6 +61,12 @@ M.BIG_CAR_MAX_WEIGHT = 3500
 -- One-shot: log the keys of the first config-info table we read, so the real power/index field names are
 -- visible in-game (the single runtime-verification point for this module). Module-scope, reset on reload.
 local probed = false
+
+-- One-shot: log how many installed models the race-car filter drops, so a /cars listing that suddenly
+-- shows ~40 instead of ~122 entries is explainable from the log. Set only on a non-empty raw list, so an
+-- early call made before core_vehicles is ready cannot burn the one-shot on a meaningless "0 of 0".
+-- Module-scope, reset on reload (mirrors `probed`).
+local filter_logged = false
 
 -- Pull the first parseable number out of a value that may be a number or a string like "150 hp" /
 -- "110 kW / 150 hp". Returns a number or nil.
@@ -120,9 +140,14 @@ local function get_model(model)
     return data
 end
 
--- Sorted array of installed vehicle model keys (excluding the unicycle), or an empty table when the
--- model list is unavailable. Source for /cars and the cross-model substitute search.
-function M.list_models()
+-- PRIVATE raw enumeration: every installed vehicle model key, sorted, unfiltered -- props, trailers,
+-- traffic fillers and debug rigs included. Empty when the model list is unavailable.
+--
+-- Deliberately private and deliberately named for what it is: BeamComp has exactly ONE public vehicle
+-- list, M.list_car_models, and the point of that is that a second list can never drift away from it
+-- again (ADR-0032 amendment 2026-08-09). Nothing user-facing may read this -- it exists only as the
+-- source M.list_car_models filters.
+local function installed_models()
     local models = {}
     if type(core_vehicles) ~= "table" or type(core_vehicles.getModelList) ~= "function" then
         return models
@@ -136,7 +161,7 @@ function M.list_models()
         return models
     end
     for key in pairs(by_key) do
-        if type(key) == "string" and not EXCLUDED_MODELS[key] then
+        if type(key) == "string" then
             models[#models + 1] = key
         end
     end
@@ -155,28 +180,55 @@ local function model_type(model)
     return info.Type
 end
 
--- Sorted array of installed DRIVABLE model keys -- list_models minus the props/trailers (NON_CAR_TYPES).
--- The random AI vehicle pool (ADR-0036 Etappe B) draws from this so an AI never spawns as a cone/pylon. A
--- model whose Type is unreadable is kept (treated as a car), so the filter only removes a known non-car.
+-- THE single "is this model a race car?" decision (ADR-0032 amendment 2026-08-09): the hand-excluded
+-- models plus the NON_CAR_TYPES denylist, in one place, so the list filter and the per-model guard below
+-- can never disagree. An unreadable/absent/unknown Type is a CAR (see NON_CAR_TYPES) -- the filter only
+-- ever removes a KNOWN non-race model, which is what keeps modded vehicles usable.
+local function is_race_car(model)
+    if EXCLUDED_MODELS[model] then
+        return false
+    end
+    local kind = model_type(model)
+    return not (kind ~= nil and NON_CAR_TYPES[kind] == true)
+end
+
+-- THE vehicle list of the whole mod: a sorted array of installed race-car model keys. Every enumeration
+-- BeamComp offers reads this one function -- the setup panel's three car dropdowns (carlist.options), the
+-- /cars chat listing (carlist.build), the player's Mode-3 substitute search (find_compliant) and the
+-- random AI pool (find_compliant_car / random_compliant / random_stock_compliant, race/ai.lua) -- so what
+-- an admin sees listed is exactly what an AI can draw and what a substitute search can land on
+-- (ADR-0032 amendment 2026-08-09; before it, /cars and find_compliant read an unfiltered second list).
 function M.list_car_models()
+    local models = installed_models()
     local cars = {}
-    for _, model in ipairs(M.list_models()) do
-        local model_kind = model_type(model)
-        if not (model_kind and NON_CAR_TYPES[model_kind]) then
+    for _, model in ipairs(models) do
+        if is_race_car(model) then
             cars[#cars + 1] = model
         end
+    end
+    if not filter_logged and #models > 0 then
+        filter_logged = true
+        local kinds = {}
+        for kind in pairs(NON_CAR_TYPES) do
+            kinds[#kinds + 1] = kind
+        end
+        table.sort(kinds)
+        log("I", LOG_TAG, string.format("%d of %d installed models are race cars (%d dropped as %s)",
+            #cars, #models, #models - #cars, table.concat(kinds, "/")))
     end
     return cars
 end
 
--- True only when `model` is a KNOWN non-car Type (Prop/Trailer via NON_CAR_TYPES) -- the guard that keeps a
--- player focused on an owned prop/"Stange" from being treated as a real race car (ADR-0032 amendment). An
--- unreadable Type returns false (counts as a car), so the guard only ever drops a KNOWN non-car, matching
--- list_car_models' "unreadable Type => keep" rule. Reuses model_type (data.model Type). Used by
--- race/vehicles.lua is_owned_race_car.
+-- True only when `model` is a KNOWN non-race model -- the per-model form of the same decision
+-- M.list_car_models filters with, so a model is never listed as a car here and rejected there. An
+-- unreadable Type returns false (counts as a car), so this only ever drops a KNOWN non-car.
+--
+-- Three callers, all "that is not a race car" guards: race/vehicles.lua is_owned_race_car (a player
+-- focused on an owned prop/"Stange" or a simplified-traffic car falls through to a fresh default car,
+-- ADR-0032 amendment), race/props.lua is_race_prop (bounce the player out of it mid-race) and race/ai.lua
+-- roster_car_needs_reroll (a stored roster token that is no longer a race car re-rolls).
 function M.is_known_non_car(model)
-    local kind = model_type(model)
-    return kind ~= nil and NON_CAR_TYPES[kind] == true
+    return not is_race_car(model)
 end
 
 -- The human display name of a model -- "Brand Name" (e.g. "Ibishu Pessima"), read from the model metadata
@@ -385,6 +437,11 @@ end
 -- a model the strongest compliant config wins. Deterministic so the pick is predictable. `max_weight` (kg,
 -- optional, lenient) and `weight_range` ({min?, max?} kg, optional, strict maxkg/minkg) additionally
 -- exclude over-/under-weight trims; nil = no weight limit on that axis (unchanged behavior).
+--
+-- Searches M.list_car_models like every other path (ADR-0032 amendment 2026-08-09): a substitute for a
+-- player's over-cap car is a CAR, never a cone, trailer or traffic filler that happened to sort early.
+-- The own-model bias is unaffected -- an own model is tried first whatever its Type, and a player sitting
+-- in a non-car reaches here only after is_owned_race_car has already dropped it.
 function M.find_compliant(own_model, max_power, max_pwr, max_weight, weight_range)
     if type(own_model) == "string" and own_model ~= "" then
         local own = strongest_compliant(own_model, max_power, max_pwr, max_weight, weight_range)
@@ -392,7 +449,7 @@ function M.find_compliant(own_model, max_power, max_pwr, max_weight, weight_rang
             return {model = own_model, config = own.config}
         end
     end
-    for _, model in ipairs(M.list_models()) do
+    for _, model in ipairs(M.list_car_models()) do
         if model ~= own_model then
             local pick = strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
             if pick then
@@ -403,10 +460,11 @@ function M.find_compliant(own_model, max_power, max_pwr, max_weight, weight_rang
     return nil
 end
 
--- The cars-only sibling of find_compliant (draws from list_car_models, never list_models) -- the best-effort
--- deterministic fallback for the random-AI pool, so an AI never spawns as a prop/trailer even when no car
--- passes the active filters (ADR-0036 "AI never spawns a prop" invariant). No own-model bias: the AI random
--- path has no "own" car. Strongest compliant config within a model wins, models alphabetically. Returns
+-- The no-own-model sibling of find_compliant -- the best-effort deterministic fallback for the random-AI
+-- pool, so an AI still gets a real car even when no car passes the active filters (ADR-0036 "AI never
+-- spawns a prop" invariant). Both draw from the same list_car_models now; what differs is the bias: the AI
+-- random path has no "own" car to try first. Strongest compliant config within a model wins, models
+-- alphabetically. Returns
 -- {model, config} or nil. max_weight is include-on-unreadable via is_compliant, exactly like find_compliant;
 -- the strict weight_range (maxkg/minkg) is exclude-on-unreadable, also via is_compliant.
 function M.find_compliant_car(max_power, max_pwr, max_weight, weight_range)
@@ -438,8 +496,9 @@ end
 -- the pool of drivable models that have a compliant config, then a compliant trim within it uniformly -- so a
 -- field of "random" AI under a Mode-3 cap (ADR-0036 Etappe B) varies per car while never exceeding the cap.
 -- Models with no compliant config are never drawn (the pool pre-filter IS the "re-roll among compliant
--- models"), so the cap is never violated. Draws from list_car_models so an AI never spawns as a prop/trailer.
--- Owner-local -> math.random is fine (only the owner spawns AI, no cross-client determinism, like ai.lua's
+-- models"), so the cap is never violated. Draws from list_car_models so an AI never spawns as a prop,
+-- trailer or traffic filler. Owner-local -> math.random is fine (only the owner spawns AI, no
+-- cross-client determinism, like ai.lua's
 -- random_stock_model). `max_weight` (lenient) and `weight_range` (strict maxkg/minkg) additionally exclude
 -- over-/under-weight trims from the pool.
 function M.random_compliant(max_power, max_pwr, max_weight, weight_range)
@@ -470,8 +529,8 @@ end
 -- spawn stock -- accepted, matching the big-car weight heuristic's imprecision. The "exclude big vehicles"
 -- (max_weight) path -- the actual bug trigger -- is exact, because config weights are populated. With all
 -- caps nil every car that has a config qualifies => uniform random, effectively the unconstrained stock
--- pick. Draws from list_car_models so an AI never spawns as a prop/trailer. Owner-local -> math.random is
--- fine (mirrors random_compliant).
+-- pick. Draws from list_car_models so an AI never spawns as a prop, trailer or traffic filler.
+-- Owner-local -> math.random is fine (mirrors random_compliant).
 function M.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
@@ -523,8 +582,8 @@ end
 -- covers both the capped and the uncapped case -- no separate branch. Returns {model, config} or nil when NO
 -- installed car qualifies (an impossible cap, or no cars installed). The CALLER owns the ultimate fallback,
 -- which differs by path: the AI degrades best-effort to a cap-ignoring stock car (silent); the player spawns
--- the fixed default car + warns. Draws only from list_car_models (cars only), so no branch ever returns a
--- prop/trailer.
+-- the fixed default car + warns. Draws only from list_car_models (the one cars-only list), so no branch
+-- ever returns a prop, trailer or traffic filler.
 function M.random_vehicle(spec)
     spec = type(spec) == "table" and spec or {}
     if spec.random_trim then

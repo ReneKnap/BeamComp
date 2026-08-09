@@ -236,7 +236,16 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         log("W", LOG_TAG, "roster car 'host': no resolved host car; falling back to the AI-car chain")
     elseif slot_policy.car then
         local model, vehicle_config = split_car_token(slot_policy.car)
-        if model then
+        -- Defensive net (ADR-0036 "an AI never spawns a prop"): a roster token can predate the vehicle
+        -- filter -- a preset saved when the prop/traffic models were still pickable, or a roster the
+        -- panel-side repair never reached. Such a token falls through to the normal chain and gets a real
+        -- car instead of spawning a cone. Only a KNOWN non-race model is rejected, so a modded car is
+        -- untouched. Deliberately NOT applied to config.car/policy.car below: an admin who types
+        -- `/race aicar=simple_traffic:<config>` has named it explicitly and gets what they asked for.
+        if model and vehiclespecs.is_known_non_car(model) then
+            log("W", LOG_TAG, "roster car '" .. tostring(slot_policy.car)
+                .. "' is not a race car; falling back to the AI-car chain")
+        elseif model then
             return model, vehicle_config
         end
     elseif slot_policy.maxhp or slot_policy.maxpwr then
@@ -1886,6 +1895,12 @@ function M.preferred_car_compliant(token, config, policy)
     if not model or model == "host" then
         return false
     end
+    -- A preferred car that is not a race car at all never applies, whatever the caps say -- the driver
+    -- file is hand-edited, and a prop/traffic model slipping into it must not reach a grid slot. The
+    -- caller then rolls a car instead, exactly as it does for a cap-violating preference.
+    if vehiclespecs.is_known_non_car(model) then
+        return false
+    end
     local fixed_player_car = policy.car ~= nil and policy.car ~= "random"
     local cap_active = not fixed_player_car
         and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg)
@@ -1922,6 +1937,69 @@ function M.roll_roster_car(config, policy, index)
     end
     local model, vehicle_config = resolve_ai_vehicle(config, nil, policy, index or 1, nil, nil)
     return vehicle_config and (model .. ":" .. vehicle_config) or model
+end
+
+-- Whether a roster car token no longer points at a race car and must be re-rolled (ADR-0047 amendment
+-- 2026-08-09). True ONLY for a KNOWN non-race model -- a prop, trailer, traffic filler or debug rig that
+-- was pickable when the preset was saved and is not offered any more.
+--
+-- Everything else answers false, and each "no" is deliberate:
+--   * "host" is a sentinel resolved at spawn, not a model;
+--   * an absent/empty token is a row without a car, which falls through the AI-car chain at spawn and is
+--     the admin's business, not a broken pick;
+--   * a model the engine cannot read -- an uninstalled mod, or core_vehicles not being ready yet -- is
+--     KEPT. That is the R5 rule (only a known non-car is ever removed) and it is what makes the check
+--     safe to run at panel-restore time: the worst case is that a repair is missed, never that a valid
+--     hand-tuned roster is overwritten because the metadata was momentarily unavailable.
+function M.roster_car_needs_reroll(token)
+    if type(token) ~= "string" or token == "" or token == "host" then
+        return false
+    end
+    local model = split_car_token(token)
+    return model ~= nil and vehiclespecs.is_known_non_car(model)
+end
+
+-- Re-roll the cars of the roster entries whose token is no longer a race car (ADR-0047 amendment
+-- 2026-08-09). `entries` is the panel's roster as {name, car} pairs; returns ONLY the rows that changed,
+-- as {name, from, car, carLabel} -- an empty list means the roster was already fine.
+--
+-- The replacement comes from M.roll_roster_car, the same chain a normal roll and the spawn use, so a
+-- repaired row is indistinguishable from a rolled one (carLabel included) and ADR-0047's "one resolution
+-- chain" still holds. `from` lets the caller apply the fix only to the exact token that was vetted, so a
+-- manual pick landing in between is not overwritten.
+--
+-- A replacement that is itself not a race car is only reachable when the admin's own aicar= names one (the
+-- typed escape hatch, which the chain honours on purpose). Reporting that as a "repair" would swap one
+-- non-car for another, so the row is left alone with a warning instead.
+function M.repair_roster_cars(entries, config, policy)
+    local repaired = {}
+    if type(entries) ~= "table" then
+        return repaired
+    end
+    for index, entry in ipairs(entries) do
+        -- The same 16-AI ceiling the roll paths clamp to: one repair can never cost more than a create.
+        if index > 16 then
+            break
+        end
+        if type(entry) == "table" and M.roster_car_needs_reroll(entry.car) then
+            local car = M.roll_roster_car(config, policy, index)
+            if M.roster_car_needs_reroll(car) then
+                log("W", LOG_TAG, string.format(
+                    "roster repair: '%s' has %s, but the AI car setting rolls %s -- leaving it",
+                    tostring(entry.name), tostring(entry.car), tostring(car)))
+            else
+                log("I", LOG_TAG, string.format("roster repair: '%s' had %s (no longer a race car) -> %s",
+                    tostring(entry.name), tostring(entry.car), tostring(car)))
+                repaired[#repaired + 1] = {
+                    name = entry.name,
+                    from = entry.car,
+                    car = car,
+                    carLabel = M.car_label(car),
+                }
+            end
+        end
+    end
+    return repaired
 end
 
 -- A human label for a roster car token (ADR-0047): the model's display name (vehiclespecs.model_label)
