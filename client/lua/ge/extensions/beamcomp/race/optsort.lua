@@ -8,10 +8,10 @@
 -- racelist.options for races), and this module holds the comparator once so those three call sites
 -- cannot drift apart on case handling or tiebreaks.
 --
--- Deliberately NOT applied to the sources those builders read -- vehiclespecs.list_models /
--- list_car_models / list_configs and discovery.list keep their key/id order, because the random AI pool,
--- the compliant-substitute search and the /cars + /races chat listings all read it and would silently
--- change with it. Sorting happens on the builders' own copies only.
+-- Deliberately NOT applied to the sources those builders read -- vehiclespecs.list_car_models /
+-- list_configs and discovery.list keep their key/id order, because the random AI pool, the
+-- compliant-substitute search and the /cars + /races chat listings all read it and would silently change
+-- with it. Sorting happens on the builders' own copies only.
 
 local M = {}
 
