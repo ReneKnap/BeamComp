@@ -251,6 +251,7 @@ M.state = {
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
+    restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
@@ -667,6 +668,7 @@ local function handle_race_start(payload)
             M.state.restage_pending = true
             M.state.restage_baseline = nil
             M.state.restage_wait = RESTAGE_MAX_WAIT
+            M.state.restage_preplaced = 0
             -- The fresh car came up with a generated plate; re-apply the player's own plate on the
             -- restage, once its jbeam has loaded. Only this fresh-spawn path carries a plate -- a staging
             -- swap (lock.consume_replace) is the player's own pick and keeps the plate it spawned with.
@@ -5823,6 +5825,7 @@ local function restage_swapped_car(dt_real)
         M.state.restage_pending = true
         M.state.restage_baseline = nil
         M.state.restage_wait = RESTAGE_MAX_WAIT
+        M.state.restage_preplaced = 0
         -- Scope the compliance-gate skip to THIS restage cycle only (ADR-0032): if this consumed replace is
         -- our own over-cap revert (revert_pending), its car is the known-compliant target -- skip the gate
         -- so a transient nil read can't loop. Any OTHER replace is a new player swap and must be re-gated,
@@ -5852,6 +5855,30 @@ local function restage_swapped_car(dt_real)
     local baseline = M.state.restage_baseline
     local loaded = current ~= nil and baseline ~= nil and math.abs(current - baseline) > RESTAGE_MIN_DELTA
     if not loaded and M.state.restage_wait > 0 then
+        -- Still waiting for the jbeam -- but the WAIT is only there because MEASURING needs it. A swap
+        -- inherits the old car's reference point (BeamNG _replaceVehicle: `localOptions.pos =
+        -- veh:getPosition()`), so the replacement stands off by the two cars' size difference, and the
+        -- metadata box can say by how much without measuring anything. Correct it now instead of seconds
+        -- from now; the tolerance gate inside makes this a no-op once it has landed (and a no-op the whole
+        -- time for a fresh spawn, which the spawn path already anchored).
+        --
+        -- Everything the wait actually guards stays behind it: the Mode-3 compliance gate needs the LIVE
+        -- power/weight read (ADR-0032), the plate must be applied after the jbeam's licenseplate init, and
+        -- the re-freeze belongs with the adoption. This only moves the car.
+        local tries = M.state.restage_preplaced or 0
+        if tries < vehicles.PREPLACE_MAX_TRIES then
+            local moved, delta, model = vehicles.preplace_at_grid(own, M.state.race and M.state.race.myPose)
+            if moved then
+                M.state.restage_preplaced = tries + 1
+                -- One line per cycle, so a test can tell this path apart from the restage safety net
+                -- behind it. Silent when there was nothing to correct.
+                if tries == 0 then
+                    log("I", RACE_LOG_TAG, string.format(
+                        "pre-placed swapped car '%s' on its grid slot from metadata (%.2f m off)",
+                        tostring(model), delta))
+                end
+            end
+        end
         return
     end
 

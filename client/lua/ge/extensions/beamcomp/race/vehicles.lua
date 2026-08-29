@@ -679,6 +679,68 @@ function M.restage_at_grid(veh, pose)
     return true, delta
 end
 
+-- How many early placements one restage cycle may make (see M.preplace_at_grid). Only an actual teleport
+-- counts, so the normal swap spends exactly one: the second frame finds the car in place and stops. The
+-- cap only bites if a setPositionRotation on a still-loading vehicle does NOT hold -- then we try a couple
+-- of frames, give up, and the car falls back to the load wait plus restage_at_grid, i.e. exactly the
+-- behaviour before this existed. Without the cap that case would teleport once per frame for 3 seconds.
+M.PREPLACE_MAX_TRIES = 3
+
+-- (public) Front-anchor a car onto its grid pose from METADATA ALONE -- no getSpawnWorldOOBB read, and
+-- therefore no waiting for its jbeam to load.
+--
+-- This exists for the vehicle SWAP, the one grid path that never goes through spawn_vehicle_at. BeamNG's
+-- core/vehicles.lua `_replaceVehicle` does `localOptions.pos = veh:getPosition()`, so the replacement
+-- inherits the OLD car's reference point. Because the old car stood correctly front-anchored -- its own
+-- anchor baked into that very point -- the new one lands off by exactly the difference between the two
+-- anchors, i.e. by the size difference of the two cars. That was only corrected once the jbeam had
+-- loaded, up to RESTAGE_MAX_WAIT later: the shuffle players still saw after swapping on the grid.
+--
+-- The load wait only ever existed because MEASURING needs a loaded jbeam. The metadata box needs no
+-- measurement, so the correction can land in the frame the new identity becomes readable -- which is at
+-- once: spawn.setVehicleObject assigns veh.JBeam and veh.partConfig synchronously inside the replace,
+-- before the jbeam starts loading, and the engine's own positioning (including its safeSpawn nudge) has
+-- finished by then too, so nothing re-applies a position behind us afterwards.
+--
+-- Should the identity still read as the OLD car on an early frame, the prediction is the old car's -- and
+-- the old car was already standing correctly, so the tolerance gate finds nothing to do and we simply try
+-- again next frame. Idempotent by that same gate, so calling this every frame of the wait costs one
+-- teleport, not one per frame.
+--
+-- Deliberately gives up (nil) rather than guessing whenever anything is unreadable: this is the
+-- optimistic path, and the deferred restage behind it is the safety net.
+--
+-- Returns `moved` (true = teleported, false = already in place) plus the horizontal deviation in metres
+-- and the model it predicted for, or nil plus a reason.
+function M.preplace_at_grid(veh, pose)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+    local model, config = model_config_of(veh)
+    if not model then
+        return nil, "vehicle model unreadable"
+    end
+    local target = metadata_anchored_target(pose, model, config)
+    if not target then
+        return nil, "no config box for '" .. tostring(model) .. "'"
+    end
+    local delta = horizontal_gap(veh, target)
+    if not delta then
+        return nil, "vehicle position unreadable"
+    end
+    if delta <= RESTAGE_TOLERANCE then
+        return false, delta, model
+    end
+    local ok, err = pcall(repair_and_place, veh, pose, target)
+    if not ok then
+        return nil, "preplace_at_grid failed: " .. tostring(err)
+    end
+    return true, delta, model
+end
+
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
 -- plate BEFORE a forced/substitute spawn despawns their car, then re-apply it to the new car once its
 -- jbeam has loaded (M.apply_plate). pcall-guarded -- core_vehicles.getVehicleLicenseText is unverified
