@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "cars-only-vehicle-lists/2026-08-09"
+local BUILD_MARKER = "bbox-prespawn-anchor-r2/2026-08-29"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -251,6 +251,7 @@ M.state = {
     restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
+    restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
@@ -620,6 +621,10 @@ local function handle_race_start(payload)
     -- spawn-time licenseText and the jbeam regenerates it -- so we re-apply this plate on the deferred
     -- restage once the new car's jbeam has loaded (vehicles.apply_plate in restage_swapped_car).
     local own_plate = vehicles.read_plate(own_car)
+    -- Open the bounding-box tally for this race: every car this client puts on the grid below (own car
+    -- plus, on the host, the AI field) counts whether its footprint could be read from metadata before
+    -- the spawn. Closed by log_bbox_report at the end of this handler with a single verdict line.
+    vehicles.begin_bbox_report()
     local race_car, respawn_err, degraded = vehicles.respawn_own_at(race.myPose, own_car, policy)
     if degraded then
         -- No-suitable-car fallback (ADR-0032 §5 superseded): the resolver spawned the fixed default car
@@ -663,6 +668,7 @@ local function handle_race_start(payload)
             M.state.restage_pending = true
             M.state.restage_baseline = nil
             M.state.restage_wait = RESTAGE_MAX_WAIT
+            M.state.restage_preplaced = 0
             -- The fresh car came up with a generated plate; re-apply the player's own plate on the
             -- restage, once its jbeam has loaded. Only this fresh-spawn path carries a plate -- a staging
             -- swap (lock.consume_replace) is the player's own pick and keeps the plate it spawned with.
@@ -773,6 +779,12 @@ local function handle_race_start(payload)
     if M.state.race_car_id then
         arm_dashboard_refresh()
     end
+
+    -- Every grid spawn of this race is done: one line saying whether the pre-spawn bounding-box lookup
+    -- carried. This is the in-game proof that BeamMP passes core_vehicles' config metadata through; a
+    -- "0 of N cars resolved (metadata unavailable)" means the cars fell back to the old centre-anchored
+    -- spawn plus restage, and that a second box source is needed.
+    vehicles.log_bbox_report()
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
@@ -5797,6 +5809,11 @@ end
 -- record the footprint on the first pending frame and wait until the spawn bbox's forward half-length
 -- changes by RESTAGE_MIN_DELTA (new jbeam loaded), or until RESTAGE_MAX_WAIT elapses (same-size swap,
 -- where placing with the unchanged box is correct anyway).
+--
+-- The wait is unchanged, but the placement at the end of it is now a CHECK: a freshly spawned car was
+-- already front-anchored from its config bounding box, so it is normally standing on its slot by the time
+-- we get here and restage_at_grid leaves it alone. That removes the late shuffle players used to see; a
+-- car the prediction missed, and any staging swap, is still corrected in full.
 local function restage_swapped_car(dt_real)
     if not M.state.race_car_id then
         return
@@ -5808,6 +5825,7 @@ local function restage_swapped_car(dt_real)
         M.state.restage_pending = true
         M.state.restage_baseline = nil
         M.state.restage_wait = RESTAGE_MAX_WAIT
+        M.state.restage_preplaced = 0
         -- Scope the compliance-gate skip to THIS restage cycle only (ADR-0032): if this consumed replace is
         -- our own over-cap revert (revert_pending), its car is the known-compliant target -- skip the gate
         -- so a transient nil read can't loop. Any OTHER replace is a new player swap and must be re-gated,
@@ -5837,6 +5855,30 @@ local function restage_swapped_car(dt_real)
     local baseline = M.state.restage_baseline
     local loaded = current ~= nil and baseline ~= nil and math.abs(current - baseline) > RESTAGE_MIN_DELTA
     if not loaded and M.state.restage_wait > 0 then
+        -- Still waiting for the jbeam -- but the WAIT is only there because MEASURING needs it. A swap
+        -- inherits the old car's reference point (BeamNG _replaceVehicle: `localOptions.pos =
+        -- veh:getPosition()`), so the replacement stands off by the two cars' size difference, and the
+        -- metadata box can say by how much without measuring anything. Correct it now instead of seconds
+        -- from now; the tolerance gate inside makes this a no-op once it has landed (and a no-op the whole
+        -- time for a fresh spawn, which the spawn path already anchored).
+        --
+        -- Everything the wait actually guards stays behind it: the Mode-3 compliance gate needs the LIVE
+        -- power/weight read (ADR-0032), the plate must be applied after the jbeam's licenseplate init, and
+        -- the re-freeze belongs with the adoption. This only moves the car.
+        local tries = M.state.restage_preplaced or 0
+        if tries < vehicles.PREPLACE_MAX_TRIES then
+            local moved, delta, model = vehicles.preplace_at_grid(own, M.state.race and M.state.race.myPose)
+            if moved then
+                M.state.restage_preplaced = tries + 1
+                -- One line per cycle, so a test can tell this path apart from the restage safety net
+                -- behind it. Silent when there was nothing to correct.
+                if tries == 0 then
+                    log("I", RACE_LOG_TAG, string.format(
+                        "pre-placed swapped car '%s' on its grid slot from metadata (%.2f m off)",
+                        tostring(model), delta))
+                end
+            end
+        end
         return
     end
 
@@ -5896,15 +5938,22 @@ local function restage_swapped_car(dt_real)
     M.state.current_vehicle_id = own_id
     local pose = M.state.race and M.state.race.myPose
     if pose then
-        -- place_at_grid, NOT respawn_own_at: respawn_own_at -> keep_own -> despawn_owned_except
+        -- restage_at_grid, NOT respawn_own_at: respawn_own_at -> keep_own -> despawn_owned_except
         -- deletes every OTHER owned vehicle, which on the host includes the AI cars (they are
-        -- host-owned) -- that wiped the whole AI field. place_at_grid does the same front-anchored
+        -- host-owned) -- that wiped the whole AI field. restage_at_grid does the same front-anchored
         -- repair+teleport without any despawn (the exact path the AI restage uses, ai.lua).
         -- There is no stray own car to clean here anyway: a fresh spawn already despawned at spawn
         -- time, and a staging swap replaces in place.
-        local placed, place_err = vehicles.place_at_grid(own, pose)
-        if not placed then
-            log("W", RACE_LOG_TAG, "could not re-place staging car: " .. tostring(place_err))
+        -- restage_at_grid, not place_at_grid: the fresh-spawn path already front-anchored the car from
+        -- its config bounding box, so this measures the now-loaded jbeam and only teleports when the car
+        -- is genuinely off its slot. A staging swap into a differently sized car still gets its full
+        -- correction; a correctly predicted car is left standing where it is.
+        local moved, delta = vehicles.restage_at_grid(own, pose)
+        if moved == nil then
+            log("W", RACE_LOG_TAG, "could not re-place staging car: " .. tostring(delta))
+        elseif not moved then
+            log("I", RACE_LOG_TAG, string.format(
+                "staging car already on its grid slot (%.3f m); no re-place", delta))
         end
     end
     vehicles.set_vehicle_frozen(own, true)
@@ -5924,7 +5973,7 @@ local function restage_swapped_car(dt_real)
         M.state.restage_plate = nil
     end
     M.state.restage_pending = false
-    log("I", RACE_LOG_TAG, "re-placed staging car at grid slot as race car " .. tostring(own_id))
+    log("I", RACE_LOG_TAG, "staging car adopted at its grid slot as race car " .. tostring(own_id))
 end
 
 -- Keep the staging-wait line on the centered overlay (ADR-0021 amendment). There is nothing to count

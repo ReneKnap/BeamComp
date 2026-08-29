@@ -1,7 +1,9 @@
 -- BeamComp -- race vehicle lifecycle (despawn + own-car respawn on a race start).
 --
--- Lives at lua/ge/extensions/beamcomp/race/vehicles.lua inside the client mod zip. Stateless
--- and reload-safe (no M.state, no file-scope mutable state). Target: client GE (LuaJIT 5.1).
+-- Lives at lua/ge/extensions/beamcomp/race/vehicles.lua inside the client mod zip. Stateless and
+-- reload-safe: no M.state, and the one piece of file-scope mutable state (bbox_report, a per-race
+-- diagnostic counter) is reset at every race start and carries nothing a reload could corrupt.
+-- Target: client GE (LuaJIT 5.1).
 --
 -- On a race start each client places its own car at the grid pose the server assigned it
 -- (M.respawn_own_at, ADR-0007). Primary path: if the player is already in a real owned car, keep
@@ -265,6 +267,61 @@ local function pose_orientation(pose)
     return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
 end
 
+-- The (model, config-key) pair identifying which stock config's metadata box describes `veh`, read off
+-- the vehicle itself the way capture_spec does -- so a placement path can reach the box without a new
+-- parameter threaded through every caller. `config` is a NAMED preset only: an inline parts table (a
+-- tuned car) and a serialized partsTree blob both come back nil, which vehiclespecs resolves to the
+-- model's stock config. pcall-guarded; nil model when the read fails.
+local function model_config_of(veh)
+    if not veh then
+        return nil
+    end
+    local ok, model, config = pcall(function()
+        local part_config = veh.partConfig
+        return veh.JBeam, is_preset_variant(part_config) and part_config or nil
+    end)
+    if not ok or type(model) ~= "string" or model == "" then
+        return nil
+    end
+    return model, config
+end
+
+-- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
+-- bounding-box bottom sits on the pose Z -- the same anchor front_anchored_target computes, but derived
+-- from the config's METADATA box (vehiclespecs.config_anchor) instead of a live getSpawnWorldOOBB read.
+-- That makes it usable BEFORE the car exists (the spawn pre-position) and as the stand-in when the live
+-- read fails.
+--
+-- config_anchor has already resolved the vehicle-local axes into forward/lateral/bottom; here those three
+-- numbers are re-projected onto the TARGET pose's forward/right exactly as front_anchored_target
+-- re-projects its measured ones, so both paths aim at the same point and can be compared.
+--
+-- Returns nil -- never a guess -- when the pose carries no forward axis, no box is known, or the
+-- arithmetic degenerates; the caller then keeps today's centre-anchored behaviour.
+local function metadata_anchored_target(pose, model, config)
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" or not pose.forward then
+        return nil
+    end
+    local anchor = vehiclespecs.config_anchor(model, config)
+    if not anchor then
+        return nil
+    end
+    local ok, target = pcall(function()
+        local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
+        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
+        target_fwd:normalize()
+        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
+        local horizontal = base - (target_fwd * anchor.forward + target_right * anchor.lateral)
+        return vec3(horizontal.x, horizontal.y, horizontal.z - anchor.bottom)
+    end)
+    -- A degenerate forward axis normalizes to NaN instead of raising, and a NaN spawn position would lose
+    -- the car entirely -- so validate the value, not just the pcall.
+    if not ok or not target or target.x ~= target.x or target.y ~= target.y or target.z ~= target.z then
+        return nil
+    end
+    return target
+end
+
 -- The world position to place the reference point at so the car's FRONT-centre lands on the grid
 -- pose (horizontally) and its wheels sit ON the surface (vertically), instead of the reference point
 -- BeamNG puts there (which sits mid-car, ~on the seats -- above the wheels).
@@ -279,8 +336,12 @@ end
 -- The SAME OOBB read also anchors the Z axis: the grid pose Z is the grounded surface (placement.lua,
 -- ADR-0034) with the reference point placed there, but the reference sits above the wheels, so a
 -- taller car buried its wheels below the surface. We instead place the bounding-box BOTTOM at the
--- grounded Z, so wheels of any size car meet the surface. Returns the grid pose unchanged when there
--- is no forward axis or the bbox API is unavailable (keeps the centre anchor -- today's behaviour).
+-- grounded Z, so wheels of any size car meet the surface.
+--
+-- When the live measurement is unavailable the fallback is two-stage: the car's own config METADATA box
+-- first (a real footprint, just not this car's deformed one), and only if that is unknown too the raw
+-- grid pose -- which centre-anchors the car and leaves it standing roughly half its length too far
+-- forward. Returns the grid pose unchanged when the pose carries no forward axis at all.
 local function front_anchored_target(veh, pose)
     local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
     if not pose.forward then
@@ -309,8 +370,48 @@ local function front_anchored_target(veh, pose)
     if ok and target then
         return target
     end
+    -- Measurement failed (bbox API gone / vehicle handle unusable): stand in with the config box before
+    -- giving up on the anchor entirely. Every placement path reaches this -- the deferred restage, the
+    -- staged-quali hold and requeue, the staging repair and the quali re-grid.
+    local model, config = model_config_of(veh)
+    local predicted = model and metadata_anchored_target(pose, model, config) or nil
+    if predicted then
+        log("W", LOG_TAG, string.format(
+            "front-anchor measurement unavailable for '%s' (%s); using its config box",
+            tostring(model), tostring(target)))
+        return predicted
+    end
     log("W", LOG_TAG, "front-anchor unavailable; centre-anchoring: " .. tostring(target))
     return base
+end
+
+-- Race-scoped tally of the pre-spawn bounding-box lookup: how many of the cars this client puts on the
+-- grid could be front-anchored from metadata. Module-scope and reset per race start, mirroring the
+-- one-shot flags in vehiclespecs.lua; a Lua reload just restarts the count.
+--
+-- It exists for the ONE question that cannot be answered headless: does BeamMP -- which replaces parts of
+-- the spawn/vehicle stack -- still hand core_vehicles' config metadata through? The single line
+-- log_bbox_report writes after a race start is the answer, and the trigger for adding a second source
+-- behind vehiclespecs.config_bbox if it reads zero.
+local bbox_report = {attempted = 0, resolved = 0}
+
+-- (public) Start a fresh bounding-box tally, before the first grid spawn of a race.
+function M.begin_bbox_report()
+    bbox_report.attempted = 0
+    bbox_report.resolved = 0
+end
+
+-- (public) Write the one-line verdict on the tally and reset it. Silent when this client spawned no car
+-- onto the grid at all (a kept own car and no AI) -- there was nothing to pre-position, so there is
+-- nothing to report.
+function M.log_bbox_report()
+    local attempted, resolved = bbox_report.attempted, bbox_report.resolved
+    M.begin_bbox_report()
+    if attempted == 0 then
+        return
+    end
+    log("I", LOG_TAG, string.format("bbox lookup: %d of %d cars resolved%s", resolved, attempted,
+        resolved == 0 and " (metadata unavailable)" or ""))
 end
 
 -- Spawn one vehicle at a grid pose (plain {pos, rot, forward?} tables). Uses the captured spec when
@@ -324,12 +425,24 @@ local function spawn_vehicle_at(pose, spec)
         return nil, "no vehicle model to spawn"
     end
 
+    -- Front-anchor the spawn ITSELF from the config's metadata box. A fresh car cannot be measured (its
+    -- jbeam is still loading), so the grid pose used to be applied centre-anchored and the deferred
+    -- restage shoved the car forward by half its length up to 3 s later -- the visible twitch this
+    -- replaces. With the box that correction is known up front and the car lands right the first time.
+    -- No box (unknown config, unreadable field, metadata not reaching us under BeamMP) -> the raw pose,
+    -- byte-for-byte the previous behaviour; the restage still corrects it.
+    local anchored = metadata_anchored_target(pose, model, spec and spec.config)
+    bbox_report.attempted = bbox_report.attempted + 1
+    if anchored then
+        bbox_report.resolved = bbox_report.resolved + 1
+    end
+
     -- spawnNewVehicle wants vec3/quat userdata, not the plain tables myPose carries. Heading caveat:
     -- spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0) * rot), so we
     -- pass pose_orientation straight through -- the internal flip then turns a forward-derived
     -- quatFromDir into a car facing down the grid, matching repair_and_place's explicit flip.
     local opt = {
-        pos = vec3(pose.pos.x, pose.pos.y, pose.pos.z),
+        pos = anchored or vec3(pose.pos.x, pose.pos.y, pose.pos.z),
         rot = pose_orientation(pose),
     }
     if spec then
@@ -436,11 +549,13 @@ end
 -- (gameplay/race/startPosition.lua). The 180-degree Z flip (quat(0,0,1,0) * rot) matches the flip
 -- the spawn path applies internally and the engine's repair branch applies explicitly; verified
 -- in-game at handover.
-local function repair_and_place(veh, pose)
+local function repair_and_place(veh, pose, target)
     local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
     -- Front-anchor the car: measure the target from its current transform BEFORE teleporting (the
-    -- world bbox is stale right after setPositionRotation), then place once.
-    local pos = front_anchored_target(veh, pose)
+    -- world bbox is stale right after setPositionRotation), then place once. `target` lets a caller that
+    -- already measured -- restage_at_grid, which needs the number to decide whether to move at all --
+    -- reuse its reading instead of measuring the same untouched car twice.
+    local pos = target or front_anchored_target(veh, pose)
     veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
 end
 
@@ -461,6 +576,169 @@ function M.place_at_grid(veh, pose)
         return nil, "place_at_grid failed: " .. tostring(err)
     end
     return true
+end
+
+-- Deviation (metres, horizontal) below which the deferred restage leaves a car alone. The whole point of
+-- front-anchoring the spawn is that the restage becomes a no-op; teleporting a car that already stands
+-- within 5 cm of its slot would put the visible twitch back for a correction nobody can see.
+--
+-- HORIZONTAL on purpose. The grid pose sits placement.GROUND_CLEARANCE above the surface and the car
+-- settles onto its suspension during the up-to-3 s restage wait, so its Z legitimately drifts a few
+-- centimetres away from the rest-pose target. Comparing in 3D would read that settling as an error and
+-- lift every car back up -- exactly the shuffle being removed here. A genuine Z prediction error surfaces
+-- through the prediction check below instead, and any car that does get placed is re-anchored in Z anyway.
+local RESTAGE_TOLERANCE = 0.05
+
+-- Gap (metres) between the metadata prediction and the live measurement past which the restage says so.
+-- This is the in-game verification of the box's axis convention: the prediction is what the spawn aimed
+-- at, the measurement is the truth once the jbeam has loaded. Silent when they agree -- a quiet log is a
+-- scarce resource in this project.
+local PREDICTION_TOLERANCE = 0.10
+
+-- Horizontal distance (metres) from where `veh` stands to `target`, or nil when the position is
+-- unreadable -- which makes the caller place unconditionally rather than guess.
+local function horizontal_gap(veh, target)
+    local ok, pos = pcall(function() return veh:getPosition() end)
+    if not ok or not pos then
+        return nil
+    end
+    local dx, dy = pos.x - target.x, pos.y - target.y
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Put the metadata prediction (what the spawn aimed at) next to the live measurement (the truth, now that
+-- the jbeam has loaded) and log ONLY when they disagree by more than PREDICTION_TOLERANCE. This is the
+-- self-check for the box's axis convention: it can only be confirmed in a real race, and a wrong sign
+-- would show here as a car-length-sized gap naming the exact model and config. No log when they match.
+local function report_prediction_gap(veh, pose, measured)
+    local model, config = model_config_of(veh)
+    local predicted = model and metadata_anchored_target(pose, model, config) or nil
+    if not predicted then
+        return
+    end
+    local dx, dy, dz = predicted.x - measured.x, predicted.y - measured.y, predicted.z - measured.z
+    local gap = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if gap <= PREDICTION_TOLERANCE then
+        return
+    end
+    log("W", LOG_TAG, string.format(
+        "bbox prediction off by %.2f m for '%s%s': predicted (%.2f, %.2f, %.2f), "
+        .. "measured (%.2f, %.2f, %.2f)",
+        gap, tostring(model), config and (":" .. config) or "",
+        predicted.x, predicted.y, predicted.z, measured.x, measured.y, measured.z))
+end
+
+-- (public) The deferred restage's placement: work out where the car really belongs now that its jbeam has
+-- loaded, and teleport it only when it is actually off that spot.
+--
+-- Before the spawn was front-anchored this was an unconditional re-place, and the half-car-length
+-- correction it applied is the shuffle players saw a second or two after every race start. The spawn now
+-- aims at the same point, so for a correctly predicted car this resolves to "nothing to do", while a car
+-- the prediction missed -- a body kit, an unknown config, a staging swap into a differently sized car --
+-- is still corrected exactly as before. Everything else the restage guarantees is untouched; only the
+-- setPositionRotation became conditional.
+--
+-- Accepted consequence: setPositionRotation also RESETS a car to its undamaged rest state, so a skipped
+-- restage skips that repair too. Skipping only happens when the car is standing within a few centimetres
+-- of its slot, i.e. it has not moved in the seconds since it spawned frozen, so there is nothing to
+-- repair. The on-demand staging repair (init.lua) still places unconditionally for the case where there is.
+--
+-- Returns `moved` (true = teleported, false = already in place) plus the measured horizontal deviation in
+-- metres, or nil plus a reason. A nil deviation alongside a true `moved` means the car's position could
+-- not be read and it was placed unconditionally.
+function M.restage_at_grid(veh, pose)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+
+    -- Measure here rather than inside repair_and_place: the target is needed to DECIDE, and the placement
+    -- then reuses it -- the car cannot move between the two.
+    local ok_target, target = pcall(front_anchored_target, veh, pose)
+    if not ok_target or not target then
+        -- No usable target: fall back to the unconditional re-place, i.e. exactly what this replaced.
+        local placed, err = M.place_at_grid(veh, pose)
+        if not placed then
+            return nil, err
+        end
+        return true, nil
+    end
+
+    report_prediction_gap(veh, pose, target)
+
+    local delta = horizontal_gap(veh, target)
+    if delta and delta <= RESTAGE_TOLERANCE then
+        return false, delta
+    end
+    local ok, err = pcall(repair_and_place, veh, pose, target)
+    if not ok then
+        return nil, "restage_at_grid failed: " .. tostring(err)
+    end
+    return true, delta
+end
+
+-- How many early placements one restage cycle may make (see M.preplace_at_grid). Only an actual teleport
+-- counts, so the normal swap spends exactly one: the second frame finds the car in place and stops. The
+-- cap only bites if a setPositionRotation on a still-loading vehicle does NOT hold -- then we try a couple
+-- of frames, give up, and the car falls back to the load wait plus restage_at_grid, i.e. exactly the
+-- behaviour before this existed. Without the cap that case would teleport once per frame for 3 seconds.
+M.PREPLACE_MAX_TRIES = 3
+
+-- (public) Front-anchor a car onto its grid pose from METADATA ALONE -- no getSpawnWorldOOBB read, and
+-- therefore no waiting for its jbeam to load.
+--
+-- This exists for the vehicle SWAP, the one grid path that never goes through spawn_vehicle_at. BeamNG's
+-- core/vehicles.lua `_replaceVehicle` does `localOptions.pos = veh:getPosition()`, so the replacement
+-- inherits the OLD car's reference point. Because the old car stood correctly front-anchored -- its own
+-- anchor baked into that very point -- the new one lands off by exactly the difference between the two
+-- anchors, i.e. by the size difference of the two cars. That was only corrected once the jbeam had
+-- loaded, up to RESTAGE_MAX_WAIT later: the shuffle players still saw after swapping on the grid.
+--
+-- The load wait only ever existed because MEASURING needs a loaded jbeam. The metadata box needs no
+-- measurement, so the correction can land in the frame the new identity becomes readable -- which is at
+-- once: spawn.setVehicleObject assigns veh.JBeam and veh.partConfig synchronously inside the replace,
+-- before the jbeam starts loading, and the engine's own positioning (including its safeSpawn nudge) has
+-- finished by then too, so nothing re-applies a position behind us afterwards.
+--
+-- Should the identity still read as the OLD car on an early frame, the prediction is the old car's -- and
+-- the old car was already standing correctly, so the tolerance gate finds nothing to do and we simply try
+-- again next frame. Idempotent by that same gate, so calling this every frame of the wait costs one
+-- teleport, not one per frame.
+--
+-- Deliberately gives up (nil) rather than guessing whenever anything is unreadable: this is the
+-- optimistic path, and the deferred restage behind it is the safety net.
+--
+-- Returns `moved` (true = teleported, false = already in place) plus the horizontal deviation in metres
+-- and the model it predicted for, or nil plus a reason.
+function M.preplace_at_grid(veh, pose)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+    local model, config = model_config_of(veh)
+    if not model then
+        return nil, "vehicle model unreadable"
+    end
+    local target = metadata_anchored_target(pose, model, config)
+    if not target then
+        return nil, "no config box for '" .. tostring(model) .. "'"
+    end
+    local delta = horizontal_gap(veh, target)
+    if not delta then
+        return nil, "vehicle position unreadable"
+    end
+    if delta <= RESTAGE_TOLERANCE then
+        return false, delta, model
+    end
+    local ok, err = pcall(repair_and_place, veh, pose, target)
+    if not ok then
+        return nil, "preplace_at_grid failed: " .. tostring(err)
+    end
+    return true, delta, model
 end
 
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
