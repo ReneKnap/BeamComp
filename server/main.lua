@@ -4105,7 +4105,12 @@ function runlog.replay()
     end
 
     local folded, skipped = 0, 0
-    for line in file:lines() do
+    for raw in file:lines() do
+        -- Trim a trailing CR before anything else. The log is written in text mode, so it holds CRLF on
+        -- Windows, and reading it back on Linux (BeamMP ships a Linux server binary) leaves the CR on
+        -- every line. Without this, every line would fail the check below and the whole history would
+        -- silently fold to an empty aggregate -- indistinguishable from lost data.
+        local line = raw:gsub("\r+$", "")
         -- Cheap completeness check before the decode: a whole run line is a JSON object, so it opens
         -- with "{" and closes with "}". A torn final line fails here and is skipped silently -- handing
         -- it to Util.JsonDecode would work too (it answers nil), but it also prints a [LUA ERROR] into
@@ -4176,6 +4181,11 @@ function runlog.race_context()
         order = order_mode,
         order_rev = order_rev,
         start_mode = session.start_mode,
+        -- The phase the run was captured in. A normal finish captures during "racing"; an abort during a
+        -- qualifying session (ADR-0041 reuses the racing machinery and writes quali laps into
+        -- session.progress) captures during "qualifying". Without this a cleared quali would look exactly
+        -- like an aborted race run in the history. Never folds -- those runs are aborted, not finished.
+        phase = session.phase,
     }
 end
 
@@ -4198,10 +4208,14 @@ end
 function runlog.build_run(id, record, date, timestamp, context, position)
     local info = (session.identities or {})[id]
     local vehicle = info and info.vehicle or nil
-    local ctx = {slot = record.slot, pos = position}
+    -- The shared race context first, then this driver's own fields -- so a context key added later can
+    -- never shadow the per-run slot/position.
+    local ctx = {}
     for key, value in pairs(context) do
         ctx[key] = value
     end
+    ctx.slot = record.slot
+    ctx.pos = position
     return {
         v = runlog.RECORD_VERSION,
         ts = timestamp,
