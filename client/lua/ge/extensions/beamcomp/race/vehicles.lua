@@ -265,52 +265,23 @@ local function pose_orientation(pose)
     return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
 end
 
--- The world position to place the reference point at so the car's FRONT-centre lands on the grid
--- pose (horizontally) and its wheels sit ON the surface (vertically), instead of the reference point
--- BeamNG puts there (which sits mid-car, ~on the seats -- above the wheels).
---
--- The spawn bounding box is measured from the car's CURRENT, pre-teleport transform -- a
--- getSpawnWorldOOBB read right after setPositionRotation still reflects the old transform, so we must
--- measure before moving. We learn the reference->front-centre offset there (decomposed along the
--- car's current forward/right via the OOBB centre and its forward half-length, getHalfExtents().y),
--- then re-apply it along the grid's target forward/right. This needs no vehicle-local axis or
--- quaternion-flip assumption -- it reads the real geometry and re-projects it.
---
--- The SAME OOBB read also anchors the Z axis: the grid pose Z is the grounded surface (placement.lua,
--- ADR-0034) with the reference point placed there, but the reference sits above the wheels, so a
--- taller car buried its wheels below the surface. We instead place the bounding-box BOTTOM at the
--- grounded Z, so wheels of any size car meet the surface. Returns the grid pose unchanged when there
--- is no forward axis or the bbox API is unavailable (keeps the centre anchor -- today's behaviour).
-local function front_anchored_target(veh, pose)
-    local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
-    if not pose.forward then
-        return base
+-- The (model, config-key) pair identifying which stock config's metadata box describes `veh`, read off
+-- the vehicle itself the way capture_spec does -- so a placement path can reach the box without a new
+-- parameter threaded through every caller. `config` is a NAMED preset only: an inline parts table (a
+-- tuned car) and a serialized partsTree blob both come back nil, which vehiclespecs resolves to the
+-- model's stock config. pcall-guarded; nil model when the read fails.
+local function model_config_of(veh)
+    if not veh then
+        return nil
     end
-    local ok, target = pcall(function()
-        local bb = veh:getSpawnWorldOOBB()
-        local fwd = veh:getDirectionVector()
-        fwd = vec3(fwd.x, fwd.y, 0)
-        fwd:normalize()
-        local right = vec3(fwd.y, -fwd.x, 0)
-        local to_centre = bb:getCenter() - veh:getPosition()
-        -- reference -> front-centre, split into the car's own forward (+ half-length) and lateral.
-        local forward_dist = to_centre:dot(fwd) + bb:getHalfExtents().y
-        local lateral_dist = to_centre:dot(right)
-        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
-        target_fwd:normalize()
-        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
-        local horizontal = base - (target_fwd * forward_dist + target_right * lateral_dist)
-        -- Vertical anchor: horizontal.z is still base.z (the grounded grid Z, already lifted by
-        -- placement.GROUND_CLEARANCE). bottom_offset is the reference -> bbox-bottom Z; subtracting it
-        -- lifts the reference so the bbox bottom -- not the mid-car reference -- lands on the surface.
-        local bottom_offset = to_centre.z - bb:getHalfExtents().z
-        return vec3(horizontal.x, horizontal.y, horizontal.z - bottom_offset)
+    local ok, model, config = pcall(function()
+        local part_config = veh.partConfig
+        return veh.JBeam, is_preset_variant(part_config) and part_config or nil
     end)
-    if ok and target then
-        return target
+    if not ok or type(model) ~= "string" or model == "" then
+        return nil
     end
-    log("W", LOG_TAG, "front-anchor unavailable; centre-anchoring: " .. tostring(target))
-    return base
+    return model, config
 end
 
 -- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
@@ -347,6 +318,69 @@ local function metadata_anchored_target(pose, model, config)
         return nil
     end
     return target
+end
+
+-- The world position to place the reference point at so the car's FRONT-centre lands on the grid
+-- pose (horizontally) and its wheels sit ON the surface (vertically), instead of the reference point
+-- BeamNG puts there (which sits mid-car, ~on the seats -- above the wheels).
+--
+-- The spawn bounding box is measured from the car's CURRENT, pre-teleport transform -- a
+-- getSpawnWorldOOBB read right after setPositionRotation still reflects the old transform, so we must
+-- measure before moving. We learn the reference->front-centre offset there (decomposed along the
+-- car's current forward/right via the OOBB centre and its forward half-length, getHalfExtents().y),
+-- then re-apply it along the grid's target forward/right. This needs no vehicle-local axis or
+-- quaternion-flip assumption -- it reads the real geometry and re-projects it.
+--
+-- The SAME OOBB read also anchors the Z axis: the grid pose Z is the grounded surface (placement.lua,
+-- ADR-0034) with the reference point placed there, but the reference sits above the wheels, so a
+-- taller car buried its wheels below the surface. We instead place the bounding-box BOTTOM at the
+-- grounded Z, so wheels of any size car meet the surface.
+--
+-- When the live measurement is unavailable the fallback is two-stage: the car's own config METADATA box
+-- first (a real footprint, just not this car's deformed one), and only if that is unknown too the raw
+-- grid pose -- which centre-anchors the car and leaves it standing roughly half its length too far
+-- forward. Returns the grid pose unchanged when the pose carries no forward axis at all.
+local function front_anchored_target(veh, pose)
+    local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
+    if not pose.forward then
+        return base
+    end
+    local ok, target = pcall(function()
+        local bb = veh:getSpawnWorldOOBB()
+        local fwd = veh:getDirectionVector()
+        fwd = vec3(fwd.x, fwd.y, 0)
+        fwd:normalize()
+        local right = vec3(fwd.y, -fwd.x, 0)
+        local to_centre = bb:getCenter() - veh:getPosition()
+        -- reference -> front-centre, split into the car's own forward (+ half-length) and lateral.
+        local forward_dist = to_centre:dot(fwd) + bb:getHalfExtents().y
+        local lateral_dist = to_centre:dot(right)
+        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
+        target_fwd:normalize()
+        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
+        local horizontal = base - (target_fwd * forward_dist + target_right * lateral_dist)
+        -- Vertical anchor: horizontal.z is still base.z (the grounded grid Z, already lifted by
+        -- placement.GROUND_CLEARANCE). bottom_offset is the reference -> bbox-bottom Z; subtracting it
+        -- lifts the reference so the bbox bottom -- not the mid-car reference -- lands on the surface.
+        local bottom_offset = to_centre.z - bb:getHalfExtents().z
+        return vec3(horizontal.x, horizontal.y, horizontal.z - bottom_offset)
+    end)
+    if ok and target then
+        return target
+    end
+    -- Measurement failed (bbox API gone / vehicle handle unusable): stand in with the config box before
+    -- giving up on the anchor entirely. Every placement path reaches this -- the deferred restage, the
+    -- staged-quali hold and requeue, the staging repair and the quali re-grid.
+    local model, config = model_config_of(veh)
+    local predicted = model and metadata_anchored_target(pose, model, config) or nil
+    if predicted then
+        log("W", LOG_TAG, string.format(
+            "front-anchor measurement unavailable for '%s'; using its config box: %s",
+            tostring(model), tostring(target)))
+        return predicted
+    end
+    log("W", LOG_TAG, "front-anchor unavailable; centre-anchoring: " .. tostring(target))
+    return base
 end
 
 -- Race-scoped tally of the pre-spawn bounding-box lookup: how many of the cars this client puts on the
