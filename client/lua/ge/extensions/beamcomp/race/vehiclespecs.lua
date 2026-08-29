@@ -307,6 +307,129 @@ function M.config_weight(model, config)
     return read_numeric(data.configs[config], WEIGHT_FIELDS)
 end
 
+-- The config-info table whose BoundingBox represents `model`/`config`, or nil. Resolution (R3 of
+-- precompute-default-car-bbox-direct-spawn -- deliberately NO special path for a modified car): a named
+-- preset config that actually exists is used as given; anything else -- an inline parts TABLE (a tuned
+-- car), a serialized partsTree blob string, or nil (stock spawn) -- falls back to the model's STOCK
+-- config (data.model.default_pc), whose box is right for every tuning that does not change the body
+-- shell. The model-level info.json carries no BoundingBox of its own, so default_pc is the only
+-- model-wide stand-in there is.
+local function box_config_info(data, config)
+    local configs = data and data.configs
+    if type(configs) ~= "table" then
+        return nil
+    end
+    if type(config) == "string" and config ~= "" and type(configs[config]) == "table" then
+        return configs[config]
+    end
+    local info = data.model
+    local default_pc = type(info) == "table" and info.default_pc or nil
+    if type(default_pc) == "string" and type(configs[default_pc]) == "table" then
+        return configs[default_pc]
+    end
+    return nil
+end
+
+-- One corner of a BoundingBox entry as {x, y, z}, or nil when it is not a 3-number array. The field is
+-- authored data (dynamicVehicleData writes it, a mod may hand-write it), so validate rather than trust.
+local function box_corner(corner)
+    if type(corner) ~= "table" then
+        return nil
+    end
+    local x, y, z = corner[1], corner[2], corner[3]
+    if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
+        return nil
+    end
+    return {x = x, y = y, z = z}
+end
+
+-- (public) One config's VEHICLE-LOCAL bounding box from BeamNG's own metadata, WITHOUT spawning the car:
+-- {min = {x, y, z}, max = {x, y, z}}, or nil when it is unknown or unreadable.
+--
+-- Source: the `BoundingBox` field of info_<config>.json, which core_vehicles.getModel hands through
+-- verbatim (core/vehicles.lua: `local configData = readData`) -- the same table config_power/config_weight
+-- already read Power/Weight from. The engine uses the field this way itself (career vehicleShopping checks
+-- pre-spawn whether a car fits a parking spot). It is written by lua/vehicle/extensions/
+-- dynamicVehicleData.lua constructAABB(): the AABB over ALL jbeam nodes, expressed RELATIVE TO THE
+-- REFERENCE NODE -- i.e. relative to exactly the point veh:getPosition() returns.
+--
+-- Coverage in a stock 0.39 install: 1000 of 1689 config infos carry a box, and 40 of the 45
+-- non-Prop/Trailer/Traffic/Debug models have one on their DEFAULT config. The gaps are props, trailers,
+-- simple_traffic and test rigs -- the set NON_CAR_TYPES filters out anyway.
+--
+-- THIS IS THE SEAM for a second source: should the metadata prove unavailable under BeamMP (the one thing
+-- that cannot be verified headless -- watch for the "bbox lookup: 0 of N cars resolved" line race/
+-- vehicles.lua writes on the first grid spawn of a race), a baked-in table gets added HERE, behind this
+-- lookup, and no caller changes. It is deliberately NOT built yet.
+function M.config_bbox(model, config)
+    local data = get_model(model)
+    local info = box_config_info(data, config)
+    if type(info) ~= "table" then
+        return nil
+    end
+    local box = info.BoundingBox
+    if type(box) ~= "table" then
+        return nil
+    end
+    local min, max = box_corner(box[1]), box_corner(box[2])
+    if not min or not max then
+        return nil
+    end
+    if max.x < min.x or max.y < min.y or max.z < min.z then
+        return nil
+    end
+    return {min = min, max = max}
+end
+
+-- (public) One config's box PROJECTED INTO PLACEMENT TERMS, or nil when no box is known:
+--   forward -- reference point -> the car's FRONT face, along the car's forward axis (metres, positive)
+--   lateral -- reference point -> the box centre, along the car's RIGHT axis (signed; negative for the
+--              usual right-side reference node)
+--   bottom  -- reference point -> the box BOTTOM, along up (signed, normally negative)
+--   half    -- half extents {x = width/2, y = length/2, z = height/2}, all positive
+--
+-- These are exactly the three numbers race/vehicles.lua front_anchored_target derives from a LIVE
+-- getSpawnWorldOOBB read (forward_dist / lateral_dist / bottom_offset), so a caller can front-anchor a car
+-- that does not exist yet.
+--
+-- THE AXES ARE THE DANGEROUS PART, so they are derived here rather than assumed. The jbeam frame the box
+-- lives in is +x = LEFT, +y = REAR, +z = UP, verified against the shipped 0.39 data:
+--   * etk800 slot "Front Wheels" nodeOffset.y = -1.40 vs "Rear Wheels" +1.41 (wheelbase 2.81 m) -> -y is
+--     forward; lua/vehicle/wheels.lua computes its "vector facing forward" as nodes[ref] - nodes[back],
+--     which for this car is (0, -0.53, 0) -- the same answer.
+--   * node fw2r (front wheel RIGHT) sits at x = -0.6898, fw2l (LEFT) at +0.6898 -> -x is right.
+--   * cross-check: etk800's box is [[-0.69, -2.05, -0.225], [1.35, 2.62, 1.165]] and its reference node
+--     f2r sits at jbeam (-0.33, -0.23, +0.23), so the box centre lands on x = 0 (a car is symmetric) and
+--     its floor on z = 0 (the tyre contact patch). citybus: min.y = -1.54 on a 12.63 m body -- the
+--     reference node is 1.54 m behind the nose, which is where a bus driver sits.
+-- With the local centre c = (min + max) / 2 the projections onto the car's own axes are therefore
+-- (forward, right, up) = (-c.y, -c.x, c.z), and substituting the half extents gives
+--     forward = -c.y + (max.y - min.y) / 2 = -min.y
+--     lateral = -c.x
+--     bottom  =  c.z - (max.z - min.z) / 2 =  min.z
+-- Reading the box as "+x right / +y forward" instead would put an etk800 57 cm too far forward and 66 cm
+-- sideways, and a citybus 9.6 m out.
+--
+-- `half` is not used by the placement path; it is published because the box is the only place these
+-- extents exist pre-spawn, and the terrain-slope follow-up needs them.
+function M.config_anchor(model, config)
+    local box = M.config_bbox(model, config)
+    if not box then
+        return nil
+    end
+    local min, max = box.min, box.max
+    return {
+        forward = -min.y,
+        lateral = -(min.x + max.x) / 2,
+        bottom = min.z,
+        half = {
+            x = (max.x - min.x) / 2,
+            y = (max.y - min.y) / 2,
+            z = (max.z - min.z) / 2,
+        },
+    }
+end
+
 -- Engine power (hp) of a SPAWNED vehicle, read from its live details -- the reliable source for the
 -- player's own car's compliance check (computed for a real vehicle, unlike static config metadata).
 -- Number or nil. pcall-guarded; mirrors vehicles.collect_client_info's getVehicleDetails read.
