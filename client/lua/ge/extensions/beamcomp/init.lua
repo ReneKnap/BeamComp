@@ -206,14 +206,10 @@ local RESTAGE_MIN_DELTA = 0.2
 -- acts once the car is actually bindable rather than mid-churn.
 local DASH_REFRESH_SETTLE = 0.75
 
--- Seconds between lobby footprint checks (ADR-0051 round 2). Slow on purpose: it only has to be current
--- by the time somebody types /race, and it sends nothing unless the number changed.
-local SIZE_REPORT_INTERVAL = 2.0
-
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-size-reservation-r2/2026-08-29"
+local BUILD_MARKER = "grid-size-reservation-r3/2026-08-29"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -256,8 +252,7 @@ M.state = {
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
-    size_report_wait = 0,     -- seconds until the next lobby car-footprint check (ADR-0051 round 2)
-    size_reported = nil,      -- {length, width} last reported to the server, so an unchanged car sends nothing
+    size_track = {},          -- lobby car-footprint poll state {wait, reported} owned by race/vehicles.poll_own_size (ADR-0051 round 2); plain numbers, so it survives a Lua reload
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
@@ -882,8 +877,7 @@ local function teardown_race_world()
     lock.on_before_replace = nil
     -- Re-report the lobby car footprint after a race: the car (and with it the footprint) is very likely a
     -- different one now, and the next /race must not assign slots from the pre-race value.
-    M.state.size_reported = nil
-    M.state.size_report_wait = 0
+    M.state.size_track = {}
     -- prop_owner is deliberately NOT cleared here: it is the "we spawned the shared props" marker that gates
     -- the scene-scan cleanup, and teardown runs from several places (lobby, session leave, extension
     -- unload). Clearing it would make every pass after the first a no-op, so a prop that reappeared late --
@@ -2308,45 +2302,13 @@ end
 -- /race options here, we vet them against the locally-parsed race (race/start.validate) and report the
 -- verdict back. The server starts on ok, or posts our reason to the issuing admin on a refusal. The
 -- nonce is echoed so the server can match the reply to its in-flight check.
--- Resolve the footprints of the cars this race has already decided on (ADR-0051 round 2), from the
--- tokens the server relayed with its pre-flight request. This is the earliest point at which anything can
--- be known: it happens BEFORE the server assigns slots, so a bus that is fixed by car= or pre-picked for
--- an AI reserves its space in the very first grid rather than in a correction afterwards. Every miss is
--- silent -- "random", a car nobody pinned, or a model with no metadata box all simply report nothing.
-local function resolved_car_sizes(payload)
-    local sizes = {}
-    local length, width = vehicles.token_size(payload.car)
-    if length then
-        sizes.carSize = {carLength = length, carWidth = width}
-    end
-    length, width = vehicles.token_size(payload.aiCar)
-    if length then
-        sizes.aiCarSize = {carLength = length, carWidth = width}
-    end
-    if type(payload.aiRoster) == "table" then
-        local roster = {}
-        for _, entry in ipairs(payload.aiRoster) do
-            if type(entry) == "table" then
-                local roster_length, roster_width = vehicles.token_size(entry.car)
-                if roster_length and tonumber(entry.index) then
-                    roster[#roster + 1] = {
-                        index = tonumber(entry.index),
-                        carLength = roster_length,
-                        carWidth = roster_width,
-                    }
-                end
-            end
-        end
-        if #roster > 0 then
-            sizes.aiRosterSizes = roster
-        end
-    end
-    return sizes
-end
-
 local function handle_validate_race(payload)
     local result = race_start.validate(payload)
-    local sizes = type(payload) == "table" and resolved_car_sizes(payload) or {}
+    -- Footprints of the cars this race has already pinned (ADR-0051 round 2), resolved from the tokens
+    -- the server relayed. Answering here is the earliest possible moment: it lands BEFORE the server
+    -- assigns slots, so a bus fixed by car= or pre-picked for an AI reserves its space in the very first
+    -- grid instead of in a correction afterwards.
+    local sizes = vehicles.resolve_pinned_sizes(payload)
     send_to_server("raceValidation", {
         nonce = type(payload) == "table" and payload.nonce or nil,
         ok = result.ok,
@@ -6168,39 +6130,6 @@ local function restage_swapped_car(dt_real)
     log("I", RACE_LOG_TAG, "staging car adopted at its grid slot as race car " .. tostring(own_id))
 end
 
--- Report the footprint of the car the player is sitting in, so the server knows it BEFORE the next
--- /race assigns slots (ADR-0051 round 2).
---
--- Unsolicited and connection-scoped, exactly like the identity report (ADR-0031) -- and for the same
--- reason: it must exist before a race does. Round 1 reported footprints only from inside the race-start
--- handler, which runs after the slots are out, so the first grid could never be the reserved one.
---
--- POLLED rather than hooked on the vehicle switch: a car the player just switched into (or just spawned)
--- may still be loading its jbeam, so a one-shot read at that moment can be wrong and stays wrong; a poll
--- notices when the number settles. Silent unless it actually changed, so a parked player costs one
--- bounding-box read every SIZE_REPORT_INTERVAL and no traffic at all.
-local function step_car_size_report(dt_real)
-    if M.state.race then
-        return  -- during a race the per-car clientInfo reports own this
-    end
-    M.state.size_report_wait = (M.state.size_report_wait or 0) - (dt_real or 0)
-    if M.state.size_report_wait > 0 then
-        return
-    end
-    M.state.size_report_wait = SIZE_REPORT_INTERVAL
-    local length, width = vehicles.car_size(vehicles.resolve_own_car(M.state.current_vehicle_id))
-    if not length then
-        return
-    end
-    local last = M.state.size_reported
-    if last and math.abs(last.length - length) < 0.01 and math.abs(last.width - width) < 0.01 then
-        return
-    end
-    M.state.size_reported = {length = length, width = width}
-    send_to_server("carSize", {carLength = length, carWidth = width})
-    log("I", "beamcomp.grid", string.format("reported own car footprint %.2f x %.2f m", length, width))
-end
-
 -- Keep the staging-wait line on the centered overlay (ADR-0021 amendment). There is nothing to count
 -- any more -- staging is open-ended and only the host starts it -- so this re-pushes the same payload on
 -- a slow cadence rather than ticking a clock; see countdown.STAGING_REPAINT_INTERVAL for why it repeats
@@ -6355,9 +6284,22 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         setup.step(dtReal)
     end
     -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
-    -- race can reserve grid space for it from the first slot assignment (ADR-0051 round 2). Self-gating --
-    -- it returns immediately while a race is running.
-    step_car_size_report(dtReal)
+    -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
+    -- polling lives in race/vehicles (it is a measurement of the car); this is only the wiring, kept
+    -- inline so it costs no top-level local in a file that sits near the 200 ceiling. During a race the
+    -- per-car clientInfo reports own the footprint, so the poll stands down.
+    if not M.state.race then
+        -- Re-created rather than assumed: a Lua reload restores M.state as it was serialized, which for a
+        -- state written before this field existed has no tracker at all -- and a nil one would silently
+        -- kill the poll for the rest of the session.
+        M.state.size_track = M.state.size_track or {}
+        local own_size = vehicles.poll_own_size(M.state.size_track, M.state.current_vehicle_id, dtReal)
+        if own_size then
+            send_to_server("carSize", {carLength = own_size.length, carWidth = own_size.width})
+            log("I", "beamcomp.grid", string.format("reported own car footprint %.2f x %.2f m",
+                own_size.length, own_size.width))
+        end
+    end
     if M.state.phase == "staging" and M.state.race then
         -- Keep the staging-wait line up on the centered overlay (ADR-0021 amendment).
         step_staging(dtReal)
