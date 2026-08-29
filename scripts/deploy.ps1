@@ -9,6 +9,14 @@
   are replaced on each run. The committed client/ and server/ trees are never
   modified -- all duplication happens in a staging directory and the target.
 
+  Runtime data the plugin writes into the server folder (named grids, saved
+  presets, the per-run records log) is copied out before the folder is wiped and
+  put back afterwards, so a redeploy never resets it to the empty repo seed.
+
+  A leftover beamcomp.records.json from the retired aggregate format (ADR-0050)
+  is archived to <Target>\BeamComp-Archive\ -- deliberately a sibling of
+  Resources\, which the wipe never touches -- and not restored.
+
 .PARAMETER Target
   Path to the BeamMP server root (the folder that contains, or will contain, a
   Resources/ directory). Required -- no default. Example:
@@ -18,8 +26,9 @@
   Optional staging directory. Defaults to a unique temp folder, removed on exit.
 
 .PARAMETER Clean
-  Remove the existing Resources/Server/BeamComp folder and
-  Resources/Client/BeamComp.zip before deploying.
+  Remove Resources/Client/BeamComp.zip before deploying. The server folder is
+  wiped on every run anyway -- but only after the runtime data has been copied
+  out, which is why -Clean must not delete it up front.
 
 .EXAMPLE
   .\scripts\deploy.ps1 -Target 'C:\BeamMP-Server'
@@ -89,8 +98,11 @@ if ([string]::IsNullOrWhiteSpace($StagingDir)) {
 $stageClient = Join-Path $StagingDir 'client'
 
 try {
+    # -Clean must NOT delete $serverOut here. The server folder is wiped further down anyway, but there
+    # the wipe happens *after* the runtime data has been copied out; deleting it up front destroyed the
+    # data the preserve step was about to save -- and the per-run records log (ADR-0050) is now the only
+    # copy of every best time there is.
     if ($Clean) {
-        if (Test-Path -LiteralPath $serverOut) { Remove-Item -LiteralPath $serverOut -Recurse -Force }
         if (Test-Path -LiteralPath $clientZip) { Remove-Item -LiteralPath $clientZip -Force }
     }
 
@@ -119,14 +131,30 @@ try {
         Copy-Item -LiteralPath $gridsTarget -Destination $gridsBackup -Force
     }
 
-    # beamcomp.records.json is the same class of runtime data (accumulated best times the plugin writes
-    # at each race finish, ADR-0027). Preserve it identically, or a redeploy resets every record to the
-    # empty repo seed.
-    $recordsTarget = Join-Path $serverOut 'beamcomp.records.json'
-    $recordsBackup = $null
-    if (Test-Path -LiteralPath $recordsTarget) {
-        $recordsBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("beamcomp_records_" + [Guid]::NewGuid().ToString('N') + ".json")
-        Copy-Item -LiteralPath $recordsTarget -Destination $recordsBackup -Force
+    # beamcomp.runs.jsonl is the same class of runtime data: the append-only per-run records log the
+    # plugin writes at each race end (ADR-0050), and the ONLY copy of every best time and track record
+    # there is -- the aggregate is derived from it in RAM and never written back. Preserve it identically,
+    # or a redeploy wipes the whole history.
+    $runsTarget = Join-Path $serverOut 'beamcomp.runs.jsonl'
+    $runsBackup = $null
+    if (Test-Path -LiteralPath $runsTarget) {
+        $runsBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("beamcomp_runs_" + [Guid]::NewGuid().ToString('N') + ".jsonl")
+        Copy-Item -LiteralPath $runsTarget -Destination $runsBackup -Force
+    }
+
+    # beamcomp.records.json is the retired aggregate format (ADR-0050 supersedes ADR-0027 section 1/2).
+    # Nothing reads or writes it any more, so it must not be restored -- but it holds months of best
+    # times, so archive it instead of letting the wipe take it. The archive goes OUTSIDE the deploy
+    # target: everything under Resources\Server\BeamComp\ is wiped on every deploy. Timestamped, so a
+    # second archive never overwrites the first.
+    $legacyRecords = Join-Path $serverOut 'beamcomp.records.json'
+    if (Test-Path -LiteralPath $legacyRecords) {
+        $archiveDir = Join-Path $Target 'BeamComp-Archive'
+        New-Dir $archiveDir
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $archived = Join-Path $archiveDir "beamcomp.records.$stamp.json"
+        Copy-Item -LiteralPath $legacyRecords -Destination $archived -Force
+        Write-Host "  archived legacy beamcomp.records.json -> $archived"
     }
 
     # beamcomp.presets.json is the same class of runtime data (named race-setup presets the panel writes,
@@ -150,10 +178,10 @@ try {
         Write-Host "  preserved existing beamcomp.grids.json (editor-authored grids kept)"
     }
 
-    if ($null -ne $recordsBackup) {
-        Copy-Item -LiteralPath $recordsBackup -Destination $recordsTarget -Force
-        Remove-Item -LiteralPath $recordsBackup -Force
-        Write-Host "  preserved existing beamcomp.records.json (accumulated best times kept)"
+    if ($null -ne $runsBackup) {
+        Copy-Item -LiteralPath $runsBackup -Destination $runsTarget -Force
+        Remove-Item -LiteralPath $runsBackup -Force
+        Write-Host "  preserved existing beamcomp.runs.jsonl (per-run records history kept)"
     }
 
     if ($null -ne $presetsBackup) {
