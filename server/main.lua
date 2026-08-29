@@ -264,6 +264,7 @@ local session = {
                               -- while staging, so that this specific admin leaving cancels the race nobody else will
                               -- start. Seeded at the staging entry, dropped by enter_phase on any other phase.
     ai_roster = nil,          -- named AI roster for the active race (ADR-0047): [k] = {name, car?} for AI id "ai:<k>", sanitized from the panel's overrides.ai.roster; nil on the chat path (classic "AI <k>" labels). Per-race, cleared by reset_to_lobby
+    runs_logged = nil,        -- whether this race's runs already went into the run log (ADR-0050). Set by runlog.capture, cleared per race, so the finish seam and the two abort paths cannot log the same race twice
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race, /raceend and
@@ -3455,6 +3456,11 @@ end
 -- back to free-roam (B3) -- so a /raceclear or the finished-window expiry has a visible close-out.
 local function reset_to_lobby()
     local had_race = session.race ~= nil
+    -- A race cleared before it settled (/raceclear, or the server running empty) never reaches
+    -- finalize_race, so its runs would be lost. Log them here as aborted/DNF before the state is dropped
+    -- (ADR-0050); a no-op after a normal finish, and skipped when nobody reached a checkpoint.
+    runlog.capture(true)
+    session.runs_logged = nil
     session.race = nil
     session.roster = nil
     session.progress = nil
@@ -3522,6 +3528,11 @@ end
 -- raceStart carries propOwner = true, designating it as the one client that spawns the shared race
 -- props -- the knockable cones -- which BeamMP then syncs to every other client (ADR-0009).
 local function start_race(race_name, owner_id, overrides, map, race_id, race_data)
+    -- A /race re-issued while one is running goes racing -> finished (abort window) -> here, bypassing
+    -- finalize_race, so the outgoing race's runs are logged now -- before its state is overwritten
+    -- (ADR-0050). A no-op from the lobby and after a normal finish.
+    runlog.capture(true)
+    session.runs_logged = nil
     -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
@@ -4158,14 +4169,39 @@ function runlog.build_run(id, record, date, timestamp)
     }
 end
 
+-- Whether any real player got far enough for this race to be worth recording: at least one scored
+-- checkpoint. Gates the two abort paths -- a race cleared during spawning or staging has nothing to say
+-- and would only add all-zero rows. The finish seam does NOT gate on this: a genuine zero-progress DNF
+-- is a fact about a race that actually ran.
+function runlog.any_real_progress()
+    if not session.progress then
+        return false
+    end
+    for _, record in pairs(session.progress) do
+        if not record.ai and (record.completed or 0) > 0 then
+            return true
+        end
+    end
+    return false
+end
+
 -- Append every real player's run of the active race to the log (ADR-0050). AI slots are skipped -- they
 -- never hold records (ADR-0036/0027) and are not part of the driver history. Returns the {id, run} pairs
 -- that were written, so the caller can fold them and address the bestNotice back to the right player.
-function runlog.capture()
+--
+-- Called from three seams: the finish (capture_records), the lobby reset (/raceclear, server ran empty)
+-- and the top of start_race (a /race re-issued mid-race never passes through finalize_race). Whichever
+-- fires first wins -- session.runs_logged makes the capture idempotent per race. `require_progress` is
+-- set by the two abort seams; see runlog.any_real_progress.
+function runlog.capture(require_progress)
     local logged = {}
-    if not session.race or not session.progress then
+    if not session.race or not session.progress or session.runs_logged then
         return logged
     end
+    if require_progress and not runlog.any_real_progress() then
+        return logged
+    end
+    session.runs_logged = true
 
     local runs = {}
     local date = os.date("%Y-%m-%d")
