@@ -1080,6 +1080,94 @@ local function detect_modified(veh)
     return nil
 end
 
+-- A footprint pair that is safe to report, or nil, nil. Rejects a non-number, a NaN (which survives
+-- every comparison and would poison the server's reservation arithmetic) and a non-positive extent.
+local function usable_size(length, width)
+    if type(length) ~= "number" or type(width) ~= "number" then
+        return nil, nil
+    end
+    if length ~= length or width ~= width then
+        return nil, nil
+    end
+    if length <= 0 or width <= 0 then
+        return nil, nil
+    end
+    return length, width
+end
+
+-- (public) One config's grid footprint from BeamNG's own metadata, WITHOUT spawning the car: length
+-- and width in metres, or nil, nil when that config carries no bounding box.
+--
+-- The size-aware slot reservation (ADR-0051) is decided server-side from exactly these two numbers, so
+-- they have to be readable BEFORE the car exists -- that is what lets a fixed car= policy and a
+-- rostered AI car be reported early enough to land on a reserved grid. config_anchor publishes the half
+-- extents in the vehicle-local frame it verified against the shipped jbeam data: y is longitudinal,
+-- x is lateral.
+function M.spec_size(model, config)
+    if type(model) ~= "string" or model == "" then
+        return nil, nil
+    end
+    local anchor = vehiclespecs.config_anchor(model, config)
+    local half = anchor and anchor.half or nil
+    if not half then
+        return nil, nil
+    end
+    return usable_size(half.y * 2, half.x * 2)
+end
+
+-- (public) A LIVE car's grid footprint (length, width in metres), or nil, nil when neither source reads.
+--
+-- Metadata FIRST, deliberately: a car reported before its spawn and the same car reported after it then
+-- yield identical numbers, so the early report cannot trigger a pointless second re-grid. The live
+-- oriented spawn box is the fallback for a car whose config has no box at all (a mod vehicle); its
+-- half extents use the same axis convention front_anchored_target already reads getHalfExtents().y with.
+function M.car_size(veh)
+    if not veh then
+        return nil, nil
+    end
+    local model, config = model_config_of(veh)
+    local length, width = M.spec_size(model, config)
+    if length then
+        return length, width
+    end
+    local ok, measured = pcall(function()
+        local half = veh:getSpawnWorldOOBB():getHalfExtents()
+        return {length = half.y * 2, width = half.x * 2}
+    end)
+    if not ok or not measured then
+        return nil, nil
+    end
+    return usable_size(measured.length, measured.width)
+end
+
+-- (public) The footprint of a "model[:config]" car token, or nil, nil. "random" is branched out ahead of
+-- the parse exactly as respawn_own_at does -- a random car is only known once it has been rolled.
+function M.token_size(token)
+    if type(token) ~= "string" or token == "" or token == "random" then
+        return nil, nil
+    end
+    local model, config = parse_car_token(token)
+    return M.spec_size(model, config)
+end
+
+-- (public) The footprint of the car this client is about to put on the grid, as far as it is knowable
+-- BEFORE the spawn (ADR-0051 §6). Two cases are knowable, and they are the ones that matter:
+--   * a FIXED car (car=model[:config], Mode 2, or a class-drop class car, ADR-0042) -- exactly that
+--     config's metadata box;
+--   * KEEP-OWN (Mode 1: no fixed car and no caps) -- the car the player is already sitting in.
+-- A cap-driven substitute (Mode 3) and car=random are only decided at spawn time, so they come back
+-- nil, nil and are reported after the spawn like every other car.
+function M.planned_size(policy, own_car)
+    policy = policy or {}
+    if policy.car then
+        return M.token_size(policy.car)
+    end
+    if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
+        return nil, nil
+    end
+    return M.car_size(own_car)
+end
+
 -- Collect this client's vehicle metadata for the server's best-times records (ADR-0027). `veh` is the
 -- resolved race car (the caller already holds it). Every engine read is pcall-guarded and degrades to
 -- nil: the BeamNG globals for vehicle details are UNVERIFIED under BeamMP, so any gap yields a nil field
@@ -1134,6 +1222,11 @@ function M.collect_client_info(veh)
     if type(power) == "number" and type(weight) == "number" and weight > 0 then
         info.pwr = power / weight
     end
+
+    -- Grid footprint (metres) for the size-aware slot reservation (ADR-0051). Two plain numbers with
+    -- exactly pwr's shape: the server reserves slots by arithmetic on them and never reads the vehicle
+    -- (race-blind, ADR-0005). nil when no box is known -- that car then reserves nothing.
+    info.car_length, info.car_width = M.car_size(veh)
 
     return info
 end
