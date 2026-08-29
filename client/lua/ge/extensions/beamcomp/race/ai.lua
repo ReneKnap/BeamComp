@@ -353,8 +353,10 @@ function M.spawn(ai_slots, grid_poses, config, content_defaults, policy, host_ca
                 }
                 -- Diagnostic: the grid pose we aimed for vs where the car actually landed, so a grid
                 -- mismatch (wrong slot / pose) is visible in beamng.log against the player's "placed at
-                -- grid (x, y, z)" line. The fresh car is center-anchored here (no front-anchor/restage
-                -- yet, unlike a player car), so a ~half-car forward offset is expected, not a bug.
+                -- grid (x, y, z)" line. The spawn is front-anchored from the config bounding box, so the
+                -- landed position sits about half a car length BEHIND the pose along the grid direction
+                -- (that is the car's front sitting on the pose) -- expected, not a bug. Without a box for
+                -- this config the car lands centred on the pose instead and the restage corrects it.
                 local landed = veh:getPosition()
                 log("I", LOG_TAG, string.format(
                     "spawned AI '%s' (%s) '%s%s' slot %s -> pose (%.1f, %.1f, %.1f), "

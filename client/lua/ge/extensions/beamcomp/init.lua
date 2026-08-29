@@ -5911,9 +5911,9 @@ local function restage_swapped_car(dt_real)
     M.state.current_vehicle_id = own_id
     local pose = M.state.race and M.state.race.myPose
     if pose then
-        -- place_at_grid, NOT respawn_own_at: respawn_own_at -> keep_own -> despawn_owned_except
+        -- restage_at_grid, NOT respawn_own_at: respawn_own_at -> keep_own -> despawn_owned_except
         -- deletes every OTHER owned vehicle, which on the host includes the AI cars (they are
-        -- host-owned) -- that wiped the whole AI field. place_at_grid does the same front-anchored
+        -- host-owned) -- that wiped the whole AI field. restage_at_grid does the same front-anchored
         -- repair+teleport without any despawn (the exact path the AI restage uses, ai.lua).
         -- There is no stray own car to clean here anyway: a fresh spawn already despawned at spawn
         -- time, and a staging swap replaces in place.

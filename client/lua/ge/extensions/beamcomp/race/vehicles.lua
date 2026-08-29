@@ -1,7 +1,9 @@
 -- BeamComp -- race vehicle lifecycle (despawn + own-car respawn on a race start).
 --
--- Lives at lua/ge/extensions/beamcomp/race/vehicles.lua inside the client mod zip. Stateless
--- and reload-safe (no M.state, no file-scope mutable state). Target: client GE (LuaJIT 5.1).
+-- Lives at lua/ge/extensions/beamcomp/race/vehicles.lua inside the client mod zip. Stateless and
+-- reload-safe: no M.state, and the one piece of file-scope mutable state (bbox_report, a per-race
+-- diagnostic counter) is reset at every race start and carries nothing a reload could corrupt.
+-- Target: client GE (LuaJIT 5.1).
 --
 -- On a race start each client places its own car at the grid pose the server assigned it
 -- (M.respawn_own_at, ADR-0007). Primary path: if the player is already in a real owned car, keep
@@ -375,7 +377,7 @@ local function front_anchored_target(veh, pose)
     local predicted = model and metadata_anchored_target(pose, model, config) or nil
     if predicted then
         log("W", LOG_TAG, string.format(
-            "front-anchor measurement unavailable for '%s'; using its config box: %s",
+            "front-anchor measurement unavailable for '%s' (%s); using its config box",
             tostring(model), tostring(target)))
         return predicted
     end
@@ -423,10 +425,6 @@ local function spawn_vehicle_at(pose, spec)
         return nil, "no vehicle model to spawn"
     end
 
-    -- spawnNewVehicle wants vec3/quat userdata, not the plain tables myPose carries. Heading caveat:
-    -- spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0) * rot), so we
-    -- pass pose_orientation straight through -- the internal flip then turns a forward-derived
-    -- quatFromDir into a car facing down the grid, matching repair_and_place's explicit flip.
     -- Front-anchor the spawn ITSELF from the config's metadata box. A fresh car cannot be measured (its
     -- jbeam is still loading), so the grid pose used to be applied centre-anchored and the deferred
     -- restage shoved the car forward by half its length up to 3 s later -- the visible twitch this
@@ -438,6 +436,11 @@ local function spawn_vehicle_at(pose, spec)
     if anchored then
         bbox_report.resolved = bbox_report.resolved + 1
     end
+
+    -- spawnNewVehicle wants vec3/quat userdata, not the plain tables myPose carries. Heading caveat:
+    -- spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0) * rot), so we
+    -- pass pose_orientation straight through -- the internal flip then turns a forward-derived
+    -- quatFromDir into a car facing down the grid, matching repair_and_place's explicit flip.
     local opt = {
         pos = anchored or vec3(pose.pos.x, pose.pos.y, pose.pos.z),
         rot = pose_orientation(pose),
@@ -634,6 +637,11 @@ end
 -- the prediction missed -- a body kit, an unknown config, a staging swap into a differently sized car --
 -- is still corrected exactly as before. Everything else the restage guarantees is untouched; only the
 -- setPositionRotation became conditional.
+--
+-- Accepted consequence: setPositionRotation also RESETS a car to its undamaged rest state, so a skipped
+-- restage skips that repair too. Skipping only happens when the car is standing within a few centimetres
+-- of its slot, i.e. it has not moved in the seconds since it spawned frozen, so there is nothing to
+-- repair. The on-demand staging repair (init.lua) still places unconditionally for the case where there is.
 --
 -- Returns `moved` (true = teleported, false = already in place) plus the measured horizontal deviation in
 -- metres, or nil plus a reason. A nil deviation alongside a true `moved` means the car's position could
