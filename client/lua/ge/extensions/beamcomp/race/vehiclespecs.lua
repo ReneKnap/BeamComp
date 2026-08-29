@@ -343,6 +343,23 @@ local function box_corner(corner)
     return {x = x, y = y, z = z}
 end
 
+-- The {min, max} box out of a config-info table, or nil when it carries none / a malformed one. Split
+-- out so the substituting and the strict lookup share one parse.
+local function box_of(info)
+    local box = type(info) == "table" and info.BoundingBox or nil
+    if type(box) ~= "table" then
+        return nil
+    end
+    local min, max = box_corner(box[1]), box_corner(box[2])
+    if not min or not max then
+        return nil
+    end
+    if max.x < min.x or max.y < min.y or max.z < min.z then
+        return nil
+    end
+    return {min = min, max = max}
+end
+
 -- (public) One config's VEHICLE-LOCAL bounding box from BeamNG's own metadata, WITHOUT spawning the car:
 -- {min = {x, y, z}, max = {x, y, z}}, or nil when it is unknown or unreadable.
 --
@@ -362,23 +379,31 @@ end
 -- vehicles.lua writes on the first grid spawn of a race), a baked-in table gets added HERE, behind this
 -- lookup, and no caller changes. It is deliberately NOT built yet.
 function M.config_bbox(model, config)
+    return box_of(box_config_info(get_model(model), config))
+end
+
+-- (public) One config's box ONLY when the model actually ships that config -- no substitution.
+--
+-- config_bbox above falls back to the model's DEFAULT config for an unknown key. As a placement
+-- stand-in that is right: it puts a car a few centimetres off instead of half a car length. As a
+-- FOOTPRINT it is a wrong answer dressed as a right one -- an md_series whose partConfig read "Truck"
+-- (a name the model does not ship, e.g. a player-saved config) came back as the 6.39 m default dump
+-- truck, so a 10.9 m school bus reserved nothing and the field spawned into it.
+--
+-- An absent config is not the dangerous case: the car then spawns as the model's default, so the default
+-- box IS its box. Only a non-empty key the model does not ship yields nil here.
+function M.config_bbox_exact(model, config)
     local data = get_model(model)
-    local info = box_config_info(data, config)
-    if type(info) ~= "table" then
+    local configs = data and data.configs
+    if type(configs) ~= "table" then
         return nil
     end
-    local box = info.BoundingBox
-    if type(box) ~= "table" then
-        return nil
+    if type(config) == "string" and config ~= "" then
+        return box_of(configs[config])
     end
-    local min, max = box_corner(box[1]), box_corner(box[2])
-    if not min or not max then
-        return nil
-    end
-    if max.x < min.x or max.y < min.y or max.z < min.z then
-        return nil
-    end
-    return {min = min, max = max}
+    local info = data.model
+    local default_pc = type(info) == "table" and info.default_pc or nil
+    return box_of(type(default_pc) == "string" and configs[default_pc] or nil)
 end
 
 -- (public) One config's box PROJECTED INTO PLACEMENT TERMS, or nil when no box is known:

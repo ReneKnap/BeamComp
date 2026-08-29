@@ -286,6 +286,26 @@ local function model_config_of(veh)
     return model, config
 end
 
+-- The config KEY out of whatever a replaceVehicle caller was handed: a plain preset name, a .pc path, or
+-- a table carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves
+-- to the model's default config downstream (the right answer: that is what would spawn).
+local function config_key(config)
+    if type(config) == "table" then
+        config = config.linkedPCFile
+    end
+    if type(config) ~= "string" or config == "" then
+        return nil
+    end
+    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
+    -- the config key core_vehicles indexes its configs by.
+    local key = config:match("([^/]+)$") or config
+    key = key:gsub("%.pc$", "")
+    if key == "" then
+        return nil
+    end
+    return key
+end
+
 -- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
 -- bounding-box bottom sits on the pose Z -- the same anchor front_anchored_target computes, but derived
 -- from the config's METADATA box (vehiclespecs.config_anchor) instead of a live getSpawnWorldOOBB read.
@@ -741,6 +761,43 @@ function M.preplace_at_grid(veh, pose)
     return true, delta, model
 end
 
+-- (public) Put `veh` exactly where a REPLACEMENT of it by `model`/`config` has to start from, so the new
+-- car comes up already front-anchored on `pose` -- with no correction afterwards, and therefore no jump.
+--
+-- BeamNG's _replaceVehicle takes the replacement's spawn position from the OUTGOING car
+-- (`localOptions.pos = veh:getPosition()`), so a swap inherits the old car's reference point and a
+-- differently sized car lands offset by the difference -- the ~1 m nudge players saw a frame later.
+-- Moving the outgoing car first costs nothing visually: it is deleted inside the same replaceVehicle
+-- call, so it is never rendered where it was moved to.
+--
+-- Uses the SUBSTITUTING config box (metadata_anchored_target), deliberately unlike the footprint reader:
+-- for placement an unknown config key resolving to the model default is a few centimetres of error, which
+-- beats not placing at all. Returns true, or nil plus a reason -- every failure path means "leave the car
+-- alone", and the deferred restage stays the safety net behind this.
+function M.preplace_for_replacement(veh, pose, model, config)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+    if type(model) ~= "string" or model == "" then
+        return nil, "no replacement model"
+    end
+    local target = metadata_anchored_target(pose, model, config_key(config))
+    if not target then
+        return nil, "no config box for '" .. model .. "'"
+    end
+    local ok, err = pcall(function()
+        local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
+        veh:setPositionRotation(target.x, target.y, target.z, rot.x, rot.y, rot.z, rot.w)
+    end)
+    if not ok then
+        return nil, "pre-position failed: " .. tostring(err)
+    end
+    return true
+end
+
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
 -- plate BEFORE a forced/substitute spawn despawns their car, then re-apply it to the new car once its
 -- jbeam has loaded (M.apply_plate). pcall-guarded -- core_vehicles.getVehicleLicenseText is unverified
@@ -1080,6 +1137,11 @@ local function detect_modified(veh)
     return nil
 end
 
+-- Metres by which a live measurement may differ from the car's own config metadata before it is worth a
+-- warning. Generous: a deformed or slightly settled car reads a few centimetres off, a substituted config
+-- box is metres off.
+local SIZE_CROSSCHECK_TOLERANCE = 0.25
+
 -- A footprint pair that is safe to report, or nil, nil. Rejects a non-number, a NaN (which survives
 -- every comparison and would poison the server's reservation arithmetic) and a non-positive extent.
 local function usable_size(length, width)
@@ -1095,49 +1157,58 @@ local function usable_size(length, width)
     return length, width
 end
 
--- (public) One config's grid footprint from BeamNG's own metadata, WITHOUT spawning the car: length
--- and width in metres, or nil, nil when that config carries no bounding box.
+-- (public) One config's grid footprint from BeamNG's own metadata, WITHOUT spawning the car: length and
+-- width in metres, or nil, nil.
 --
--- The size-aware slot reservation (ADR-0051) is decided server-side from exactly these two numbers, so
--- they have to be readable BEFORE the car exists -- that is what lets a fixed car= policy and a
--- rostered AI car be reported early enough to land on a reserved grid. config_anchor publishes the half
--- extents in the vehicle-local frame it verified against the shipped jbeam data: y is longitudinal,
--- x is lateral.
+-- Uses the STRICT lookup (config_bbox_exact): a config key the model does not ship yields nothing rather
+-- than the model default's box. That substitution is fine when it only shifts a car by centimetres at
+-- placement time, but as a footprint it is a wrong number that looks right -- it is what let a 10.9 m
+-- school bus report itself as the 6.39 m default dump truck and reserve nothing.
+--
+-- Being readable before the car exists is what makes the early report possible: the size has to reach the
+-- server BEFORE it assigns slots. config_bbox_exact publishes the box in the vehicle-local frame that
+-- vehiclespecs verified against the shipped jbeam data -- y longitudinal, x lateral.
 function M.spec_size(model, config)
     if type(model) ~= "string" or model == "" then
         return nil, nil
     end
-    local anchor = vehiclespecs.config_anchor(model, config)
-    local half = anchor and anchor.half or nil
-    if not half then
+    local box = vehiclespecs.config_bbox_exact(model, config)
+    if not box then
         return nil, nil
     end
-    return usable_size(half.y * 2, half.x * 2)
+    return usable_size(box.max.y - box.min.y, box.max.x - box.min.x)
 end
 
--- (public) A LIVE car's grid footprint (length, width in metres), or nil, nil when neither source reads.
+-- (public) A LIVE car's grid footprint (length, width in metres) plus where the number came from, or
+-- nil when neither source reads.
 --
--- Metadata FIRST, deliberately: a car reported before its spawn and the same car reported after it then
--- yield identical numbers, so the early report cannot trigger a pointless second re-grid. The live
--- oriented spawn box is the fallback for a car whose config has no box at all (a mod vehicle); its
--- half extents use the same axis convention front_anchored_target already reads getHalfExtents().y with.
+-- MEASURED FIRST, metadata second -- the opposite of the placement path, and deliberately. A live car is
+-- ground truth: it is immune to a config key the model does not ship, to a player-saved config, and to a
+-- mod vehicle with no metadata at all. The measured extents come from the same oriented spawn box
+-- front_anchored_target already reads getHalfExtents().y from, so the axis convention is the verified one.
+--
+-- The cost of measuring is that a car whose jbeam is still loading can read wrong; that is covered, because
+-- the deferred restage re-reports the car once its jbeam is up (init.lua restage_swapped_car).
 function M.car_size(veh)
     if not veh then
         return nil, nil
-    end
-    local model, config = model_config_of(veh)
-    local length, width = M.spec_size(model, config)
-    if length then
-        return length, width
     end
     local ok, measured = pcall(function()
         local half = veh:getSpawnWorldOOBB():getHalfExtents()
         return {length = half.y * 2, width = half.x * 2}
     end)
-    if not ok or not measured then
-        return nil, nil
+    if ok and measured then
+        local length, width = usable_size(measured.length, measured.width)
+        if length then
+            return length, width, "measured"
+        end
     end
-    return usable_size(measured.length, measured.width)
+    local model, config = model_config_of(veh)
+    local length, width = M.spec_size(model, config)
+    if length then
+        return length, width, "config"
+    end
+    return nil, nil, nil
 end
 
 -- (public) The footprint of a "model[:config]" car token, or nil, nil. "random" is branched out ahead of
@@ -1226,7 +1297,34 @@ function M.collect_client_info(veh)
     -- Grid footprint (metres) for the size-aware slot reservation (ADR-0051). Two plain numbers with
     -- exactly pwr's shape: the server reserves slots by arithmetic on them and never reads the vehicle
     -- (race-blind, ADR-0005). nil when no box is known -- that car then reserves nothing.
-    info.car_length, info.car_width = M.car_size(veh)
+    --
+    -- Logged with its SOURCE. Round 1 shipped a footprint that was silently the model default's, and
+    -- nothing in either log said so; this line is what makes the next such case one grep away.
+    local source
+    info.car_length, info.car_width, source = M.car_size(veh)
+    if not info.car_length then
+        log("W", LOG_TAG, string.format("grid footprint unreadable for '%s' -- it will reserve nothing",
+            tostring(info.vehicle.model)))
+        return info
+    end
+    log("I", LOG_TAG, string.format("grid footprint %.2f x %.2f m (%s) for '%s'",
+        info.car_length, info.car_width, tostring(source), tostring(info.vehicle.model)))
+    -- Cross-check the measured car against its own config metadata and say so loudly when they disagree.
+    -- The two must agree to within a few centimetres. A large gap means one of exactly two things, and
+    -- both are invisible otherwise: the config box is not this car's (round 1 -- an md_series reporting a
+    -- config key the model does not ship silently got the DEFAULT config's 6.39 m instead of its real
+    -- 10.91 m, so nothing reserved and the field spawned into it), or the box axes are not what this file
+    -- reads them as. One line here is what makes either one a grep instead of an in-game mystery.
+    if source == "measured" then
+        local spec_length, spec_width = M.spec_size(model_config_of(veh))
+        if spec_length and (math.abs(spec_length - info.car_length) > SIZE_CROSSCHECK_TOLERANCE
+                or math.abs(spec_width - info.car_width) > SIZE_CROSSCHECK_TOLERANCE) then
+            log("W", LOG_TAG, string.format(
+                "footprint mismatch for '%s': measured %.2f x %.2f m, config metadata says %.2f x %.2f m"
+                .. " -- using the measurement",
+                tostring(info.vehicle.model), info.car_length, info.car_width, spec_length, spec_width))
+        end
+    end
 
     return info
 end
