@@ -36,6 +36,11 @@ local M = {}
 
 local LOG_TAG = "beamcomp.lock"
 
+-- Optional callback the swap-allowed replaceVehicle pass-through invokes with (modelName, opt) right
+-- before the engine replaces the car, so the caller can act on the car that is ABOUT to exist. Set by
+-- init.lua for the staging swap (ADR-0051 round 2); nil means the pass-through behaves exactly as before.
+M.on_before_replace = nil
+
 -- Set true by the swap-allowed replaceVehicle pass-through when the player replaces their car during
 -- staging, consumed by init.lua (consume_replace) to re-stage the new car. A replace keeps the same
 -- vehicle id, so this event flag is the only reliable signal that a swap happened.
@@ -199,9 +204,57 @@ local function guard_core_vehicles(allow_replace)
     end
     if core_vehicles[ORIG_REPLACE_KEY] ~= nil then
         if allow_replace then
-            core_vehicles.replaceVehicle = function(...)
+            core_vehicles.replaceVehicle = function(model_name, opt, ...)
                 M.replace_seen = true
-                return core_vehicles[ORIG_REPLACE_KEY](...)
+                -- The caller's chance to act on the NEW car before the engine touches anything (ADR-0051
+                -- round 2). _replaceVehicle takes the replacement's spawn position from the OUTGOING car
+                -- (`localOptions.pos = veh:getPosition()`), so a swap into a differently sized car lands
+                -- offset and has to be nudged afterwards -- a visible jump. Knowing model_name and
+                -- opt.config here is what lets init.lua pre-position the outgoing car instead, which is
+                -- free: it is deleted in this same call and never rendered where it was moved to.
+                --
+                -- Kept deliberately thin: this is lock infrastructure on an engine function, so the hook
+                -- is optional, pcall-guarded, and its outcome is ignored. Anything that goes wrong in it
+                -- must leave the replace itself exactly as it was.
+                if type(M.on_before_replace) == "function" then
+                    pcall(M.on_before_replace, model_name, opt)
+                end
+                -- Turn OFF the engine's spawn-avoidance nudge for this one replace.
+                --
+                -- safeSpawn defaults to ON (spawn.lua: `options.safeSpawn == true or == nil`), and it
+                -- pushes the freshly placed car around until it intersects no other vehicle
+                -- (setSafePosition -> placeVehicle). That is the right instinct for a car being spawned
+                -- SOMEWHERE; it is exactly wrong for one we are deliberately putting on its own reserved
+                -- grid slot, where the neighbours it is "rescued" from are the cars it is supposed to
+                -- line up with. It is also what made the swap asymmetric: a smaller replacement
+                -- intersected nobody and stayed put, a bigger one got shoved off the slot we had just
+                -- anchored and then had to be visibly corrected back.
+                --
+                -- Safe here for two reasons: the field is frozen through staging, so nothing can move
+                -- into the slot; and the flag survives the option chain -- replaceVehicle deepcopies opt
+                -- AFTER this line, and sanitizeVehicleSpawnOptions returns the same table it was given
+                -- (fillVehicleSpawnOptionDefaults mutates and returns opt), so `false` reaches
+                -- replaceOtherVehicle's `if options.safeSpawn == nil` guard as a real false.
+                --
+                -- Scoped to this wrapper alone, which only exists under the swap-allowed staging lock --
+                -- never global, and never for the race spawn (see race/vehicles.lua spawn_vehicle_at).
+                --
+                -- Forwarded as a COPY rather than set on the caller's table: the options belong to
+                -- whoever called replaceVehicle (the vehicle/parts selector, our own compliance revert),
+                -- and a table they might reuse must not silently keep our flag. A shallow copy is enough
+                -- -- we only add a boolean, and replaceVehicle deep-copies before anything mutates it.
+                local forwarded = opt
+                pcall(function()
+                    if type(opt) == "table" then
+                        local copy = {}
+                        for key, value in pairs(opt) do
+                            copy[key] = value
+                        end
+                        copy.safeSpawn = false
+                        forwarded = copy
+                    end
+                end)
+                return core_vehicles[ORIG_REPLACE_KEY](model_name, forwarded, ...)
             end
         else
             core_vehicles.replaceVehicle = function()

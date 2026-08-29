@@ -286,6 +286,26 @@ local function model_config_of(veh)
     return model, config
 end
 
+-- The config KEY out of whatever a replaceVehicle caller was handed: a plain preset name, a .pc path, or
+-- a table carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves
+-- to the model's default config downstream (the right answer: that is what would spawn).
+local function config_key(config)
+    if type(config) == "table" then
+        config = config.linkedPCFile
+    end
+    if type(config) ~= "string" or config == "" then
+        return nil
+    end
+    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
+    -- the config key core_vehicles indexes its configs by.
+    local key = config:match("([^/]+)$") or config
+    key = key:gsub("%.pc$", "")
+    if key == "" then
+        return nil
+    end
+    return key
+end
+
 -- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
 -- bounding-box bottom sits on the pose Z -- the same anchor front_anchored_target computes, but derived
 -- from the config's METADATA box (vehiclespecs.config_anchor) instead of a live getSpawnWorldOOBB read.
@@ -425,6 +445,22 @@ local function spawn_vehicle_at(pose, spec)
         return nil, "no vehicle model to spawn"
     end
 
+    -- safeSpawn is left ON for the race spawn, unlike the staging swap (race/lock.lua turns it off there).
+    -- The reasons are specific to this path and were checked in the engine source, not assumed:
+    --   * the end position is the grid slot either way. Every car spawned here is re-placed onto its slot
+    --     by the deferred restage (restage_at_grid / ai.restage), which is a direct setPositionRotation
+    --     and never goes through safeSpawn -- so the nudge costs a brief displacement, not a wrong
+    --     result. The staging swap has no such correction ahead of the car becoming visible, which is
+    --     why it needs the flag and this does not.
+    --   * turning it off also turns off the GROUND SNAP (setSafePositionRec -> getBBOnGround). Here that
+    --     is the only net under a failed terrain raycast in placement.ground_all; the swap does not need
+    --     it, because the car is already standing on a grounded slot.
+    -- It is not free: for spawnNewVehicle removeWhenNoPositionFound defaults to TRUE (spawn.lua), so a
+    -- car the engine cannot place is DELETED rather than nudged -- which is what an "AI spawn failed for
+    -- slot N" line can mean on a tight grid. That is a separate symptom with its own evidence, and
+    -- trading it for cars that may spawn inside each other or underground is not a call to make without
+    -- an in-game test. The log line below is what will provide that evidence.
+
     -- Front-anchor the spawn ITSELF from the config's metadata box. A fresh car cannot be measured (its
     -- jbeam is still loading), so the grid pose used to be applied centre-anchored and the deferred
     -- restage shoved the car forward by half its length up to 3 s later -- the visible twitch this
@@ -461,6 +497,28 @@ local function spawn_vehicle_at(pose, spec)
     end
     if not veh then
         return nil, "spawn returned no vehicle"
+    end
+
+    -- Say so when the ENGINE moved the car after we placed it.
+    --
+    -- safeSpawn is on for this path (deliberately -- see the note below), so spawn.lua's setSafePosition
+    -- both drops the car onto the ground and pushes it around until it intersects no other vehicle. The
+    -- second half can silently take a car off the slot we just computed for it, and a silent correction
+    -- by the engine is exactly the class of event that cost a whole round on this feature. So measure it:
+    -- the horizontal distance from where we asked for the reference point to where it actually is. Z is
+    -- deliberately excluded -- the ground snap legitimately changes it.
+    local moved = pcall(function()
+        local landed = veh:getPosition()
+        local dx, dy = landed.x - opt.pos.x, landed.y - opt.pos.y
+        local gap = math.sqrt(dx * dx + dy * dy)
+        if gap > SPAWN_NUDGE_TOLERANCE then
+            log("W", LOG_TAG, string.format(
+                "engine moved '%s' %.2f m off its spawn position (safeSpawn avoidance); "
+                .. "the grid restage will pull it back", tostring(model), gap))
+        end
+    end)
+    if not moved then
+        log("W", LOG_TAG, "could not check the spawn position of '" .. tostring(model) .. "'")
     end
     return veh
 end
@@ -739,6 +797,43 @@ function M.preplace_at_grid(veh, pose)
         return nil, "preplace_at_grid failed: " .. tostring(err)
     end
     return true, delta, model
+end
+
+-- (public) Put `veh` exactly where a REPLACEMENT of it by `model`/`config` has to start from, so the new
+-- car comes up already front-anchored on `pose` -- with no correction afterwards, and therefore no jump.
+--
+-- BeamNG's _replaceVehicle takes the replacement's spawn position from the OUTGOING car
+-- (`localOptions.pos = veh:getPosition()`), so a swap inherits the old car's reference point and a
+-- differently sized car lands offset by the difference -- the ~1 m nudge players saw a frame later.
+-- Moving the outgoing car first costs nothing visually: it is deleted inside the same replaceVehicle
+-- call, so it is never rendered where it was moved to.
+--
+-- Uses the SUBSTITUTING config box (metadata_anchored_target), deliberately unlike the footprint reader:
+-- for placement an unknown config key resolving to the model default is a few centimetres of error, which
+-- beats not placing at all. Returns true, or nil plus a reason -- every failure path means "leave the car
+-- alone", and the deferred restage stays the safety net behind this.
+function M.preplace_for_replacement(veh, pose, model, config)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+    if type(model) ~= "string" or model == "" then
+        return nil, "no replacement model"
+    end
+    local target = metadata_anchored_target(pose, model, config_key(config))
+    if not target then
+        return nil, "no config box for '" .. model .. "'"
+    end
+    local ok, err = pcall(function()
+        local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
+        veh:setPositionRotation(target.x, target.y, target.z, rot.x, rot.y, rot.z, rot.w)
+    end)
+    if not ok then
+        return nil, "pre-position failed: " .. tostring(err)
+    end
+    return true
 end
 
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
@@ -1080,6 +1175,190 @@ local function detect_modified(veh)
     return nil
 end
 
+-- Metres of footprint change below which a re-report is not worth sending.
+local SIZE_REPORT_EPSILON = 0.01
+
+-- Metres the engine may move a car away from the position we asked it to spawn at before it is worth a
+-- line. Above the float noise and the ground snap's horizontal drift, far below a real avoidance shove.
+local SPAWN_NUDGE_TOLERANCE = 0.25
+
+-- Metres by which a live measurement may differ from the car's own config metadata before it is worth a
+-- warning. Generous: a deformed or slightly settled car reads a few centimetres off, a substituted config
+-- box is metres off.
+local SIZE_CROSSCHECK_TOLERANCE = 0.25
+
+-- A footprint pair that is safe to report, or nil, nil. Rejects a non-number, a NaN (which survives
+-- every comparison and would poison the server's reservation arithmetic) and a non-positive extent.
+local function usable_size(length, width)
+    if type(length) ~= "number" or type(width) ~= "number" then
+        return nil, nil
+    end
+    if length ~= length or width ~= width then
+        return nil, nil
+    end
+    if length <= 0 or width <= 0 then
+        return nil, nil
+    end
+    return length, width
+end
+
+-- (public) One config's grid footprint from BeamNG's own metadata, WITHOUT spawning the car: length and
+-- width in metres, or nil, nil.
+--
+-- Uses the STRICT lookup (config_bbox_exact): a config key the model does not ship yields nothing rather
+-- than the model default's box. That substitution is fine when it only shifts a car by centimetres at
+-- placement time, but as a footprint it is a wrong number that looks right -- it is what let a 10.9 m
+-- school bus report itself as the 6.39 m default dump truck and reserve nothing.
+--
+-- Being readable before the car exists is what makes the early report possible: the size has to reach the
+-- server BEFORE it assigns slots. config_bbox_exact publishes the box in the vehicle-local frame that
+-- vehiclespecs verified against the shipped jbeam data -- y longitudinal, x lateral.
+function M.spec_size(model, config)
+    if type(model) ~= "string" or model == "" then
+        return nil, nil
+    end
+    local box = vehiclespecs.config_bbox_exact(model, config)
+    if not box then
+        return nil, nil
+    end
+    return usable_size(box.max.y - box.min.y, box.max.x - box.min.x)
+end
+
+-- (public) A LIVE car's grid footprint (length, width in metres) plus where the number came from, or
+-- nil when neither source reads.
+--
+-- MEASURED FIRST, metadata second -- the opposite of the placement path, and deliberately. A live car is
+-- ground truth: it is immune to a config key the model does not ship, to a player-saved config, and to a
+-- mod vehicle with no metadata at all. The measured extents come from the same oriented spawn box
+-- front_anchored_target already reads getHalfExtents().y from, so the axis convention is the verified one.
+--
+-- The cost of measuring is that a car whose jbeam is still loading can read wrong; that is covered, because
+-- the deferred restage re-reports the car once its jbeam is up (init.lua restage_swapped_car).
+function M.car_size(veh)
+    if not veh then
+        return nil, nil
+    end
+    local ok, measured = pcall(function()
+        local half = veh:getSpawnWorldOOBB():getHalfExtents()
+        return {length = half.y * 2, width = half.x * 2}
+    end)
+    if ok and measured then
+        local length, width = usable_size(measured.length, measured.width)
+        if length then
+            return length, width, "measured"
+        end
+    end
+    local model, config = model_config_of(veh)
+    local length, width = M.spec_size(model, config)
+    if length then
+        return length, width, "config"
+    end
+    return nil, nil, nil
+end
+
+-- (public) The footprint of a "model[:config]" car token, or nil, nil. "random" is branched out ahead of
+-- the parse exactly as respawn_own_at does -- a random car is only known once it has been rolled.
+function M.token_size(token)
+    if type(token) ~= "string" or token == "" or token == "random" then
+        return nil, nil
+    end
+    local model, config = parse_car_token(token)
+    return M.spec_size(model, config)
+end
+
+-- (public) The footprint of the car this client is about to put on the grid, as far as it is knowable
+-- BEFORE the spawn (ADR-0051 §6). Two cases are knowable, and they are the ones that matter:
+--   * a FIXED car (car=model[:config], Mode 2, or a class-drop class car, ADR-0042) -- exactly that
+--     config's metadata box;
+--   * KEEP-OWN (Mode 1: no fixed car and no caps) -- the car the player is already sitting in.
+-- A cap-driven substitute (Mode 3) and car=random are only decided at spawn time, so they come back
+-- nil, nil and are reported after the spawn like every other car.
+function M.planned_size(policy, own_car)
+    policy = policy or {}
+    if policy.car then
+        return M.token_size(policy.car)
+    end
+    if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
+        return nil, nil
+    end
+    return M.car_size(own_car)
+end
+
+-- (public) Resolve the footprints of the cars a race has ALREADY pinned, from the tokens the server
+-- relays with its pre-flight check (ADR-0051 round 2): the fixed car= policy, the uniform aicar, and the
+-- roster's per-AI picks. Answering with these is what lets the very first slot assignment reserve for a
+-- bus, instead of only correcting after it has spawned.
+--
+-- Pure token resolution, so it lives here rather than in the message handler: every miss is silent, and
+-- "random", an unpinned car and a model without a metadata box all simply report nothing. Returns a table
+-- with the wire fields the verdict carries; absent keys mean "not knowable yet".
+function M.resolve_pinned_sizes(relayed)
+    local sizes = {}
+    if type(relayed) ~= "table" then
+        return sizes
+    end
+    local length, width = M.token_size(relayed.car)
+    if length then
+        sizes.carSize = {carLength = length, carWidth = width}
+    end
+    length, width = M.token_size(relayed.aiCar)
+    if length then
+        sizes.aiCarSize = {carLength = length, carWidth = width}
+    end
+    if type(relayed.aiRoster) == "table" then
+        local roster = {}
+        for _, entry in ipairs(relayed.aiRoster) do
+            if type(entry) == "table" and tonumber(entry.index) then
+                local roster_length, roster_width = M.token_size(entry.car)
+                if roster_length then
+                    roster[#roster + 1] = {
+                        index = tonumber(entry.index),
+                        carLength = roster_length,
+                        carWidth = roster_width,
+                    }
+                end
+            end
+        end
+        if #roster > 0 then
+            sizes.aiRosterSizes = roster
+        end
+    end
+    return sizes
+end
+
+-- Seconds between lobby footprint checks (ADR-0051 round 2). Slow on purpose: it only has to be current
+-- by the time somebody types /race, and nothing is sent unless the number changed.
+M.SIZE_REPORT_INTERVAL = 2.0
+
+-- (public) Poll the seated car's footprint on a slow timer and return it ONLY when it is new; nil
+-- otherwise, which is the normal answer.
+--
+-- POLLED rather than hooked on the vehicle switch: a car just switched into (or just spawned) may still
+-- be loading its jbeam, so a one-shot read at that moment can be wrong and stays wrong -- a poll notices
+-- when the number settles. `tracker` is the caller's own little state table {wait, reported}; keeping it
+-- outside means this stays a plain function and costs the caller no module-level state.
+function M.poll_own_size(tracker, vehicle_id, dt_real)
+    if type(tracker) ~= "table" then
+        return nil
+    end
+    tracker.wait = (tracker.wait or 0) - (dt_real or 0)
+    if tracker.wait > 0 then
+        return nil
+    end
+    tracker.wait = M.SIZE_REPORT_INTERVAL
+    local length, width = M.car_size(M.resolve_own_car(vehicle_id))
+    if not length then
+        return nil
+    end
+    local last = tracker.reported
+    if last and math.abs(last.length - length) < SIZE_REPORT_EPSILON
+        and math.abs(last.width - width) < SIZE_REPORT_EPSILON then
+        return nil
+    end
+    tracker.reported = {length = length, width = width}
+    return tracker.reported
+end
+
 -- Collect this client's vehicle metadata for the server's best-times records (ADR-0027). `veh` is the
 -- resolved race car (the caller already holds it). Every engine read is pcall-guarded and degrades to
 -- nil: the BeamNG globals for vehicle details are UNVERIFIED under BeamMP, so any gap yields a nil field
@@ -1133,6 +1412,38 @@ function M.collect_client_info(veh)
     local weight = vehiclespecs.vehicle_weight(veh)
     if type(power) == "number" and type(weight) == "number" and weight > 0 then
         info.pwr = power / weight
+    end
+
+    -- Grid footprint (metres) for the size-aware slot reservation (ADR-0051). Two plain numbers with
+    -- exactly pwr's shape: the server reserves slots by arithmetic on them and never reads the vehicle
+    -- (race-blind, ADR-0005). nil when no box is known -- that car then reserves nothing.
+    --
+    -- Logged with its SOURCE. Round 1 shipped a footprint that was silently the model default's, and
+    -- nothing in either log said so; this line is what makes the next such case one grep away.
+    local source
+    info.car_length, info.car_width, source = M.car_size(veh)
+    if not info.car_length then
+        log("W", LOG_TAG, string.format("grid footprint unreadable for '%s' -- it will reserve nothing",
+            tostring(info.vehicle.model)))
+        return info
+    end
+    log("I", LOG_TAG, string.format("grid footprint %.2f x %.2f m (%s) for '%s'",
+        info.car_length, info.car_width, tostring(source), tostring(info.vehicle.model)))
+    -- Cross-check the measured car against its own config metadata and say so loudly when they disagree.
+    -- The two must agree to within a few centimetres. A large gap means one of exactly two things, and
+    -- both are invisible otherwise: the config box is not this car's (round 1 -- an md_series reporting a
+    -- config key the model does not ship silently got the DEFAULT config's 6.39 m instead of its real
+    -- 10.91 m, so nothing reserved and the field spawned into it), or the box axes are not what this file
+    -- reads them as. One line here is what makes either one a grep instead of an in-game mystery.
+    if source == "measured" then
+        local spec_length, spec_width = M.spec_size(model_config_of(veh))
+        if spec_length and (math.abs(spec_length - info.car_length) > SIZE_CROSSCHECK_TOLERANCE
+                or math.abs(spec_width - info.car_width) > SIZE_CROSSCHECK_TOLERANCE) then
+            log("W", LOG_TAG, string.format(
+                "footprint mismatch for '%s': measured %.2f x %.2f m, config metadata says %.2f x %.2f m"
+                .. " -- using the measurement",
+                tostring(info.vehicle.model), info.car_length, info.car_width, spec_length, spec_width))
+        end
     end
 
     return info

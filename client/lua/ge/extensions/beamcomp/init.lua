@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "bbox-prespawn-anchor-r2/2026-08-29"
+local BUILD_MARKER = "grid-size-reservation-r3/2026-08-29"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -252,6 +252,7 @@ M.state = {
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
+    size_track = {},          -- lobby car-footprint poll state {wait, reported} owned by race/vehicles.poll_own_size (ADR-0051 round 2); plain numbers, so it survives a Lua reload
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
@@ -621,6 +622,19 @@ local function handle_race_start(payload)
     -- spawn-time licenseText and the jbeam regenerates it -- so we re-apply this plate on the deferred
     -- restage once the new car's jbeam has loaded (vehicles.apply_plate in restage_swapped_car).
     local own_plate = vehicles.read_plate(own_car)
+    -- Report the footprint of the car we are ABOUT to put on the grid, before spawning it (ADR-0051).
+    -- Wherever the car is already decided -- a fixed car= policy, a class-drop class car, or simply
+    -- keeping our own -- the server can reserve the space behind it right away instead of waiting for
+    -- the post-spawn report at the end of this handler. It never gates anything: a car that is only
+    -- decided at spawn time (a Mode-3 substitute, car=random) reports nil here and nothing is sent.
+    local planned_length, planned_width = vehicles.planned_size(policy, own_car)
+    if planned_length then
+        send_to_server("clientInfo", {
+            race = payload.race,
+            carLength = planned_length,
+            carWidth = planned_width,
+        })
+    end
     -- Open the bounding-box tally for this race: every car this client puts on the grid below (own car
     -- plus, on the host, the AI field) counts whether its footprint could be read from metadata before
     -- the spawn. Closed by log_bbox_report at the end of this handler with a single verdict line.
@@ -707,6 +721,10 @@ local function handle_race_start(payload)
         -- Power-to-weight for the start-order pwr mode (ADR-0033); nil when unreadable. The server stores
         -- it per player and only sorts by it -- it never reads the vehicle (race-blind, ADR-0005).
         pwr = client_info.pwr,
+        -- Grid footprint in metres for the size-aware slot reservation (ADR-0051); same form as pwr --
+        -- numbers the server does arithmetic on, never a vehicle it reads.
+        carLength = client_info.car_length,
+        carWidth = client_info.car_width,
     })
 
     -- Refresh the canonical identity from the race car now that it exists (ADR-0031): the license name
@@ -732,6 +750,21 @@ local function handle_race_start(payload)
         -- (re)spawn so the AI follow if the host's car changes. nil when placement degraded -> the resolver
         -- logs and falls through so the AI still race.
         local host_car = race_car and vehicles.host_car_spec(race_car) or nil
+        -- Report the footprint of every AI whose car is already decided -- a roster pick (ADR-0047) or a
+        -- class-drop class car (ADR-0042) -- BEFORE spawning them, so a bus in the AI field reserves its
+        -- space on the earliest grid the server can build (ADR-0051). A randomly rolled AI car is only
+        -- known afterwards and rides the post-spawn proxy report below.
+        for _, ai_slot in ipairs(payload.aiSlots) do
+            local ai_length, ai_width = vehicles.token_size(ai_slot.car)
+            if ai_length then
+                send_to_server("clientInfo", {
+                    race = payload.race,
+                    aiId = ai_slot.id,
+                    carLength = ai_length,
+                    carWidth = ai_width,
+                })
+            end
+        end
         local cars = ai.spawn(payload.aiSlots, race.gridPoses, payload.aiConfig, race.aiDefaults, policy,
             host_car)
         if #cars > 0 then
@@ -742,11 +775,16 @@ local function handle_race_start(payload)
                     ai.suppress(veh)
                     -- Report this AI car's power-to-weight by proxy (ADR-0036 Etappe B) so the server can
                     -- sort it into an order=pwr grid (ADR-0033); aiId-tagged, owner-only. Best-effort: a
-                    -- nil pwr just leaves the AI in its provisional back-of-grid slot.
+                    -- nil pwr just leaves the AI in its provisional back-of-grid slot. The footprint
+                    -- rides along (ADR-0051) so an AI bus reserves the slot behind it too -- this is the
+                    -- only report that sees a RANDOMLY rolled AI car, which no pre-spawn read can know.
+                    local ai_info = vehicles.collect_client_info(veh)
                     send_to_server("clientInfo", {
                         race = payload.race,
                         aiId = car.id,
-                        pwr = vehicles.collect_client_info(veh).pwr,
+                        pwr = ai_info.pwr,
+                        carLength = ai_info.car_length,
+                        carWidth = ai_info.car_width,
                     })
                 end
             end
@@ -834,6 +872,12 @@ local function teardown_race_world()
     M.state.prop_names = nil
     M.state.cone_ids = nil
     M.state.grinder_activate = nil
+    -- Drop the staging-swap pre-anchor hook with the race that installed it, so no closure outlives the
+    -- pose it was built for (ADR-0051 round 2). Re-installed on the next staging phase.
+    lock.on_before_replace = nil
+    -- Re-report the lobby car footprint after a race: the car (and with it the footprint) is very likely a
+    -- different one now, and the next /race must not assign slots from the pre-race value.
+    M.state.size_track = {}
     -- prop_owner is deliberately NOT cleared here: it is the "we spawned the shared props" marker that gates
     -- the scene-scan cleanup, and teardown runs from several places (lobby, session leave, extension
     -- unload). Clearing it would make every pass after the first a no-op, so a prop that reappeared late --
@@ -1289,6 +1333,35 @@ local function handle_race_phase(payload)
         -- (handle_race_start) and stays so until racing. Force the HUD app visible now so the countdown
         -- overlay it hosts is present before the count starts (ADR-0021), and seed the staging indicator.
         lock.install({allow_replace = true})
+        -- Make a staging car swap land on the grid slot WITHOUT the visible correction afterwards
+        -- (ADR-0051 round 2). BeamNG's replaceVehicle gives the new car the outgoing car's reference
+        -- point, so a differently sized replacement comes up offset and used to be nudged into place a
+        -- frame later -- a small jump the player sees. The lock already wraps replaceVehicle for the
+        -- staging swap, so it can hand us the model that is about to exist; we then move the OUTGOING car
+        -- to the reference point that model needs, and the replacement inherits exactly the right spot.
+        -- Moving the outgoing car is invisible: it is deleted inside the same call.
+        --
+        -- Everything about this is best-effort. The hook is pcall-guarded on the lock side, every step
+        -- here bails out silently, and preplace_at_grid + the deferred restage stay behind it as the
+        -- safety net -- they simply find nothing left to do when this works.
+        lock.on_before_replace = function(model_name, opt)
+            local pose = M.state.race and M.state.race.myPose
+            if not pose then
+                return
+            end
+            local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
+            if not own then
+                return
+            end
+            local placed, reason = vehicles.preplace_for_replacement(own, pose, model_name,
+                type(opt) == "table" and opt.config or nil)
+            if placed then
+                log("I", RACE_LOG_TAG, string.format(
+                    "pre-anchored the grid slot for the incoming '%s'", tostring(model_name)))
+            else
+                log("I", RACE_LOG_TAG, "swap pre-anchor skipped: " .. tostring(reason))
+            end
+        end
         hud.show()
         -- No clock: staging is open-ended and waits for the host (ADR-0021 amendment), so the server
         -- sends no duration. Zero makes the first onUpdate paint the waiting line immediately.
@@ -1601,15 +1674,24 @@ local function replace_ai_for_regrid(ai_slots)
     for _, car in ipairs(M.state.ai_cars) do
         car_by_id[car.id] = car
     end
+    -- A re-grid reaches every client even when it moved nobody here, and a size-aware one can fire while
+    -- the field is still spawning (ADR-0051). Leave an AI that is already standing on its pose alone:
+    -- re-placing it would measure a bounding box that may still be loading and shove it off its slot,
+    -- which the per-frame ai.restage would then have to walk back.
+    local parked = M.state.phase == "spawning" or M.state.phase == "staging"
     for _, entry in ipairs(ai_slots) do
         local car = car_by_id[entry.id]
         local pose = (type(entry.slot) == "number") and poses[entry.slot + 1] or nil
         if car and pose then
+            local settled = parked and car.slot == entry.slot
+                and race_start.pose_matches(car.pose, pose)
             car.slot = entry.slot
             car.pose = pose
             local veh = be and be:getObjectByID(car.veh_id)
             if veh then
-                vehicles.place_at_grid(veh, pose)
+                if not settled then
+                    vehicles.place_at_grid(veh, pose)
+                end
                 vehicles.set_vehicle_frozen(veh, true)
             end
         end
@@ -1648,10 +1730,24 @@ function quali.respawn_ai_for_regrid(ai_slots)
         return
     end
     ai.set_frozen(cars, true)
+    -- The AI cars are RE-SPAWNED here, not teleported, so a chat-path field without a fixed roster car
+    -- re-rolls its random cars. Re-report each one's footprint and pwr (ADR-0051 / ADR-0033) so the
+    -- reservation and the power order describe the cars that are actually on the race grid.
+    local race_name = M.state.race.serverName
     for _, car in ipairs(cars) do
         local veh = be and be:getObjectByID(car.veh_id)
         if veh then
             ai.suppress(veh)
+            if race_name then
+                local ai_info = vehicles.collect_client_info(veh)
+                send_to_server("clientInfo", {
+                    race = race_name,
+                    aiId = car.id,
+                    pwr = ai_info.pwr,
+                    carLength = ai_info.car_length,
+                    carWidth = ai_info.car_width,
+                })
+            end
         end
     end
     M.state.ai_cars = cars
@@ -1686,6 +1782,26 @@ local function handle_regrid(payload)
     if M.state.phase == "qualiResults" then
         M.state.quali_settle = true
     end
+    local slot = payload.slot
+    -- Adopt the new roster and re-lay the grid FIRST, before any car is moved: the server hands out
+    -- sparse slots to keep the space behind an oversized car free (ADR-0051), so a re-grid can need
+    -- more poses than the current layout has -- and on a rows-pinned grid every pose can move. The AI
+    -- re-place below reads race.gridPoses, so it has to see the new set.
+    if type(payload.grid) == "table" then
+        M.state.race.roster = payload.grid
+    end
+    local extent = race_start.layout_extent(M.state.race.roster, slot)
+    if extent ~= M.state.race.layoutCount then
+        local poses, ramp = race_start.layout_for(M.state.race.gridLayout, extent)
+        if poses then
+            M.state.race.gridPoses = poses
+            M.state.race.rampPose = ramp
+            M.state.race.layoutCount = extent
+            log("I", RACE_LOG_TAG, string.format("regrid: grid re-laid for %d poses", extent))
+        else
+            log("W", RACE_LOG_TAG, "regrid: could not re-lay the grid; keeping the current poses")
+        end
+    end
     -- Re-place / re-spawn the host's AI cars (owner-only; no-op otherwise) before the own-car logic, so a
     -- missing own slot/pose below never skips it.
     if payload.qualiRespawnAi then
@@ -1693,34 +1809,45 @@ local function handle_regrid(payload)
     else
         replace_ai_for_regrid(payload.aiSlots)
     end
-    local slot = payload.slot
     local poses = M.state.race.gridPoses
     local pose = (type(slot) == "number" and poses) and poses[slot + 1] or nil
     if not pose then
         log("W", RACE_LOG_TAG, "regrid ignored: no pose for slot " .. tostring(slot))
         return
     end
+    -- A re-grid that only moved OTHER cars still reaches every client (the roster has to stay in sync),
+    -- so skip the teleport when this car's own pose is unchanged. Without this, one incoming footprint
+    -- report would re-place the whole field (ADR-0051). Compared by value, not by identity: the
+    -- re-layout above builds fresh pose tables even where the numbers did not move.
+    --
+    -- Only in the phases where the field is PARKED on the grid. A quali re-grid (qualiResults) is what
+    -- brings the cars back from the track, so an unchanged pole slot must still be teleported -- the
+    -- stored pose says nothing about where the car actually is there.
+    local parked = M.state.phase == "spawning" or M.state.phase == "staging"
+    local settled = parked and M.state.race.mySlot == slot
+        and race_start.pose_matches(M.state.race.myPose, pose)
     M.state.race.mySlot = slot
     M.state.race.myPose = pose
-    if type(payload.grid) == "table" then
-        M.state.race.roster = payload.grid
-    end
 
     local race_car = (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
     if not race_car then
         log("W", RACE_LOG_TAG, "regrid: no race car to re-place")
         return
     end
-    local placed, place_err = vehicles.respawn_own_at(pose, race_car)
-    if not placed then
-        log("W", RACE_LOG_TAG, "regrid re-place failed: " .. tostring(place_err))
-        return
+    if not settled then
+        local placed, place_err = vehicles.respawn_own_at(pose, race_car)
+        if not placed then
+            log("W", RACE_LOG_TAG, "regrid re-place failed: " .. tostring(place_err))
+            return
+        end
+        -- The regrid re-seated/re-placed the race car: re-queue the stock-dashboard rebind so the tacho
+        -- survives this reseat too (bug default-dashboard-ui-missing-at-race-start).
+        arm_dashboard_refresh()
+        log("I", RACE_LOG_TAG, string.format("re-gridded to slot %d", slot))
     end
+    -- Re-asserted either way: it is one queued VE command, and a car that lost its freeze must not stay
+    -- loose just because this particular re-grid did not move it.
     vehicles.set_vehicle_frozen(race_car, true)
-    -- The regrid re-seated/re-placed the race car: re-queue the stock-dashboard rebind so the tacho
-    -- survives this reseat too (bug default-dashboard-ui-missing-at-race-start).
-    arm_dashboard_refresh()
-    log("I", RACE_LOG_TAG, string.format("re-gridded to slot %d", slot))
 end
 
 -- ===== Rally staged sprint quali, client side (ADR-0044) ==================================
@@ -2177,6 +2304,11 @@ end
 -- nonce is echoed so the server can match the reply to its in-flight check.
 local function handle_validate_race(payload)
     local result = race_start.validate(payload)
+    -- Footprints of the cars this race has already pinned (ADR-0051 round 2), resolved from the tokens
+    -- the server relayed. Answering here is the earliest possible moment: it lands BEFORE the server
+    -- assigns slots, so a bus fixed by car= or pre-picked for an AI reserves its space in the very first
+    -- grid instead of in a correction afterwards.
+    local sizes = vehicles.resolve_pinned_sizes(payload)
     send_to_server("raceValidation", {
         nonce = type(payload) == "table" and payload.nonce or nil,
         ok = result.ok,
@@ -2198,6 +2330,12 @@ local function handle_validate_race(payload)
         -- staged single-car variant (sprint) vs. the ADR-0041 all-at-once circuit quali. The race-blind
         -- server reads this (it cannot see meta.closed) only when the race is order=quali.
         stagedQuali = result.stagedQuali,
+        -- Footprints of the cars this race already pinned (ADR-0051 round 2). Plain numbers the server
+        -- only computes with; absent whenever the car is not knowable yet (car=random, a cap that may
+        -- substitute, an AI whose car is rolled at spawn).
+        carSize = sizes.carSize,
+        aiCarSize = sizes.aiCarSize,
+        aiRosterSizes = sizes.aiRosterSizes,
     })
 end
 
@@ -5972,6 +6110,22 @@ local function restage_swapped_car(dt_real)
         end
         M.state.restage_plate = nil
     end
+    -- Re-report the adopted car (ADR-0051). A staging swap can make the car bigger OR smaller, so the
+    -- reservation behind it has to be able to appear AND disappear again -- and this is the one point
+    -- where the swapped car's jbeam is loaded, which is what makes the read reliable. It also brings the
+    -- reported pwr (ADR-0033) and the recorded car (ADR-0027) in line with the car actually staged;
+    -- until now both still described the car this client first spawned with.
+    local race_name = M.state.race and M.state.race.serverName
+    if race_name then
+        local swapped_info = vehicles.collect_client_info(own)
+        send_to_server("clientInfo", {
+            race = race_name,
+            vehicle = swapped_info.vehicle,
+            pwr = swapped_info.pwr,
+            carLength = swapped_info.car_length,
+            carWidth = swapped_info.car_width,
+        })
+    end
     M.state.restage_pending = false
     log("I", RACE_LOG_TAG, "staging car adopted at its grid slot as race car " .. tostring(own_id))
 end
@@ -6128,6 +6282,23 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- no panel is open.
     if M.state.setup_open then
         setup.step(dtReal)
+    end
+    -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
+    -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
+    -- polling lives in race/vehicles (it is a measurement of the car); this is only the wiring, kept
+    -- inline so it costs no top-level local in a file that sits near the 200 ceiling. During a race the
+    -- per-car clientInfo reports own the footprint, so the poll stands down.
+    if not M.state.race then
+        -- Re-created rather than assumed: a Lua reload restores M.state as it was serialized, which for a
+        -- state written before this field existed has no tracker at all -- and a nil one would silently
+        -- kill the poll for the rest of the session.
+        M.state.size_track = M.state.size_track or {}
+        local own_size = vehicles.poll_own_size(M.state.size_track, M.state.current_vehicle_id, dtReal)
+        if own_size then
+            send_to_server("carSize", {carLength = own_size.length, carWidth = own_size.width})
+            log("I", "beamcomp.grid", string.format("reported own car footprint %.2f x %.2f m",
+                own_size.length, own_size.width))
+        end
     end
     if M.state.phase == "staging" and M.state.race then
         -- Keep the staging-wait line up on the centered overlay (ADR-0021 amendment).
