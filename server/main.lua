@@ -265,6 +265,7 @@ local session = {
                               -- start. Seeded at the staging entry, dropped by enter_phase on any other phase.
     ai_roster = nil,          -- named AI roster for the active race (ADR-0047): [k] = {name, car?} for AI id "ai:<k>", sanitized from the panel's overrides.ai.roster; nil on the chat path (classic "AI <k>" labels). Per-race, cleared by reset_to_lobby
     runs_logged = nil,        -- whether this race's runs already went into the run log (ADR-0050). Set by runlog.capture, cleared per race, so the finish seam and the two abort paths cannot log the same race twice
+    race_event = nil,         -- id shared by every logged run of THIS race instance (ADR-0050), so field size, start slot and finishing position can be related across rows; assigned in start_race
 }
 
 -- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race, /raceend and
@@ -3461,6 +3462,7 @@ local function reset_to_lobby()
     -- (ADR-0050); a no-op after a normal finish, and skipped when nobody reached a checkpoint.
     runlog.capture(true)
     session.runs_logged = nil
+    session.race_event = nil
     session.race = nil
     session.roster = nil
     session.progress = nil
@@ -3533,6 +3535,7 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- (ADR-0050). A no-op from the lobby and after a normal finish.
     runlog.capture(true)
     session.runs_logged = nil
+    session.race_event = runlog.next_event_id()
     -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
@@ -4138,19 +4141,72 @@ function runlog.run_status(record)
     return "aborted"
 end
 
+-- A fresh id for one race instance (ADR-0050): unix seconds at the start plus a counter, so every run
+-- of the same race shares it and two races on the same track on the same day stay distinguishable. The
+-- counter breaks ties when two races start within the same second.
+function runlog.next_event_id()
+    runlog.event_seq = runlog.event_seq + 1
+    return string.format("%d-%d", os.time(), runlog.event_seq)
+end
+
+-- The race-level context every run of this race shares (ADR-0050), read straight off the session -- no
+-- new client report, nothing the server does not already know. The race SOURCE (ADR-0035/0045) is
+-- deliberately absent: the server never learns it, "map:"/"menu:" is only a name-resolution prefix on
+-- the typed command and the client's validation verdict reports map/raceId/raceData but no source.
+function runlog.race_context()
+    local humans, ai = 0, 0
+    for _, record in pairs(session.progress or {}) do
+        if record.ai then
+            ai = ai + 1
+        else
+            humans = humans + 1
+        end
+    end
+    -- Unpacked rather than folded into `x and y or nil`: order.rev is a boolean whose `false` is
+    -- meaningful (forward), and the and/or idiom would silently turn that into nil (unknown).
+    local order_mode, order_rev
+    if session.order then
+        order_mode = session.order.mode
+        order_rev = session.order.rev
+    end
+    return {
+        field = humans + ai,
+        humans = humans,
+        ai = ai,
+        order = order_mode,
+        order_rev = order_rev,
+        start_mode = session.start_mode,
+    }
+end
+
+-- Final position per participant id, from the same ranked standings the results card shows and the next
+-- race's order=last grids by (ADR-0043 penalty included). build_standings is pure, so this is a free read.
+function runlog.final_positions()
+    local positions = {}
+    for _, entry in ipairs(build_standings(true)) do
+        positions[entry.id] = entry.position
+    end
+    return positions
+end
+
 -- The log record for one participant's run (ADR-0050). The timing field names deliberately match a live
 -- session.progress record, so a decoded run feeds run_section_aggregate verbatim and best_lap ~= nil
 -- stays the circuit signal (ADR-0030). The vehicle is COPIED down to the four fields the aggregate and
 -- the push actually read, never referenced: the ingestion gate already dropped any serialized partConfig
 -- blob and this keeps it out of the log too (bug partconfig-blob-bloats-standings). car_key is stored as
 -- captured and reused on replay, so a later change to the key rule leaves old aggregates intact.
-function runlog.build_run(id, record, date, timestamp)
+function runlog.build_run(id, record, date, timestamp, context, position)
     local info = (session.identities or {})[id]
     local vehicle = info and info.vehicle or nil
+    local ctx = {slot = record.slot, pos = position}
+    for key, value in pairs(context) do
+        ctx[key] = value
+    end
     return {
         v = runlog.RECORD_VERSION,
         ts = timestamp,
         date = date,
+        event = session.race_event,
         race = session.race,
         identity = resolve_identity(id) or record.name,
         status = runlog.run_status(record),
@@ -4166,6 +4222,7 @@ function runlog.build_run(id, record, date, timestamp)
         lap = record.lap,
         count = record.count,
         splits = record.splits,
+        ctx = ctx,
     }
 end
 
@@ -4206,9 +4263,11 @@ function runlog.capture(require_progress)
     local runs = {}
     local date = os.date("%Y-%m-%d")
     local timestamp = os.time()
+    local context = runlog.race_context()
+    local positions = runlog.final_positions()
     for id, record in pairs(session.progress) do
         if not record.ai then
-            local run = runlog.build_run(id, record, date, timestamp)
+            local run = runlog.build_run(id, record, date, timestamp, context, positions[id])
             runs[#runs + 1] = run
             logged[#logged + 1] = {id = id, run = run}
         end
