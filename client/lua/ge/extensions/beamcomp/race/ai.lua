@@ -387,10 +387,14 @@ function M.set_frozen(cars, frozen)
 end
 
 -- Deferred front-anchor restage of each AI car onto its grid pose (ADR-0036), the per-car mirror of the
--- player restage. The spawn lands the car center-anchored at the pose; once its jbeam has loaded (spawn
--- bbox changes) or RESTAGE_MAX_WAIT elapses, re-place it front-anchored (vehicles.place_at_grid, which
--- touches no other car) and re-freeze it (still held until racing). Called per frame over the frozen
+-- player restage. Once the car's jbeam has loaded (spawn bbox changes) or RESTAGE_MAX_WAIT elapses, check
+-- it against its grid slot and re-place it front-anchored if it is off (vehicles.restage_at_grid, which
+-- touches no other car), then re-freeze it (still held until racing). Called per frame over the frozen
 -- phases; each car restages once (`restaged`). No-op once all are done.
+--
+-- The spawn itself is now front-anchored from the config's bounding box, so a correctly predicted car is
+-- already standing on its slot and restage_at_grid leaves it there -- no teleport, no visible shuffle. The
+-- freeze is still re-asserted either way (it is idempotent, and a car that WAS moved needs it).
 function M.restage(cars, dt)
     if type(cars) ~= "table" or not be then
         return
@@ -407,11 +411,21 @@ function M.restage(cars, dt)
                 local loaded = current ~= nil and car.restage_baseline ~= nil
                     and math.abs(current - car.restage_baseline) > RESTAGE_MIN_DELTA
                 if loaded or car.restage_wait <= 0 then
-                    vehicles.place_at_grid(veh, car.pose)
+                    local moved, delta = vehicles.restage_at_grid(veh, car.pose)
                     vehicles.set_vehicle_frozen(veh, true)
                     car.restaged = true
-                    log("I", LOG_TAG, string.format("re-placed AI '%s' on grid slot %s",
-                        tostring(car.label), tostring(car.slot)))
+                    if moved == nil then
+                        log("W", LOG_TAG, string.format("could not restage AI '%s' on grid slot %s: %s",
+                            tostring(car.label), tostring(car.slot), tostring(delta)))
+                    elseif moved then
+                        log("I", LOG_TAG, string.format("re-placed AI '%s' on grid slot %s (%s m off)",
+                            tostring(car.label), tostring(car.slot),
+                            delta and string.format("%.2f", delta) or "?"))
+                    else
+                        log("I", LOG_TAG, string.format(
+                            "AI '%s' already on grid slot %s (%.3f m); no re-place",
+                            tostring(car.label), tostring(car.slot), delta))
+                    end
                 end
             elseif not veh then
                 car.restaged = true  -- vehicle gone; nothing to restage

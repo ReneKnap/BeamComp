@@ -5807,6 +5807,11 @@ end
 -- record the footprint on the first pending frame and wait until the spawn bbox's forward half-length
 -- changes by RESTAGE_MIN_DELTA (new jbeam loaded), or until RESTAGE_MAX_WAIT elapses (same-size swap,
 -- where placing with the unchanged box is correct anyway).
+--
+-- The wait is unchanged, but the placement at the end of it is now a CHECK: a freshly spawned car was
+-- already front-anchored from its config bounding box, so it is normally standing on its slot by the time
+-- we get here and restage_at_grid leaves it alone. That removes the late shuffle players used to see; a
+-- car the prediction missed, and any staging swap, is still corrected in full.
 local function restage_swapped_car(dt_real)
     if not M.state.race_car_id then
         return
@@ -5912,9 +5917,16 @@ local function restage_swapped_car(dt_real)
         -- repair+teleport without any despawn (the exact path the AI restage uses, ai.lua).
         -- There is no stray own car to clean here anyway: a fresh spawn already despawned at spawn
         -- time, and a staging swap replaces in place.
-        local placed, place_err = vehicles.place_at_grid(own, pose)
-        if not placed then
-            log("W", RACE_LOG_TAG, "could not re-place staging car: " .. tostring(place_err))
+        -- restage_at_grid, not place_at_grid: the fresh-spawn path already front-anchored the car from
+        -- its config bounding box, so this measures the now-loaded jbeam and only teleports when the car
+        -- is genuinely off its slot. A staging swap into a differently sized car still gets its full
+        -- correction; a correctly predicted car is left standing where it is.
+        local moved, delta = vehicles.restage_at_grid(own, pose)
+        if moved == nil then
+            log("W", RACE_LOG_TAG, "could not re-place staging car: " .. tostring(delta))
+        elseif not moved then
+            log("I", RACE_LOG_TAG, string.format(
+                "staging car already on its grid slot (%.3f m); no re-place", delta))
         end
     end
     vehicles.set_vehicle_frozen(own, true)
@@ -5934,7 +5946,7 @@ local function restage_swapped_car(dt_real)
         M.state.restage_plate = nil
     end
     M.state.restage_pending = false
-    log("I", RACE_LOG_TAG, "re-placed staging car at grid slot as race car " .. tostring(own_id))
+    log("I", RACE_LOG_TAG, "staging car adopted at its grid slot as race car " .. tostring(own_id))
 end
 
 -- Keep the staging-wait line on the centered overlay (ADR-0021 amendment). There is nothing to count

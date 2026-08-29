@@ -546,11 +546,13 @@ end
 -- (gameplay/race/startPosition.lua). The 180-degree Z flip (quat(0,0,1,0) * rot) matches the flip
 -- the spawn path applies internally and the engine's repair branch applies explicitly; verified
 -- in-game at handover.
-local function repair_and_place(veh, pose)
+local function repair_and_place(veh, pose, target)
     local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
     -- Front-anchor the car: measure the target from its current transform BEFORE teleporting (the
-    -- world bbox is stale right after setPositionRotation), then place once.
-    local pos = front_anchored_target(veh, pose)
+    -- world bbox is stale right after setPositionRotation), then place once. `target` lets a caller that
+    -- already measured -- restage_at_grid, which needs the number to decide whether to move at all --
+    -- reuse its reading instead of measuring the same untouched car twice.
+    local pos = target or front_anchored_target(veh, pose)
     veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
 end
 
@@ -571,6 +573,102 @@ function M.place_at_grid(veh, pose)
         return nil, "place_at_grid failed: " .. tostring(err)
     end
     return true
+end
+
+-- Deviation (metres, horizontal) below which the deferred restage leaves a car alone. The whole point of
+-- front-anchoring the spawn is that the restage becomes a no-op; teleporting a car that already stands
+-- within 5 cm of its slot would put the visible twitch back for a correction nobody can see.
+--
+-- HORIZONTAL on purpose. The grid pose sits placement.GROUND_CLEARANCE above the surface and the car
+-- settles onto its suspension during the up-to-3 s restage wait, so its Z legitimately drifts a few
+-- centimetres away from the rest-pose target. Comparing in 3D would read that settling as an error and
+-- lift every car back up -- exactly the shuffle being removed here. A genuine Z prediction error surfaces
+-- through the prediction check below instead, and any car that does get placed is re-anchored in Z anyway.
+local RESTAGE_TOLERANCE = 0.05
+
+-- Gap (metres) between the metadata prediction and the live measurement past which the restage says so.
+-- This is the in-game verification of the box's axis convention: the prediction is what the spawn aimed
+-- at, the measurement is the truth once the jbeam has loaded. Silent when they agree -- a quiet log is a
+-- scarce resource in this project.
+local PREDICTION_TOLERANCE = 0.10
+
+-- Horizontal distance (metres) from where `veh` stands to `target`, or nil when the position is
+-- unreadable -- which makes the caller place unconditionally rather than guess.
+local function horizontal_gap(veh, target)
+    local ok, pos = pcall(function() return veh:getPosition() end)
+    if not ok or not pos then
+        return nil
+    end
+    local dx, dy = pos.x - target.x, pos.y - target.y
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Put the metadata prediction (what the spawn aimed at) next to the live measurement (the truth, now that
+-- the jbeam has loaded) and log ONLY when they disagree by more than PREDICTION_TOLERANCE. This is the
+-- self-check for the box's axis convention: it can only be confirmed in a real race, and a wrong sign
+-- would show here as a car-length-sized gap naming the exact model and config. No log when they match.
+local function report_prediction_gap(veh, pose, measured)
+    local model, config = model_config_of(veh)
+    local predicted = model and metadata_anchored_target(pose, model, config) or nil
+    if not predicted then
+        return
+    end
+    local dx, dy, dz = predicted.x - measured.x, predicted.y - measured.y, predicted.z - measured.z
+    local gap = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if gap <= PREDICTION_TOLERANCE then
+        return
+    end
+    log("W", LOG_TAG, string.format(
+        "bbox prediction off by %.2f m for '%s%s': predicted (%.2f, %.2f, %.2f), "
+        .. "measured (%.2f, %.2f, %.2f)",
+        gap, tostring(model), config and (":" .. config) or "",
+        predicted.x, predicted.y, predicted.z, measured.x, measured.y, measured.z))
+end
+
+-- (public) The deferred restage's placement: work out where the car really belongs now that its jbeam has
+-- loaded, and teleport it only when it is actually off that spot.
+--
+-- Before the spawn was front-anchored this was an unconditional re-place, and the half-car-length
+-- correction it applied is the shuffle players saw a second or two after every race start. The spawn now
+-- aims at the same point, so for a correctly predicted car this resolves to "nothing to do", while a car
+-- the prediction missed -- a body kit, an unknown config, a staging swap into a differently sized car --
+-- is still corrected exactly as before. Everything else the restage guarantees is untouched; only the
+-- setPositionRotation became conditional.
+--
+-- Returns `moved` (true = teleported, false = already in place) plus the measured horizontal deviation in
+-- metres, or nil plus a reason. A nil deviation alongside a true `moved` means the car's position could
+-- not be read and it was placed unconditionally.
+function M.restage_at_grid(veh, pose)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" then
+        return nil, "invalid grid pose"
+    end
+
+    -- Measure here rather than inside repair_and_place: the target is needed to DECIDE, and the placement
+    -- then reuses it -- the car cannot move between the two.
+    local ok_target, target = pcall(front_anchored_target, veh, pose)
+    if not ok_target or not target then
+        -- No usable target: fall back to the unconditional re-place, i.e. exactly what this replaced.
+        local placed, err = M.place_at_grid(veh, pose)
+        if not placed then
+            return nil, err
+        end
+        return true, nil
+    end
+
+    report_prediction_gap(veh, pose, target)
+
+    local delta = horizontal_gap(veh, target)
+    if delta and delta <= RESTAGE_TOLERANCE then
+        return false, delta
+    end
+    local ok, err = pcall(repair_and_place, veh, pose, target)
+    if not ok then
+        return nil, "restage_at_grid failed: " .. tostring(err)
+    end
+    return true, delta
 end
 
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
