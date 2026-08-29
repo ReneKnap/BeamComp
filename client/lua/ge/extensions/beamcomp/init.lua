@@ -620,6 +620,10 @@ local function handle_race_start(payload)
     -- spawn-time licenseText and the jbeam regenerates it -- so we re-apply this plate on the deferred
     -- restage once the new car's jbeam has loaded (vehicles.apply_plate in restage_swapped_car).
     local own_plate = vehicles.read_plate(own_car)
+    -- Open the bounding-box tally for this race: every car this client puts on the grid below (own car
+    -- plus, on the host, the AI field) counts whether its footprint could be read from metadata before
+    -- the spawn. Closed by log_bbox_report at the end of this handler with a single verdict line.
+    vehicles.begin_bbox_report()
     local race_car, respawn_err, degraded = vehicles.respawn_own_at(race.myPose, own_car, policy)
     if degraded then
         -- No-suitable-car fallback (ADR-0032 §5 superseded): the resolver spawned the fixed default car
@@ -773,6 +777,12 @@ local function handle_race_start(payload)
     if M.state.race_car_id then
         arm_dashboard_refresh()
     end
+
+    -- Every grid spawn of this race is done: one line saying whether the pre-spawn bounding-box lookup
+    -- carried. This is the in-game proof that BeamMP passes core_vehicles' config metadata through; a
+    -- "0 of N cars resolved (metadata unavailable)" means the cars fell back to the old centre-anchored
+    -- spawn plus restage, and that a second box source is needed.
+    vehicles.log_bbox_report()
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving

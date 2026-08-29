@@ -313,6 +313,71 @@ local function front_anchored_target(veh, pose)
     return base
 end
 
+-- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
+-- bounding-box bottom sits on the pose Z -- the same anchor front_anchored_target computes, but derived
+-- from the config's METADATA box (vehiclespecs.config_anchor) instead of a live getSpawnWorldOOBB read.
+-- That makes it usable BEFORE the car exists (the spawn pre-position) and as the stand-in when the live
+-- read fails.
+--
+-- config_anchor has already resolved the vehicle-local axes into forward/lateral/bottom; here those three
+-- numbers are re-projected onto the TARGET pose's forward/right exactly as front_anchored_target
+-- re-projects its measured ones, so both paths aim at the same point and can be compared.
+--
+-- Returns nil -- never a guess -- when the pose carries no forward axis, no box is known, or the
+-- arithmetic degenerates; the caller then keeps today's centre-anchored behaviour.
+local function metadata_anchored_target(pose, model, config)
+    if type(pose) ~= "table" or type(pose.pos) ~= "table" or not pose.forward then
+        return nil
+    end
+    local anchor = vehiclespecs.config_anchor(model, config)
+    if not anchor then
+        return nil
+    end
+    local ok, target = pcall(function()
+        local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
+        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
+        target_fwd:normalize()
+        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
+        local horizontal = base - (target_fwd * anchor.forward + target_right * anchor.lateral)
+        return vec3(horizontal.x, horizontal.y, horizontal.z - anchor.bottom)
+    end)
+    -- A degenerate forward axis normalizes to NaN instead of raising, and a NaN spawn position would lose
+    -- the car entirely -- so validate the value, not just the pcall.
+    if not ok or not target or target.x ~= target.x or target.y ~= target.y or target.z ~= target.z then
+        return nil
+    end
+    return target
+end
+
+-- Race-scoped tally of the pre-spawn bounding-box lookup: how many of the cars this client puts on the
+-- grid could be front-anchored from metadata. Module-scope and reset per race start, mirroring the
+-- one-shot flags in vehiclespecs.lua; a Lua reload just restarts the count.
+--
+-- It exists for the ONE question that cannot be answered headless: does BeamMP -- which replaces parts of
+-- the spawn/vehicle stack -- still hand core_vehicles' config metadata through? The single line
+-- log_bbox_report writes after a race start is the answer, and the trigger for adding a second source
+-- behind vehiclespecs.config_bbox if it reads zero.
+local bbox_report = {attempted = 0, resolved = 0}
+
+-- (public) Start a fresh bounding-box tally, before the first grid spawn of a race.
+function M.begin_bbox_report()
+    bbox_report.attempted = 0
+    bbox_report.resolved = 0
+end
+
+-- (public) Write the one-line verdict on the tally and reset it. Silent when this client spawned no car
+-- onto the grid at all (a kept own car and no AI) -- there was nothing to pre-position, so there is
+-- nothing to report.
+function M.log_bbox_report()
+    local attempted, resolved = bbox_report.attempted, bbox_report.resolved
+    M.begin_bbox_report()
+    if attempted == 0 then
+        return
+    end
+    log("I", LOG_TAG, string.format("bbox lookup: %d of %d cars resolved%s", resolved, attempted,
+        resolved == 0 and " (metadata unavailable)" or ""))
+end
+
 -- Spawn one vehicle at a grid pose (plain {pos, rot, forward?} tables). Uses the captured spec when
 -- present, else the engine's default model. Returns the new vehicle, or nil plus a reason.
 local function spawn_vehicle_at(pose, spec)
@@ -328,8 +393,19 @@ local function spawn_vehicle_at(pose, spec)
     -- spawn.setVehicleObject applies a built-in 180-degree Z flip (rot = quat(0,0,1,0) * rot), so we
     -- pass pose_orientation straight through -- the internal flip then turns a forward-derived
     -- quatFromDir into a car facing down the grid, matching repair_and_place's explicit flip.
+    -- Front-anchor the spawn ITSELF from the config's metadata box. A fresh car cannot be measured (its
+    -- jbeam is still loading), so the grid pose used to be applied centre-anchored and the deferred
+    -- restage shoved the car forward by half its length up to 3 s later -- the visible twitch this
+    -- replaces. With the box that correction is known up front and the car lands right the first time.
+    -- No box (unknown config, unreadable field, metadata not reaching us under BeamMP) -> the raw pose,
+    -- byte-for-byte the previous behaviour; the restage still corrects it.
+    local anchored = metadata_anchored_target(pose, model, spec and spec.config)
+    bbox_report.attempted = bbox_report.attempted + 1
+    if anchored then
+        bbox_report.resolved = bbox_report.resolved + 1
+    end
     local opt = {
-        pos = vec3(pose.pos.x, pose.pos.y, pose.pos.z),
+        pos = anchored or vec3(pose.pos.x, pose.pos.y, pose.pos.z),
         rot = pose_orientation(pose),
     }
     if spec then
