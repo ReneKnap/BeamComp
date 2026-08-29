@@ -23,6 +23,9 @@ local LOG_TAG = "beamcomp.race"
 -- Upper bound on circuit laps, so a typo'd /race lap count can't build a runaway traversal plan.
 local MAX_LAPS = 1000
 
+-- Metres within which two grid poses count as the same place (M.pose_matches).
+local POSE_MATCH_TOLERANCE = 1e-3
+
 -- The start grid's default 15 m setback behind the line (it clears CP0's volume so a circuit's lap-1
 -- clock starts on a real line crossing, ADR-0022) now lives in race/grid as the default offsetForward.
 -- A race with a server-stored custom grid relays its own params in raceStart.gridParams (ADR-0023);
@@ -162,6 +165,69 @@ local function grid_params_for(grid_params, direction)
         return grid_params.reverse
     end
     return grid_params.forward
+end
+
+-- (public) How many grid poses a roster needs: one past its HIGHEST slot, not one per entry.
+--
+-- The server may leave slots empty behind an oversized car (ADR-0051), so the slot map is sparse and
+-- the layout has to be long enough to cover its holes. Nothing is ever reserved behind the LAST
+-- participant, so the highest slot is the exact extent -- no count has to ride the wire. `my_slot` is
+-- folded in so a short/inconsistent roster still covers our own slot (the guard that used to sit on
+-- #roster). A contiguous roster yields exactly #roster, i.e. today's layout bit-for-bit.
+function M.layout_extent(roster, my_slot)
+    local highest = tonumber(my_slot) or 0
+    if type(roster) == "table" then
+        for _, entry in ipairs(roster) do
+            local slot = type(entry) == "table" and tonumber(entry.slot) or nil
+            if slot and slot > highest then
+                highest = slot
+            end
+        end
+    end
+    return math.floor(highest) + 1
+end
+
+-- (public) Whether two grid poses put a car in the same place. Compared by VALUE, not by identity: a
+-- re-layout (M.layout_for) builds fresh pose tables even where the numbers did not move, and a re-grid
+-- that only moved other cars must not teleport a car that is already standing right. The tolerance is
+-- far below anything a real re-grid shifts and far above the float noise of a recomputation.
+function M.pose_matches(one, two)
+    if type(one) ~= "table" or type(two) ~= "table"
+        or type(one.pos) ~= "table" or type(two.pos) ~= "table" then
+        return false
+    end
+    return math.abs(one.pos.x - two.pos.x) < POSE_MATCH_TOLERANCE
+        and math.abs(one.pos.y - two.pos.y) < POSE_MATCH_TOLERANCE
+        and math.abs(one.pos.z - two.pos.z) < POSE_MATCH_TOLERANCE
+end
+
+-- (public) Lay the field out on a captured grid layout and return (poses, ramp_pose).
+--
+-- `layout` is the frozen input set M.prepare captured for this race -- base pose, gate normal, the
+-- ordered segment list, and whether a staged-quali start ramp is split off the front. It holds
+-- everything grid.poses_segmented needs and nothing that changes when the field is re-gridded, so a
+-- re-grid onto a LONGER layout (ADR-0051) can lay the field out again without re-resolving the race.
+-- Recomputing rather than extending is required, not just convenient: a rows-pinned grid derives its
+-- column count from the number of poses laid out (race/grid.lua), so every pose can move.
+function M.layout_for(layout, count)
+    if type(layout) ~= "table" or type(count) ~= "number" or count < 1 then
+        return nil, nil
+    end
+    -- Rally staged sprint quali (ADR-0044/Round4): P1 is a dedicated, initially-EMPTY start ramp. Lay
+    -- out ONE extra pose and split the front one off as the ramp; the field holds on the rest (grid
+    -- positions 2..N+1), so P1 is never occupied at the start. The active driver is teleported onto the
+    -- ramp for their run and returns to their own holding slot after. The returned holding list is
+    -- re-indexed (slot k -> poses[k+1]), so spawn / AI / regrid keep their usual mapping.
+    local poses = placement.ground_all(grid.poses_segmented(layout.pos, layout.rot,
+        layout.ramp and (count + 1) or count, layout.segments, layout.gateNormal))
+    if not layout.ramp then
+        return poses, nil
+    end
+    local holding = {}
+    for index = 2, #poses do
+        holding[#holding + 1] = poses[index]
+    end
+    return holding, poses[1]
 end
 
 -- The AI race line for `direction` (ADR-0036): the parser's forward route as-is, or a plain order
@@ -457,11 +523,6 @@ function M.prepare(payload)
 
     local roster = payload.grid or {}
     local my_slot = payload.slot or 0
-    -- Cover my own slot even if the roster is shorter than expected (server inconsistency).
-    local count = #roster
-    if my_slot + 1 > count then
-        count = my_slot + 1
-    end
 
     local mode, laps = resolve_mode(race, payload)
 
@@ -489,25 +550,21 @@ function M.prepare(payload)
     -- expanded into its ordered segment list (ADR-0023 amendment) and laid out via poses_segmented, so
     -- the spawned field matches the editor's stacked preview exactly; a plain single-param block (or nil)
     -- expands to one segment and reproduces today's layout bit-for-bit.
-    -- Rally staged sprint quali (ADR-0044/Round4): P1 is a dedicated, initially-EMPTY start ramp. Lay out
-    -- ONE extra grid pose and split the front one off as the ramp; the field spawns + holds on the remaining
-    -- poses (grid positions 2..N+1), so P1 is never occupied at the start. The active driver is teleported
-    -- onto the ramp (rampPose) for their run and returns to their own holding slot after. gridPoses stays the
-    -- holding poses re-indexed (slot k -> gridPoses[k+1]), so spawn / AI / regrid keep their usual mapping.
-    local staged_quali = (mode == "sprint") and (type(payload.quali) == "table")
-    local layout_count = staged_quali and (count + 1) or count
-    local poses = placement.ground_all(grid.poses_segmented(base_pose.pos, base_pose.rot, layout_count,
-        grid.block_to_segments(grid_params), gate_normal))
-    local ramp_pose = nil
-    if staged_quali then
-        ramp_pose = poses[1]
-        local holding = {}
-        for i = 2, #poses do
-            holding[#holding + 1] = poses[i]
-        end
-        poses = holding
-    end
-    local my_pose = poses[my_slot + 1]
+    -- The layout inputs are kept on the race state so a re-grid can lay the field out again: the server
+    -- may hand out SPARSE slots to keep the space behind an oversized car free (ADR-0051), and which
+    -- slots those are can change with the start order (order=pwr, quali) or with a staging car swap.
+    local grid_layout = {
+        pos = base_pose.pos,
+        rot = base_pose.rot,
+        gateNormal = gate_normal,
+        segments = grid.block_to_segments(grid_params),
+        -- Rally staged sprint quali (ADR-0044/Round4): split a dedicated, initially-EMPTY P1 start ramp
+        -- off the front of the layout.
+        ramp = ((mode == "sprint") and (type(payload.quali) == "table")) or nil,
+    }
+    local layout_count = M.layout_extent(roster, my_slot)
+    local poses, ramp_pose = M.layout_for(grid_layout, layout_count)
+    local my_pose = poses and poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
     end
@@ -515,12 +572,18 @@ function M.prepare(payload)
     local plan = checkpoints.plan(race_checkpoints, mode, laps)
 
     log("I", LOG_TAG, string.format(
-        "race '%s' ready: slot %d of %d, mode=%s laps=%d dir=%s (%d crossings) at (%.1f, %.1f, %.1f)",
-        race.meta.name, my_slot, count, mode, laps, direction, plan.count,
+        "race '%s' ready: slot %d of %d (%d grid poses), mode=%s laps=%d dir=%s (%d crossings) "
+        .. "at (%.1f, %.1f, %.1f)",
+        race.meta.name, my_slot, #roster, layout_count, mode, laps, direction, plan.count,
         my_pose.pos.x, my_pose.pos.y, my_pose.pos.z))
 
     return {
         name = race.meta.name,
+        -- The race name the server relayed, kept verbatim. Every message the server race-guards has to
+        -- echo THIS, not the resolved meta name -- they differ whenever /race was given a shorthand. The
+        -- handlers that answer a raceStart still echo payload.race directly; this is for the later
+        -- reports that no longer have the payload in hand (a staging swap re-reporting its car).
+        serverName = payload.race,
         -- The discovered track name (slug / quickrace file), for the analysis overlay's Track header. The
         -- parsed race path's own name is often the generic "Path", so prefer this human-facing label.
         displayName = locator.displayName,
@@ -528,6 +591,10 @@ function M.prepare(payload)
         mySlot = my_slot,
         myPose = my_pose,
         gridPoses = poses,
+        -- The frozen layout inputs + how many poses they were laid out for (ADR-0051), so a re-grid onto a
+        -- sparser/longer slot map can re-run M.layout_for without re-resolving the race.
+        gridLayout = grid_layout,
+        layoutCount = layout_count,
         -- Rally staged sprint quali (ADR-0044/Round4): the dedicated P1 start ramp, split off the front of the
         -- grid so P1 stays empty at the start. The active driver is teleported here for their run; nil for a
         -- normal race / circuit quali (no separate ramp).
