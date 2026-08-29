@@ -379,21 +379,36 @@ grid_store.MSG_PRESET_LIST_REQ = "presetListReq"  -- panel lists a map's saved p
 grid_store.MSG_PRESET_DATA = "presetData"         -- reply to presetFetch: a preset's form blob (server -> client)
 grid_store.MSG_PRESET_LIST = "presetList"         -- reply to presetListReq: the map's saved preset names (server -> client)
 
--- Persistent best-times records (ADR-0027). A separate data file from the settings config (ADR-0016):
--- records[race_name] = {track_best = {...}, players = {[identity] = {...}}}. The server stores only
--- numbers + opaque client-reported strings keyed on the relayed race name, so race-blindness (ADR-0005)
--- holds. Candidate paths tolerate the unverified working directory exactly like config + grids; writes
--- go back to the loaded path, else the first candidate that opens. deploy.ps1 preserves this file
--- across the server-folder wipe (like beamcomp.grids.json) so accumulated times survive a redeploy.
-local RECORDS_CANDIDATE_PATHS = {
-    "Resources/Server/BeamComp/beamcomp.records.json",
-    "beamcomp.records.json",
+-- Persistent per-run records (ADR-0050, superseding ADR-0027 §1/§2). The truth on disk is an
+-- APPEND-ONLY run log: one JSON object per line, one line per run, written with io.open(path, "a").
+-- The best-times aggregate the push contract reads (ADR-0028/0029/0030) is NOT stored -- it is derived
+-- in RAM by replaying the log once per Lua state, so there is one truth and it cannot drift.
+--
+-- All of it hangs off this single namespace table rather than a local per field/function: main.lua's
+-- main chunk sits at Lua's 200-local ceiling (see grid_store / champ / f1), and a table costs one local
+-- no matter how much it carries. Retiring beamcomp.records.json frees seven slots on top of that.
+--
+-- The server stores only numbers + opaque client-reported strings keyed on the relayed race name, so
+-- race-blindness (ADR-0005) holds. Candidate paths tolerate the unverified working directory exactly
+-- like config + grids; deploy.ps1 preserves the log across the server-folder wipe (like
+-- beamcomp.grids.json) so accumulated runs survive a redeploy.
+--
+-- Functions are assigned in three later blocks, each after the locals it closes over (path/append near
+-- the other file I/O, fold/replay after update_track_best, capture after build_standings). A table field
+-- needs no forward declaration and every cross-call is a runtime lookup, so the order is free.
+local runlog = {
+    CANDIDATE_PATHS = {
+        "Resources/Server/BeamComp/beamcomp.runs.jsonl",
+        "beamcomp.runs.jsonl",
+    },
+    RECORD_VERSION = 1,   -- schema tag on every written line, so a later format change stays readable
+    path = nil,           -- resolved log path, set on first use
+    loaded = false,       -- whether store has been replayed from the log in this Lua state
+    -- The derived aggregate: store[race_name] = {track_best = {...}, players = {[identity] = {...}}},
+    -- shape unchanged from ADR-0029/0030. Empty until replayed; never written to disk.
+    store = {},
+    event_seq = 0,        -- monotonic counter behind the per-race-instance event id
 }
-
--- records[race_name] = {...}; see capture_records. Empty until loaded from disk.
-local records_store = {}
-local records_file_path = nil
-local records_loaded = false
 
 
 local function log_info(subsystem, msg)
@@ -1001,102 +1016,86 @@ function grid_store.write_presets()
     return false
 end
 
--- Read and JSON-decode the records file from the first candidate path that opens (ADR-0027). Returns
--- the decoded table + resolved path, or nil + path + error label ("parse"/"missing"). pcall-guarded so
--- a malformed file never crashes the plugin load -- mirrors read_config/read_grids.
-local function read_records()
-    for _, path in ipairs(RECORDS_CANDIDATE_PATHS) do
+-- Resolve the run log's path once (ADR-0050): an existing file at the first candidate that opens for
+-- reading wins, so a redeployed server keeps writing where its history already is; otherwise the first
+-- candidate that can be created wins. Mirrors the config/grids candidate-path strategy (ADR-0016), which
+-- tolerates the unverified runtime working directory. Returns the path, or nil when none is writable.
+function runlog.resolve_path()
+    if runlog.path then
+        return runlog.path
+    end
+    for _, path in ipairs(runlog.CANDIDATE_PATHS) do
         local file = io.open(path, "r")
         if file then
-            local contents = file:read("*a")
             file:close()
-            local ok, decoded = pcall(Util.JsonDecode, contents)
-            if not ok or type(decoded) ~= "table" then
-                return nil, path, "parse"
-            end
-            return decoded, path, nil
+            runlog.path = path
+            return path
         end
     end
-    return nil, nil, "missing"
-end
-
--- Populate records_store from the records file (ADR-0027). A missing or unparseable file leaves the
--- store empty -- the first finish then seeds it. The resolved path is logged so the write target is
--- visible in the server console (recon TODO #4). Called lazily via ensure_records_loaded.
-local function load_records()
-    records_store = {}
-
-    local data, path, err = read_records()
-    records_file_path = path
-    if not data then
-        if err == "parse" then
-            log_info("beamcomp.records", "records file at " .. tostring(path)
-                .. " is not valid JSON; starting empty")
-        else
-            log_info("beamcomp.records", "no records file found; starting empty")
+    for _, path in ipairs(runlog.CANDIDATE_PATHS) do
+        local file = io.open(path, "a")
+        if file then
+            file:close()
+            runlog.path = path
+            return path
         end
-        return
     end
-
-    records_store = data
-    log_info("beamcomp.records", "loaded records from " .. path)
+    return nil
 end
 
--- Populate records_store once per Lua-state instance, lazily on first access -- robust to a file-watch
--- reload that resets the in-memory store without re-firing onInit, exactly like ensure_grids_loaded.
-local function ensure_records_loaded()
-    if records_loaded then
-        return
+-- Append runs to the log as one JSON object per line (ADR-0050). The whole race goes out in a single
+-- open/write/close -- no rewrite, so cost is independent of how much history has accumulated. Encoding
+-- and file I/O are pcall-guarded: a failure is logged and the run is lost, never thrown into the BeamMP
+-- runtime. Every line is newline-terminated, so a crash mid-write can only damage the last line, which
+-- readers skip. Returns true when the block reached disk.
+function runlog.append(runs)
+    if #runs == 0 then
+        return true
     end
-    records_loaded = true
-    load_records()
-end
-
--- Serialize records_store and write it back, trying the loaded path first then the candidates
--- (ADR-0027). Returns true + path on success, false otherwise. pcall-guarded around the encode + file
--- I/O so a write failure is reported, never thrown into the BeamMP runtime -- mirrors write_grids.
-local function write_records()
-    local ok, encoded = pcall(Util.JsonEncode, records_store)
-    if not ok then
-        log_info("beamcomp.records", "could not encode records: " .. tostring(encoded))
+    local path = runlog.resolve_path()
+    if not path then
+        log_info("beamcomp.records", "could not open any run log path for appending")
         return false
     end
 
-    local candidates = {}
-    if records_file_path then
-        candidates[#candidates + 1] = records_file_path
-    end
-    for _, path in ipairs(RECORDS_CANDIDATE_PATHS) do
-        candidates[#candidates + 1] = path
-    end
-
-    for _, path in ipairs(candidates) do
-        -- Atomic write: fill a temp file in the same directory, then swap it into place. A crash mid-
-        -- write leaves the live file untouched (unlike truncate-then-write). os.rename can't overwrite
-        -- an existing target on Windows, so drop it first -- that gap writes no data, and the complete
-        -- temp survives a crash there for recovery.
-        local tmp = path .. ".tmp"
-        local file = io.open(tmp, "w")
-        if file then
-            local ok_write = file:write(encoded)
-            local ok_close = file:close()
-            if ok_write and ok_close then
-                -- Swap only once the full content is safely on disk. On a partial write (e.g. disk
-                -- full) the live file is left untouched -- the very data loss this fix prevents.
-                os.remove(path)
-                if os.rename(tmp, path) then
-                    records_file_path = path
-                    return true, path
-                end
-                log_info("beamcomp.records", "could not commit records write at " .. path)
-            else
-                log_info("beamcomp.records", "could not write records temp at " .. path)
-            end
-            os.remove(tmp)
+    local encoded = {}
+    for _, run in ipairs(runs) do
+        local ok, line = pcall(Util.JsonEncode, run)
+        if ok then
+            encoded[#encoded + 1] = line
+        else
+            log_info("beamcomp.records", "could not encode run: " .. tostring(line))
         end
     end
-    log_info("beamcomp.records", "could not open any records path for writing")
-    return false
+    if #encoded == 0 then
+        return false
+    end
+
+    local file = io.open(path, "a")
+    if not file then
+        log_info("beamcomp.records", "could not open run log at " .. path .. " for appending")
+        return false
+    end
+    local ok_write = file:write(table.concat(encoded, "\n"), "\n")
+    local ok_close = file:close()
+    if not ok_write or not ok_close then
+        log_info("beamcomp.records", "could not append " .. #encoded .. " run(s) to " .. path)
+        return false
+    end
+    log_info("beamcomp.records", string.format("appended %d run(s) to %s", #encoded, path))
+    return true
+end
+
+-- Derive the aggregate once per Lua-state instance, lazily on first access -- robust to a file-watch
+-- reload that resets the in-memory store without re-firing onInit, exactly like ensure_grids_loaded.
+-- runlog.replay is assigned further down (after the fold helpers it needs); by the time anything calls
+-- this, the chunk has fully executed.
+function runlog.ensure()
+    if runlog.loaded then
+        return
+    end
+    runlog.loaded = true
+    runlog.replay()
 end
 
 local function now()
@@ -1127,8 +1126,8 @@ local net = {peak = {}}
 -- every ~1 Hz standings broadcast to ~150 KB, freezing the host. Accept only a short (<= 64 char),
 -- single-line string with no serialized-table markers ("{" / "partsTree"); anything else -> nil, so the car
 -- buckets under model-only (vehicle_car_key). The 64 cap matches the client gate (race/vehicles.lua).
--- Defense-in-depth: the client already gates this at the source, but an old/malformed client -- or a legacy
--- records.json entry loaded into track.vehicle -- can still carry a blob. On `net` (not a top-level local):
+-- Defense-in-depth: the client already gates this at the source, but an old/malformed client -- or an old
+-- run-log line loaded into track.vehicle -- can still carry a blob. On `net` (not a top-level local):
 -- main.lua sits at LuaJIT's 200-local ceiling, and guarding what goes on the wire is a net concern.
 function net.safe_variant(variant)
     if type(variant) ~= "string" or variant == "" or #variant > 64 then
@@ -1688,7 +1687,7 @@ local function vehicle_car_key(vehicle)
         return nil
     end
     -- Only a short, non-serialized preset name is a valid variant (bug partconfig-blob-bloats-standings). A
-    -- malformed/old client or a legacy records.json entry can carry a full serialized partsTree here; gate it
+    -- malformed/old client or an old run-log line can carry a full serialized partsTree here; gate it
     -- so it can never key a record or ride a payload. Rejected -> model-only key (the inline-modified bucket).
     local variant = net.safe_variant(vehicle.variant)
     if variant then
@@ -4035,6 +4034,154 @@ local function update_track_best(track, car_key, is_circuit, primary, time, aggr
     return is_record
 end
 
+-- Fold one logged run into the derived aggregate (ADR-0050). THE single place a run becomes an
+-- aggregate: both the live capture at the finish seam and the startup replay go through here, so the
+-- running server and a restarted one cannot drift apart. Only finished runs count -- DNF and aborted
+-- runs are kept in the log for later analysis but never touch a best time (ADR-0027 §3, unchanged).
+-- The run's field names match a live session.progress record, so run_section_aggregate takes it
+-- verbatim and best_lap ~= nil is the circuit signal exactly as before (ADR-0030).
+-- Returns whether this run set a new personal best and/or a new track record.
+function runlog.fold(run)
+    if type(run) ~= "table" or type(run.race) ~= "string" or run.status ~= "finished" then
+        return false, false
+    end
+
+    local race = runlog.store[run.race]
+    if type(race) ~= "table" then
+        race = {players = {}, track_best = {}}
+        runlog.store[run.race] = race
+    end
+    if type(race.players) ~= "table" then
+        race.players = {}
+    end
+    if type(race.track_best) ~= "table" then
+        race.track_best = {}
+    end
+
+    local is_circuit = run.best_lap ~= nil
+    local primary = is_circuit and run.best_lap or run.total_time
+    local aggregate = run_section_aggregate(run)
+
+    local is_pb = update_player_record(race.players, run.identity, run.car_key, is_circuit, primary,
+        run.total_time, aggregate, run.vehicle, run.date)
+    local is_track_record = update_track_best(race.track_best, run.car_key, is_circuit, primary,
+        run.total_time, aggregate, run.identity, run.vehicle, run.date)
+    return is_pb, is_track_record
+end
+
+-- Rebuild the aggregate from the run log (ADR-0050), once per Lua state via runlog.ensure. The log is
+-- append-only and therefore already in chronological order, so replaying it top to bottom reproduces
+-- exactly the sequence of folds the live server performed -- including which run owns a record's date.
+-- Every line is decoded under pcall and type-checked: Util.JsonDecode answers a torn last line with
+-- (true, nil) rather than an error, so an ok status alone would not catch it. A missing log leaves the
+-- store empty and the first finish seeds it.
+function runlog.replay()
+    runlog.store = {}
+
+    local path = runlog.resolve_path()
+    if not path then
+        log_info("beamcomp.records", "no run log found; starting empty")
+        return
+    end
+
+    local file = io.open(path, "r")
+    if not file then
+        log_info("beamcomp.records", "could not open run log at " .. path .. "; starting empty")
+        return
+    end
+
+    local folded, skipped = 0, 0
+    for line in file:lines() do
+        -- Cheap completeness check before the decode: a whole run line is a JSON object, so it opens
+        -- with "{" and closes with "}". A torn final line fails here and is skipped silently -- handing
+        -- it to Util.JsonDecode would work too (it answers nil), but it also prints a [LUA ERROR] into
+        -- the server console on every start, which reads like a fault when it is just a truncated write.
+        if line:sub(1, 1) == "{" and line:sub(-1) == "}" then
+            local ok, run = pcall(Util.JsonDecode, line)
+            if ok and type(run) == "table" then
+                runlog.fold(run)
+                folded = folded + 1
+            else
+                skipped = skipped + 1
+            end
+        elseif line ~= "" then
+            skipped = skipped + 1
+        end
+    end
+    file:close()
+
+    log_info("beamcomp.records", string.format("replayed %d run(s) from %s%s", folded, path,
+        skipped > 0 and (" (" .. skipped .. " unreadable line(s) skipped)") or ""))
+end
+
+-- How one participant's run ended (ADR-0050). Every real player's run is logged whatever the outcome,
+-- so the history keeps DNFs and abandoned races too; only "finished" ever folds into a best time
+-- (runlog.fold), which is why leaderboards are unaffected by the wider logging.
+function runlog.run_status(record)
+    if record.finished and not record.dnf then
+        return "finished"
+    end
+    if record.dnf then
+        return "dnf"
+    end
+    return "aborted"
+end
+
+-- The log record for one participant's run (ADR-0050). The timing field names deliberately match a live
+-- session.progress record, so a decoded run feeds run_section_aggregate verbatim and best_lap ~= nil
+-- stays the circuit signal (ADR-0030). The vehicle is COPIED down to the four fields the aggregate and
+-- the push actually read, never referenced: the ingestion gate already dropped any serialized partConfig
+-- blob and this keeps it out of the log too (bug partconfig-blob-bloats-standings). car_key is stored as
+-- captured and reused on replay, so a later change to the key rule leaves old aggregates intact.
+function runlog.build_run(id, record, date, timestamp)
+    local info = (session.identities or {})[id]
+    local vehicle = info and info.vehicle or nil
+    return {
+        v = runlog.RECORD_VERSION,
+        ts = timestamp,
+        date = date,
+        race = session.race,
+        identity = resolve_identity(id) or record.name,
+        status = runlog.run_status(record),
+        car_key = vehicle_car_key(vehicle),
+        vehicle = vehicle and {
+            model = vehicle.model,
+            variant = net.safe_variant(vehicle.variant),
+            modified = vehicle.modified,
+            type = vehicle.type,
+        } or nil,
+        total_time = record.total_time,
+        best_lap = record.best_lap,
+        lap = record.lap,
+        count = record.count,
+        splits = record.splits,
+    }
+end
+
+-- Append every real player's run of the active race to the log (ADR-0050). AI slots are skipped -- they
+-- never hold records (ADR-0036/0027) and are not part of the driver history. Returns the {id, run} pairs
+-- that were written, so the caller can fold them and address the bestNotice back to the right player.
+function runlog.capture()
+    local logged = {}
+    if not session.race or not session.progress then
+        return logged
+    end
+
+    local runs = {}
+    local date = os.date("%Y-%m-%d")
+    local timestamp = os.time()
+    for id, record in pairs(session.progress) do
+        if not record.ai then
+            local run = runlog.build_run(id, record, date, timestamp)
+            runs[#runs + 1] = run
+            logged[#logged + 1] = {id = id, run = run}
+        end
+    end
+
+    runlog.append(runs)
+    return logged
+end
+
 -- Shallow copy of a 1-based numeric array, or nil. Used to snapshot a section-best array before capture
 -- mutates it in place (ADR-0030).
 local function copy_array(array)
@@ -4071,8 +4218,8 @@ local function snapshot_prerun_section_bests()
     if not session.race or not session.progress then
         return snapshot
     end
-    ensure_records_loaded()
-    local race = records_store[session.race]
+    runlog.ensure()
+    local race = runlog.store[session.race]
     local players = (type(race) == "table" and type(race.players) == "table") and race.players or {}
     local track_best = (type(race) == "table" and type(race.track_best) == "table")
         and race.track_best or nil
@@ -4162,7 +4309,7 @@ local function compute_driver_totals(identity, car_key)
     if not identity then
         return {anyCar = any_car, thisCar = this_car}
     end
-    for _, race_record in pairs(records_store) do
+    for _, race_record in pairs(runlog.store) do
         if type(race_record) == "table" then
             local player = type(race_record.players) == "table" and race_record.players[identity] or nil
             if type(player) == "table" then
@@ -4201,10 +4348,10 @@ local function send_race_records(prerun)
         return
     end
 
-    ensure_records_loaded()
+    runlog.ensure()
     prerun = prerun or {}
 
-    local race = records_store[session.race]
+    local race = runlog.store[session.race]
     local players = (type(race) == "table" and type(race.players) == "table") and race.players or {}
     local track_record = type(race) == "table" and race.track_best or nil
     local identities = session.identities or {}
@@ -4228,80 +4375,26 @@ local function send_race_records(prerun)
     end
 end
 
--- Capture every non-DNF finisher's best times into the persistent records at the racing -> finished
--- seam (ADR-0027). One pass over session.progress, one file write. Per finisher: pick the primary
--- metric (best lap for a circuit -- signalled by the non-nil best_lap the client reported -- else the
--- total time), derive per-CP segments from the cumulative splits, and update the player record and the
--- race's track record when improved. The server reads only numbers + the opaque client-reported
+-- Persist this race at the racing -> finished seam (ADR-0027 §3, storage per ADR-0050): append every
+-- real player's run to the log, then fold the finishers into the derived aggregate. runlog.capture logs
+-- finishers, DNFs and aborted drivers alike, while runlog.fold counts only the finishers -- so the
+-- history keeps everything and the leaderboards are exactly what they were. The old
+-- "no finisher -> return early" shortcut is gone: it existed only to skip a file load and a full
+-- rewrite, and there is no rewrite any more. The server reads only numbers + the opaque client-reported
 -- identity/vehicle, keyed on session.race, so race-blindness (ADR-0005) holds. Improved finishers get
--- a bestNotice. DNFs are not scored.
+-- a bestNotice.
 local function capture_records()
     if not session.race or not session.progress then
         return
     end
 
-    -- Nothing to record when no real player finished (all DNF / AI only): skip the load + write. AI never
-    -- hold records (ADR-0036/0027), so an AI finisher does not count here.
-    local has_finisher = false
-    for _, record in pairs(session.progress) do
-        if record.finished and not record.dnf and not record.ai then
-            has_finisher = true
-            break
+    runlog.ensure()
+
+    for _, entry in ipairs(runlog.capture()) do
+        local is_pb, is_track_record = runlog.fold(entry.run)
+        if (is_pb or is_track_record) and entry.run.identity then
+            send_event(entry.id, MSG_BEST_NOTICE, {pb = is_pb, trackRecord = is_track_record})
         end
-    end
-    if not has_finisher then
-        return
-    end
-
-    ensure_records_loaded()
-
-    local race = records_store[session.race]
-    if type(race) ~= "table" then
-        race = {players = {}, track_best = {}}
-        records_store[session.race] = race
-    end
-    if type(race.players) ~= "table" then
-        race.players = {}
-    end
-    if type(race.track_best) ~= "table" then
-        race.track_best = {}
-    end
-
-    local date = os.date("%Y-%m-%d")
-    local identities = session.identities or {}
-    local notify = {}
-
-    for id, record in pairs(session.progress) do
-        if record.finished and not record.dnf and not record.ai then
-            local info = identities[id]
-            local identity = resolve_identity(id) or record.name
-            local vehicle = info and info.vehicle or nil
-            local car_key = vehicle_car_key(vehicle)
-            local is_circuit = record.best_lap ~= nil
-            local primary = is_circuit and record.best_lap or record.total_time
-            local time = record.total_time
-            local aggregate = run_section_aggregate(record)
-
-            local is_pb = update_player_record(race.players, identity, car_key, is_circuit, primary,
-                time, aggregate, vehicle, date)
-            local is_track_record = update_track_best(race.track_best, car_key, is_circuit, primary,
-                time, aggregate, identity, vehicle, date)
-
-            if (is_pb or is_track_record) and identity then
-                notify[id] = {pb = is_pb, track_record = is_track_record}
-            end
-        end
-    end
-
-    local ok = write_records()
-    if not ok then
-        log_info("beamcomp.records", "capture: write failed; records kept in memory only")
-    else
-        log_info("beamcomp.records", "captured best times for race '" .. session.race .. "'")
-    end
-
-    for id, flags in pairs(notify) do
-        send_event(id, MSG_BEST_NOTICE, {pb = flags.pb, trackRecord = flags.track_record})
     end
 end
 
@@ -4978,8 +5071,8 @@ local function handle_client_info(player_id, payload)
     end
     local vehicle = type(payload.vehicle) == "table" and payload.vehicle or nil
     -- Gate the reported variant at ingestion (bug partconfig-blob-bloats-standings): a serialized partsTree
-    -- blob is dropped here, in place, before it is keyed, broadcast, or persisted -- entry.vehicle/track.vehicle
-    -- store this same table by reference, so this one gate covers records.json too.
+    -- blob is dropped here, in place, before it is keyed, broadcast, or persisted -- the run log copies the
+    -- vehicle from here, so this one gate covers the persisted history too.
     if vehicle then
         vehicle.variant = net.safe_variant(vehicle.variant)
     end
@@ -6366,7 +6459,7 @@ local function on_init()
     load_config()
     ensure_grids_loaded()
     grid_store.ensure_presets_loaded()
-    ensure_records_loaded()
+    runlog.ensure()
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
     -- fully up; the tick is a no-op while the session sits in lobby.
     MP.CreateEventTimer(TICK_EVENT, TICK_INTERVAL_MS, MP.CallStrategy.BestEffort)
