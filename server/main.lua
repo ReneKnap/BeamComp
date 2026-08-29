@@ -1577,15 +1577,12 @@ grid_fit.DEFAULT_COL_GAP = 4.0
 grid_fit.AXIS_CAPACITY = 8
 
 -- Safety rails.
---   MAX_RESERVED_ROWS -- a 12.6 m bus on a hand-authored 0.5 m row gap would otherwise reserve 25 slots
---     and blow the field apart. Cap it and let the (already unusable) grid stay tight.
 --   MAX_PASSES -- the allocation is a fixpoint: a ROWS-pinned segment derives its column count from how
 --     many poses are laid out (race/grid.lua), which is what the allocation itself decides. It settles on
 --     the first comparison for the columns-pinned default; give the rows-pinned case a few tries and then
 --     give up rather than guess, because server and client must agree on the column count exactly.
---   MAX_SCAN_PER_CAR -- hard bound on the search for a free slot, so a logic slip can never spin the
---     BeamMP server's single Lua thread.
-grid_fit.MAX_RESERVED_ROWS = 4
+--   MAX_SCAN_PER_CAR -- hard bound on the search for a free slot, so a degenerate grid (or a logic slip)
+--     can never spin the BeamMP server's single Lua thread.
 grid_fit.MAX_PASSES = 6
 grid_fit.MAX_SCAN_PER_CAR = 64
 
@@ -1674,75 +1671,88 @@ function grid_fit.gap(value, fallback)
     return value
 end
 
--- The 0-based column of a layout index inside its segment.
-function grid_fit.column_of(geometry, index)
-    return (index - geometry.start) % geometry.columns
+-- Where a layout index sits inside its segment, in metres: `setback` back along the travel axis and
+-- `lateral` across it. Mirrors race/grid.lua's slot_setback and column spread, minus every term that is
+-- identical for all slots of one segment (offsetForward / offsetLateral / mirror / headingDeg) -- those
+-- cancel when two slots of the same segment are compared.
+--
+-- The columns are STAGGERED: the next slot is only row_gap/columns further back, and only the slot
+-- `columns` later sits a full row_gap behind. That is why the fit compares actual rectangles instead of
+-- testing a length against row_gap -- the nearest car in the travel direction is normally the diagonal
+-- one, not the one in the same column.
+function grid_fit.slot_offsets(geometry, index)
+    local local_index = index - geometry.start
+    local column = local_index % geometry.columns
+    local row = math.floor(local_index / geometry.columns)
+    return row * geometry.row_gap + column * (geometry.row_gap / geometry.columns),
+        column * geometry.col_gap
 end
 
--- Mark the slots a car at `index` covers as taken. Longitudinally that is `index + columns`,
--- `index + 2*columns`, ... -- the same COLUMN STRAND, never index + 1, because the car directly behind
--- one in a staggered grid is a full row_gap back. Laterally it is the neighbours to the right within the
--- same row. A car that is both over-long and over-wide covers the rectangle they span.
--- Front-anchoring makes the longitudinal half exact and purely backward-directed: a long car never
--- reaches the car AHEAD of it.
-function grid_fit.reserve(reserved, geometry, index, length, width)
-    local extra_rows = 0
-    if length and geometry.row_gap > 0 and length + grid_fit.SAFETY_MARGIN > geometry.row_gap then
-        extra_rows = math.min(math.ceil((length + grid_fit.SAFETY_MARGIN) / geometry.row_gap) - 1,
-            grid_fit.MAX_RESERVED_ROWS)
-    end
-    local extra_columns = 0
-    if width and geometry.col_gap > 0 and width + grid_fit.SAFETY_MARGIN > geometry.col_gap then
-        -- Clamped to the row's right edge: a car in the last column spills off the side of the grid,
-        -- where index + 1 is the next ROW's first column and has nothing to do with it.
-        extra_columns = math.min(math.ceil((width + grid_fit.SAFETY_MARGIN) / geometry.col_gap) - 1,
-            geometry.columns - 1 - grid_fit.column_of(geometry, index))
-    end
-    for row = 0, extra_rows do
-        for column = 0, extra_columns do
-            if row > 0 or column > 0 then
-                reserved[index + row * geometry.columns + column] = true
-            end
-        end
-    end
-end
-
--- Whether a car of half-width `half` can stand at `index` without touching the nearest car already
--- placed to its LEFT in the same row. The right-hand side is covered by the reservation the wide car
--- writes itself; the left cannot be, because those slots were handed out earlier in the start order and
--- the order must not be re-sorted (ADR-0051 §7) -- so an over-wide car steps over the slot instead.
--- Laterally the car's box CENTRE lands on the pose (ADR-0034), so half-widths are exact.
-function grid_fit.room_beside(placed_half, geometry, index, half)
-    if not half or geometry.col_gap <= 0 then
+-- Whether two cars on the same segment keep the safety margin. Each car is a rectangle: its front on its
+-- pose with the body extending BACKWARD by its length (front-anchored, ADR-0034), centred laterally on
+-- the pose (the placement puts the box centre there). They are clear when at least one axis separates
+-- them by the margin -- which is exactly what "these two cannot touch" means.
+--
+-- This one rule replaces the per-axis proxies of round 1 (length vs row_gap, width vs col_gap). Each of
+-- those was right about the case it was named after and blind to the others: the staggered diagonal
+-- neighbour, a wide car beside an already-placed narrow one, and a long car reaching across a row
+-- boundary into the next column.
+function grid_fit.clears(one, two)
+    local lateral = math.abs(one.lateral - two.lateral) - (one.width + two.width) / 2
+    if lateral >= grid_fit.SAFETY_MARGIN then
         return true
     end
-    for step = 1, grid_fit.column_of(geometry, index) do
-        local neighbour = placed_half[index - step]
-        if neighbour then
-            return step * geometry.col_gap >= half + neighbour + grid_fit.SAFETY_MARGIN
-        end
-    end
-    return true
+    local longitudinal = math.max(one.setback - (two.setback + two.length),
+        two.setback - (one.setback + one.length))
+    return longitudinal >= grid_fit.SAFETY_MARGIN
 end
 
 -- One allocation pass over `ordered` (participant ids in START ORDER -- never re-sorted), assuming the
 -- client lays `total` poses out. `offset` shifts a participant slot onto its layout index: 1 for the
--- staged-quali start ramp the client splits off the front (ADR-0044), else 0. Returns the slot for each
--- ordered position plus the resulting participant-slot extent, or nil when the search ran away.
+-- staged-quali start ramp the client splits off the front (ADR-0044), else 0.
+--
+-- Each car takes the first slot at or after the previous one that clears every car already placed on the
+-- same segment. Slots that no longer clear are simply passed over and stay empty -- that IS the
+-- reservation, and it needs no separate bookkeeping. A car whose footprint is unknown takes the next slot
+-- and constrains nobody, the same way an unreported pwr just sorts to the back instead of failing.
+--
+-- Cars on DIFFERENT segments are never compared: a segment starts at its predecessor's continuation point
+-- with its own offsets and heading (race/grid.lua), which the server does not reproduce. Returns the slot
+-- per ordered position plus the resulting participant-slot extent, or nil when the search ran away.
 function grid_fit.assign_pass(ordered, sizes, segments, offset, total)
-    local reserved = {}
-    local placed_half = {}
+    local placed = {}
     local slots = {}
     local cursor = 0
     for position, id in ipairs(ordered) do
         local size = sizes[id]
-        local half = size and size.width / 2 or nil
-        local slot, geometry
+        local slot
         for candidate = cursor, cursor + grid_fit.MAX_SCAN_PER_CAR do
             local index = candidate + offset
-            local at = grid_fit.geometry(segments, index, total)
-            if not reserved[index] and grid_fit.room_beside(placed_half, at, index, half) then
-                slot, geometry = candidate, at
+            local geometry = grid_fit.geometry(segments, index, total)
+            -- No footprint, or a grid whose gaps cannot be reasoned about (a hand-edited 0): take the
+            -- slot as it comes, exactly as before this feature existed.
+            if not size or geometry.row_gap <= 0 or geometry.col_gap <= 0 then
+                slot = candidate
+                break
+            end
+            local setback, lateral = grid_fit.slot_offsets(geometry, index)
+            local box = {
+                setback = setback,
+                lateral = lateral,
+                length = size.length,
+                width = size.width,
+                segment = geometry.start,
+            }
+            local free = true
+            for _, other in ipairs(placed) do
+                if other.segment == box.segment and not grid_fit.clears(box, other) then
+                    free = false
+                    break
+                end
+            end
+            if free then
+                slot = candidate
+                placed[#placed + 1] = box
                 break
             end
         end
@@ -1750,10 +1760,6 @@ function grid_fit.assign_pass(ordered, sizes, segments, offset, total)
             return nil
         end
         slots[position] = slot
-        if size then
-            placed_half[slot + offset] = half
-            grid_fit.reserve(reserved, geometry, slot + offset, size.length, size.width)
-        end
         cursor = slot + 1
     end
     return slots, cursor
@@ -1808,6 +1814,136 @@ function grid_fit.assign(ordered)
     end
     log_info("beamcomp.grid", "slot reservation did not settle on a grid size; using a plain grid")
     return nil
+end
+
+-- ===== footprints known BEFORE the slots are handed out (ADR-0051 round 2) ================
+-- Round 1 reported every footprint from inside the race-start handler -- which runs AFTER the server has
+-- assigned slots and sent raceStart, so the first grid a player ever saw was necessarily the unreserved
+-- one and the reservation could only ever be a correction. These two sources close that: a car the server
+-- already knows about when /race is issued reserves its space in the FIRST slot assignment.
+--
+-- Neither makes the race start wait on anything. A footprint that is missing simply is not there, slots
+-- are handed out densely as before, and the post-spawn report corrects it exactly as it does today.
+
+grid_fit.MSG_SIZE = "carSize"
+
+-- Footprints of the car each connected player is currently sitting in, keyed by player id.
+-- CONNECTION-scoped, not race-scoped -- modelled on client_names (ADR-0031) for the same reason: it has
+-- to be available before a race exists. Cleared on disconnect.
+grid_fit.client_sizes = {}
+
+-- A client reports the car it is sitting in (unsolicited, from the lobby). Two plain numbers, arithmetic
+-- only, never a vehicle the server reads (race-blind, ADR-0005). An unreadable pair clears the entry
+-- rather than keeping a stale one -- a footprint that no longer describes the car is worse than none.
+function grid_fit.handle_size(player_id, payload)
+    if type(payload) ~= "table" then
+        return
+    end
+    local length = tonumber(payload.carLength)
+    local width = tonumber(payload.carWidth)
+    if not length or not width or length <= 0 or width <= 0 then
+        grid_fit.client_sizes[player_id] = nil
+        return
+    end
+    grid_fit.client_sizes[player_id] = {length = length, width = width}
+    log_info("beamcomp.grid", string.format("carSize id=%s %.2f x %.2f m",
+        tostring(player_id), length, width))
+end
+
+-- The roster's per-AI car tokens as {index, car} entries (ADR-0047), for the pre-flight footprint
+-- request. A list, not a sparse array: entries without a pre-picked car are left out, and a sparse Lua
+-- array does not survive a JSON round trip as one.
+function grid_fit.roster_cars(roster)
+    if type(roster) ~= "table" then
+        return nil
+    end
+    local list = {}
+    for index, entry in ipairs(roster) do
+        if type(entry) == "table" and type(entry.car) == "string" and entry.car ~= "" then
+            list[#list + 1] = {index = index, car = entry.car}
+        end
+    end
+    if #list == 0 then
+        return nil
+    end
+    return list
+end
+
+-- A reported {carLength, carWidth} pair as {length, width}, or nil when it is not a usable pair.
+function grid_fit.usable_pair(reported)
+    if type(reported) ~= "table" then
+        return nil
+    end
+    local length = tonumber(reported.carLength)
+    local width = tonumber(reported.carWidth)
+    if not length or not width or length <= 0 or width <= 0 then
+        return nil
+    end
+    return {length = length, width = width}
+end
+
+-- A list of {index, carLength, carWidth} entries as a table keyed by index.
+function grid_fit.indexed_pairs(reported)
+    if type(reported) ~= "table" then
+        return nil
+    end
+    local sizes = {}
+    for _, entry in ipairs(reported) do
+        local index = type(entry) == "table" and tonumber(entry.index) or nil
+        local pair = grid_fit.usable_pair(entry)
+        if index and pair then
+            sizes[math.floor(index)] = pair
+        end
+    end
+    if next(sizes) == nil then
+        return nil
+    end
+    return sizes
+end
+
+-- Write a footprint into this race's identity record without disturbing anything else already there.
+function grid_fit.seed(id, length, width)
+    if not id or not length or not width then
+        return
+    end
+    session.identities = session.identities or {}
+    local record = session.identities[id] or {}
+    record.car_length = length
+    record.car_width = width
+    session.identities[id] = record
+end
+
+-- Seed the footprints that are already known at race start, before the slots are assigned.
+--
+--   * every connected player's LOBBY car -- but only when the policy actually leaves them in it. A fixed
+--     car=, a weight/power cap that may substitute, or a class-drop class car all mean the lobby car is
+--     not the car that will be on the grid, and a wrong footprint is worse than none.
+--   * the FIXED car, for everyone, when there is one (the issuer's client resolved its box during the
+--     pre-flight check).
+--   * each AI's roster car, else the uniform aicar (same source). A randomly rolled AI car cannot be
+--     known here and is reported after its spawn.
+function grid_fit.seed_known(overrides, ai_count)
+    local capped = overrides.maxhp or overrides.maxpwr or overrides.maxkg or overrides.minkg
+    if overrides.car_size then
+        for id in pairs(MP.GetPlayers()) do
+            grid_fit.seed(id, overrides.car_size.length, overrides.car_size.width)
+        end
+    -- session.tournament rather than tour.is_active(): the tour table is declared later in the file
+    -- (the same reason quali.regrid reads the field directly).
+    elseif not overrides.car and not capped and session.tournament == nil then
+        for id in pairs(MP.GetPlayers()) do
+            local size = grid_fit.client_sizes[id]
+            if size then
+                grid_fit.seed(id, size.length, size.width)
+            end
+        end
+    end
+    for k = 1, (tonumber(ai_count) or 0) do
+        local size = (overrides.ai_roster_sizes and overrides.ai_roster_sizes[k]) or overrides.ai_car_size
+        if size then
+            grid_fit.seed(AI_ID_PREFIX .. k, size.length, size.width)
+        end
+    end
 end
 
 -- One slot record for an id at a 0-based slot. AI ids (ADR-0036) carry their display name -- the roster
@@ -3952,6 +4088,9 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- starts clean; each player re-reports clientInfo on the new spawn (ADR-0027). Cleared BEFORE the slot
     -- assignment: a stale footprint from the last race must never reserve a slot on this grid (ADR-0051).
     session.identities = nil
+    -- Seed every footprint that is ALREADY known (ADR-0051 round 2) -- the lobby cars, the fixed car and
+    -- the rostered AI cars -- so this first slot assignment can reserve rather than only correct later.
+    grid_fit.seed_known(overrides, overrides.ai and overrides.ai.count)
     -- The requested AI opponents become synthetic participant slots (ADR-0036), so the roster, grid
     -- layout, and standings include them like any participant; the owner spawns + drives them. They mix
     -- into a random order and sort by reported pwr; otherwise they take the back of the grid.
@@ -5441,6 +5580,14 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         force = overrides.force,
         all = overrides.all,  -- opt the deprecated quickrace source into resolution (ADR-0026)
         nonce = nonce,
+        -- The cars this race has ALREADY decided on (ADR-0051 round 2): the fixed car= policy, the
+        -- uniform aicar, and the roster's pre-picked AI cars. The issuer's client resolves their
+        -- footprints from vehicle metadata and returns them in the verdict, so the slot assignment that
+        -- follows can reserve for them right away instead of waiting for a spawn report. The tokens are
+        -- the admin's own, relayed back verbatim -- the server neither parses nor interprets them.
+        car = overrides.car,
+        aiCar = overrides.ai and overrides.ai.car or nil,
+        aiRoster = grid_fit.roster_cars(overrides.ai and overrides.ai.roster),
     })
 end
 
@@ -5516,6 +5663,12 @@ local function handle_race_validation(player_id, payload)
         -- issuer's client reports whether an order=quali on this race is the staged sprint variant (sprint =
         -- meta.closed false, or a sprint mode override). Captured verbatim; only read when order=quali.
         overrides.staged_quali = payload.stagedQuali == true
+        -- The footprints of the already-decided cars (ADR-0051 round 2), resolved by the issuer's client
+        -- from the tokens we relayed. Kept on overrides so they ride into start_race -- including a race
+        -- queued behind a running one -- and are seeded before the slots are handed out.
+        overrides.car_size = grid_fit.usable_pair(payload.carSize)
+        overrides.ai_car_size = grid_fit.usable_pair(payload.aiCarSize)
+        overrides.ai_roster_sizes = grid_fit.indexed_pairs(payload.aiRosterSizes)
         -- The issuer's serialized race definition + statics content (ADR-0039): captured here as an opaque
         -- blob and relayed verbatim into raceStart so a file-less client can build the race. The server
         -- never parses or inspects it -- race-blindness holds (ADR-0005). nil from an older client.
@@ -5576,11 +5729,18 @@ local function handle_client_info(player_id, payload)
     -- feed the size-aware slot reservation (ADR-0051). All three are stored verbatim and only computed
     -- with, never interpreted as a vehicle (race-blind, ADR-0005). nil/non-number when the client could
     -- not read them -- that car then sorts to the back / reserves nothing rather than failing the grid.
+    --
+    -- The footprint is the one field that is KEPT when a report does not carry it. Everything else here
+    -- describes the report itself, but a footprint may already have arrived from an earlier, different
+    -- source -- the lobby report or the pre-flight resolve, both of which land before the slots are even
+    -- assigned (round 2). Letting a later read that happened to fail wipe it would silently un-reserve a
+    -- bus mid-staging; keeping it costs at worst one slot that nobody needed.
+    local previous = session.identities[target_id]
     session.identities[target_id] = {
         vehicle = vehicle,
         pwr = tonumber(payload.pwr),
-        car_length = tonumber(payload.carLength),
-        car_width = tonumber(payload.carWidth),
+        car_length = tonumber(payload.carLength) or (previous and previous.car_length),
+        car_width = tonumber(payload.carWidth) or (previous and previous.car_width),
     }
     -- The footprint rides this line too, so the ADR-0051 reservation can be diagnosed from the server
     -- console alone: an early (pre-spawn) report shows a size with no vehicle, and a car that reserves
@@ -5930,6 +6090,8 @@ end
 local function on_player_disconnect(player_id)
     -- Drop the connection-scoped name regardless of phase (ADR-0031) -- a player may leave in lobby too.
     client_names[player_id] = nil
+    -- Same for the lobby footprint (ADR-0051 round 2); a reconnecting player re-reports it.
+    grid_fit.client_sizes[player_id] = nil
     if session.phase == PHASE.lobby then
         return
     end
@@ -6904,6 +7066,8 @@ local function handle_client_event(player_id, data)
         handle_client_info(player_id, decoded.payload)
     elseif decoded.type == MSG_CLIENT_IDENTITY then
         handle_client_identity(player_id, decoded.payload)
+    elseif decoded.type == grid_fit.MSG_SIZE then
+        grid_fit.handle_size(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
         handle_grid_save(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_ASSIGN then
