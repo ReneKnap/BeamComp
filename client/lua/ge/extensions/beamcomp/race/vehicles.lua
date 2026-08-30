@@ -18,6 +18,9 @@
 local M = {}
 
 local vehiclespecs = require("beamcomp/race/vehiclespecs")
+-- Supplies the pose's measured surface normal semantics: placement.plane_axis is the single recipe for
+-- tilting a travel axis into the surface plane, shared with the grid editor's preview (ADR-0034).
+local placement = require("beamcomp/race/placement")
 
 local LOG_TAG = "beamcomp.spawn"
 
@@ -255,14 +258,70 @@ function M.replace_spec(veh, spec)
     return true
 end
 
+-- Below this length a derived placement axis is degenerate (a zero-length travel axis) and the pose has
+-- no usable frame at all.
+local MIN_AXIS_LENGTH = 1e-6
+
+-- The three world axes a grid pose places a car on: forward (lying IN the surface), right, up. Returns
+-- nil exactly when the pose carries no `forward` -- the same condition under which pose_orientation
+-- keeps the authored start quaternion -- so the orientation and the anchor can never disagree about
+-- which frame the car ends up in. That is the whole reason this is one function and not three.
+--
+-- `pose.up` is the measured surface normal (placement.ground_pose, ADR-0034 amendment 2026-08-30).
+-- Without it the frame is the historical flat one (horizontal forward, world up) and every caller
+-- reproduces its pre-slope result bit for bit -- the horizontal terms carry no z, so the Z anchor below
+-- collapses back to "subtract bottom_offset from base.z".
+--
+-- The tilted forward comes from placement.plane_axis and NOT from handing quatFromDir the horizontal
+-- axis plus the normal: setFromDir keeps `dir` verbatim and only orthogonalises `up` against it, so that
+-- would produce roll with exactly zero pitch (see placement.plane_axis).
+local function pose_frame(pose)
+    local forward = pose.forward
+    if not forward then
+        return nil
+    end
+    -- An unusable normal (a vertical surface, no horizontal heading) falls back to the flat frame as a
+    -- PAIR -- never a tilted up next to an untilted forward, which would be a skewed, non-orthogonal
+    -- frame and worse than no slope at all.
+    local axis = pose.up and placement.plane_axis(forward, pose.up)
+    local f = axis and vec3(axis.x, axis.y, axis.z) or vec3(forward.x, forward.y, 0)
+    f:normalize()
+    local u = axis and vec3(pose.up.x, pose.up.y, pose.up.z) or vec3(0, 0, 1)
+    u:normalize()
+    -- Right-hand perpendicular, the same handedness the flat path used (right = forward x up gives
+    -- (forward.y, -forward.x, 0) for a world-up frame, which is what race/grid.lua lays columns out on).
+    local r = f:cross(u)
+    if r:length() < MIN_AXIS_LENGTH then
+        return nil
+    end
+    r:normalize()
+    return f, r, u
+end
+
 -- The orientation quaternion for a grid pose, BEFORE the 180-degree Z flip each placement path
 -- applies. Prefer the grid's `forward` travel axis -- face the car down the grid via quatFromDir,
 -- the recipe verified in recover_to -- so the car is oriented to the grid, not the authored start
--- quaternion. Fall back to the start rotation (`rot`) when the pose carries no forward (no gate
--- normal). quatFromDir/vec3/quat are engine globals, kept here rather than in the pure grid module.
+-- quaternion, and tilt it into the measured surface (pose_frame). Fall back to the start rotation
+-- (`rot`) when the pose carries no forward (no gate normal). quatFromDir/vec3/quat are engine globals,
+-- kept here rather than in the pure grid module.
+--
+-- The `rot` fallback stays FLAT on purpose (ADR-0034 amendment 2026-08-30). That quaternion is the
+-- track's own start-position transform (race/start.lua start_pose), i.e. a full 3-D orientation an
+-- author placed ON the surface -- it already carries whatever pitch and roll that spot has. Composing a
+-- measured normal onto it would double-count an authored tilt, and every way of doing so either needs a
+-- second rotation recipe with no verified precedent here or rebuilds the quaternion from a derived
+-- heading, which would throw the authored pitch/roll away even on flat ground. The tilt is therefore
+-- applied only where we SYNTHESISE the orientation from a horizontal gate normal and so genuinely hold
+-- no tilt information of our own.
+--
+-- The 180-degree flip composes correctly with a tilted pose and needs no change: `quat(0,0,1,0) * rot`
+-- reads as "flip first, then rot" under BeamNG's quaternion convention (LuaQuat.__mul is the Hamilton
+-- product while `q * v` applies the CONJUGATE rotation, so a*b applies a first), i.e. it is a turn about
+-- the body's own Z, not about world Z. The engine's own spawn does the same (lua/ge/spawn.lua:605).
 local function pose_orientation(pose)
-    if pose.forward then
-        return quatFromDir(vec3(pose.forward.x, pose.forward.y, pose.forward.z), vec3(0, 0, 1))
+    local forward, _, up = pose_frame(pose)
+    if forward then
+        return quatFromDir(forward, up)
     end
     return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
 end
@@ -313,8 +372,10 @@ end
 -- read fails.
 --
 -- config_anchor has already resolved the vehicle-local axes into forward/lateral/bottom; here those three
--- numbers are re-projected onto the TARGET pose's forward/right exactly as front_anchored_target
--- re-projects its measured ones, so both paths aim at the same point and can be compared.
+-- numbers are re-projected onto the TARGET pose's frame (pose_frame) exactly as front_anchored_target
+-- re-projects its measured ones, so both paths aim at the same point and can be compared. On a tilted
+-- pose that frame is tilted too -- including `bottom`, which is an offset along the CAR's up, not along
+-- world Z (ADR-0034 amendment 2026-08-30).
 --
 -- Returns nil -- never a guess -- when the pose carries no forward axis, no box is known, or the
 -- arithmetic degenerates; the caller then keeps today's centre-anchored behaviour.
@@ -327,12 +388,13 @@ local function metadata_anchored_target(pose, model, config)
         return nil
     end
     local ok, target = pcall(function()
+        local target_fwd, target_right, target_up = pose_frame(pose)
+        if not target_fwd then
+            return nil
+        end
         local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
-        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
-        target_fwd:normalize()
-        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
-        local horizontal = base - (target_fwd * anchor.forward + target_right * anchor.lateral)
-        return vec3(horizontal.x, horizontal.y, horizontal.z - anchor.bottom)
+        return base - (target_fwd * anchor.forward + target_right * anchor.lateral
+            + target_up * anchor.bottom)
     end)
     -- A degenerate forward axis normalizes to NaN instead of raising, and a NaN spawn position would lose
     -- the car entirely -- so validate the value, not just the pcall.
@@ -358,34 +420,53 @@ end
 -- taller car buried its wheels below the surface. We instead place the bounding-box BOTTOM at the
 -- grounded Z, so wheels of any size car meet the surface.
 --
+-- BOTH the measurement and the re-projection are done in a real 3-D frame, because "down" stops being
+-- world Z the moment a pose follows the ground (ADR-0034 amendment 2026-08-30):
+--   * measuring -- the car is decomposed along its OWN forward/right/up (getDirectionVectorUp), not
+--     along a flattened forward plus world Z. getHalfExtents is body-local, so mixing it with a
+--     world-Z offset was only correct while the car stood level -- and this feature makes cars stand
+--     tilted, which is exactly when every restage, quali hold and staging repair re-measures one.
+--   * re-projecting -- the three offsets go back onto the TARGET pose's frame (pose_frame), bottom
+--     included, so the bbox bottom meets the surface along the surface's own normal.
+-- On level ground both reduce to the previous arithmetic exactly: up is (0,0,1), so the dot products
+-- are the old components and the horizontal terms contribute no z.
+--
 -- When the live measurement is unavailable the fallback is two-stage: the car's own config METADATA box
 -- first (a real footprint, just not this car's deformed one), and only if that is unknown too the raw
 -- grid pose -- which centre-anchors the car and leaves it standing roughly half its length too far
 -- forward. Returns the grid pose unchanged when the pose carries no forward axis at all.
 local function front_anchored_target(veh, pose)
     local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
-    if not pose.forward then
+    local target_fwd, target_right, target_up = pose_frame(pose)
+    if not target_fwd then
         return base
     end
     local ok, target = pcall(function()
         local bb = veh:getSpawnWorldOOBB()
-        local fwd = veh:getDirectionVector()
-        fwd = vec3(fwd.x, fwd.y, 0)
-        fwd:normalize()
-        local right = vec3(fwd.y, -fwd.x, 0)
+        local half = bb:getHalfExtents()
         local to_centre = bb:getCenter() - veh:getPosition()
-        -- reference -> front-centre, split into the car's own forward (+ half-length) and lateral.
-        local forward_dist = to_centre:dot(fwd) + bb:getHalfExtents().y
+        local fwd = veh:getDirectionVector()
+        fwd = vec3(fwd.x, fwd.y, fwd.z)
+        fwd:normalize()
+        -- getDirectionVectorUp is a core vehicle method (lua/ge/spawn.lua:685, :780) but has never been
+        -- read under BeamMP from here. Guarded on its own so a missing one costs the car's up axis and
+        -- nothing else: world up reproduces exactly the pre-amendment decomposition, which beats failing
+        -- the whole measurement and dropping to the coarser metadata box.
+        local ok_up, raw_up = pcall(function() return veh:getDirectionVectorUp() end)
+        local up = (ok_up and raw_up) and vec3(raw_up.x, raw_up.y, raw_up.z) or vec3(0, 0, 1)
+        up:normalize()
+        local right = fwd:cross(up)
+        right:normalize()
+        -- reference -> the car's front-centre-bottom point, split along the car's own three axes:
+        -- forward (+ its half-length), lateral, and down to the bbox bottom.
+        local forward_dist = to_centre:dot(fwd) + half.y
         local lateral_dist = to_centre:dot(right)
-        local target_fwd = vec3(pose.forward.x, pose.forward.y, 0)
-        target_fwd:normalize()
-        local target_right = vec3(target_fwd.y, -target_fwd.x, 0)
-        local horizontal = base - (target_fwd * forward_dist + target_right * lateral_dist)
-        -- Vertical anchor: horizontal.z is still base.z (the grounded grid Z, already lifted by
-        -- placement.GROUND_CLEARANCE). bottom_offset is the reference -> bbox-bottom Z; subtracting it
-        -- lifts the reference so the bbox bottom -- not the mid-car reference -- lands on the surface.
-        local bottom_offset = to_centre.z - bb:getHalfExtents().z
-        return vec3(horizontal.x, horizontal.y, horizontal.z - bottom_offset)
+        local bottom_offset = to_centre:dot(up) - half.z
+        -- Put that same point on the pose: the grounded grid position (already lifted by
+        -- placement.GROUND_CLEARANCE), with the car's front-centre on it horizontally and its bbox
+        -- bottom -- not its mid-car reference -- on the surface.
+        return base - (target_fwd * forward_dist + target_right * lateral_dist
+            + target_up * bottom_offset)
     end)
     if ok and target then
         return target
