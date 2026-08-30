@@ -109,6 +109,14 @@ local function coerce_preview_count(count)
     return math.max(MIN_PREVIEW_COUNT, math.min(MAX_PREVIEW_COUNT, math.floor(number)))
 end
 
+-- Styling of the ground-sample blobs the preview draws on each pose's four slope-measuring points
+-- (ADR-0034 amendment 2026-08-30): a flat disc, drawn as a very short cylinder because drawCylinder is
+-- the draw API this project has actually proven. init.lua renders them; they live HERE, as table fields,
+-- because init.lua's main chunk sits just under LuaJIT's 200-top-level-local ceiling (CLAUDE.md) and a
+-- field costs none -- and because the preview these belong to is this module's.
+M.SAMPLE_BLOB_RADIUS = 0.16
+M.SAMPLE_BLOB_HEIGHT = 0.03
+
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
@@ -143,10 +151,18 @@ local function recompute()
     -- height-only too (placement.ground_all, ADR-0034 amendment), preview and spawn are the same pass.
     -- The pose's `lift` (the offsetHeight knob's POST-grounding lift) is added after the snap in the
     -- same order as the spawn pass, so a +1 m knob shows pillars hovering exactly 1 m. Copy back only
-    -- Z: ground_pose returns a fresh {pos, rot, forward} table that would drop the segment tag and
-    -- faceDir. These pose tables are freshly built here, so mutating them is safe.
+    -- what the preview needs: ground_pose returns a fresh {pos, rot, forward} table that would drop the
+    -- segment tag and faceDir. These pose tables are freshly built here, so mutating them is safe.
+    --
+    -- `up` and `samples` come from the same call (ADR-0034 amendment 2026-08-30): the pillars lean with
+    -- the measured slope, and a blob is drawn on each of the four points it was measured at. The slope is
+    -- taken unclamped by design, so a corner landing on a kerb really does tip a slot hard -- the blobs
+    -- are what makes that readable, and fixable by moving the slot, instead of mysterious.
     for _, pose in ipairs(poses) do
-        pose.pos.z = placement.ground_pose(pose).pos.z + (tonumber(pose.lift) or 0)
+        local grounded = placement.ground_pose(pose)
+        pose.pos.z = grounded.pos.z + (tonumber(pose.lift) or 0)
+        pose.up = grounded.up
+        pose.samples = grounded.samples
     end
     M.state.poses = poses
 end

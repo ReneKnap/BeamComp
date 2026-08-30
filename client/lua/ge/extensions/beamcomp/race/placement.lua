@@ -12,6 +12,11 @@
 -- so on undulating tracks rear-row cars bury / float and a recover drops into the ground. This module
 -- drops a pose onto the surface (a downward ray) before anything is placed on it.
 --
+-- It also measures the surface's SLOPE (ADR-0034 amendment 2026-08-30): four more casts, at the corners
+-- of a nominal car footprint, span the plane the car will stand on, and that plane's normal rides along
+-- on the pose as `up`. race/vehicles.lua turns it into the spawn orientation and the front anchor, and
+-- the grid editor draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour.
+--
 -- Division of labor (ADR-0034 amendment 2026-07-14): the GRID spawn path (start.prepare -> ground_all)
 -- grounds HEIGHT-ONLY -- no wall displacement -- so cars spawn at exactly the authored X/Y the editor
 -- preview shows. The wall test misfired on steep slopes (its horizontal ray hits the rising ground
@@ -25,7 +30,8 @@
 --
 -- ENGINE-API NOTE: castRayStatic(origin, dir, maxDist) -> distance-to-nearest-static-hit and
 -- core_terrain.getTerrainHeight(vec3) are used against BeamNG 0.38.5 and are UNVERIFIED under BeamMP
--- here -- confirm the signature/return in-game (a miss is assumed to return >= maxDist).
+-- here -- confirm the signature/return in-game (a miss is assumed to return >= maxDist). The slope
+-- measurement adds no new engine API: it is the same castRayStatic, four more times.
 
 local M = {}
 
@@ -50,6 +56,18 @@ local WALL_RAY_HEIGHT = 0.5
 -- many tries, re-grounding each step.
 local NUDGE_STEP = 1.0
 local MAX_NUDGES = 8
+
+-- Half the footprint the ground NORMAL is sampled over (ADR-0034 amendment 2026-08-30): a nominal car's
+-- wheelbase (~2.7 m) and track (~1.6 m), halved. The four corners are where a car's wheels would touch,
+-- so the plane through them is the plane the car ends up in.
+--
+-- Deliberately a fixed nominal car and NOT the real vehicle's box, even though vehiclespecs.config_anchor
+-- publishes one: every client computes the pose of EVERY slot before it knows who drives what
+-- (race/start.layout_for), and the grid editor previews the same poses with no cars in the world at all.
+-- A size-dependent footprint would give two clients two different normals for one slot and would break
+-- ADR-0023's preview-matches-spawn invariant.
+local NORMAL_HALF_LENGTH = 1.35
+local NORMAL_HALF_WIDTH = 0.8
 
 -- Cast start lifts (metres above the hint) for probe_ground_z's wide editor window: each cast covers
 -- [lift + UP_MARGIN - MAX_DROP, lift + UP_MARGIN] around the hint, so together they search contiguously
@@ -99,6 +117,65 @@ local function terrain_ground_z(x, y)
         return height
     end
     return nil
+end
+
+-- The four footprint corner points on the surface around (x, y), in the order front-left, front-right,
+-- rear-left, rear-right, or nil. `axis` is the pose's facing; the rectangle is laid out along it so its
+-- long sides read as the car's pitch and its short ones as its roll. Each corner reuses cast_ground_z --
+-- this module's single cast path -- seeded at `surface_z`, the height already found under the centre.
+--
+-- ALL FOUR must hit: spanning a plane from fewer points needs an invented one, and the contract is to
+-- degrade to flat rather than guess. Terrain height is deliberately not a fallback here either -- it
+-- knows nothing about the bridge or road deck the cast found.
+local function cast_normal_samples(x, y, surface_z, axis)
+    local forward = horizontal_unit(axis)
+    if not forward then
+        return nil
+    end
+    local right_x, right_y = forward.y, -forward.x
+
+    local function corner(along, across)
+        local corner_x = x + forward.x * along + right_x * across
+        local corner_y = y + forward.y * along + right_y * across
+        local corner_z = cast_ground_z(corner_x, corner_y, surface_z)
+        if not corner_z then
+            return nil
+        end
+        return {x = corner_x, y = corner_y, z = corner_z}
+    end
+
+    local front_left = corner(NORMAL_HALF_LENGTH, -NORMAL_HALF_WIDTH)
+    local front_right = corner(NORMAL_HALF_LENGTH, NORMAL_HALF_WIDTH)
+    local rear_left = corner(-NORMAL_HALF_LENGTH, -NORMAL_HALF_WIDTH)
+    local rear_right = corner(-NORMAL_HALF_LENGTH, NORMAL_HALF_WIDTH)
+    if not (front_left and front_right and rear_left and rear_right) then
+        return nil
+    end
+    return {front_left, front_right, rear_left, rear_right}
+end
+
+-- The unit normal of the plane through those four samples: the cross product of the two DIAGONALS,
+-- (front-right - rear-left) x (front-left - rear-right). That is the exact normal of a planar quad and
+-- the evenly weighted fit of a warped one, and it needs no point ordering beyond the two diagonals.
+--
+-- It always points UP, with no sign fix-up and no "is this upside down" guess: the cross product's z
+-- component works out to 8 * NORMAL_HALF_LENGTH * NORMAL_HALF_WIDTH for ANY heading, because it depends
+-- only on the corners' horizontal layout -- and each sample sits directly below its own corner, so no
+-- ground shape can invert it.
+local function plane_normal(samples)
+    local front_left, front_right, rear_left, rear_right = samples[1], samples[2], samples[3], samples[4]
+    local ax = front_right.x - rear_left.x
+    local ay = front_right.y - rear_left.y
+    local az = front_right.z - rear_left.z
+    local bx = front_left.x - rear_right.x
+    local by = front_left.y - rear_right.y
+    local bz = front_left.z - rear_right.z
+    local nx, ny, nz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+    local len = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if len < EPSILON then
+        return nil
+    end
+    return {x = nx / len, y = ny / len, z = nz / len}
 end
 
 -- True when a static obstacle sits within the car footprint around (x, y, z) facing `forward` (a
@@ -162,6 +239,55 @@ function M.ground_z(x, y, hint_z)
     return terrain_ground_z(x, y)
 end
 
+-- The unit surface normal under (x, y), plus the four points it was measured at, or nil when the
+-- footprint could not be fully sampled. `surface_z` is the height already found under the centre (it
+-- seeds the corner casts), `axis` the pose's facing.
+--
+-- Public because the grid editor's preview draws the very same measurement (ADR-0034 amendment
+-- 2026-08-30). Preview and spawn therefore share one helper and one set of casts; there is deliberately
+-- no second approximation of the slope anywhere.
+function M.ground_normal(x, y, surface_z, axis)
+    local samples = cast_normal_samples(x, y, surface_z, axis)
+    if not samples then
+        return nil
+    end
+    local normal = plane_normal(samples)
+    if not normal then
+        return nil
+    end
+    return normal, samples
+end
+
+-- The unit direction that LIES in the surface with normal `up` and keeps the COMPASS HEADING of `axis`
+-- (whose own z is ignored -- it is read as a heading). Geometrically the intersection of the surface with
+-- the vertical plane through that heading: driving off in `axis`, following the ground. Returns nil when
+-- either argument is missing or the surface is vertical (no direction on it has that heading).
+--
+-- This is the ONE recipe in the codebase for putting a travel axis onto a slope, and it exists because
+-- of how quatFromDir works: setFromDir (lua/common/mathlib.lua:1059) keeps `dir` VERBATIM and only
+-- orthogonalises `up` against it, so handing it a HORIZONTAL axis plus a surface normal yields roll and
+-- exactly ZERO pitch. The axis has to arrive already lying in the surface. BeamNG's own surface-aligned
+-- placement passes an already-tilted dir for the same reason (lua/ge/spawn.lua:759, :774).
+--
+-- Deliberately NOT the orthogonal projection of the axis onto the plane. That also lands in the surface,
+-- but on a slope with a sideways component it rotates the heading (0.8 degrees on a 15-degree slope with
+-- a 5% cross-fall) -- it would let the terrain feed yaw back into an authored grid heading, when the
+-- whole premise here is that a surface normal carries NO yaw information and the two are orthogonal.
+function M.plane_axis(axis, up)
+    if type(axis) ~= "table" or type(up) ~= "table" then
+        return nil
+    end
+    local heading_len = math.sqrt(axis.x * axis.x + axis.y * axis.y)
+    if heading_len < EPSILON or math.abs(up.z) < EPSILON then
+        return nil
+    end
+    local x, y = axis.x / heading_len, axis.y / heading_len
+    -- On the plane through the origin with this normal, z = -(up.x * x + up.y * y) / up.z.
+    local z = -(up.x * x + up.y * y) / up.z
+    local len = math.sqrt(1 + z * z)
+    return {x = x / len, y = y / len, z = z / len}
+end
+
 -- Wide-window surface probe for the EDITOR's grid-split height-anchor seed (ADR-0023 amendment).
 -- Unlike ground_z -- whose fixed UP_MARGIN window is a spawn-side contract (the cast must start UNDER a
 -- tunnel ceiling, ADR-0034) -- this also searches far ABOVE the hint, for the exact case the seed exists for:
@@ -193,11 +319,28 @@ function M.ground_pose(pose)
     local pos = pose.pos
     local ground = M.ground_z(pos.x, pos.y, pos.z)
     local z = ground and (ground + GROUND_CLEARANCE) or pos.z
-    return {
+    local grounded = {
         pos = {x = pos.x, y = pos.y, z = z},
         rot = pose.rot,
         forward = pose.forward,
     }
+    -- ... and the surface's SLOPE at the same spot, so the car follows the ground instead of standing
+    -- flat in it (ADR-0034 amendment 2026-08-30). `up` absent means every consumer keeps world-up, i.e.
+    -- exactly the behaviour before the amendment.
+    --
+    -- Two conditions, and the second one is load-bearing: the centre cast must have found a surface (its
+    -- height seeds the corner casts), and the pose must carry `forward`. `forward` is EXACTLY what
+    -- vehicles.pose_frame requires to place a car in a tilted frame -- a pose without it keeps the
+    -- authored start quaternion and spawns flat. Measuring a normal it could never use would only make
+    -- the grid editor lean pillars over cars that will not lean (ADR-0023: the preview IS the spawn).
+    --
+    -- `samples` (the four measured points) rides along the same way grid.lua's `faceDir` does: it is
+    -- draw-only, and the grid editor needs it to show WHERE the slope was measured -- the slope is taken
+    -- unclamped, so a corner landing on a kerb is a real result an admin has to be able to see.
+    if ground and pose.forward then
+        grounded.up, grounded.samples = M.ground_normal(pos.x, pos.y, ground, pose.forward)
+    end
+    return grounded
 end
 
 -- Ground a list of poses HEIGHT-ONLY, in place-order -- the grid spawn pass (ADR-0034 amendment): each
@@ -207,7 +350,8 @@ end
 -- path when no surface answers -- so +1 m spawns the car exactly 1 m above where it would otherwise
 -- sit. Grid poses carry `lift`; recover targets never do. Entries that are not {pos = {...}} tables
 -- pass through unchanged (defensive at the call boundary, like resolve). Returns a new list; the input
--- list and its pose tables are not mutated.
+-- list and its pose tables are not mutated. The measured surface normal ground_pose attaches (`up`, plus
+-- its `samples`) rides through unchanged -- the `lift` moves the pose along world Z only, as before.
 function M.ground_all(poses)
     if type(poses) ~= "table" then
         return poses
@@ -233,7 +377,9 @@ end
 -- re-grounding each step, up to MAX_NUDGES. Gives up gracefully (logged) on the last position rather
 -- than looping forever. Recover-only since the grid spawn went height-only (ADR-0034 amendment): a
 -- checkpoint's authored centre can sit inside geometry, so the nudge earns its keep there. `forward` is
--- read from pose.forward (the recover seam passes the facing dir as `forward`).
+-- read from pose.forward (the recover seam passes the facing dir as `forward`). The surface normal plays
+-- no part on this path: init.recover_target reads only `pos` off the result, and ADR-0034's slope
+-- amendment is deliberately grid-only.
 function M.clear_pose(pose)
     local grounded = M.ground_pose(pose)
     local forward = horizontal_unit(pose.forward)

@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-size-reservation-r3/2026-08-29"
+local BUILD_MARKER = "grid-slope-follow/2026-08-30"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -3547,6 +3547,12 @@ end
 -- segment's pillars read bright and the rest are dimmed, so it is clear which slots the current knobs
 -- affect. Immediate-mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false)
 -- removes them with no scene objects to clean up.
+--
+-- Pillar and line follow the slot's MEASURED ground slope, and the four points that slope was measured
+-- at get a blob each (ADR-0034 amendment 2026-08-30). Both read the normal race/placement put on the
+-- pose and tilt through placement.plane_axis -- the same values the spawn orients the car by, never a
+-- second approximation of the terrain. Nothing here logs: this runs every frame, and the client log
+-- stops recording after ~15k lines (memory beamng-client-log-blind-after-15k-lines).
 local function draw_editor_grid()
     if not grideditor.state.active or not grideditor.state.poses then
         return
@@ -3555,12 +3561,16 @@ local function draw_editor_grid()
     local active_color = ColorF(0.35, 0.95, 1.0, 0.95)
     local inactive_color = ColorF(0.16, 0.55, 0.72, 0.6)
     local orient_color = ColorF(1.0, 0.15, 0.15, 0.9)
+    local sample_color = ColorF(1.0, 0.78, 0.2, 0.85)
     local label_fg = ColorF(1, 1, 1, 1)
     local label_bg = ColorI(0, 0, 0, 255)
     for index, pose in ipairs(grideditor.state.poses) do
         local p = pose.pos
         local base = vec3(p.x, p.y, p.z)
-        local top = vec3(p.x, p.y, p.z + GRID_COLUMN_HEIGHT)
+        -- The pillar stands along the measured surface normal, so it leans exactly as the car will.
+        -- No normal (flat ground answered, or nothing measured) -> world up, i.e. upright as before.
+        local up = pose.up and vec3(pose.up.x, pose.up.y, pose.up.z) or vec3(0, 0, 1)
+        local top = base + up * GRID_COLUMN_HEIGHT
         local color = (pose.segment == active_segment) and active_color or inactive_color
         debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, color)
         -- The label is in DISPLAY space (ADR-0023 amendment 2026-08-01): the admin reads grid positions
@@ -3574,11 +3584,23 @@ local function draw_editor_grid()
         -- cylinder just above the ground (the confirmed draw API; no unverified drawLine).
         local dir = pose.faceDir
         if dir then
-            local z = p.z + GRID_ORIENT_LINE_HEIGHT
-            local from = vec3(p.x, p.y, z)
-            local to = vec3(p.x + dir.x * GRID_ORIENT_LINE_LENGTH,
-                p.y + dir.y * GRID_ORIENT_LINE_LENGTH, z)
+            -- Laid IN the surface through the same projection the spawn orientation uses, so the line
+            -- keeps its distance to the ground over its whole length on a slope.
+            local along = (pose.up and placement.plane_axis(dir, pose.up)) or dir
+            local from = base + up * GRID_ORIENT_LINE_HEIGHT
+            local to = from + vec3(along.x, along.y, along.z or 0) * GRID_ORIENT_LINE_LENGTH
             debugDrawer:drawCylinder(from, to, GRID_ORIENT_LINE_RADIUS, orient_color)
+        end
+        -- The four points the slope was measured at, as flat discs lying in it. The slope is taken
+        -- unclamped by design, so a sample on a kerb tips its slot hard -- showing WHERE it measured is
+        -- what turns that from a mystery into "move this slot half a metre".
+        if pose.samples then
+            local thickness = up * grideditor.SAMPLE_BLOB_HEIGHT
+            for _, sample in ipairs(pose.samples) do
+                local centre = vec3(sample.x, sample.y, sample.z)
+                debugDrawer:drawCylinder(centre - thickness, centre + thickness,
+                    grideditor.SAMPLE_BLOB_RADIUS, sample_color)
+            end
         end
     end
 end
