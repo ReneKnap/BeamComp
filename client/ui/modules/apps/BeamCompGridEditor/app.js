@@ -21,23 +21,19 @@
 // list, ng-click): native <select> does not open in the BeamNG CEF overlay.
 angular.module('beamng.apps')
 .directive('beamCompGridEditor', [function () {
-  // The eight NUMERIC tunable knobs (ADR-0023) in display order. Each continuous knob has a fine (0.05)
-  // and a coarse (1.0) stepper pair; integer knobs (rows/columns) step by 1 only. rows and columns are
-  // mutually exclusive width pins: pinning one drops the other (GE clears it), which then shows blank
-  // ("auto") and is derived from the field at spawn. Both carry `auto: true` so whichever is unpinned
-  // reads "auto". The boolean `mirror` param is not in this list -- it renders as its own On/Off toggle
-  // (the first Layout row, see app.html + scope.setMirror), not a numeric stepper. offsetHeight is the
-  // segment's POST-grounding lift: GE adds it after the surface snap at spawn and in the preview, so
-  // +1 hovers the cars exactly 1 m above the ground; per segment, it does not chain into later
-  // segments (blank on an older saved grid, which GE treats as 0). The internal split height anchor
-  // (anchorHeight, auto-seeded on breakpoint creation) is deliberately NOT a knob.
+  // The NUMERIC tunable knobs (ADR-0023) in display order, split into the two sections that render them.
+  // Each continuous knob has a fine (0.05) and a coarse (1.0) stepper pair; integer knobs (rows/columns)
+  // step by 1 only. rows and columns are mutually exclusive width pins: pinning one drops the other (GE
+  // clears it), which then shows blank ("auto") and is derived from the field at spawn. Both carry
+  // `auto: true` so whichever is unpinned reads "auto". The boolean params are in neither list -- they
+  // render as their own On/Off toggles (see BOOL_KNOBS below).
   //
   // `min` mirrors the Lua constraint of the same name in race/grideditor.lua's own KNOBS table, because
   // a held stepper clamps locally now (see clampKnob) instead of letting GE clamp and echo back.
   // `tip` is the knob's hover help (ADR-0049), rendered by bc-grid-tip straight off this entry. It lives
   // here rather than in the ng-repeat markup for the same reason `label` and `min` do: a knob and its
   // explanation belong together, and the repeat then renders ONE text instead of one per row.
-  var KNOBS = [
+  var LAYOUT_KNOBS = [
     { key: 'offsetForward', label: 'Offset forward (m)',
       tip: 'How far behind the start line the whole field sits. Higher moves everyone further back.' },
     { key: 'offsetLateral', label: 'Offset lateral (m)',
@@ -55,10 +51,48 @@ angular.module('beamng.apps')
     { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1,
       tip: 'Fix how many cars stand side by side and let the rows follow the number of cars. Setting this '
         + 'clears Rows -- only one of the two can be fixed.' },
+  ];
+
+  // The height section (ADR-0023 amendment 2026-09-01), revealed on demand and collapsed by default --
+  // four controls that only matter where the ground is awkward, and that would otherwise crowd the
+  // layout knobs every admin does use. Each car is dropped onto the ground from the height the car in
+  // FRONT of it landed on, so these all describe that one drop: castHeight moves where the search
+  // starts, offsetHeight where the car ends up, and the two switches turn the drop and the tilt off.
+  // All four are per segment, like every other knob. The internal split height anchor is gone (the
+  // chain does its job now) and was never a knob.
+  var HEIGHT_KNOBS = [
+    { key: 'castHeight', label: 'Height before drop (m)',
+      tip: 'Starts the search for the ground this much higher up. Use it when a part of the grid sits on '
+        + 'a bank the cars cannot see from below. It only moves the search -- the cars still land on '
+        + 'whatever ground it finds.' },
     { key: 'offsetHeight', label: 'Height lift (m)',
       tip: 'Lifts the cars off the ground after they are dropped onto it, so +1 leaves them hovering a '
         + 'metre up. Only this part of the grid. Use a little where cars sink into the terrain.' },
   ];
+
+  // Every numeric knob, for the helpers that do not care which section a knob renders in (the edit-field
+  // sync and the hold accumulator). One list so a knob can never be tuned but not synced.
+  var KNOBS = LAYOUT_KNOBS.concat(HEIGHT_KNOBS);
+
+  // The switch params, rendered as an Off/On pair each. They are named after what they SWITCH ON, so
+  // nothing between this panel and the stored value has to invert anything: "Disable downcast: On"
+  // stores noDowncast = true. `section` picks the block that renders the row.
+  var BOOL_KNOBS = [
+    { key: 'mirror', label: 'Mirror', section: 'layout',
+      tip: 'Flip the grid to the other side of the road, so the front car swaps between left and '
+        + 'right.' },
+    { key: 'noDowncast', label: 'Disable downcast', section: 'height',
+      tip: 'Stops the cars in this part of the grid being dropped onto the ground. They stay at the '
+        + 'height carried over from the car in front, plus the lift below.' },
+    { key: 'noSlope', label: 'Disable slope', section: 'height',
+      tip: 'Keeps the cars in this part of the grid level instead of leaning them with the ground. Use '
+        + 'it where a kerb or a step tips a car over.' },
+  ];
+
+  // The switch rows of one section, in declaration order.
+  function boolKnobsOf(section) {
+    return BOOL_KNOBS.filter(function (k) { return k.section === section; });
+  }
 
   // The name of `raceId`'s default grid in a {name, race, isDefault} list, or '' when it has none. The
   // server holds the one-default-per-race invariant (grid_store.ensure_default), so at most one matches.
@@ -73,8 +107,9 @@ angular.module('beamng.apps')
   }
 
   // ----- Hover help copy (ADR-0049) -----------------------------------------------------------------
-  // One entry per control that is not a layout knob (those carry their own text in KNOBS above), rendered
-  // by bcGridTip at the bottom of this file after a deliberate hover. The markup carries only the key.
+  // One entry per control that is not a knob (numeric knobs and switches carry their own text on their
+  // entry above), rendered by bcGridTip at the bottom of this file after a deliberate hover. The markup
+  // carries only the key.
   //
   // STYLE, tightened after the first in-game round: short everyday words; say what the control does and
   // what changes if you touch it; then stop. No mechanism, and no sentence whose job is to justify a
@@ -105,9 +140,11 @@ angular.module('beamng.apps')
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
       + 'one to edit it with the knobs below.',
 
-    mirror: 'Flip the grid to the other side of the road, so the front car swaps between left and right.',
     previewCount: 'How many cars the preview draws. It is also the field size above which starting a race '
       + 'warns you, and it never changes the layout itself.',
+
+    heightOptions: 'Show the settings for how the cars meet the ground. You only need them where the '
+      + 'ground is awkward -- under a bridge, on a bank, on a kerb.',
 
     saveGrid: 'Show the name field, to store this grid for the race you are editing.',
     saveName: 'What to call this grid. No spaces -- a grid name has to work as an argument, so a spaced '
@@ -261,13 +298,15 @@ angular.module('beamng.apps')
     bngApi.engineLua("beamcomp_init.grid_set('" + escaped + "', " + n + ')');
   }
 
-  // Set the boolean mirror knob: grid_set('mirror', <bool>). Sent as a Lua boolean literal (no quoting,
-  // no Number coercion) so grideditor stores a genuine true/false, matching grid.lua's boolean contract.
-  function geSetMirror(on) {
+  // Set a switch knob: grid_set('<knob>', <bool>). Sent as a Lua boolean literal (no quoting, no Number
+  // coercion) so grideditor stores a genuine true/false, matching grid.lua's boolean contract -- it reads
+  // all three switches as `== true`, where a quoted "false" or a 0 would read as ON (0 is truthy in Lua).
+  function geSetBool(knob, on) {
     if (typeof bngApi === 'undefined' || !bngApi.engineLua) {
       return;
     }
-    bngApi.engineLua("beamcomp_init.grid_set('mirror', " + (on ? 'true' : 'false') + ')');
+    var escaped = String(knob).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    bngApi.engineLua("beamcomp_init.grid_set('" + escaped + "', " + (on ? 'true' : 'false') + ')');
   }
 
   // The saved-grid dropdown lists grids of several races, and a name is unique only within one race, so an
@@ -315,7 +354,10 @@ angular.module('beamng.apps')
     restrict: 'EA',
     scope: true,
     link: function (scope, element) {
-      scope.knobs = KNOBS;
+      scope.layoutKnobs = LAYOUT_KNOBS;
+      scope.heightKnobs = HEIGHT_KNOBS;
+      scope.layoutFlags = boolKnobsOf('layout');
+      scope.heightFlags = boolKnobsOf('height');
       scope.data = { races: [], grids: [] };
       // `loadName` holds a gridKey (race + name), not a bare name: the list spans several races.
       scope.form = { race: '', loadName: '', saveName: '' };
@@ -344,6 +386,10 @@ angular.module('beamng.apps')
       scope.saveOpen = false;   // the Save name row is revealed
       scope.armedLoad = '';     // gridKey of the row armed to REPLACE the running session with its grid
       scope.armedDelete = '';   // gridKey of the row whose delete is armed for its confirming click
+      // The height options reveal the same way (ADR-0023 amendment 2026-09-01), collapsed to start with.
+      // Plain scope state on purpose: it is not in `form`, not in the snapshot and never sent to GE, so
+      // it CANNOT end up in a saved grid -- the grid file describes the grid, not the editor's state.
+      scope.heightOpen = false;
 
       function rebuildRaceOpts() {
         scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
@@ -634,9 +680,9 @@ angular.module('beamng.apps')
         document.removeEventListener('click', closeOnOutsideClick, false);
       });
 
-      // Hover help text by key (ADR-0049), read by bc-grid-tip. The layout knobs do not come through
-      // here -- they carry their own text on the KNOBS entry. An unknown key yields '' and the directive
-      // then shows nothing at all, which is a far better failure than an empty box on a control.
+      // Hover help text by key (ADR-0049), read by bc-grid-tip. The knobs do not come through here --
+      // numeric knobs and switches carry their own text on their entry. An unknown key yields '' and the
+      // directive then shows nothing at all, which is a far better failure than an empty box on a control.
       //
       // A TIPS entry may be a FUNCTION of the scope instead of a fixed string (ADR-0049 amendment), for
       // help that only makes sense against live state -- the Default button has to say which grid this
@@ -747,13 +793,13 @@ angular.module('beamng.apps')
         advanceHold(holdFor(knob.key, knobHold, knob), delta);
       };
 
-      // Mirror toggle: send the boolean to GE, which echoes it back through BeamCompGridState so the
+      // Switch toggle: send the boolean to GE, which echoes it back through BeamCompGridState so the
       // On/Off highlight reflects the authoritative value (not local state).
-      scope.setMirror = function (on) {
+      scope.setFlag = function (knob, on) {
         if (!scope.state.active) {
           return;
         }
-        geSetMirror(on);
+        geSetBool(knob.key, on);
       };
 
       // The grey placeholder of an empty knob field. A knob only reads empty when the loaded block carries
@@ -886,6 +932,12 @@ angular.module('beamng.apps')
       // already there; overwriting it on every reveal would destroy a name the admin typed and collapsed.
       scope.toggleSave = function () {
         scope.saveOpen = !scope.saveOpen;
+      };
+
+      // Reveal (or hide) the height options. Pure panel state: nothing is sent to GE and nothing is
+      // read back, so collapsing a section can never change a grid or lose an entered value.
+      scope.toggleHeight = function () {
+        scope.heightOpen = !scope.heightOpen;
       };
 
       // Non-empty AND no whitespace. A grid name has to survive `/race grid=<name>`, whose parser splits on
@@ -1182,8 +1234,8 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
 
 // Hover help: a delayed, in-DOM tooltip for one control (ADR-0049).
 //
-//   bc-grid-tip="tip('mirror')"    an Angular expression that yields the help text
-//   bc-grid-tip="k.tip"            the layout knobs carry their own, straight off the KNOBS entry
+//   bc-grid-tip="tip('close')"    an Angular expression that yields the help text
+//   bc-grid-tip="k.tip"           a knob carries its own, straight off its LAYOUT_/HEIGHT_/BOOL_KNOBS entry
 //
 // NATIVE title= IS DEAD IN BEAMNG. The UI renders in an off-screen CEF and native tooltips are painted by
 // the browser chrome, which an off-screen renderer does not have -- the same reason native <select> does

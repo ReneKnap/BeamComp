@@ -267,7 +267,8 @@ local MIN_AXIS_LENGTH = 1e-6
 -- keeps the authored start quaternion -- so the orientation and the anchor can never disagree about
 -- which frame the car ends up in. That is the whole reason this is one function and not three.
 --
--- `pose.up` is the measured surface normal (placement.ground_pose, ADR-0034 amendment 2026-08-30).
+-- `pose.up` is the measured surface normal (placement.ground_all for a grid pose, ground_pose for the
+-- recover assist's single-pose pass; ADR-0034 amendment 2026-08-30).
 -- Without it the frame is the historical flat one (horizontal forward, world up) and every caller
 -- reproduces its pre-slope result bit for bit -- the horizontal terms carry no z, so the Z anchor below
 -- collapses back to "subtract bottom_offset from base.z".

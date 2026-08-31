@@ -25,12 +25,15 @@
 -- breakpoint slot with its own full param set, laid out BEHIND the previous one. M.poses_segmented runs the
 -- stacking as a KINEMATIC FRAME CHAIN: each segment lays out in a running frame and passes the next segment
 -- the frame at its own end, so a segment's forward continuation (seamless at offsetForward 0), its lateral
--- offset, its height anchor (anchorHeight, metres above the inherited chain z -- editor-seeded on a grid
--- split so the split re-anchors the grounding window on climbing terrain), and its heading rotation all
--- carry into the whole tail behind it (headings compose cumulatively). Distinct from the anchor, the
--- offsetHeight KNOB is a per-segment POST-grounding lift: it rides on each pose as `lift` and is added
--- by the ground passes (spawn + editor preview) AFTER the surface snap -- it does NOT chain and never
--- moves the chain z or the ground-cast window.
+-- offset, its height anchor (anchorHeight -- retired, see resolved_params) and its heading rotation all
+-- carry into the whole tail behind it (headings compose cumulatively).
+--
+-- Distinct from the chaining anchor, four per-segment params say how a slot MEETS THE GROUND. They do not
+-- chain and this module never acts on them -- it states them on each pose and the ground pass
+-- (race/placement.lua) is what reads them, which is how grid.lua stays engine-independent while the knobs
+-- still reach the cast: offsetHeight -> `lift` (the post-grounding lift, added after the surface snap),
+-- castHeight -> `castLift` (how much higher the ground SEARCH starts -- window only), noDowncast (no drop
+-- at all) and noSlope (no measured tilt).
 -- A single-segment list reproduces M.poses (today's layout) bit-for-bit. block_to_segments /
 -- segments_to_block convert between the stored block and the segment list.
 
@@ -46,6 +49,9 @@ local DEFAULT_OFFSET_FORWARD = 15.0  -- metres the whole grid trails behind the 
 local DEFAULT_OFFSET_LATERAL = 0.0   -- metres the whole grid shifts along the right axis
 local DEFAULT_ANCHOR_HEIGHT = 0.0    -- metres the segment base lifts above the inherited chain z (chains)
 local DEFAULT_OFFSET_HEIGHT = 0.0    -- metres each pose lifts above the grounded surface (no chaining)
+local DEFAULT_CAST_HEIGHT = 0.0      -- metres the ground search starts higher (window only, no chaining)
+local DEFAULT_NO_DOWNCAST = false    -- skip the ground drop for this segment
+local DEFAULT_NO_SLOPE = false       -- skip the measured surface tilt for this segment
 local DEFAULT_HEADING_DEG = 0.0      -- extra rotation about vertical applied to layout + headings
 local DEFAULT_ROW_GAP = 8.0          -- longitudinal gap between rows (metres)
 local DEFAULT_COL_GAP = 4.0          -- lateral gap between adjacent columns (metres)
@@ -195,15 +201,23 @@ local function resolved_params(params)
         offset_forward = params.offsetForward or DEFAULT_OFFSET_FORWARD,
         offset_lateral = params.offsetLateral or DEFAULT_OFFSET_LATERAL,
         -- Internal pre-grounding height ANCHOR (ADR-0023 amendment): metres the segment base lifts
-        -- above the inherited chain z, auto-seeded by the editor when a breakpoint is created so a grid
-        -- split re-centers the ground-cast window on climbing terrain. Chains into following segments.
-        -- Deliberately NOT a knob (no UI surface); re-creating the breakpoint re-seeds it. The 0 default
-        -- keeps a param set without the field bit-for-bit at today's flat-chain poses.
+        -- above the inherited chain z, chaining into the following segments. RETIRED as of the
+        -- 2026-09-01 amendment -- nothing writes it any more (the editor's auto-seed is gone) and
+        -- block_to_segments strips it from every loaded grid, because the height chain re-centres the
+        -- ground-cast window per slot, which is the whole job this anchor was seeded for. Kept because
+        -- the segment frame still carries a z and this is where it would be lifted; at its 0 default the
+        -- base is exactly the inherited chain z.
         anchor_height = params.anchorHeight or DEFAULT_ANCHOR_HEIGHT,
         -- The height KNOB (ADR-0023 amendment): a POST-grounding lift, metres above the surface. Pure
         -- math here only writes it onto each pose as `lift`; the ground passes (spawn ground_all,
         -- editor preview) add it AFTER their surface snap. Does NOT chain, never moves the cast window.
         offset_height = params.offsetHeight or DEFAULT_OFFSET_HEIGHT,
+        -- The three placement options of the ADR-0023 amendment 2026-09-01, all per segment and all pure
+        -- pass-through: this module only writes them onto each pose, the ground pass (placement.lua) is
+        -- what acts on them. None of the three chains -- they describe how ONE slot meets the ground.
+        cast_height = params.castHeight or DEFAULT_CAST_HEIGHT,
+        no_downcast = params.noDowncast == true,
+        no_slope = params.noSlope == true,
         heading_deg = params.headingDeg or DEFAULT_HEADING_DEG,
         row_gap = params.rowGap or DEFAULT_ROW_GAP,
         col_gap = params.colGap or DEFAULT_COL_GAP,
@@ -222,11 +236,14 @@ function M.default_params()
         offsetForward = DEFAULT_OFFSET_FORWARD,
         offsetLateral = DEFAULT_OFFSET_LATERAL,
         offsetHeight = DEFAULT_OFFSET_HEIGHT,
+        castHeight = DEFAULT_CAST_HEIGHT,
         headingDeg = DEFAULT_HEADING_DEG,
         rowGap = DEFAULT_ROW_GAP,
         colGap = DEFAULT_COL_GAP,
         columns = DEFAULT_COLUMNS,
         mirror = DEFAULT_MIRROR,
+        noDowncast = DEFAULT_NO_DOWNCAST,
+        noSlope = DEFAULT_NO_SLOPE,
     }
 end
 
@@ -298,8 +315,9 @@ local function compute_segment(frame, count, params)
     local origin = frame.origin
     -- The segment's base height: the inherited chain z lifted by this segment's anchorHeight. Applied to
     -- every pose AND to next_frame below, so the anchor carries the whole tail with it -- the same
-    -- chain the lateral offset and heading rotation ride (ADR-0023 amendment). At the 0 default this is
-    -- exactly origin.z, reproducing the historical flat chain bit-for-bit.
+    -- chain the lateral offset and heading rotation ride (ADR-0023 amendment). The anchor is retired
+    -- (resolved_params) and therefore always 0, so this is origin.z: the pure-math z the ground pass
+    -- then uses as the CHAIN SEED for the first slot and as the fallback if nothing ever grounds.
     local base_z = origin.z + p.anchor_height
     local poses = {}
     for slot = 0, count - 1 do
@@ -331,6 +349,16 @@ local function compute_segment(frame, count, params)
             -- The ground passes (spawn ground_all, editor preview) add it AFTER their surface snap, so
             -- +1 m hovers the car/pillar exactly 1 m above where it would otherwise sit.
             lift = p.offset_height,
+            -- How this slot meets the ground (ADR-0023 amendment 2026-09-01), riding along exactly like
+            -- `lift`: this module states them, placement.ground_all acts on them, and grid.lua stays
+            -- engine-independent (ADR-0023) -- it still never casts and never learns what a surface is.
+            --   castLift  -- metres the ground SEARCH starts higher. Only the window: neither the
+            --               surface found nor the height handed to the next slot moves with it.
+            --   noDowncast -- no drop at all; the slot keeps the inherited chain height plus `lift`.
+            --   noSlope    -- no measured tilt; the slot stays flat (world up).
+            castLift = p.cast_height,
+            noDowncast = p.no_downcast,
+            noSlope = p.no_slope,
         }
     end
 
@@ -424,6 +452,19 @@ function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
     return all_poses
 end
 
+-- Drop the retired height anchor from a param set as it is loaded (ADR-0023 amendment 2026-09-01). Every
+-- stored anchorHeight was auto-seeded against the OLD base -- one height per segment, measured to
+-- re-centre a grounding window that started at the flat start-line z. The height chain
+-- (placement.ground_all) now puts that window on the real surface for every slot, so the base is already
+-- right and the old delta would be a second, visible offset on top of it. Idempotent by construction:
+-- the field is REMOVED, so a block that has already been through here (or was saved after the
+-- migration) passes through untouched. It runs in the LOAD path -- the funnel both the editor and the
+-- race start pass through -- so a grid that only ever lives on the server is migrated too.
+local function drop_retired_anchor(params)
+    params.anchorHeight = nil
+    return params
+end
+
 -- Convert a STORED per-direction block into the ordered segment list the stacker consumes. Segment 0 is
 -- the block's own params (a shallow copy minus the nested `segments` array, so segment 0 carries no nested
 -- list and the stored block is never mutated); the optional `block.segments` array supplies segments 1..n,
@@ -433,7 +474,7 @@ function M.block_to_segments(block)
     if type(block) ~= "table" then
         return {{startSlot = 0, params = {}}}
     end
-    local base_params = shallow_copy(block)
+    local base_params = drop_retired_anchor(shallow_copy(block))
     base_params.segments = nil
     local list = {{startSlot = 0, params = base_params}}
     if type(block.segments) == "table" then
@@ -443,7 +484,7 @@ function M.block_to_segments(block)
                 if start_slot and start_slot >= 1 then
                     list[#list + 1] = {
                         startSlot = math.floor(start_slot),
-                        params = shallow_copy(seg.params),
+                        params = drop_retired_anchor(shallow_copy(seg.params)),
                     }
                 end
             end

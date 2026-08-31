@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-slope-follow/2026-08-30"
+local BUILD_MARKER = "grid-height-chain/2026-09-01"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -2744,6 +2744,12 @@ local function push_grid_state()
             rows = block.rows,
             columns = block.columns,
             mirror = block.mirror,
+            -- The segment's three placement options (ADR-0023 amendment 2026-09-01): how high above the
+            -- inherited chain height its ground search starts, and the two switches that turn the drop
+            -- and the measured tilt off for this part of the field.
+            castHeight = block.castHeight,
+            noDowncast = block.noDowncast,
+            noSlope = block.noSlope,
         } or nil,
         -- The layout defaults behind the knobs above, so a knob a stored block omits (offsetHeight on a
         -- grid saved before that knob existed) shows the value that actually applies as its grey
