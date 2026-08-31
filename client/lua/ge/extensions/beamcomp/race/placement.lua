@@ -24,6 +24,13 @@
 -- RECOVER assist (init.recover_target -> resolve) keeps the full ground + wall-nudge pass: a
 -- checkpoint's authored centre can genuinely sit inside geometry, a grid slot is ground an admin chose.
 --
+-- The grid pass is a CHAIN (ADR-0034 amendment 2026-09-01): ground_all walks the slots in order and each
+-- one starts its search at the surface the slot BEFORE it found, not at its own authored z. The search
+-- window therefore travels with the terrain and can be small (CHAIN_UP_MARGIN, 3 m) instead of the fixed
+-- 10 m a per-slot search needed -- small enough that a bridge deck overhead is no longer the first thing
+-- a ray meets, and still enough to climb a hill. The recover assist keeps the wide window: it has no
+-- chain to inherit from.
+--
 -- Degrade-don't-crash (like ADR-0017's engine wrappers): every engine read is pcall/type-guarded, and a
 -- missing/unhappy cast API leaves the pose UNCHANGED -- never worse than the pre-ADR-0034 behaviour. The
 -- degrade is silent (no per-pose log spam: this runs once per grid slot); only the rare wall give-up logs.
@@ -37,12 +44,23 @@ local M = {}
 
 local LOG_TAG = "beamcomp.spawn"
 
--- Vertical cast bounds. The ray starts UP_MARGIN above the pose's own Z so it begins ABOVE the surface
--- even when the authored Z is slightly underground (a checkpoint centre), then drops up to MAX_DROP.
+-- Vertical cast bounds. The ray starts UP_MARGIN above the hint height so it begins ABOVE the surface
+-- even when the hint is slightly underground (a checkpoint centre), then drops up to MAX_DROP.
 -- GROUND_CLEARANCE lifts the car a hair off the surface so it settles rather than clips.
+--
+-- UP_MARGIN is the RECOVER assist's window: its hint is a checkpoint's authored centre, a single point
+-- with nothing before it to inherit from, so it keeps the wide 10 m it has always had.
 local UP_MARGIN = 10.0
 local MAX_DROP = 200.0
 local GROUND_CLEARANCE = 0.2
+
+-- The GRID chain's window (ADR-0034 amendment 2026-09-01): metres above the height the PREVIOUS slot
+-- found. 3 m, because that is what the chain makes sufficient -- a slot only has to see over the rise
+-- since its neighbour, and 3 m between two grid positions is already a very steep hill. Small on
+-- purpose: the 10 m a per-slot search needed is exactly what made a ray under a bridge meet the deck
+-- above it first and spawn the field on the bridge. A segment whose FIRST slot genuinely starts far
+-- below its ground has the per-segment castHeight knob to lift its own window.
+local CHAIN_UP_MARGIN = 3.0
 
 -- Nominal car footprint for the horizontal wall test (no real vehicle exists when a grid is computed or
 -- previewed). Half-length/half-width of a typical car plus a clearance margin; the rays fire from
@@ -69,12 +87,6 @@ local MAX_NUDGES = 8
 local NORMAL_HALF_LENGTH = 1.35
 local NORMAL_HALF_WIDTH = 0.8
 
--- Cast start lifts (metres above the hint) for probe_ground_z's wide editor window: each cast covers
--- [lift + UP_MARGIN - MAX_DROP, lift + UP_MARGIN] around the hint, so together they search contiguously
--- from MAX_DROP below up to ~200 m ABOVE the chain z (the grid-split seed's motivating case), trying
--- the window nearest the hint first.
-local PROBE_HINT_LIFTS = {0, 40, 90, 190}
-
 local EPSILON = 1e-6
 
 
@@ -92,12 +104,13 @@ local function horizontal_unit(v)
 end
 
 -- Downward ray to the nearest static surface (terrain AND static meshes/roads) below (x, y), or nil. The
--- ray starts UP_MARGIN above `hint_z` and a miss is taken as dist >= MAX_DROP (see ENGINE-API NOTE).
-local function cast_ground_z(x, y, hint_z)
+-- ray starts `up_margin` (default UP_MARGIN) above `hint_z` and a miss is taken as dist >= MAX_DROP
+-- (see ENGINE-API NOTE). The grid chain passes CHAIN_UP_MARGIN; the recover assist takes the default.
+local function cast_ground_z(x, y, hint_z, up_margin)
     if type(castRayStatic) ~= "function" or type(vec3) ~= "function" then
         return nil
     end
-    local start_z = (hint_z or 0) + UP_MARGIN
+    local start_z = (hint_z or 0) + (up_margin or UP_MARGIN)
     local ok, dist = pcall(castRayStatic, vec3(x, y, start_z), vec3(0, 0, -1), MAX_DROP)
     if ok and type(dist) == "number" and dist >= 0 and dist < MAX_DROP then
         return start_z - dist
@@ -127,7 +140,11 @@ end
 -- ALL FOUR must hit: spanning a plane from fewer points needs an invented one, and the contract is to
 -- degrade to flat rather than guess. Terrain height is deliberately not a fallback here either -- it
 -- knows nothing about the bridge or road deck the cast found.
-local function cast_normal_samples(x, y, surface_z, axis)
+--
+-- `up_margin` is passed through to the corner casts, and the grid hands down its narrow chain window on
+-- purpose: with the wide default, a deck 4 m above a corner would still be sampled and tilt the slot
+-- towards a surface the car will never stand on -- the bridge defect one level down.
+local function cast_normal_samples(x, y, surface_z, axis, up_margin)
     local forward = horizontal_unit(axis)
     if not forward then
         return nil
@@ -137,7 +154,7 @@ local function cast_normal_samples(x, y, surface_z, axis)
     local function corner(along, across)
         local corner_x = x + forward.x * along + right_x * across
         local corner_y = y + forward.y * along + right_y * across
-        local corner_z = cast_ground_z(corner_x, corner_y, surface_z)
+        local corner_z = cast_ground_z(corner_x, corner_y, surface_z, up_margin)
         if not corner_z then
             return nil
         end
@@ -229,10 +246,12 @@ local function probe_height_apis(x, y, hint_z)
 end
 
 -- The surface Z below (x, y): a downward static-geometry cast, falling back to terrain height, or nil
--- when neither API answers. `hint_z` seeds the ray's start height (see cast_ground_z).
-function M.ground_z(x, y, hint_z)
+-- when neither API answers. `hint_z` seeds the ray's start height and `up_margin` how far above it the
+-- ray starts (see cast_ground_z). The terrain fallback is height-independent, so it answers whatever the
+-- window was -- which is why a chain slot that overshot its window still lands on the terrain under it.
+function M.ground_z(x, y, hint_z, up_margin)
     probe_height_apis(x, y, hint_z)
-    local z = cast_ground_z(x, y, hint_z)
+    local z = cast_ground_z(x, y, hint_z, up_margin)
     if z then
         return z
     end
@@ -241,13 +260,13 @@ end
 
 -- The unit surface normal under (x, y), plus the four points it was measured at, or nil when the
 -- footprint could not be fully sampled. `surface_z` is the height already found under the centre (it
--- seeds the corner casts), `axis` the pose's facing.
+-- seeds the corner casts), `axis` the pose's facing, `up_margin` the corner casts' window.
 --
 -- Public because the grid editor's preview draws the very same measurement (ADR-0034 amendment
 -- 2026-08-30). Preview and spawn therefore share one helper and one set of casts; there is deliberately
 -- no second approximation of the slope anywhere.
-function M.ground_normal(x, y, surface_z, axis)
-    local samples = cast_normal_samples(x, y, surface_z, axis)
+function M.ground_normal(x, y, surface_z, axis, up_margin)
+    local samples = cast_normal_samples(x, y, surface_z, axis, up_margin)
     if not samples then
         return nil
     end
@@ -288,82 +307,117 @@ function M.plane_axis(axis, up)
     return {x = x / len, y = y / len, z = z / len}
 end
 
--- Wide-window surface probe for the EDITOR's grid-split height-anchor seed (ADR-0023 amendment).
--- Unlike ground_z -- whose fixed UP_MARGIN window is a spawn-side contract (the cast must start UNDER a
--- tunnel ceiling, ADR-0034) -- this also searches far ABOVE the hint, for the exact case the seed exists for:
--- terrain that climbed more than UP_MARGIN over the chain z, where the normal cast starts inside the
--- hill and misses. Casts at escalating start heights (nearest window first, so a surface close to the
--- hint wins over a high overpass), then falls back to terrain height (z-independent), refined by one
--- more cast seeded there (catches a road deck just above the terrain). Returns the surface z, or nil
--- when no API answers (the caller degrades to a 0 seed). Editor-only; the spawn path never calls this.
-function M.probe_ground_z(x, y, hint_z)
-    local base = hint_z or 0
-    for _, lift in ipairs(PROBE_HINT_LIFTS) do
-        local z = cast_ground_z(x, y, base + lift)
-        if z then
-            return z
-        end
+-- Put the surface's SLOPE at (x, y) on an already-dropped pose, so the car follows the ground instead
+-- of standing flat in it (ADR-0034 amendment 2026-08-30). `seed_z` is the height the corner casts start
+-- from -- the surface just found under the centre -- and `up_margin` their window. Absent `up` means
+-- every consumer keeps world-up, i.e. exactly the behaviour before that amendment.
+--
+-- Two conditions, and both are load-bearing: without a `seed_z` there is no measured height to hang the
+-- corner casts on, and without `forward` the car cannot be placed in a tilted frame at all --
+-- vehicles.pose_frame needs exactly that field, and a pose without it keeps the authored start
+-- quaternion and spawns flat. Measuring a normal that could never be used would only make the grid
+-- editor lean pillars over cars that will not lean (ADR-0023: the preview IS the spawn).
+--
+-- `samples` (the four measured points) rides along the same way grid.lua's `faceDir` does: it is
+-- draw-only, and the grid editor needs it to show WHERE the slope was measured -- the slope is taken
+-- unclamped, so a corner landing on a kerb is a real result an admin has to be able to see.
+local function attach_slope(grounded, x, y, seed_z, forward, up_margin)
+    if not seed_z or not forward then
+        return
     end
-    local terrain = terrain_ground_z(x, y)
-    if not terrain then
-        return nil
-    end
-    return cast_ground_z(x, y, terrain) or terrain
+    grounded.up, grounded.samples = M.ground_normal(x, y, seed_z, forward, up_margin)
 end
 
 -- A copy of `pose` dropped onto the surface: z = ground + GROUND_CLEARANCE, or the original z when no
--- surface is found (degrade-don't-crash). Never mutates the input: grid.poses shares one read-only
--- `forward` table across slots and reuses `rot`, so those pass through by reference while a NEW pos
--- table is built.
+-- surface is found (degrade-don't-crash). The single-pose, UN-CHAINED form -- the recover assist's pass
+-- (via clear_pose), which searches from the pose's own authored z through the wide UP_MARGIN window.
+-- The grid goes through ground_all instead, which chains. Never mutates the input: grid.poses shares one
+-- read-only `forward` table across slots and reuses `rot`, so those pass through by reference while a
+-- NEW pos table is built.
 function M.ground_pose(pose)
     local pos = pose.pos
     local ground = M.ground_z(pos.x, pos.y, pos.z)
-    local z = ground and (ground + GROUND_CLEARANCE) or pos.z
     local grounded = {
-        pos = {x = pos.x, y = pos.y, z = z},
+        pos = {x = pos.x, y = pos.y, z = ground and (ground + GROUND_CLEARANCE) or pos.z},
         rot = pose.rot,
         forward = pose.forward,
     }
-    -- ... and the surface's SLOPE at the same spot, so the car follows the ground instead of standing
-    -- flat in it (ADR-0034 amendment 2026-08-30). `up` absent means every consumer keeps world-up, i.e.
-    -- exactly the behaviour before the amendment.
-    --
-    -- Two conditions, and the second one is load-bearing: the centre cast must have found a surface (its
-    -- height seeds the corner casts), and the pose must carry `forward`. `forward` is EXACTLY what
-    -- vehicles.pose_frame requires to place a car in a tilted frame -- a pose without it keeps the
-    -- authored start quaternion and spawns flat. Measuring a normal it could never use would only make
-    -- the grid editor lean pillars over cars that will not lean (ADR-0023: the preview IS the spawn).
-    --
-    -- `samples` (the four measured points) rides along the same way grid.lua's `faceDir` does: it is
-    -- draw-only, and the grid editor needs it to show WHERE the slope was measured -- the slope is taken
-    -- unclamped, so a corner landing on a kerb is a real result an admin has to be able to see.
-    if ground and pose.forward then
-        grounded.up, grounded.samples = M.ground_normal(pos.x, pos.y, ground, pose.forward)
-    end
+    attach_slope(grounded, pos.x, pos.y, ground, pose.forward)
     return grounded
 end
 
--- Ground a list of poses HEIGHT-ONLY, in place-order -- the grid spawn pass (ADR-0034 amendment): each
+-- Ground ONE slot of the grid chain and report the surface it found (nil when nothing answered).
+--
+-- `hint_z` is where the search starts: the surface the PREVIOUS slot found, or -- until anything has
+-- grounded -- the slot's own authored z. That inherited height is also what the slot falls back to when
+-- its own cast finds nothing, and that is the point of the chain rather than a detail of it: a gap in
+-- the geometry must not drop one car back to the flat start-line height the rest of the field has
+-- already climbed away from.
+--
+-- The pose's own three placement options ride along from grid.lua (ADR-0023 amendment 2026-09-01) and
+-- are read HERE, so the editor preview and the spawn honour them through the same code.
+local function ground_chained(pose, hint_z)
+    local pos = pose.pos
+    local lift = tonumber(pose.lift) or 0
+    -- `castLift` moves ONLY where the ray starts. The height this slot falls back to and the height it
+    -- hands on both stay measured from the un-shifted chain, so lifting one segment's window to see over
+    -- a rise can never drag the field up with it.
+    local surface = nil
+    if not pose.noDowncast then
+        surface = M.ground_z(pos.x, pos.y, hint_z + (tonumber(pose.castLift) or 0), CHAIN_UP_MARGIN)
+    end
+    local grounded = {
+        pos = {
+            x = pos.x,
+            y = pos.y,
+            z = (surface and (surface + GROUND_CLEARANCE) or hint_z) + lift,
+        },
+        rot = pose.rot,
+        forward = pose.forward,
+    }
+    -- The tilt is measured from the surface the drop found -- or, when the drop is switched OFF, from
+    -- the chain height, so that "no ground drop" and "no slope" stay two independent switches. A drop
+    -- that FAILED still yields no seed and therefore no tilt, exactly as before: a slot whose own cast
+    -- found nothing must not lean on a guess.
+    if not pose.noSlope then
+        local seed = surface
+        if not seed and pose.noDowncast then
+            seed = hint_z
+        end
+        attach_slope(grounded, pos.x, pos.y, seed, pose.forward, CHAIN_UP_MARGIN)
+    end
+    return grounded, surface
+end
+
+-- Ground a list of poses HEIGHT-ONLY, in slot order -- the grid spawn pass (ADR-0034 amendment): each
 -- pose drops to the surface with NO wall displacement, so the spawned field keeps the authored X/Y of
--- every slot, exactly what the editor preview shows. A pose's `lift` (the offsetHeight knob's
--- POST-grounding lift, ADR-0023 amendment) is then added on top -- equally on the authored-z degrade
--- path when no surface answers -- so +1 m spawns the car exactly 1 m above where it would otherwise
--- sit. Grid poses carry `lift`; recover targets never do. Entries that are not {pos = {...}} tables
--- pass through unchanged (defensive at the call boundary, like resolve). Returns a new list; the input
--- list and its pose tables are not mutated. The measured surface normal ground_pose attaches (`up`, plus
--- its `samples`) rides through unchanged -- the `lift` moves the pose along world Z only, as before.
+-- every slot, exactly what the editor preview shows.
+--
+-- The drops form a CHAIN (ADR-0034 amendment 2026-09-01): each slot searches from the height the slot
+-- BEFORE it found, so the search window travels with the terrain instead of hanging off one authored
+-- start-line z for the whole field. What is handed on is the RAW SURFACE -- never the pose z -- so
+-- clearance and lift can never accumulate down the field. Slot order is spatial order here (staggered
+-- columns, `column = slot % columns` in grid.lua), so the chain really does walk the ground.
+--
+-- A pose's `lift` (the offsetHeight knob's POST-grounding lift, ADR-0023 amendment) is added on top --
+-- equally on the degrade path when no surface answers -- so +1 m spawns the car exactly 1 m above where
+-- it would otherwise sit. Grid poses carry `lift`, `castLift`, `noDowncast` and `noSlope` (ADR-0023
+-- amendment 2026-09-01, read in ground_chained); recover targets carry none of them. A slot that finds
+-- nothing leaves the chain height untouched for the next slot: the last surface actually measured stays
+-- the reference. Entries that are not {pos = {...}} tables pass through unchanged (defensive at the call
+-- boundary, like resolve). Returns a new list; the input list and its pose tables are not mutated.
 function M.ground_all(poses)
     if type(poses) ~= "table" then
         return poses
     end
     local grounded = {}
+    local chain_z = nil
     for index = 1, #poses do
         local pose = poses[index]
         if type(pose) == "table" and type(pose.pos) == "table" then
-            local dropped = M.ground_pose(pose)
-            local lift = tonumber(pose.lift)
-            if lift and lift ~= 0 then
-                dropped.pos.z = dropped.pos.z + lift
+            local dropped, surface = ground_chained(pose, chain_z or pose.pos.z)
+            if surface then
+                chain_z = surface
             end
             grounded[index] = dropped
         else

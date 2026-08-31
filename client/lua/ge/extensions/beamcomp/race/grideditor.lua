@@ -16,18 +16,17 @@
 -- is the base param set, and a breakpoint at a chosen slot adds a further segment (seeded from the covering
 -- segment's params) that lays out behind the previous one (grid.poses_segmented). M.state.segment is the
 -- active segment the knobs edit; the breakpoint selector (M.select_segment / M.remove_segment) chooses it.
--- A fresh breakpoint auto-seeds its internal anchorHeight from the real surface at its first slot
--- (seed_segment_anchor), so splitting alone re-anchors the grounding window on climbing terrain; the
--- anchor is deliberately NOT a knob -- re-creating the breakpoint re-seeds it. The offsetHeight knob is
--- a separate POST-grounding lift applied after the preview/spawn ground snap (see recompute).
+-- A fresh breakpoint starts at 0 and changes nothing until the admin dials something in: the height anchor
+-- it used to auto-seed existed only to re-centre the grounding window at a segment boundary, and the
+-- height CHAIN (placement.ground_all, ADR-0034 amendment 2026-09-01) now does that continuously, per slot.
 -- A grid with only segment 0 is exactly today's single-block behaviour.
 
 local M = {}
 
 local grid = require("beamcomp/race/grid")
--- Grounds each preview pose to terrain HEIGHT (see recompute) so the pillars follow the surface the way
--- spawned cars do. Height-only is now the REAL spawn semantics too (placement.ground_all, ADR-0034
--- amendment) -- what the admin dials in here is exactly what spawns, X/Y untouched on both sides.
+-- Grounds the preview poses through placement.ground_all (see recompute) -- literally the call the real
+-- spawn makes, chain and all -- so what the admin dials in here is exactly what spawns, X/Y untouched
+-- on both sides.
 local placement = require("beamcomp/race/placement")
 local start = require("beamcomp/race/start")
 local maps = require("beamcomp/race/maps")
@@ -53,13 +52,14 @@ local MAX_BREAKPOINT_SLOT = MAX_PREVIEW_COUNT
 -- heading are unrestricted; gaps are non-negative; rows and columns are positive integers. rows and
 -- columns are two ways to express the same width and are mutually exclusive (see M.set): pinning one axis
 -- drops the other, which then becomes the dynamic axis derived from the field at spawn (grid.poses).
--- offsetHeight is the POST-grounding lift (added after the ground snap at spawn and preview). The
--- internal anchorHeight (the auto-seeded split anchor) is deliberately absent here: it has no editing
--- surface, so M.set rejects it -- re-create the breakpoint to re-seed it.
+-- offsetHeight is the POST-grounding lift and castHeight the pre-grounding SEARCH-WINDOW shift (ADR-0023
+-- amendment 2026-09-01), both unrestricted. The internal anchorHeight is deliberately absent here: it has
+-- no editing surface and no writer left (see M.select_segment), so M.set rejects it.
 local KNOBS = {
     offsetForward = {},
     offsetLateral = {},
     offsetHeight = {},
+    castHeight = {},
     headingDeg = {},
     rowGap = {min = 0},
     colGap = {min = 0},
@@ -67,9 +67,19 @@ local KNOBS = {
     columns = {min = 1, max = PREVIEW_COUNT, integer = true},
 }
 
--- Coerce a knob value to a boolean for the `mirror` toggle (the one non-numeric knob). Accepts a real
--- boolean, a number (non-zero is on), or a string ("true"/"1"/"on" -> on) so the UI, the GE console, and
--- a hand-edited param file all settle on a genuine boolean in the stored block.
+-- The knobs that are switches, not numbers: the lateral flip and the two placement switches of the
+-- ADR-0023 amendment 2026-09-01. They take the coerce_bool path in M.set instead of the clamped numeric
+-- one, so what lands in the stored block is a genuine true/false (grid.lua reads all three as `== true`,
+-- where a 0 would misfire -- 0 is truthy in Lua).
+local BOOLEAN_KNOBS = {
+    mirror = true,
+    noDowncast = true,
+    noSlope = true,
+}
+
+-- Coerce a knob value to a boolean for the switch knobs. Accepts a real boolean, a number (non-zero is
+-- on), or a string ("true"/"1"/"on" -> on) so the UI, the GE console, and a hand-edited param file all
+-- settle on a genuine boolean in the stored block.
 local function coerce_bool(value)
     if type(value) == "boolean" then
         return value
@@ -146,69 +156,26 @@ local function recompute()
     -- and faceDir, which init.lua reads to highlight the active segment and draw the orientation line.
     local poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot,
         M.state.preview_count, segments, anchor.gate_normal)
-    -- Ground each pose to the surface HEIGHT ONLY (placement.ground_pose): Z follows the terrain so the
-    -- preview matches where cars land, with NO lateral wall-nudge -- and since the grid spawn grounds
-    -- height-only too (placement.ground_all, ADR-0034 amendment), preview and spawn are the same pass.
-    -- The pose's `lift` (the offsetHeight knob's POST-grounding lift) is added after the snap in the
-    -- same order as the spawn pass, so a +1 m knob shows pillars hovering exactly 1 m. Copy back only
-    -- what the preview needs: ground_pose returns a fresh {pos, rot, forward} table that would drop the
-    -- segment tag and faceDir. These pose tables are freshly built here, so mutating them is safe.
+    -- Ground the preview through the very function the spawn grounds with (placement.ground_all): the
+    -- height-only drop, the height CHAIN across the slots (ADR-0034 amendment 2026-09-01) and the
+    -- post-grounding `lift` are then one implementation, not two that have to be kept in step. Two
+    -- approximations of the same terrain are exactly the defect the chain exists to remove.
     --
-    -- `up` and `samples` come from the same call (ADR-0034 amendment 2026-08-30): the pillars lean with
+    -- Copy back only what the preview needs: ground_all returns fresh {pos, rot, forward} tables that
+    -- would drop the segment tag and faceDir. These pose tables are freshly built above, so mutating
+    -- them is safe.
+    --
+    -- `up` and `samples` come from the same pass (ADR-0034 amendment 2026-08-30): the pillars lean with
     -- the measured slope, and a blob is drawn on each of the four points it was measured at. The slope is
     -- taken unclamped by design, so a corner landing on a kerb really does tip a slot hard -- the blobs
     -- are what makes that readable, and fixable by moving the slot, instead of mysterious.
-    for _, pose in ipairs(poses) do
-        local grounded = placement.ground_pose(pose)
-        pose.pos.z = grounded.pos.z + (tonumber(pose.lift) or 0)
-        pose.up = grounded.up
-        pose.samples = grounded.samples
+    local grounded = placement.ground_all(poses)
+    for index, pose in ipairs(poses) do
+        pose.pos.z = grounded[index].pos.z
+        pose.up = grounded[index].up
+        pose.samples = grounded[index].samples
     end
     M.state.poses = poses
-end
-
--- Auto-seed a NEW breakpoint segment's internal anchorHeight from the real surface at its first slot
--- (ADR-0023 amendment): measure the ground under the pose the pure chain puts there and set the delta
--- that lifts the segment base onto it -- the split point becomes the segment's new height zero. This is
--- what makes SPLITTING a grid re-anchor the grounding window on climbing terrain by itself. The anchor
--- is pre-grounding and internal (no knob; re-creating the breakpoint is the way to re-seed it) --
--- distinct from the offsetHeight knob's post-grounding lift. Uses the wide editor probe
--- (placement.probe_ground_z) because the motivating case is ground far above the inherited chain z,
--- outside the spawn window. Editor-only; the spawn side stays pure param application. Must be called
--- AFTER the segment (anchorHeight 0) is inserted, so the chain pose reflects the inherited height.
--- Degrade-don't-crash: any failure (no ground, engine API missing) leaves the anchor at 0, logged, and
--- never surfaces an error into the editor flow.
-local function seed_segment_anchor(new_segment)
-    local seeded_delta = nil
-    pcall(function()
-        local anchor = M.state.anchors[M.state.direction]
-        -- Lay the chain out PURE (grid.poses_segmented, not the preview -- recompute overwrites z with
-        -- the grounded height) far enough to include the new segment's first slot, and read the
-        -- un-grounded chain pose there.
-        local count = math.max(M.state.preview_count, new_segment.startSlot + 1)
-        local poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot, count,
-            active_segments(), anchor.gate_normal)
-        local first_pose = poses[new_segment.startSlot + 1]
-        if not first_pose then
-            return
-        end
-        local chain_z = first_pose.pos.z
-        local ground = placement.probe_ground_z(first_pose.pos.x, first_pose.pos.y, chain_z)
-        if not ground then
-            return
-        end
-        -- Centimetre rounding keeps the stored value clean; the grounding window this anchor exists
-        -- to re-center is metres wide, so the lost precision is irrelevant.
-        seeded_delta = math.floor((ground - chain_z) * 100 + 0.5) / 100
-    end)
-    if seeded_delta then
-        new_segment.params.anchorHeight = seeded_delta
-        log("I", LOG_TAG, string.format("breakpoint at slot %d: height anchor auto-seeded to %+.2f m",
-            new_segment.startSlot, seeded_delta))
-    else
-        log("W", LOG_TAG, string.format("breakpoint at slot %d: no ground found for the height anchor"
-            .. " -- anchor stays 0 (re-create the breakpoint to retry)", new_segment.startSlot))
-    end
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given STORED blocks
@@ -314,8 +281,8 @@ function M.set_direction(direction)
 end
 
 -- Set one knob on the ACTIVE SEGMENT's params and re-preview. `knob` is a camelCase param name. The
--- numeric knobs coerce `value` to a number, clamped per the knob's constraints; the boolean `mirror`
--- knob is special-cased (stored as a genuine true/false). Returns true + the applied value, or nil + a
+-- numeric knobs coerce `value` to a number, clamped per the knob's constraints; the switch knobs
+-- (BOOLEAN_KNOBS) are stored as a genuine true/false. Returns true + the applied value, or nil + a
 -- reason (not editing, unknown knob, non-numeric value).
 function M.set(knob, value)
     if not M.state.active then
@@ -324,10 +291,10 @@ function M.set(knob, value)
     -- The knobs edit the ACTIVE segment's params (segment 0 by default; a breakpoint selection makes a
     -- later segment active). This is the same block shape as before -- just per segment now.
     local block = active_segments()[M.state.segment].params
-    -- Mirror is the one boolean toggle, not a clamped number: coerce and store it before the numeric path.
-    if knob == "mirror" then
+    -- The switches are toggles, not clamped numbers: coerce and store before the numeric path.
+    if BOOLEAN_KNOBS[knob] then
         local on = coerce_bool(value)
-        block.mirror = on
+        block[knob] = on
         recompute()
         return true, on
     end
@@ -366,9 +333,8 @@ end
 -- (ADR-0023 amendment). Slot 0 (or below) is always the base segment. If a segment already starts at the
 -- slot it is activated; otherwise a new segment is created, SEEDED from the params of the segment that
 -- currently covers the slot (a copy you then tune, with every CHAINING field zeroed -- see the seed
--- block below), inserted in slot order, and its internal anchorHeight auto-seeded from the ground at
--- its first slot (seed_segment_anchor -- creation only, a re-select never re-seeds). Returns true +
--- the applied start slot, or nil + a reason.
+-- block below) and inserted in slot order. A fresh segment changes NOTHING until the admin dials
+-- something in. Returns true + the applied start slot, or nil + a reason.
 function M.select_segment(start_slot)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
@@ -413,20 +379,18 @@ function M.select_segment(start_slot)
     --     * headingDeg, so the tail keeps the direction it already points in. Inheriting it turned the
     --       whole tail by the covering segment's angle a second time, with the knob reading a value the
     --       admin never dialled in (bug grideditor-breakpoint-label-and-heading-reset).
-    --     * the internal anchorHeight, which is then auto-seeded from the real surface below.
     --   Inherited, because they do NOT chain: columns/rows/rowGap/colGap/mirror, so a split never
-    --   reshapes the field, and the offsetHeight LIFT, so it never visibly moves it either.
+    --   reshapes the field; the offsetHeight LIFT, so it never visibly moves it either; and the three
+    --   placement options (castHeight, noDowncast, noSlope, ADR-0023 amendment 2026-09-01), which
+    --   describe how ONE slot meets the ground and so are simply carried on by the new segment.
     -- Only breakpoint segments are zeroed here; segment 0 keeps its own offsetForward (the setback from
     -- the line) and its own heading.
     local seeded = copy_params(segments[prev_index].params)
     seeded.offsetForward = 0
     seeded.offsetLateral = 0
     seeded.headingDeg = 0
-    seeded.anchorHeight = 0
-    local new_segment = {startSlot = number, params = seeded}
-    table.insert(segments, prev_index + 1, new_segment)
+    table.insert(segments, prev_index + 1, {startSlot = number, params = seeded})
     M.state.segment = prev_index + 1
-    seed_segment_anchor(new_segment)
     recompute()
     return true, number
 end
