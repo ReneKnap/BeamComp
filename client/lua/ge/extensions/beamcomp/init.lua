@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-height-chain/2026-09-01"
+local BUILD_MARKER = "grid-slope-samples-on-car/2026-09-01"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
