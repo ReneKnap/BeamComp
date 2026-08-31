@@ -3204,8 +3204,9 @@ local function handle_grid_setup_open(_payload)
     M.uilayout.ensure_visible("beamCompGridEditor")
 end
 
--- Pull the grid-editor dataset on demand (UI -> GE): the panel calls this on link (covers the freshly-added
--- app that missed the open push) and from its Refresh button. Public as beamcomp_init.request_grid_data.
+-- Pull the grid-editor dataset on demand (UI -> GE): the panel calls this once, on link -- it covers the
+-- freshly-added app that missed the open push, and together with that push and the server's echo after a
+-- save/delete it is every timing there is. Public as beamcomp_init.request_grid_data.
 function M.request_grid_data()
     push_grid_data()
 end
@@ -3213,7 +3214,7 @@ end
 -- Open the grid-editor panel pre-seeded with `race` (UI -> GE): the race-setup panel's "Grid bearbeiten"
 -- button calls this so the grid editor starts on the race chosen there. Does not start an edit session --
 -- the admin still picks New / Load. The seed persists across the panel's on-link pull; the panel applies it
--- only while its race choice is still empty, so a later Refresh never overrides a manual pick. Public as
+-- only while its race choice is still empty, so a later push never overrides a manual pick. Public as
 -- beamcomp_init.open_grid_editor_with_race.
 function M.open_grid_editor_with_race(race)
     M.state.grid_seed_race = (type(race) == "string" and race ~= "") and race or nil

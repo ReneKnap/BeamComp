@@ -119,8 +119,6 @@ angular.module('beamng.apps')
   // race/grid.lua). An entry may be a FUNCTION of the scope where the useful answer depends on live
   // state (see scope.tip).
   var TIPS = {
-    refresh: 'Re-read the races and saved grids from the game. Use it if a grid you saved elsewhere is '
-      + 'not showing up.',
     race: 'The race this grid is for. A grid belongs to its race, so this also decides which saved grids '
       + 'count as "this race" below.',
     newGrid: 'Start a fresh grid from the track default. Needs a race picked, and it throws away whatever '
@@ -551,7 +549,7 @@ angular.module('beamng.apps')
         scope.$evalAsync(function () {
           scope.data.races = (payload && payload.races) || [];
           rebuildRaceOpts();
-          // Pre-select the carried race only while no choice has been made, so a later Refresh that still
+          // Pre-select the carried race only while no choice has been made, so a later push that still
           // carries the seed never overrides a manual pick.
           if (!scope.form.race && payload && payload.seedRace) {
             scope.form.race = payload.seedRace;
@@ -694,11 +692,6 @@ angular.module('beamng.apps')
           entry = entry(scope);
         }
         return entry || '';
-      };
-
-      // Re-pull races + saved grids from GE (Refresh button and on link).
-      scope.refresh = function () {
-        geCall('request_grid_data');
       };
 
       // Start a fresh grid from the track default for the chosen race. A new grid has no saved name, so
@@ -977,8 +970,10 @@ angular.module('beamng.apps')
       };
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
-      // asks GE for the lists itself (data arrives back via the $on handlers above).
-      scope.refresh();
+      // asks GE for the lists itself (data arrives back via the $on handlers above). The only pull the
+      // panel does: GE pushes on open and the server echoes the updated list after a save or a delete,
+      // which together cover every timing -- there is no manual refresh control.
+      geCall('request_grid_data');
     },
   };
 }]);
