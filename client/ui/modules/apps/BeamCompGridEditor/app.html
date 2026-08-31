@@ -247,14 +247,14 @@
     <!-- Knobs -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Layout</div>
-      <div class="bc-row bc-knob" bc-grid-tip="tip('mirror')">
-        <span>Mirror</span>
+      <div class="bc-row bc-knob" ng-repeat="k in layoutFlags" bc-grid-tip="k.tip">
+        <span>{{k.label}}</span>
         <div class="bc-seg">
-          <button ng-class="{on: !state.knobs.mirror}" ng-click="setMirror(false)">Off</button>
-          <button ng-class="{on: state.knobs.mirror}" ng-click="setMirror(true)">On</button>
+          <button ng-class="{on: !state.knobs[k.key]}" ng-click="setFlag(k, false)">Off</button>
+          <button ng-class="{on: !!state.knobs[k.key]}" ng-click="setFlag(k, true)">On</button>
         </div>
       </div>
-      <div class="bc-row bc-knob" ng-repeat="k in knobs" bc-grid-tip="k.tip">
+      <div class="bc-row bc-knob" ng-repeat="k in layoutKnobs" bc-grid-tip="k.tip">
         <span>{{k.label}}</span>
         <div class="bc-step">
           <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()">&minus;1</button>
@@ -274,6 +274,43 @@
           <button bc-grid-hold="stepPreview(-1)" bc-grid-hold-end="endHold()">&minus;</button>
           <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-blur="commitPreview()">
           <button bc-grid-hold="stepPreview(1)" bc-grid-hold-end="endHold()">+</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Height (reveal-on-demand, ADR-0023 amendment 2026-09-01): collapsed, the section is its title
+         plus one button, the same shape the Save section uses. The four controls only matter where the
+         ground is awkward, so they stay out of the way of the layout knobs every admin uses.
+         `heightOpen` is plain panel state -- never in `form`, never sent to GE, never in the snapshot --
+         so a saved grid can never carry the editor's own open/closed state. ng-show, not ng-if: an ng-if
+         child scope would shadow the edit fields written by syncEditFromState, and keeping the DOM keeps
+         focus and cursor across a collapse. -->
+    <div class="bc-section" ng-if="state.active">
+      <div class="bc-section-title">Height</div>
+      <div class="bc-row bc-grid-actions">
+        <button class="bc-mini" ng-click="toggleHeight()" bc-grid-tip="tip('heightOptions')">
+          {{heightOpen ? 'Hide height options' : 'Height options'}}</button>
+      </div>
+      <div ng-show="heightOpen">
+        <div class="bc-hint">Every car is dropped onto the ground starting from the height the car in
+          front of it landed on. These four settings change that drop, for this segment only.</div>
+        <div class="bc-row bc-knob" ng-repeat="k in heightKnobs" bc-grid-tip="k.tip">
+          <span>{{k.label}}</span>
+          <div class="bc-step">
+            <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()">&minus;1</button>
+            <button bc-grid-hold="stepKnob(k, -0.05)" bc-grid-hold-end="endHold()">&minus;</button>
+            <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
+              placeholder="{{knobHint(k)}}">
+            <button bc-grid-hold="stepKnob(k, 0.05)" bc-grid-hold-end="endHold()">+</button>
+            <button class="bc-coarse" bc-grid-hold="stepKnob(k, 1)" bc-grid-hold-end="endHold()">+1</button>
+          </div>
+        </div>
+        <div class="bc-row bc-knob" ng-repeat="k in heightFlags" bc-grid-tip="k.tip">
+          <span>{{k.label}}</span>
+          <div class="bc-seg">
+            <button ng-class="{on: !state.knobs[k.key]}" ng-click="setFlag(k, false)">Off</button>
+            <button ng-class="{on: !!state.knobs[k.key]}" ng-click="setFlag(k, true)">On</button>
+          </div>
         </div>
       </div>
     </div>
