@@ -14,11 +14,14 @@
 --
 -- It also measures the surface's SLOPE (ADR-0034 amendment 2026-08-30): four more casts, at the corners
 -- of a nominal car footprint, span the plane the car will stand on, and that plane's normal rides along
--- on the pose as `up`. race/vehicles.lua turns it into the spawn orientation and the front anchor, and
--- the grid editor draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour. That
--- footprint sits BEHIND the pose (ADR-0034 amendment 2026-09-01, slope-samples-on-the-car): a pose is a
--- car's FRONT-CENTRE, so a footprint centred on it measures the ground in front of the bumper instead of
--- the ground the car stands on.
+-- on the pose as `up`. race/vehicles.lua turns it into the spawn orientation, the front anchor and (since
+-- the 2026-09-01 recover-follows-surface-slope amendment) the recover orientation, and the grid editor
+-- draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour.
+--
+-- WHERE that footprint sits depends on what the pose means, and the two paths here disagree: a GRID pose
+-- is the car's front edge, so the footprint is set back half a car to land under the body; a RECOVER
+-- target is the car's middle, so it is not set back at all. Every caller of the measurement states its
+-- convention -- see NORMAL_SET_BACK.
 --
 -- Division of labor (ADR-0034 amendment 2026-07-14): the GRID spawn path (start.prepare -> ground_all)
 -- grounds HEIGHT-ONLY -- no wall displacement -- so cars spawn at exactly the authored X/Y the editor
@@ -90,13 +93,24 @@ local MAX_NUDGES = 8
 local NORMAL_HALF_LENGTH = 1.35
 local NORMAL_HALF_WIDTH = 0.8
 
--- How far BEHIND the pose that footprint's centre sits (ADR-0034 amendment 2026-09-01,
--- slope-samples-on-the-car). The pose is a car's FRONT-CENTRE, not its middle -- race/vehicles.lua
--- places the reference point so the front centre lands exactly on it -- so a footprint centred ON the
--- pose sampled 1.35 m of ground IN FRONT OF the bumper and only the first 1.35 m of the ~4.4 m the car
--- actually covers. On a crest or a slope edge the measured tilt then came mostly from ground the car
--- never touches. Set back by half a nominal car, the four samples span 0.85 m .. 3.55 m behind the front
--- edge: entirely under the car, in the stretch between its axles.
+-- How far BEHIND the pose that footprint's centre sits. There are TWO answers, because this module
+-- grounds two kinds of pose (ADR-0034 amendment 2026-09-01, recover-follows-surface-slope):
+--
+--   a GRID pose is the car's FRONT EDGE   -- race/vehicles.lua places the reference point so the front
+--                                            centre lands exactly on it -> set the footprint back by
+--                                            half a nominal car (NORMAL_SET_BACK).
+--   a RECOVER target is the car's MIDDLE  -- a checkpoint's authored centre, and vehicles.recover_to
+--                                            puts the reference point straight there with no
+--                                            front-anchor correction -> no set-back at all.
+--
+-- Which of the two a pose follows is stated at every call site and never defaulted: a forgotten caller
+-- must fail loudly rather than quietly measure the grid 2.2 m off (see cast_normal_samples).
+--
+-- The grid's set-back (ADR-0034 amendment 2026-09-01, slope-samples-on-the-car): a footprint centred ON
+-- a front-edge pose sampled 1.35 m of ground IN FRONT OF the bumper and only the first 1.35 m of the
+-- ~4.4 m the car actually covers, so on a crest or a slope edge the measured tilt came mostly from
+-- ground the car never touches. Set back by half a nominal car, the four samples span 0.85 m .. 3.55 m
+-- behind the front edge: entirely under the car, in the stretch between its axles.
 --
 -- Written as the wall test's HALF_LENGTH minus the clearance margin baked into it (0.3 m) so both
 -- nominal measurements describe ONE car and cannot drift apart: 2.2 m of half-length, i.e. a 4.4 m car,
@@ -106,6 +120,7 @@ local NORMAL_HALF_WIDTH = 0.8
 -- Only the centre moves. The footprint is deliberately NOT stretched to the whole car: a wider span
 -- reaches further into kerbs and potholes at the edges, and the slope is taken unclamped.
 local NORMAL_SET_BACK = HALF_LENGTH - 0.3
+local NORMAL_NO_SET_BACK = 0
 
 local EPSILON = 1e-6
 
@@ -155,10 +170,15 @@ end
 -- The four footprint corner points on the surface under the car standing at (x, y), in the order
 -- front-left, front-right, rear-left, rear-right, or nil. `axis` is the pose's facing; the rectangle is
 -- laid out along it so its long sides read as the car's pitch and its short ones as its roll, and its
--- centre sits NORMAL_SET_BACK behind (x, y) along that same axis -- a pose marks the car's front edge, so
--- the body is behind it. The set-back therefore turns with the pose exactly like the corners do; it is
--- never an offset along world Y. Each corner reuses cast_ground_z -- this module's single cast path --
--- seeded at `surface_z`, the height already found under the pose itself.
+-- centre sits `set_back` behind (x, y) along that same axis -- how far depends on whether the pose marks
+-- the car's front edge or its middle, which only the caller knows (see NORMAL_SET_BACK). The set-back
+-- therefore turns with the pose exactly like the corners do; it is never an offset along world Y. Each
+-- corner reuses cast_ground_z -- this module's single cast path -- seeded at `surface_z`, the height
+-- already found under the pose itself.
+--
+-- `set_back` has NO default on purpose. Both call sites state their pose convention explicitly, and a
+-- caller that forgot to raises here instead of silently measuring the grid on the wrong 2.2 m of ground:
+-- a wrong number is invisible in-game, a missing one is not.
 --
 -- ALL FOUR must hit: spanning a plane from fewer points needs an invented one, and the contract is to
 -- degrade to flat rather than guess. Terrain height is deliberately not a fallback here either -- it
@@ -168,18 +188,18 @@ end
 -- purpose: with the wide default, a deck 4 m above a corner would still be sampled and tilt the slot
 -- towards a surface the car will never stand on -- the bridge defect one level down.
 --
--- The set-back is what a corner has to reach across from that seed (up to 3.55 m behind the pose), so on
--- ground falling away steeply enough behind the pose -- roughly 40 degrees over the chain's 3 m window --
--- a rear corner starts below its surface, finds nothing and the slot degrades to flat. That is the
+-- The set-back is what a corner has to reach across from that seed (up to 3.55 m behind a grid pose), so
+-- on ground falling away steeply enough behind the pose -- roughly 40 degrees over the chain's 3 m window
+-- -- a rear corner starts below its surface, finds nothing and the slot degrades to flat. That is the
 -- intended answer here: no measurement beats an invented one.
-local function cast_normal_samples(x, y, surface_z, axis, up_margin)
+local function cast_normal_samples(x, y, surface_z, axis, up_margin, set_back)
     local forward = horizontal_unit(axis)
     if not forward then
         return nil
     end
     local right_x, right_y = forward.y, -forward.x
-    local centre_x = x - forward.x * NORMAL_SET_BACK
-    local centre_y = y - forward.y * NORMAL_SET_BACK
+    local centre_x = x - forward.x * set_back
+    local centre_y = y - forward.y * set_back
 
     local function corner(along, across)
         local corner_x = centre_x + forward.x * along + right_x * across
@@ -288,16 +308,18 @@ function M.ground_z(x, y, hint_z, up_margin)
     return terrain_ground_z(x, y)
 end
 
--- The unit surface normal under the car whose FRONT EDGE stands at (x, y) -- the footprint is set back
--- behind that point, see cast_normal_samples -- plus the four points it was measured at, or nil when the
--- footprint could not be fully sampled. `surface_z` is the height already found under (x, y) (it seeds
--- the corner casts), `axis` the pose's facing, `up_margin` the corner casts' window.
+-- The unit surface normal under the car placed at (x, y) -- `set_back` says how far behind that point
+-- the sampled footprint sits, i.e. whether (x, y) is the car's front edge or its middle, see
+-- cast_normal_samples -- plus the four points it was measured at, or nil when the footprint could not be
+-- fully sampled. `surface_z` is the height already found under (x, y) (it seeds the corner casts),
+-- `axis` the pose's facing, `up_margin` the corner casts' window.
 --
--- Public because the grid editor's preview draws the very same measurement (ADR-0034 amendment
--- 2026-08-30). Preview and spawn therefore share one helper and one set of casts; there is deliberately
--- no second approximation of the slope anywhere.
-function M.ground_normal(x, y, surface_z, axis, up_margin)
-    local samples = cast_normal_samples(x, y, surface_z, axis, up_margin)
+-- The ONE slope measurement in the codebase: the grid spawn, the grid editor's preview and the recover
+-- assist all reach it through attach_slope, so there is deliberately no second approximation of the
+-- slope anywhere. Public as the named step of that chain rather than for an outside caller -- it has
+-- none today (the editor preview goes through ground_all since the chain amendment).
+function M.ground_normal(x, y, surface_z, axis, up_margin, set_back)
+    local samples = cast_normal_samples(x, y, surface_z, axis, up_margin, set_back)
     if not samples then
         return nil
     end
@@ -340,8 +362,9 @@ end
 
 -- Put the surface's SLOPE at (x, y) on an already-dropped pose, so the car follows the ground instead
 -- of standing flat in it (ADR-0034 amendment 2026-08-30). `seed_z` is the height the corner casts start
--- from -- the surface just found under the pose -- and `up_margin` their window. Absent `up` means
--- every consumer keeps world-up, i.e. exactly the behaviour before that amendment.
+-- from -- the surface just found under the pose -- `up_margin` their window, and `set_back` the pose's
+-- convention (front edge or middle, see NORMAL_SET_BACK). Absent `up` means every consumer keeps
+-- world-up, i.e. exactly the behaviour before that amendment.
 --
 -- Two conditions, and both are load-bearing: without a `seed_z` there is no measured height to hang the
 -- corner casts on, and without `forward` the car cannot be placed in a tilted frame at all --
@@ -352,11 +375,11 @@ end
 -- `samples` (the four measured points) rides along the same way grid.lua's `faceDir` does: it is
 -- draw-only, and the grid editor needs it to show WHERE the slope was measured -- the slope is taken
 -- unclamped, so a corner landing on a kerb is a real result an admin has to be able to see.
-local function attach_slope(grounded, x, y, seed_z, forward, up_margin)
+local function attach_slope(grounded, x, y, seed_z, forward, up_margin, set_back)
     if not seed_z or not forward then
         return
     end
-    grounded.up, grounded.samples = M.ground_normal(x, y, seed_z, forward, up_margin)
+    grounded.up, grounded.samples = M.ground_normal(x, y, seed_z, forward, up_margin, set_back)
 end
 
 -- A copy of `pose` dropped onto the surface: z = ground + GROUND_CLEARANCE, or the original z when no
@@ -365,6 +388,9 @@ end
 -- The grid goes through ground_all instead, which chains. Never mutates the input: grid.poses shares one
 -- read-only `forward` table across slots and reuses `rot`, so those pass through by reference while a
 -- NEW pos table is built.
+--
+-- The slope is sampled with NO set-back: this pose is the car's MIDDLE (recover_to puts the reference
+-- point straight on it), not the front edge a grid slot describes -- see NORMAL_SET_BACK.
 function M.ground_pose(pose)
     local pos = pose.pos
     local ground = M.ground_z(pos.x, pos.y, pos.z)
@@ -373,7 +399,7 @@ function M.ground_pose(pose)
         rot = pose.rot,
         forward = pose.forward,
     }
-    attach_slope(grounded, pos.x, pos.y, ground, pose.forward)
+    attach_slope(grounded, pos.x, pos.y, ground, pose.forward, UP_MARGIN, NORMAL_NO_SET_BACK)
     return grounded
 end
 
@@ -415,7 +441,7 @@ local function ground_chained(pose, hint_z)
         if not seed and pose.noDowncast then
             seed = hint_z
         end
-        attach_slope(grounded, pos.x, pos.y, seed, pose.forward, CHAIN_UP_MARGIN)
+        attach_slope(grounded, pos.x, pos.y, seed, pose.forward, CHAIN_UP_MARGIN, NORMAL_SET_BACK)
     end
     return grounded, surface
 end
@@ -462,9 +488,13 @@ end
 -- re-grounding each step, up to MAX_NUDGES. Gives up gracefully (logged) on the last position rather
 -- than looping forever. Recover-only since the grid spawn went height-only (ADR-0034 amendment): a
 -- checkpoint's authored centre can sit inside geometry, so the nudge earns its keep there. `forward` is
--- read from pose.forward (the recover seam passes the facing dir as `forward`). The surface normal plays
--- no part on this path: init.recover_target reads only `pos` off the result, and ADR-0034's slope
--- amendment is deliberately grid-only.
+-- read from pose.forward (the recover seam passes the facing dir as `forward`).
+--
+-- A nudged pose gets its slope RE-MEASURED where it ends up (ADR-0034 amendment 2026-09-01,
+-- recover-follows-surface-slope): the car stands metres from the checkpoint centre by then, so the
+-- normal measured there would be the slope of a patch of ground it never touches -- and since
+-- vehicles.recover_to orients into that normal now, a stale one would tilt the car wrongly rather than
+-- go unread. Both exits re-measure, the nudged-clear one and the gave-up one.
 function M.clear_pose(pose)
     local grounded = M.ground_pose(pose)
     local forward = horizontal_unit(pose.forward)
@@ -478,19 +508,30 @@ function M.clear_pose(pose)
     end
 
     local x, y, z = pos.x, pos.y, pos.z
+    local surface = nil
+
+    -- The pose the nudge settled on, with the slope measured at THAT spot. `surface` is the height the
+    -- last step's own cast found -- the same seed ground_pose uses -- so a step whose cast found nothing
+    -- leaves the pose without a normal and the car flat, rather than tilted by a guess.
+    local function nudged_pose()
+        local moved = {pos = {x = x, y = y, z = z}, rot = pose.rot, forward = pose.forward}
+        attach_slope(moved, x, y, surface, forward, UP_MARGIN, NORMAL_NO_SET_BACK)
+        return moved
+    end
+
     for _ = 1, MAX_NUDGES do
         x = x + forward.x * NUDGE_STEP
         y = y + forward.y * NUDGE_STEP
-        local ground = M.ground_z(x, y, z)
-        z = ground and (ground + GROUND_CLEARANCE) or z
+        surface = M.ground_z(x, y, z)
+        z = surface and (surface + GROUND_CLEARANCE) or z
         if not is_blocked(x, y, z, forward) then
-            return {pos = {x = x, y = y, z = z}, rot = pose.rot, forward = pose.forward}
+            return nudged_pose()
         end
     end
 
     log("W", LOG_TAG, "placement: could not nudge the recover target clear of geometry -- "
         .. "using the last tried position")
-    return {pos = {x = x, y = y, z = z}, rot = pose.rot, forward = pose.forward}
+    return nudged_pose()
 end
 
 -- Resolve a single pose to its final spawnable form: grounded, then cleared of walls (the recover-assist

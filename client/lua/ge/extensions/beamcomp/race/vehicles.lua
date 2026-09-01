@@ -262,13 +262,14 @@ end
 -- no usable frame at all.
 local MIN_AXIS_LENGTH = 1e-6
 
--- The three world axes a grid pose places a car on: forward (lying IN the surface), right, up. Returns
--- nil exactly when the pose carries no `forward` -- the same condition under which pose_orientation
--- keeps the authored start quaternion -- so the orientation and the anchor can never disagree about
--- which frame the car ends up in. That is the whole reason this is one function and not three.
+-- The three world axes a pose places a car on: forward (lying IN the surface), right, up. Returns nil
+-- exactly when the pose carries no `forward` -- the same condition under which pose_orientation keeps
+-- the authored start quaternion -- so the orientation and the anchor can never disagree about which
+-- frame the car ends up in. That is the whole reason this is one function and not three.
 --
--- `pose.up` is the measured surface normal (placement.ground_all for a grid pose, ground_pose for the
--- recover assist's single-pose pass; ADR-0034 amendment 2026-08-30).
+-- `pose.up` is the measured surface normal: placement.ground_all for a grid pose (ADR-0034 amendment
+-- 2026-08-30), placement.clear_pose for the recover assist's single-pose pass, which reads it since the
+-- 2026-09-01 recover-follows-surface-slope amendment -- before that it was measured and thrown away.
 -- Without it the frame is the historical flat one (horizontal forward, world up) and every caller
 -- reproduces its pre-slope result bit for bit -- the horizontal terms carry no z, so the Z anchor below
 -- collapses back to "subtract bottom_offset from base.z".
@@ -299,12 +300,13 @@ local function pose_frame(pose)
     return f, r, u
 end
 
--- The orientation quaternion for a grid pose, BEFORE the 180-degree Z flip each placement path
--- applies. Prefer the grid's `forward` travel axis -- face the car down the grid via quatFromDir,
--- the recipe verified in recover_to -- so the car is oriented to the grid, not the authored start
--- quaternion, and tilt it into the measured surface (pose_frame). Fall back to the start rotation
--- (`rot`) when the pose carries no forward (no gate normal). quatFromDir/vec3/quat are engine globals,
--- kept here rather than in the pure grid module.
+-- The orientation quaternion for a pose, BEFORE the 180-degree Z flip each placement path applies.
+-- Prefer the pose's `forward` travel axis -- face the car along it via quatFromDir -- so the car is
+-- oriented to the grid (or, on the recover path, to the next checkpoint) rather than to the authored
+-- start quaternion, and tilt it into the measured surface (pose_frame). Fall back to the start rotation
+-- (`rot`) when the pose carries no forward (no gate normal); recover_to reaches this only with a
+-- forward, so its poses carry no `rot` at all. quatFromDir/vec3/quat are engine globals, kept here
+-- rather than in the pure grid module.
 --
 -- The `rot` fallback stays FLAT on purpose (ADR-0034 amendment 2026-08-30). That quaternion is the
 -- track's own start-position transform (race/start.lua start_pose), i.e. a full 3-D orientation an
@@ -1206,12 +1208,25 @@ function M.respawn_own_at(pose, own_car, policy)
     return fresh_spawn_own(pose)
 end
 
--- Teleport + repair a vehicle to a recover pose: `pos` ({x,y,z}) facing along `dir` ({x,y,z}, world
--- up). Like repair_and_place, veh:setPositionRotation resets the car to its undamaged rest state at
--- the pose, and the same 180-degree Z-flip (quat(0,0,1,0) * ...) matches the engine's repair branch
--- (verified in-game for grid placement). A nil/degenerate dir keeps the car's current heading. Used
--- by the recover-to-last-checkpoint assist (ADR-0017). Returns true, or nil plus a reason.
-function M.recover_to(veh, pos, dir)
+-- Teleport + repair a vehicle to a recover pose: `pos` ({x,y,z}) facing along `dir` ({x,y,z}) and lying
+-- in the surface whose normal is `up` -- placement measured that normal at exactly this spot, and a nil
+-- one means nothing was measured, so the car stands level (ADR-0034 amendment 2026-09-01,
+-- recover-follows-surface-slope). Like repair_and_place, veh:setPositionRotation resets the car to its
+-- undamaged rest state at the pose, and the same 180-degree Z-flip (quat(0,0,1,0) * ...) matches the
+-- engine's repair branch (verified in-game for grid placement). Used by the recover-to-last-checkpoint
+-- assist (ADR-0017). Returns true, or nil plus a reason.
+--
+-- The orientation is built by pose_orientation, the grid's own recipe, rather than by a second
+-- hand-rolled quaternion here: quatFromDir keeps `dir` VERBATIM and only orthogonalises `up` against it,
+-- so handing it a heading plus a surface normal yields roll and exactly zero pitch. That trap is
+-- answered once, in pose_frame/plane_axis, and this path now shares the answer. The pose deliberately
+-- carries no `rot`: pose_orientation's authored-start-quaternion fallback is unreachable from here,
+-- because a `forward` with a compass heading always produces a frame.
+--
+-- A dir with NO compass heading (straight up or down -- two checkpoints stacked exactly above each
+-- other) says nothing about where to point the car and would normalize to NaN, so it counts as no dir
+-- at all: keep the car's current rotation, untouched by the flip, exactly as before.
+function M.recover_to(veh, pos, dir, up)
     if not veh then
         return nil, "no vehicle"
     end
@@ -1219,9 +1234,9 @@ function M.recover_to(veh, pos, dir)
         return nil, "invalid recover pose"
     end
     local ok, err = pcall(function()
-        if dir then
-            local base = quatFromDir(vec3(dir.x, dir.y, dir.z), vec3(0, 0, 1))
-            local rot = quat(0, 0, 1, 0) * base
+        local heading_length = dir and math.sqrt(dir.x * dir.x + dir.y * dir.y) or 0
+        if heading_length >= MIN_AXIS_LENGTH then
+            local rot = quat(0, 0, 1, 0) * pose_orientation({forward = dir, up = up})
             veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
         else
             local rot = quat(veh:getRotation())
