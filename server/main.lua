@@ -4241,12 +4241,42 @@ local function maybe_end_race()
     if session.phase ~= PHASE.racing or not session.progress then
         return
     end
+    -- A driver wrecked or hung on track can no longer finish, but nothing in their record says so:
+    -- they stay not-finished and not-dnf for the whole grace, so it ran its full 120 s even when every
+    -- driver left out there had stopped moving -- observed as six AI DNF'ing simultaneously, exactly
+    -- 120 s after "finish grace armed". Discount a driver whose last forward progress is older than the
+    -- stall threshold, so this existing early end fires for them too.
+    --
+    -- ONLY while the finish grace is armed. This function also runs from /dnf, from a disconnect and
+    -- from the first finish, and the block below arms a deadline even when NOBODY has finished (the
+    -- ADR-0014 all-DNF path) -- so an ungated discount could end a race that nobody had finished yet and
+    -- DNF the whole field over one quiet moment. Gated, the discount can only ever shorten a grace that
+    -- is already running, which is exactly the reported complaint.
+    local threshold, t
+    if session.grace_deadline then
+        -- The one adaptive sizing seam (quali.stall_threshold). A normal race never folds sector bests,
+        -- so with no quali session it returns the fixed STALL_FALLBACK -- 60 s of total silence, half
+        -- the 120 s that was observed. Deliberately no second constant set for the racing path.
+        threshold = quali.stall_threshold()
+        t = now()
+    end
     local active = 0
-    for _, record in pairs(session.progress) do
+    local stalled
+    for id, record in pairs(session.progress) do
         if not record.finished and not record.dnf then
-            active = active + 1
+            local gap = threshold and stall.gap(id, t)
+            if gap and gap > threshold then
+                stalled = stalled or {}
+                stalled[#stalled + 1] = string.format("%s (%.0fs)", tostring(id), gap)
+            else
+                -- Recently stamped, or carrying no stamp at all -- either way this driver still counts.
+                active = active + 1
+            end
         end
     end
+    -- The all-or-nothing gate, and the safety property of this whole change: the grace is shortened only
+    -- when EVERY remaining driver is stalled. One driver still crossing checkpoints and nothing happens.
+    -- It matters more here than in the quali: there a false positive ended one run, here it is a DNF.
     if active > 0 then
         return
     end
@@ -4258,7 +4288,13 @@ local function maybe_end_race()
     if not session.grace_deadline or short_deadline < session.grace_deadline then
         session.grace_deadline = short_deadline
         broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.all_done_grace})
-        log_info("beamcomp.race", "all players accounted for; grace shortened to results window")
+        -- Fires exactly once: after this the stored deadline IS the short one, so a later
+        -- now() + all_done_grace is no longer smaller than it and the branch is dead.
+        log_info("beamcomp.race", stalled
+            and string.format(
+                "grace shortened to results window; %d stalled driver(s) discounted: %s (threshold %.1fs)",
+                #stalled, table.concat(stalled, ", "), threshold)
+            or "all players accounted for; grace shortened to results window")
     end
 end
 
@@ -5304,8 +5340,15 @@ local function tick()
     -- racing ends when the finish grace (armed by the first finisher) elapses; any player still out
     -- on track at that point is marked DNF before the race settles (ADR-0014).
     if phase == PHASE.racing then
-        if session.grace_deadline and now() >= session.grace_deadline then
-            finalize_race("grace expired")
+        if session.grace_deadline then
+            if now() >= session.grace_deadline then
+                finalize_race("grace expired")
+                return
+            end
+            -- Re-evaluate the early end while the grace runs. A driver going quiet is not an event but
+            -- the ABSENCE of one, so the three report-driven callers (a finish, a /dnf, a disconnect)
+            -- can never observe it -- only a poll can. Idempotent via the shortening guard inside.
+            maybe_end_race()
         end
         return
     end
@@ -5368,6 +5411,11 @@ local function tick()
             enter_phase(PHASE.qualifying, session.quali.duration)
         else
             enter_phase(PHASE.racing, nil)
+            -- The green light is forward progress for the whole field. Without it a driver pinned
+            -- before their first checkpoint would carry no stamp for the entire race, and an unstamped
+            -- driver always counts as progressing -- so the grace could never shorten for precisely the
+            -- case this exists to fix. (The staged quali stamps per driver at its own GO flip instead.)
+            stall.arm_field()
         end
         broadcast_standings()
     elseif phase == PHASE.quali_results then
