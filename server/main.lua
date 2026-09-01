@@ -2537,6 +2537,34 @@ quali.STAGE_GAP = 5.0
 -- 15 m gate normally fires first. Stays well above STAGE_GAP (5 s) so the two timers never collide.
 quali.STAGE_CLEAR_TIMEOUT = 20.0
 
+-- How long a `running` driver may go without a scored crossing before the window-closed branch of
+-- quali.advance_staged stops counting them as "still out on track" (staged-quali-stuck-ai-never-requeued).
+-- Nothing is ever done TO such a driver -- no requeue, no recover, no teleport, no reset: a wreck stays
+-- lying exactly where it is and loses its remaining turns, which is the intended behaviour. They merely
+-- stop holding the finish-your-run grace open for the entire field.
+--
+-- The numbers are deliberately GENEROUS, because the two error directions cost wildly different things.
+-- A FALSE POSITIVE -- discounting somebody who is genuinely still driving -- cuts their run short and
+-- classifies the session without them; that is the one way this can be worse than the bug it fixes. A
+-- FALSE NEGATIVE -- waiting on a wreck a while longer -- is simply today's behaviour, only less of it.
+-- So every constant below is sized to the pessimistic side.
+--
+-- Derived like quali.lap_grace_window (reference -> buffer -> clamp -> fallback) from the only movement
+-- data a race-blind server has: q.sector_best, the field-wide best split per sector.
+quali.STALL_BUFFER = 3.0    -- multiplier on the slowest field-best sector. sector_best[k] is the FASTEST
+                            -- split anyone ever drove for that sector, and a driver's own worst pass
+                            -- through it is routinely twice that (a spin, a missed braking point, a slow
+                            -- recovery), so x3 sits well outside normal variance.
+quali.STALL_MIN = 45.0      -- floor, set above the bare minimum on purpose: on a short stage with ~10 s
+                            -- sectors the buffered value would be 30 s, and 30 s is exactly what a driver
+                            -- who spins, stops, reverses and drives on can burn WHILE STILL DRIVING.
+                            -- 45 s buys a 4.5x margin there and costs at most 15 s of extra waiting.
+quali.STALL_MAX = 120.0     -- ceiling: a 60 s field-best sector would otherwise ask for 180 s, i.e. the
+                            -- very multi-minute wait this exists to remove. 120 s still covers a driver
+                            -- taking twice the field best on their slowest sector.
+quali.STALL_FALLBACK = 60.0 -- nobody has scored a crossing anywhere in the session yet (q.sector_best is
+                            -- empty), so there is nothing to derive from: one fixed generous value.
+
 -- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
 -- a free quali=<n>. A free value is clamped to [MIN, MAX] seconds.
 quali.PRESETS = {5, 8, 12, 15}
@@ -3414,6 +3442,46 @@ function quali.finish_session()
         {regridLead = PHASE_DURATIONS.quali_regrid_lead})
 end
 
+-- How long a staged driver may go without a scored crossing before they count as stalled rather than
+-- still running (staged-quali-stuck-ai-never-requeued). Same shape as quali.lap_grace_window: derive from
+-- what the field has actually driven, buffer it, clamp it, and fall back to a fixed generous value while
+-- there is no data. The reference is the SLOWEST entry in q.sector_best -- the longest sector anyone has
+-- managed even at their best -- so the threshold scales with the stage instead of being a flat guess.
+-- Race-blind (ADR-0005): reads client-reported split times already folded onto the quali table, no
+-- geometry, no positions. See the quali.STALL_* constants for why every bound leans generous.
+function quali.stall_threshold()
+    local q = session.quali
+    local slowest
+    for _, split in pairs((q and q.sector_best) or {}) do
+        local sector = tonumber(split)
+        if sector and sector > 0 and (not slowest or sector > slowest) then
+            slowest = sector
+        end
+    end
+    if not slowest then
+        return quali.STALL_FALLBACK
+    end
+    return math.max(quali.STALL_MIN,
+                    math.min(quali.STALL_MAX, slowest * quali.STALL_BUFFER))
+end
+
+-- Log one driver being discounted from the finish-your-run grace, ONCE per driver per session. The tick
+-- re-evaluates the predicate continuously for the whole length of that grace, so an unguarded line here
+-- would repeat thousands of times and bury the very entry the in-game verification looks for. A driver
+-- who somehow resumes, crosses a checkpoint and then stalls again is not logged a second time -- the
+-- guard is deliberately never cleared, because one line per driver is the contract.
+function quali.note_stall(id, gap, threshold)
+    local q = session.quali
+    if not q or not q.stall_logged or q.stall_logged[id] then
+        return
+    end
+    q.stall_logged[id] = true
+    log_info("beamcomp.race", string.format(
+        "staged quali: driver %s has scored no crossing for %.1fs (stall threshold %.1fs) -- "
+            .. "no longer holding the finish-your-run grace open",
+        tostring(id), gap, threshold))
+end
+
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
 -- the staged driver counts for STAGE_COUNTDOWN, then launches (-> clearing_id); the next driver is not staged
 -- until the launcher has BOTH cleared the ramp (the client >=15 m report) AND the STAGE_GAP clearance has
@@ -3490,12 +3558,32 @@ function quali.advance_staged()
 
     -- Window closed: let any driver still counting at the ramp / clearing / running finish their run, then
     -- classify. (A staged driver mid-count still gets to launch + run; the flip above runs before this.)
+    --
+    -- "Still out" means still PROGRESSING, not merely present (staged-quali-stuck-ai-never-requeued). A
+    -- driver who wrecked or hung mid-stage keeps `running` for the rest of the window -- by design nothing
+    -- recovers them -- and counting them armed this grace even when nobody left on track would ever cross
+    -- another checkpoint, then held it to its FULL deadline (minutes, on a sprint) while the whole field
+    -- watched a car that would never move again. So a `running` driver counts only while their last
+    -- progress stamp is within the stall threshold. The stalled driver is otherwise untouched: same
+    -- status, same HUD row, same banked best time and checkpoint progress -- they just stop making
+    -- everyone else wait. The ramp roles on the first line are deliberately NOT filtered: staging_id is
+    -- bounded by STAGE_COUNTDOWN and clearing_id by STAGE_CLEAR_TIMEOUT, so neither can hold this long.
     local anyone_out = q.staging_id ~= nil or q.clearing_id ~= nil
     if not anyone_out then
+        local threshold = quali.stall_threshold()
+        -- Scans the whole field instead of breaking on the first mover, so every stalled driver gets its
+        -- one log line whatever order pairs() happens to walk in.
         for id in pairs(session.progress or {}) do
             if q.status[id] == "running" then
-                anyone_out = true
-                break
+                local stamped_at = q.progress_at and q.progress_at[id]
+                local gap = stamped_at and (t - stamped_at)
+                if gap and gap > threshold then
+                    quali.note_stall(id, gap, threshold)
+                else
+                    -- A missing stamp counts as progressing, never as stalled: the asymmetry above holds
+                    -- on the defensive path too -- an unexpected nil must fail towards waiting longer.
+                    anyone_out = true
+                end
             end
         end
     end
