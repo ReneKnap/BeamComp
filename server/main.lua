@@ -239,6 +239,10 @@ local session = {
     phase_started_at = 0,   -- clock seconds at the current phase's entry
     phase_duration = nil,   -- configured length of the current timed phase, or nil if open-ended
     grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
+    progress_at = nil,      -- per-id clock seconds of each driver's last forward progress, or nil.
+                            -- Written only through the `stall` namespace; read by both graces to tell a
+                            -- driver still making progress from one wrecked or hung on track. Per-race,
+                            -- like progress itself: cleared at race start and by reset_to_lobby.
     pending_race = nil,      -- race name queued by a /race re-issued while one is active
     pending_owner = nil,     -- player id of the queued race's issuer (owns its shared props), or nil
     pending_overrides = nil, -- queued race's relayed {mode, laps, direction, force, assists} (ADR-0018)
@@ -2497,6 +2501,71 @@ function champ.post_table(player_id)
 end
 
 
+-- ===== driver liveness =====================================================================
+-- One seam for both graces: a per-id wall clock of when each driver last demonstrably moved forward.
+--
+-- The server is race-blind (ADR-0005) -- it holds no geometry, no positions and no velocities, and no
+-- client sends periodic telemetry -- so a scored checkpoint crossing is the ONLY signal it ever gets
+-- from a moving car. "Still driving" can therefore only ever be expressed as "stamped recently", and
+-- both finish graces read exactly that: the staged sprint quali's finish-your-run grace (ADR-0044) and
+-- the racing finish grace (ADR-0014).
+--
+-- A namespace table rather than a set of top-level locals, because main.lua's main chunk sits near
+-- Lua's 200-local ceiling: a table costs ONE local no matter how many functions it carries.
+--
+-- The stamps live on session.progress_at -- deliberately a sibling of session.progress, not a field on
+-- the progress records. build_standings and the run log both read those records, and a new record field
+-- is the shape that leaks into a broadcast or persisted blob; a sibling table cannot, which is what
+-- keeps the wire format byte-identical here.
+--
+-- Declared ahead of the `quali` namespace on purpose: quali.advance_staged closes over `stall`, and Lua
+-- binds upvalues when the closure is created, so a local declared after that function would silently
+-- resolve to a nil global inside it.
+local stall = {}
+
+-- Stamp a driver as having just moved forward. Lazily allocates the table so no caller has to seed it.
+function stall.note(id)
+    local at = session.progress_at
+    if not at then
+        at = {}
+        session.progress_at = at
+    end
+    at[id] = now()
+end
+
+-- Seconds since this driver last moved forward, or nil when they carry no stamp at all.
+--
+-- A nil gap ALWAYS counts as progressing, never as stalled, and every caller must honour that. The two
+-- error directions are wildly asymmetric: on the quali side a false positive ends a driver's run early,
+-- and on the race side it costs them a DNF, whereas a false negative merely waits a little longer --
+-- which is the old behaviour. An unexpected nil must therefore fail towards waiting.
+function stall.gap(id, t)
+    local at = session.progress_at and session.progress_at[id]
+    if not at then
+        return nil
+    end
+    return t - at
+end
+
+-- Drop every stamp. The stamps are per-race, like session.progress: called at race start and from
+-- reset_to_lobby, so one race's staleness can never be read as the next race's liveness.
+function stall.clear()
+    session.progress_at = nil
+end
+
+-- Stamp the whole field at the green light. Leaving the line is forward progress -- and without this a
+-- driver pinned before their FIRST checkpoint would carry no stamp for the entire race, and a missing
+-- stamp counts as progressing forever, so the racing grace could never shorten for exactly the case
+-- that motivated it. Deliberately here and not at build_progress time: staging is open-ended (it waits
+-- for the host), so a stamp taken then would already be minutes stale when the race actually goes green.
+function stall.arm_field()
+    for id in pairs(session.progress or {}) do
+        stall.note(id)
+    end
+end
+-- ===== end driver liveness =================================================================
+
+
 -- Qualifying-then-race format (ADR-0041). Like `champ`, all logic hangs off this one `quali` namespace
 -- table to spare top-level local slots -- main.lua's main chunk sits near Lua's 200-local limit, and a flat
 -- set of locals would overflow it and fail the whole plugin load. The event state lives in session.quali
@@ -2536,6 +2605,34 @@ quali.STAGE_GAP = 5.0
 -- STAGE_GAP after the ramp actually emptied -- the cleared-AND-gap release gate is never bypassed. The client
 -- 15 m gate normally fires first. Stays well above STAGE_GAP (5 s) so the two timers never collide.
 quali.STAGE_CLEAR_TIMEOUT = 20.0
+
+-- How long a `running` driver may go without a scored crossing before the window-closed branch of
+-- quali.advance_staged stops counting them as "still out on track" (staged-quali-stuck-ai-never-requeued).
+-- Nothing is ever done TO such a driver -- no requeue, no recover, no teleport, no reset: a wreck stays
+-- lying exactly where it is and loses its remaining turns, which is the intended behaviour. They merely
+-- stop holding the finish-your-run grace open for the entire field.
+--
+-- The numbers are deliberately GENEROUS, because the two error directions cost wildly different things.
+-- A FALSE POSITIVE -- discounting somebody who is genuinely still driving -- cuts their run short and
+-- classifies the session without them; that is the one way this can be worse than the bug it fixes. A
+-- FALSE NEGATIVE -- waiting on a wreck a while longer -- is simply today's behaviour, only less of it.
+-- So every constant below is sized to the pessimistic side.
+--
+-- Derived like quali.lap_grace_window (reference -> buffer -> clamp -> fallback) from the only movement
+-- data a race-blind server has: q.sector_best, the field-wide best split per sector.
+quali.STALL_BUFFER = 3.0    -- multiplier on the slowest field-best sector. sector_best[k] is the FASTEST
+                            -- split anyone ever drove for that sector, and a driver's own worst pass
+                            -- through it is routinely twice that (a spin, a missed braking point, a slow
+                            -- recovery), so x3 sits well outside normal variance.
+quali.STALL_MIN = 45.0      -- floor, set above the bare minimum on purpose: on a short stage with ~10 s
+                            -- sectors the buffered value would be 30 s, and 30 s is exactly what a driver
+                            -- who spins, stops, reverses and drives on can burn WHILE STILL DRIVING.
+                            -- 45 s buys a 4.5x margin there and costs at most 15 s of extra waiting.
+quali.STALL_MAX = 120.0     -- ceiling: a 60 s field-best sector would otherwise ask for 180 s, i.e. the
+                            -- very multi-minute wait this exists to remove. 120 s still covers a driver
+                            -- taking twice the field best on their slowest sector.
+quali.STALL_FALLBACK = 60.0 -- nobody has scored a crossing anywhere in the session yet (q.sector_best is
+                            -- empty), so there is nothing to derive from: one fixed generous value.
 
 -- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
 -- a free quali=<n>. A free value is clamped to [MIN, MAX] seconds.
@@ -2635,6 +2732,11 @@ function quali.begin(duration, staged)
                             -- relayed as `sectorCounts` so a no-reference (white) sector upgrades to
                             -- purple once a second scoring exists (seeded by start_session, same
                             -- fold seam and lifecycle as sector_best)
+        stall_logged = nil, -- per-id guard so the "discounted as stalled" line logs once per driver
+                            -- instead of once per tick -- the tick keeps running for the whole length of
+                            -- the finish-your-run grace (seeded by start_session, like status). The
+                            -- progress stamps themselves are NOT here: they live on session.progress_at,
+                            -- shared with the racing finish grace (see the `stall` namespace)
     }
 end
 
@@ -3102,6 +3204,11 @@ function quali.start_session()
     -- Companion crossing counter per sector (r4), same fold seam: `sectorCounts` lets the client
     -- upgrade a no-reference (white) sector to purple once at least one FURTHER scoring exists.
     q.sector_count = {}
+    -- Once-per-driver guard for the "discounted as stalled" line. The progress stamps it pairs with
+    -- live on session.progress_at (the `stall` namespace), shared with the racing grace and stamped by
+    -- the GO flip -- nothing to seed here, since everyone starts `queued` and only a `running` driver
+    -- is ever measured.
+    q.stall_logged = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
@@ -3386,6 +3493,46 @@ function quali.finish_session()
         {regridLead = PHASE_DURATIONS.quali_regrid_lead})
 end
 
+-- How long a staged driver may go without a scored crossing before they count as stalled rather than
+-- still running (staged-quali-stuck-ai-never-requeued). Same shape as quali.lap_grace_window: derive from
+-- what the field has actually driven, buffer it, clamp it, and fall back to a fixed generous value while
+-- there is no data. The reference is the SLOWEST entry in q.sector_best -- the longest sector anyone has
+-- managed even at their best -- so the threshold scales with the stage instead of being a flat guess.
+-- Race-blind (ADR-0005): reads client-reported split times already folded onto the quali table, no
+-- geometry, no positions. See the quali.STALL_* constants for why every bound leans generous.
+function quali.stall_threshold()
+    local q = session.quali
+    local slowest
+    for _, split in pairs((q and q.sector_best) or {}) do
+        local sector = tonumber(split)
+        if sector and sector > 0 and (not slowest or sector > slowest) then
+            slowest = sector
+        end
+    end
+    if not slowest then
+        return quali.STALL_FALLBACK
+    end
+    return math.max(quali.STALL_MIN,
+                    math.min(quali.STALL_MAX, slowest * quali.STALL_BUFFER))
+end
+
+-- Log one driver being discounted from the finish-your-run grace, ONCE per driver per session. The tick
+-- re-evaluates the predicate continuously for the whole length of that grace, so an unguarded line here
+-- would repeat thousands of times and bury the very entry the in-game verification looks for. A driver
+-- who somehow resumes, crosses a checkpoint and then stalls again is not logged a second time -- the
+-- guard is deliberately never cleared, because one line per driver is the contract.
+function quali.note_stall(id, gap, threshold)
+    local q = session.quali
+    if not q or not q.stall_logged or q.stall_logged[id] then
+        return
+    end
+    q.stall_logged[id] = true
+    log_info("beamcomp.race", string.format(
+        "staged quali: driver %s has scored no crossing for %.1fs (stall threshold %.1fs) -- "
+            .. "no longer holding the finish-your-run grace open",
+        tostring(id), gap, threshold))
+end
+
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
 -- the staged driver counts for STAGE_COUNTDOWN, then launches (-> clearing_id); the next driver is not staged
 -- until the launcher has BOTH cleared the ramp (the client >=15 m report) AND the STAGE_GAP clearance has
@@ -3411,6 +3558,9 @@ function quali.advance_staged()
     -- now driving (running + scored) but still block the ramp until they clear it + the gap passes.
     if q.staging_id and t >= (q.staged_at or 0) + quali.STAGE_COUNTDOWN then
         q.status[q.staging_id] = "running"
+        -- Launching IS forward progress: a driver released seconds before the window closes has not
+        -- reached checkpoint 1 yet, and must not read as stalled merely for want of a crossing.
+        stall.note(q.staging_id)
         q.clearing_id = q.staging_id
         q.launched_at = t
         q.cleared = false
@@ -3459,12 +3609,31 @@ function quali.advance_staged()
 
     -- Window closed: let any driver still counting at the ramp / clearing / running finish their run, then
     -- classify. (A staged driver mid-count still gets to launch + run; the flip above runs before this.)
+    --
+    -- "Still out" means still PROGRESSING, not merely present (staged-quali-stuck-ai-never-requeued). A
+    -- driver who wrecked or hung mid-stage keeps `running` for the rest of the window -- by design nothing
+    -- recovers them -- and counting them armed this grace even when nobody left on track would ever cross
+    -- another checkpoint, then held it to its FULL deadline (minutes, on a sprint) while the whole field
+    -- watched a car that would never move again. So a `running` driver counts only while their last
+    -- progress stamp is within the stall threshold. The stalled driver is otherwise untouched: same
+    -- status, same HUD row, same banked best time and checkpoint progress -- they just stop making
+    -- everyone else wait. The ramp roles on the first line are deliberately NOT filtered: staging_id is
+    -- bounded by STAGE_COUNTDOWN and clearing_id by STAGE_CLEAR_TIMEOUT, so neither can hold this long.
     local anyone_out = q.staging_id ~= nil or q.clearing_id ~= nil
     if not anyone_out then
+        local threshold = quali.stall_threshold()
+        -- Scans the whole field instead of breaking on the first mover, so every stalled driver gets its
+        -- one log line whatever order pairs() happens to walk in.
         for id in pairs(session.progress or {}) do
             if q.status[id] == "running" then
-                anyone_out = true
-                break
+                local gap = stall.gap(id, t)
+                if gap and gap > threshold then
+                    quali.note_stall(id, gap, threshold)
+                else
+                    -- A missing stamp counts as progressing, never as stalled: the asymmetry above holds
+                    -- on the defensive path too -- an unexpected nil must fail towards waiting longer.
+                    anyone_out = true
+                end
             end
         end
     end
@@ -4035,6 +4204,9 @@ local function reset_to_lobby()
     session.grid_direction = nil
     session.grid_ramp = nil
     session.grace_deadline = nil
+    -- The liveness stamps are per-race like the progress they measure: a stale one must never be read
+    -- as the next race's liveness.
+    stall.clear()
     session.pending_race = nil
     session.pending_owner = nil
     session.pending_overrides = nil
@@ -4069,12 +4241,42 @@ local function maybe_end_race()
     if session.phase ~= PHASE.racing or not session.progress then
         return
     end
+    -- A driver wrecked or hung on track can no longer finish, but nothing in their record says so:
+    -- they stay not-finished and not-dnf for the whole grace, so it ran its full 120 s even when every
+    -- driver left out there had stopped moving -- observed as six AI DNF'ing simultaneously, exactly
+    -- 120 s after "finish grace armed". Discount a driver whose last forward progress is older than the
+    -- stall threshold, so this existing early end fires for them too.
+    --
+    -- ONLY while the finish grace is armed. This function also runs from /dnf, from a disconnect and
+    -- from the first finish, and the block below arms a deadline even when NOBODY has finished (the
+    -- ADR-0014 all-DNF path) -- so an ungated discount could end a race that nobody had finished yet and
+    -- DNF the whole field over one quiet moment. Gated, the discount can only ever shorten a grace that
+    -- is already running, which is exactly the reported complaint.
+    local threshold, t
+    if session.grace_deadline then
+        -- The one adaptive sizing seam (quali.stall_threshold). A normal race never folds sector bests,
+        -- so with no quali session it returns the fixed STALL_FALLBACK -- 60 s of total silence, half
+        -- the 120 s that was observed. Deliberately no second constant set for the racing path.
+        threshold = quali.stall_threshold()
+        t = now()
+    end
     local active = 0
-    for _, record in pairs(session.progress) do
+    local stalled
+    for id, record in pairs(session.progress) do
         if not record.finished and not record.dnf then
-            active = active + 1
+            local gap = threshold and stall.gap(id, t)
+            if gap and gap > threshold then
+                stalled = stalled or {}
+                stalled[#stalled + 1] = string.format("%s (%.0fs)", tostring(id), gap)
+            else
+                -- Recently stamped, or carrying no stamp at all -- either way this driver still counts.
+                active = active + 1
+            end
         end
     end
+    -- The all-or-nothing gate, and the safety property of this whole change: the grace is shortened only
+    -- when EVERY remaining driver is stalled. One driver still crossing checkpoints and nothing happens.
+    -- It matters more here than in the quali: there a false positive ended one run, here it is a DNF.
     if active > 0 then
         return
     end
@@ -4086,7 +4288,13 @@ local function maybe_end_race()
     if not session.grace_deadline or short_deadline < session.grace_deadline then
         session.grace_deadline = short_deadline
         broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.all_done_grace})
-        log_info("beamcomp.race", "all players accounted for; grace shortened to results window")
+        -- Fires exactly once: after this the stored deadline IS the short one, so a later
+        -- now() + all_done_grace is no longer smaller than it and the branch is dead.
+        log_info("beamcomp.race", stalled
+            and string.format(
+                "grace shortened to results window; %d stalled driver(s) discounted: %s (threshold %.1fs)",
+                #stalled, table.concat(stalled, ", "), threshold)
+            or "all players accounted for; grace shortened to results window")
     end
 end
 
@@ -4175,6 +4383,7 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     session.owner_id = owner_id
     session.progress = build_progress(slots)
     session.grace_deadline = nil
+    stall.clear()
     session.pending_race = nil
     session.pending_owner = nil
     session.pending_overrides = nil
@@ -5131,8 +5340,15 @@ local function tick()
     -- racing ends when the finish grace (armed by the first finisher) elapses; any player still out
     -- on track at that point is marked DNF before the race settles (ADR-0014).
     if phase == PHASE.racing then
-        if session.grace_deadline and now() >= session.grace_deadline then
-            finalize_race("grace expired")
+        if session.grace_deadline then
+            if now() >= session.grace_deadline then
+                finalize_race("grace expired")
+                return
+            end
+            -- Re-evaluate the early end while the grace runs. A driver going quiet is not an event but
+            -- the ABSENCE of one, so the three report-driven callers (a finish, a /dnf, a disconnect)
+            -- can never observe it -- only a poll can. Idempotent via the shortening guard inside.
+            maybe_end_race()
         end
         return
     end
@@ -5195,6 +5411,11 @@ local function tick()
             enter_phase(PHASE.qualifying, session.quali.duration)
         else
             enter_phase(PHASE.racing, nil)
+            -- The green light is forward progress for the whole field. Without it a driver pinned
+            -- before their first checkpoint would carry no stamp for the entire race, and an unstamped
+            -- driver always counts as progressing -- so the grace could never shorten for precisely the
+            -- case this exists to fix. (The staged quali stamps per driver at its own GO flip instead.)
+            stall.arm_field()
         end
         broadcast_standings()
     elseif phase == PHASE.quali_results then
@@ -6427,6 +6648,11 @@ local function handle_checkpoint_report(player_id, payload)
     end
     record.splits[record.completed] = time
     record.total_time = time
+    -- A scored crossing is the driver's proof of life, in every phase: it is the only signal a
+    -- race-blind server ever gets from a moving car, and both finish graces read it to tell a driver
+    -- still going from one wrecked or hung on track. Deliberately outside the staged-quali gate below
+    -- -- a normal race has no session.quali at all, and it needs this just as much.
+    stall.note(subject_id)
 
     local final = record.count and (record.completed >= record.count)
     if final then
@@ -6447,7 +6673,8 @@ local function handle_checkpoint_report(player_id, payload)
     -- and the field-wide per-sector best splits (Round 13) -- BEFORE the queue-board broadcast below
     -- reads them. Every scored crossing counts -- final ones too, and those of a run later aborted by a
     -- recover/forced requeue (the fold is per crossing, so an abort can never lose banked progress).
-    -- Circuit quali / normal race: gated off.
+    -- Circuit quali / normal race: gated off. (The progress stamp that used to sit here is now taken
+    -- unconditionally further up, since the racing finish grace needs it too.)
     if quali.is_staged() and session.phase == PHASE.qualifying then
         quali.note_cp_progress(subject_id)
         quali.note_sector_best(subject_id)
