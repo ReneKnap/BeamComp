@@ -3194,6 +3194,33 @@ function quali.note_sector_best(id)
     end
 end
 
+-- Hold the ramp for one STAGE_GAP after a driver left it other than by clearing it normally (the Round-10
+-- settle). The car is still physically on/near the ramp until the hold teleport lands, a network round-trip
+-- away, so the ramp must not be handed to the next driver yet. Expressed in the existing clearing gate
+-- rather than a second timer: the distance condition is purpose-served (this driver is off the track for
+-- gate purposes) and the gap restarts from now, so advance_staged frees the ramp exactly STAGE_GAP later.
+-- clearing_id stays set until then, which keeps release_next held and the queue broadcast's `waiting` flag
+-- honest. Called by quali.requeue (Round 10).
+function quali.settle_ramp(id)
+    local q = session.quali
+    q.clearing_id = id
+    q.cleared = true
+    q.launched_at = now()
+end
+
+-- Take one driver out of the waiting line, leaving the order of everyone else intact. Callers append the id
+-- back afterwards when the driver is only going to the back (quali.requeue).
+function quali.drop_from_queue(id)
+    local q = session.quali
+    local remaining = {}
+    for _, qid in ipairs(q.queue or {}) do
+        if qid ~= id then
+            remaining[#remaining + 1] = qid
+        end
+    end
+    q.queue = remaining
+end
+
 -- Requeue a driver whose run ended (ADR-0044/Round4): reset their record so the next run scores from zero,
 -- release any ramp state they held (a held clearing gate becomes a settle timer, Round 10), then either
 -- append them to the back of the turn queue (another attempt, returning to their own fixed holding slot)
@@ -3211,23 +3238,12 @@ function quali.requeue(id)
         q.staging_id = nil
         q.staged_at = nil
     end
-    -- If this driver held the clearing gate, do NOT free it outright (Round 10): the car stays physically
-    -- on/near the ramp until the hold teleport lands, a network round-trip away. Convert the gate into a
-    -- settle timer instead -- the distance condition is purpose-served (the driver is off the track), the
-    -- gap restarts from the requeue moment -- so advance_staged stages the next driver no earlier than
-    -- STAGE_GAP from now. clearing_id stays set until the settle expires, which keeps release_next held
-    -- and the queue broadcast's `waiting` flag honest.
+    -- If this driver held the clearing gate, do NOT free it outright (Round 10): settle the ramp instead,
+    -- so the next driver stages no earlier than STAGE_GAP from this requeue.
     if q.clearing_id == id then
-        q.cleared = true
-        q.launched_at = now()
+        quali.settle_ramp(id)
     end
-    local filtered = {}
-    for _, qid in ipairs(q.queue or {}) do
-        if qid ~= id then
-            filtered[#filtered + 1] = qid
-        end
-    end
-    q.queue = filtered
+    quali.drop_from_queue(id)
     local window_open = session.phase == PHASE.qualifying and phase_elapsed() < q.duration
     if not window_open then
         -- The run ended after the window closed: this driver is finished for the session. They stay where
