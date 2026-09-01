@@ -15,7 +15,10 @@
 -- It also measures the surface's SLOPE (ADR-0034 amendment 2026-08-30): four more casts, at the corners
 -- of a nominal car footprint, span the plane the car will stand on, and that plane's normal rides along
 -- on the pose as `up`. race/vehicles.lua turns it into the spawn orientation and the front anchor, and
--- the grid editor draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour.
+-- the grid editor draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour. That
+-- footprint sits BEHIND the pose (ADR-0034 amendment 2026-09-01, slope-samples-on-the-car): a pose is a
+-- car's FRONT-CENTRE, so a footprint centred on it measures the ground in front of the bumper instead of
+-- the ground the car stands on.
 --
 -- Division of labor (ADR-0034 amendment 2026-07-14): the GRID spawn path (start.prepare -> ground_all)
 -- grounds HEIGHT-ONLY -- no wall displacement -- so cars spawn at exactly the authored X/Y the editor
@@ -87,6 +90,23 @@ local MAX_NUDGES = 8
 local NORMAL_HALF_LENGTH = 1.35
 local NORMAL_HALF_WIDTH = 0.8
 
+-- How far BEHIND the pose that footprint's centre sits (ADR-0034 amendment 2026-09-01,
+-- slope-samples-on-the-car). The pose is a car's FRONT-CENTRE, not its middle -- race/vehicles.lua
+-- places the reference point so the front centre lands exactly on it -- so a footprint centred ON the
+-- pose sampled 1.35 m of ground IN FRONT OF the bumper and only the first 1.35 m of the ~4.4 m the car
+-- actually covers. On a crest or a slope edge the measured tilt then came mostly from ground the car
+-- never touches. Set back by half a nominal car, the four samples span 0.85 m .. 3.55 m behind the front
+-- edge: entirely under the car, in the stretch between its axles.
+--
+-- Written as the wall test's HALF_LENGTH minus the clearance margin baked into it (0.3 m) so both
+-- nominal measurements describe ONE car and cannot drift apart: 2.2 m of half-length, i.e. a 4.4 m car,
+-- the size class of BeamNG's default vehicles. A fixed nominal for the same determinism reason as the
+-- footprint itself (above): it must not depend on who ends up driving the slot.
+--
+-- Only the centre moves. The footprint is deliberately NOT stretched to the whole car: a wider span
+-- reaches further into kerbs and potholes at the edges, and the slope is taken unclamped.
+local NORMAL_SET_BACK = HALF_LENGTH - 0.3
+
 local EPSILON = 1e-6
 
 
@@ -132,10 +152,13 @@ local function terrain_ground_z(x, y)
     return nil
 end
 
--- The four footprint corner points on the surface around (x, y), in the order front-left, front-right,
--- rear-left, rear-right, or nil. `axis` is the pose's facing; the rectangle is laid out along it so its
--- long sides read as the car's pitch and its short ones as its roll. Each corner reuses cast_ground_z --
--- this module's single cast path -- seeded at `surface_z`, the height already found under the centre.
+-- The four footprint corner points on the surface under the car standing at (x, y), in the order
+-- front-left, front-right, rear-left, rear-right, or nil. `axis` is the pose's facing; the rectangle is
+-- laid out along it so its long sides read as the car's pitch and its short ones as its roll, and its
+-- centre sits NORMAL_SET_BACK behind (x, y) along that same axis -- a pose marks the car's front edge, so
+-- the body is behind it. The set-back therefore turns with the pose exactly like the corners do; it is
+-- never an offset along world Y. Each corner reuses cast_ground_z -- this module's single cast path --
+-- seeded at `surface_z`, the height already found under the pose itself.
 --
 -- ALL FOUR must hit: spanning a plane from fewer points needs an invented one, and the contract is to
 -- degrade to flat rather than guess. Terrain height is deliberately not a fallback here either -- it
@@ -144,16 +167,23 @@ end
 -- `up_margin` is passed through to the corner casts, and the grid hands down its narrow chain window on
 -- purpose: with the wide default, a deck 4 m above a corner would still be sampled and tilt the slot
 -- towards a surface the car will never stand on -- the bridge defect one level down.
+--
+-- The set-back is what a corner has to reach across from that seed (up to 3.55 m behind the pose), so on
+-- ground falling away steeply enough behind the pose -- roughly 40 degrees over the chain's 3 m window --
+-- a rear corner starts below its surface, finds nothing and the slot degrades to flat. That is the
+-- intended answer here: no measurement beats an invented one.
 local function cast_normal_samples(x, y, surface_z, axis, up_margin)
     local forward = horizontal_unit(axis)
     if not forward then
         return nil
     end
     local right_x, right_y = forward.y, -forward.x
+    local centre_x = x - forward.x * NORMAL_SET_BACK
+    local centre_y = y - forward.y * NORMAL_SET_BACK
 
     local function corner(along, across)
-        local corner_x = x + forward.x * along + right_x * across
-        local corner_y = y + forward.y * along + right_y * across
+        local corner_x = centre_x + forward.x * along + right_x * across
+        local corner_y = centre_y + forward.y * along + right_y * across
         local corner_z = cast_ground_z(corner_x, corner_y, surface_z, up_margin)
         if not corner_z then
             return nil
@@ -258,9 +288,10 @@ function M.ground_z(x, y, hint_z, up_margin)
     return terrain_ground_z(x, y)
 end
 
--- The unit surface normal under (x, y), plus the four points it was measured at, or nil when the
--- footprint could not be fully sampled. `surface_z` is the height already found under the centre (it
--- seeds the corner casts), `axis` the pose's facing, `up_margin` the corner casts' window.
+-- The unit surface normal under the car whose FRONT EDGE stands at (x, y) -- the footprint is set back
+-- behind that point, see cast_normal_samples -- plus the four points it was measured at, or nil when the
+-- footprint could not be fully sampled. `surface_z` is the height already found under (x, y) (it seeds
+-- the corner casts), `axis` the pose's facing, `up_margin` the corner casts' window.
 --
 -- Public because the grid editor's preview draws the very same measurement (ADR-0034 amendment
 -- 2026-08-30). Preview and spawn therefore share one helper and one set of casts; there is deliberately
@@ -309,7 +340,7 @@ end
 
 -- Put the surface's SLOPE at (x, y) on an already-dropped pose, so the car follows the ground instead
 -- of standing flat in it (ADR-0034 amendment 2026-08-30). `seed_z` is the height the corner casts start
--- from -- the surface just found under the centre -- and `up_margin` their window. Absent `up` means
+-- from -- the surface just found under the pose -- and `up_margin` their window. Absent `up` means
 -- every consumer keeps world-up, i.e. exactly the behaviour before that amendment.
 --
 -- Two conditions, and both are load-bearing: without a `seed_z` there is no measured height to hang the
