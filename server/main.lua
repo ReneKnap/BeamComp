@@ -3194,6 +3194,33 @@ function quali.note_sector_best(id)
     end
 end
 
+-- Hold the ramp for one STAGE_GAP after a driver left it other than by clearing it normally (the Round-10
+-- settle). The car is still physically on/near the ramp -- the hold teleport, or BeamMP's despawn of a
+-- leaver, is a network round-trip away -- so the ramp must not be handed to the next driver yet. Expressed
+-- in the existing clearing gate rather than a second timer: the distance condition is purpose-served (this
+-- driver is off the track for gate purposes) and the gap restarts from now, so advance_staged frees the ramp
+-- exactly STAGE_GAP later. clearing_id stays set until then, which keeps release_next held and the queue
+-- broadcast's `waiting` flag honest. Callers: quali.requeue (Round 10) and quali.purge_driver (disconnect).
+function quali.settle_ramp(id)
+    local q = session.quali
+    q.clearing_id = id
+    q.cleared = true
+    q.launched_at = now()
+end
+
+-- Take one driver out of the waiting line, leaving the order of everyone else intact. Callers append the id
+-- back afterwards when the driver is only going to the back (quali.requeue); a purge just drops them.
+function quali.drop_from_queue(id)
+    local q = session.quali
+    local remaining = {}
+    for _, qid in ipairs(q.queue or {}) do
+        if qid ~= id then
+            remaining[#remaining + 1] = qid
+        end
+    end
+    q.queue = remaining
+end
+
 -- Requeue a driver whose run ended (ADR-0044/Round4): reset their record so the next run scores from zero,
 -- release any ramp state they held (a held clearing gate becomes a settle timer, Round 10), then either
 -- append them to the back of the turn queue (another attempt, returning to their own fixed holding slot)
@@ -3211,23 +3238,12 @@ function quali.requeue(id)
         q.staging_id = nil
         q.staged_at = nil
     end
-    -- If this driver held the clearing gate, do NOT free it outright (Round 10): the car stays physically
-    -- on/near the ramp until the hold teleport lands, a network round-trip away. Convert the gate into a
-    -- settle timer instead -- the distance condition is purpose-served (the driver is off the track), the
-    -- gap restarts from the requeue moment -- so advance_staged stages the next driver no earlier than
-    -- STAGE_GAP from now. clearing_id stays set until the settle expires, which keeps release_next held
-    -- and the queue broadcast's `waiting` flag honest.
+    -- If this driver held the clearing gate, do NOT free it outright (Round 10): settle the ramp instead,
+    -- so the next driver stages no earlier than STAGE_GAP from this requeue.
     if q.clearing_id == id then
-        q.cleared = true
-        q.launched_at = now()
+        quali.settle_ramp(id)
     end
-    local filtered = {}
-    for _, qid in ipairs(q.queue or {}) do
-        if qid ~= id then
-            filtered[#filtered + 1] = qid
-        end
-    end
-    q.queue = filtered
+    quali.drop_from_queue(id)
     local window_open = session.phase == PHASE.qualifying and phase_elapsed() < q.duration
     if not window_open then
         -- The run ended after the window closed: this driver is finished for the session. They stay where
@@ -3286,6 +3302,56 @@ function quali.handle_reset(player_id, payload)
     end
     quali.requeue(player_id)
     log_info("beamcomp.race", "player " .. tostring(player_id) .. " recover -> requeued (staged quali)")
+end
+
+-- Drop a disconnected driver out of the turn rotation (called from on_player_disconnect). Without this the
+-- leaver's id stays in the queue forever and keeps being handed ramp turns nobody drives: release_next stages
+-- the ghost, nothing ever reports its clear, and STAGE_CLEAR_TIMEOUT force-requeues it to the back -- a ~33 s
+-- cycle that burns ramp time the real drivers need for the rest of the window.
+--
+-- Deliberately NOT quali.requeue: that would send a hold to a client that is gone, and its reset_progress
+-- would clear the record.dnf the disconnect handler just set. The record itself stays exactly as it is --
+-- the leaver keeps their DNF mark, their best run time, their classification rank and the grid slot it earns
+-- (ADR-0014; quali.ranking measures pace, not presence). Only the rotation drops them.
+--
+-- Staged qualifying only: the circuit quali (ADR-0041) has no queue, and every other phase is already
+-- covered by the disconnect handler's own branches.
+function quali.purge_driver(id)
+    if not quali.is_staged() or session.phase ~= PHASE.qualifying then
+        return
+    end
+    if not (session.progress and session.progress[id]) then
+        return
+    end
+    local q = session.quali
+    -- Defensive, like advance_staged: the queue/status are seeded by quali.start_session in the same call
+    -- that enters the qualifying phase, so this should never be nil -- but a disconnect callback is the last
+    -- place we want an index error, and there is nothing to purge from before the seeding anyway.
+    if not q.status or not q.queue then
+        return
+    end
+    -- The leaver occupied the ramp, counting down on it or driving off it. BeamMP does not despawn their car
+    -- instantly, so free the ramp through a settle rather than outright -- the next driver must never be
+    -- teleported into it in the same tick. Both roles settle: a driver mid-count is parked ON the ramp, which
+    -- is if anything more in the way than one that has already launched.
+    local held_ramp = q.staging_id == id or q.clearing_id == id
+    if q.staging_id == id then
+        q.staging_id = nil
+        q.staged_at = nil
+    end
+    if held_ramp then
+        quali.settle_ramp(id)
+    end
+    quali.drop_from_queue(id)
+    -- "done" rather than removing the row: the HUD keeps showing them, reading finished instead of queued.
+    q.status[id] = "done"
+    log_info("beamcomp.race", string.format(
+        "staged quali: driver %s disconnected -- purged from the turn queue (%s)",
+        tostring(id),
+        held_ramp and "held the ramp, settling for STAGE_GAP" or "was waiting in the queue"))
+    -- Re-broadcast now so the remaining drivers' queuePos and the `waiting` flag are right immediately,
+    -- rather than at whatever the next state change happens to be.
+    quali.broadcast_queue()
 end
 
 -- The launched driver has cleared the ramp (client->server qualiCleared, ADR-0044/Round4): the >=15 m gate
@@ -6123,6 +6189,12 @@ local function on_player_disconnect(player_id)
         broadcast_standings()
         maybe_end_race()
     end
+    -- A staged sprint quali (ADR-0044) hands out ramp turns from a queue, and nothing above removes the
+    -- leaver from it -- so they would keep being staged for the rest of the window. Purge them from the
+    -- rotation after the DNF bookkeeping, and unconditionally: a leaver whose record already reads
+    -- finished/dnf skips the block above but must still be dropped from the queue. No-op in every other
+    -- phase and in a circuit quali (the purge guards itself).
+    quali.purge_driver(player_id)
 end
 
 -- Split a chat message into its leading command token and the trimmed remainder.
