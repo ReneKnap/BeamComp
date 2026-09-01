@@ -2635,6 +2635,14 @@ function quali.begin(duration, staged)
                             -- relayed as `sectorCounts` so a no-reference (white) sector upgrades to
                             -- purple once a second scoring exists (seeded by start_session, same
                             -- fold seam and lifecycle as sector_best)
+        progress_at = nil,  -- per-id now() of a driver's last forward progress (staged-quali-stuck-ai-
+                            -- never-requeued): stamped at the GO flip and on every scored crossing, the
+                            -- only two movement signals a race-blind server ever receives. Read solely by
+                            -- the window-closed branch of advance_staged, to tell a driver who is still
+                            -- going from one who wrecked mid-stage (seeded by start_session, like status)
+        stall_logged = nil, -- per-id guard so the "discounted as stalled" line logs once per driver
+                            -- instead of once per tick -- the tick keeps running for the whole length of
+                            -- the finish-your-run grace (seeded by start_session, like progress_at)
     }
 end
 
@@ -3102,6 +3110,11 @@ function quali.start_session()
     -- Companion crossing counter per sector (r4), same fold seam: `sectorCounts` lets the client
     -- upgrade a no-reference (white) sector to purple once at least one FURTHER scoring exists.
     q.sector_count = {}
+    -- Wall-clock stamp of each driver's last forward progress, plus the companion once-per-driver log
+    -- guard (staged-quali-stuck-ai-never-requeued). Empty here on purpose: everyone starts `queued`, and
+    -- only a `running` driver is ever measured -- the GO flip stamps them as they launch.
+    q.progress_at = {}
+    q.stall_logged = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
     end
@@ -3192,6 +3205,21 @@ function quali.note_sector_best(id)
     if q.sector_count then
         q.sector_count[k] = (q.sector_count[k] or 0) + 1
     end
+end
+
+-- Stamp a driver's last forward progress on the wall clock (staged-quali-stuck-ai-never-requeued). The
+-- server holds no geometry, no positions and no velocities, and no client sends periodic telemetry
+-- (ADR-0005) -- a scored checkpoint crossing is the ONLY signal it ever gets from a moving car. So "is
+-- this driver still going?" can only be expressed as "were they stamped recently?". Called from the two
+-- (and only two) places a staged driver demonstrably moves forward: the GO flip in advance_staged (they
+-- just launched) and the staged checkpoint-report seam (they just crossed). Nothing else may stamp --
+-- a stamp is a claim that the car moved.
+function quali.note_progress(id)
+    local q = session.quali
+    if not q or not q.progress_at then
+        return
+    end
+    q.progress_at[id] = now()
 end
 
 -- Hold the ramp for one STAGE_GAP after a driver left it other than by clearing it normally (the Round-10
@@ -3411,6 +3439,9 @@ function quali.advance_staged()
     -- now driving (running + scored) but still block the ramp until they clear it + the gap passes.
     if q.staging_id and t >= (q.staged_at or 0) + quali.STAGE_COUNTDOWN then
         q.status[q.staging_id] = "running"
+        -- Launching IS forward progress: a driver released seconds before the window closes has not
+        -- reached checkpoint 1 yet, and must not read as stalled merely for want of a crossing.
+        quali.note_progress(q.staging_id)
         q.clearing_id = q.staging_id
         q.launched_at = t
         q.cleared = false
@@ -6447,10 +6478,13 @@ local function handle_checkpoint_report(player_id, payload)
     -- and the field-wide per-sector best splits (Round 13) -- BEFORE the queue-board broadcast below
     -- reads them. Every scored crossing counts -- final ones too, and those of a run later aborted by a
     -- recover/forced requeue (the fold is per crossing, so an abort can never lose banked progress).
+    -- The same crossing is the driver's proof of life (staged-quali-stuck-ai-never-requeued): it stamps
+    -- their wall-clock progress, which is what keeps them counting as "still out" once the window closes.
     -- Circuit quali / normal race: gated off.
     if quali.is_staged() and session.phase == PHASE.qualifying then
         quali.note_cp_progress(subject_id)
         quali.note_sector_best(subject_id)
+        quali.note_progress(subject_id)
     end
     broadcast_standings()
     -- Staged sprint quali (Round 6): refresh the holding-queue board on every crossing, so the live-timing
