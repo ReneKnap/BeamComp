@@ -209,7 +209,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "grid-slope-samples-on-car/2026-09-01"
+local BUILD_MARKER = "recover-follows-surface-slope/2026-09-01"
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -5485,7 +5485,8 @@ end
 
 -- The recover target for the local player: the last passed checkpoint (ADR-0010/0013) facing the
 -- next one, or -- before any checkpoint is passed -- the grid start pose facing the first checkpoint.
--- Returns {pos = {x,y,z}, dir = {x,y,z} or nil}; the VE falls back to a default facing on a nil dir.
+-- Returns {pos = {x,y,z}, dir = {x,y,z} or nil, up = {x,y,z} or nil}; `up` is the surface normal
+-- placement measured under the final position, and a nil dir or up puts the car down level.
 local function recover_target(race, detection)
     local seq = (detection and detection.seq) or 0
     local target_pos, face_pos
@@ -5513,8 +5514,11 @@ local function recover_target(race, detection)
     -- authored centre sits above the road, so a raw teleport there would bury the car. Pass the facing
     -- as `forward` so the wall-nudge knows which way is down-track. (The seq <= 0 grid pose is already
     -- grounded by start.prepare; re-grounding it is idempotent.)
+    --
+    -- `up` is the slope placement measured under the position it settled on -- the car is laid INTO
+    -- that surface instead of flat into the landscape (ADR-0034 amendment 2026-09-01).
     local grounded = placement.resolve({pos = target_pos, forward = dir})
-    return {pos = grounded.pos, dir = dir}
+    return {pos = grounded.pos, dir = dir, up = grounded.up}
 end
 
 -- Arm the seated car's VE key forwarders for the race (ADR-0017). GE owns the enable check, countdown,
@@ -5615,7 +5619,7 @@ local function perform_assist(kind)
         pcall(function() own_car:queueLuaCommand("recovery.recoverInPlace()") end)
     else
         local target = recover_target(race, M.state.detection)
-        local placed, err = vehicles.recover_to(own_car, target.pos, target.dir)
+        local placed, err = vehicles.recover_to(own_car, target.pos, target.dir, target.up)
         if not placed then
             log("W", RACE_LOG_TAG, "recover-to-checkpoint failed: " .. tostring(err))
             return
