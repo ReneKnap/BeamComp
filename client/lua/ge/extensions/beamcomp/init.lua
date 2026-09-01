@@ -87,7 +87,10 @@ M.uilayout = require("beamcomp/race/uilayout")
 --          sequence, the ramp-clear gate, ADR-0044), the quali snapshot handler and the results
 --          re-grid AI respawn (ADR-0041), and the HUD's quali row.
 -- hold  -- the qualifying HOLD: the single `is_held()` predicate and the layers that enforce it
---          (bug quali-hold-reset-and-repaint-leak).
+--          (bug quali-hold-reset-and-repaint-leak), plus `is_frozen_phase()` -- the wider "the
+--          local driver's car is supposed to be standing still right now" window that the EV
+--          throttle clamp and the in-place reload re-arm share (bug
+--          recover-unguarded-when-assists-disabled).
 -- setup -- the race-setup panel's GE-side presence: the session open-state set by the admin-gated
 --          /raceui open, the one-shot watchdog that re-adds the app when a UI reload drops it
 --          (bug setup-panel-settings-survive-ui-reload), and the panel's AI-roster car re-resolve
@@ -1275,6 +1278,22 @@ function hold.is_held()
         return status == "queued" or status == "staged" or status == "done"
     end
     return M.state.quali_lap_done == true
+end
+
+-- The FULL "the local driver's car is supposed to be standing still right now" window: the two frozen
+-- start phases plus the qualifying hold above. Two layers read it and must never disagree -- the EV
+-- throttle clamp arms on it (push_freeze_hold's onUpdate gate) and the in-place reload re-arm
+-- re-asserts the GE controller freeze on it (rearm_own_car_on_reload, bug
+-- recover-unguarded-when-assists-disabled). One predicate, so they cannot drift apart.
+--
+-- The F1 light start is carved out on purpose: it keeps the phase at `countdown` while f1_begin_lights
+-- has already FREED the car at the first light (ADR-0043), so anything re-freezing on a blanket
+-- `countdown` would strand the driver on the grid at lights-out. Race-agnostic -- callers add their own
+-- M.state.race check (the reload re-arm has already made it by the time it asks).
+function hold.is_frozen_phase()
+    return M.state.phase == "staging"
+        or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))
+        or hold.is_held()
 end
 
 -- Push the current held-ness to the recover-key block. Called from every transition that can change it
@@ -6455,9 +6474,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- can simply drive out of the hold under full throttle -- no key press needed. quali.launch_local already
     -- disarms the clamp at GO (as begin_driving and f1_begin_lights do on their releases), which is what this
     -- arm was always missing its other half of.
-    if M.state.race and (M.state.phase == "staging"
-            or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))
-            or hold.is_held()) then
+    --
+    -- The window itself is hold.is_frozen_phase(), shared with the in-place reload re-arm
+    -- (rearm_own_car_on_reload) so the two layers that enforce it cannot drift apart.
+    if M.state.race and hold.is_frozen_phase() then
         push_freeze_hold()
     end
     -- Keep pushing during the finished phase too so the results template (ADR-0012) renders the
