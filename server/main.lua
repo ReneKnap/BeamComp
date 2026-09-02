@@ -5518,6 +5518,10 @@ local function tick()
         -- (A staged sprint quali never reaches this branch -- it skips the global countdown above.)
         if quali.is_pending() then
             enter_phase(PHASE.qualifying, session.quali.duration)
+            -- Same reason as the green light below: without a stamp at the phase entry a driver who never
+            -- scores a crossing carries none at all, and an unstamped driver always counts as progressing
+            -- -- so the finish-your-lap grace could never end early for exactly the car that never moved.
+            stall.arm_field()
         else
             enter_phase(PHASE.racing, nil)
             -- The green light is forward progress for the whole field. Without it a driver pinned
@@ -6378,6 +6382,10 @@ local function handle_start_command(player_id, player_name)
     -- countdown via enter_countdown_from_staging.
     if quali.is_staged() then
         enter_phase(PHASE.qualifying, session.quali.duration)
+        -- The staged path skips the countdown, so it needs its own stamp at the phase entry. Additive
+        -- here: advance_staged only ever tests drivers whose status is `running`, and those are stamped
+        -- at their own GO flip -- a queued driver's ageing stamp is never read.
+        stall.arm_field()
         broadcast_standings()
         quali.start_session()
         MP.SendChatMessage(player_id, "BeamComp: qualifying started")
