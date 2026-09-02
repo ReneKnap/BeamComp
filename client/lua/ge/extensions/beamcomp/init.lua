@@ -2385,6 +2385,8 @@ stall.MSG = "stallReport"
 --
 -- Body velocity is the right read here BECAUSE it is the recover criterion. The earlier displacement
 -- measure went with the server-side crossing-gap heuristic (ADR-0014, 2026-09-03).
+-- An unreadable car answers `false`, i.e. MOVING. Both callers want that: a recover hold must not start
+-- on a car we cannot vouch for, and an AFK claim must never rest on a failed read.
 function stall.is_stopped(veh)
     local ok, speed = pcall(function() return veh:getVelocity():length() end)
     return ok and speed ~= nil and speed <= STATIONARY_SPEED
