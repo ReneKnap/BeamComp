@@ -2523,6 +2523,12 @@ end
 -- resolve to a nil global inside it.
 local stall = {}
 
+-- client->server: {stalled = bool} for the sender's own car, {aiId = ..., stalled = bool} for one of the
+-- owner's AI. The second input to the predicate below: the client CAN see whether a car has covered
+-- ground, so it measures and reports instead of leaving the server to infer it from crossing gaps alone.
+-- Kept on the table, not as a top-level local (200-local ceiling), like quali.MSG_* and track.MSG_*.
+stall.MSG = "stallReport"
+
 -- Stamp a driver as having just moved forward. Lazily allocates the table so no caller has to seed it.
 function stall.note(id)
     local at = session.progress_at
@@ -2551,6 +2557,7 @@ end
 -- reset_to_lobby, so one race's staleness can never be read as the next race's liveness.
 function stall.clear()
     session.progress_at = nil
+    session.stall_reported = nil
 end
 
 -- Stamp the whole field at the green light. Leaving the line is forward progress -- and without this a
@@ -2559,9 +2566,71 @@ end
 -- that motivated it. Deliberately here and not at build_progress time: staging is open-ended (it waits
 -- for the host), so a stamp taken then would already be minutes stale when the race actually goes green.
 function stall.arm_field()
+    -- Any client verdict banked before the green light goes with it. A quali event runs a finish-your-run
+    -- grace of its own, so a driver can be flagged there; and the clients drop their reference poses at
+    -- this very boundary, which takes their "already reported" latch with it -- so nobody would ever send
+    -- the matching "moving again" and the flag would silently follow a driver into the race. Clearing here
+    -- puts both sides' latches back in step, and it is what arming the field already means: as of the
+    -- green light everyone is moving forward.
+    session.stall_reported = nil
     for id in pairs(session.progress or {}) do
         stall.note(id)
     end
+end
+
+-- Record or clear a CLIENT-MEASURED stall verdict for one driver (feature
+-- stall-detection-client-measured-movement). The client owns the measurement -- it can see positions and
+-- we cannot (ADR-0005) -- and reports only the two edges, so this is called once when a driver goes still
+-- and once when they move again, never per frame. Edge-guarded here as well, so a client that lost its own
+-- latch still cannot produce a second log line.
+--
+-- Purely a "stops holding the grace open" claim, and fully reversible: nothing here marks anybody DNF,
+-- touches a progress record, or moves a car. The DNF still comes from finalize_race when the grace expires.
+function stall.set_reported(id, stalled)
+    local flags = session.stall_reported
+    if stalled then
+        if flags and flags[id] then
+            return
+        end
+        flags = flags or {}
+        session.stall_reported = flags
+        flags[id] = true
+        log_info("beamcomp.race", "driver " .. tostring(id)
+            .. " reported stalled by its client -- no longer counts as able to finish")
+        return
+    end
+    if not (flags and flags[id]) then
+        return
+    end
+    flags[id] = nil
+    log_info("beamcomp.race", "driver " .. tostring(id)
+        .. " reported moving again by its client -- counts as able to finish once more")
+end
+
+-- Client->server stall verdict (stall.MSG). A player reports its own car; the race owner proxies each of
+-- its AI with aiId -- the same split, and the same validation, as quali.handle_cleared and the checkpoint
+-- proxy: accepted only from the owner and only for a known AI slot, so no client can flag another
+-- participant. Reports outside a race phase, or for an id with no progress record, are dropped.
+function stall.handle_report(player_id, payload)
+    if session.phase ~= PHASE.racing and session.phase ~= PHASE.qualifying then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local subject_id = player_id
+    if payload.aiId ~= nil then
+        if player_id ~= session.owner_id or not is_ai_id(payload.aiId) then
+            log_info("beamcomp.race", "stall report from id " .. tostring(player_id)
+                .. " ignored: not the owner or bad aiId " .. tostring(payload.aiId))
+            return
+        end
+        subject_id = payload.aiId
+    end
+    if not (session.progress and session.progress[subject_id]) then
+        return
+    end
+    stall.set_reported(subject_id, payload.stalled == true)
 end
 -- ===== end driver liveness =================================================================
 
@@ -7401,6 +7470,10 @@ local function handle_client_event(player_id, data)
     elseif decoded.type == quali.MSG_CLEARED then
         -- Staged sprint quali (ADR-0044/Round4): the launched driver cleared the ramp (>=15 m gate).
         quali.handle_cleared(player_id, decoded.payload)
+    elseif decoded.type == stall.MSG then
+        -- A client-measured movement verdict for its own car, or one of the owner's AI: the second input
+        -- to the liveness predicate both finish graces read (ADR-0014 amendment).
+        stall.handle_report(player_id, decoded.payload)
     elseif decoded.type == "raceControl" then
         -- Panel-triggered race stop (ADR-0038 amendment): delegate to the existing chat-command handlers so
         -- the admin gate, phase guards, chat replies and logging are reused. Inlined (not a named handler)
