@@ -220,7 +220,16 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "client-measured-stall/2026-09-02"
+local BUILD_MARKER = "afk-recover-criterion/2026-09-03"
+
+-- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
+-- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
+-- das auch einheitlich"):
+--   * may a recover/repair hold run? (ADR-0017, is_car_stationary) -- must not fire while driving
+--   * is this driver AFK during a finish grace? (stall.is_stopped)
+-- Declared up here rather than beside the assist code because the `stall` namespace below closes over it,
+-- and Lua binds upvalues at closure-creation time -- declared later it would silently be a nil global there.
+local STATIONARY_SPEED = 2.0
 
 -- AI count past which the owner gets a one-shot performance hint (ADR-0036 Etappe B): all AI physics run
 -- on the host, so a larger field is heavier on the owner's machine.
@@ -324,11 +333,13 @@ M.state = {
     -- the single truth; these two carry the state it cannot derive from the fields above.
     quali_lap_done = false,    -- circuit quali: the local driver's lap closed inside the finish-your-lap grace, so their session is over and the car is held (ADR-0041 amendment)
     quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. Kept in M.state (not a file local): it survives a Lua reload in lockstep with the engine's own serialized filter state
-    -- Per-owned-car movement reference for the client-measured stall verdict (feature
+    -- Per-owned-car standstill clock for the client-measured AFK verdict (feature
     -- stall-detection-client-measured-movement), keyed "self" for the local car and by AI id for each
-    -- host-driven AI: {x, y, z, since, reported}. Plain numbers + a boolean on purpose, so a Lua reload
-    -- carries it intact (like size_track) and no engine handle can go stale in it. Lazily created by
-    -- stall.step; cleared wherever M.state.grace is, plus at the racing green light. nil off-race
+    -- host-driven AI: {since, warned, reported} -- when this car last started standing still, and the two
+    -- one-shot latches. A number and two booleans on purpose, so a Lua reload carries it intact (like
+    -- size_track) and no engine handle can go stale in it. Exists ONLY while M.state.grace is armed:
+    -- stall.step drops the whole table whenever the finish timer is not running, which is also what makes
+    -- every car start its 15 s from zero the instant the timer arms. nil the rest of the time
     stall_track = nil,
 }
 
@@ -2343,56 +2354,40 @@ end
 -- ===== client-measured driver liveness ===================================================
 -- The client half of the server's `stall` predicate (feature stall-detection-client-measured-movement).
 --
--- The server is race-blind (ADR-0005): it holds no positions and gets no telemetry, so on its own it can
--- only ask "how long since this driver's last scored crossing?" -- a guess that has to outlast the longest
--- legitimate sector, which is why it sits at a flat 60 s. WE can see the world. So we measure whether each
--- car this client owns has actually covered ground and report the verdict; the server folds it into the
--- same one predicate as its own gap backstop. That is the established seam, not an exception to it -- the
--- checkpoint reports, the F1 reaction and qualiCleared all work exactly this way.
+-- The server is race-blind (ADR-0005): it holds no positions, no telemetry, and no client sends either.
+-- It therefore has NO way of its own to tell a parked wreck from someone still driving, so this client is
+-- the ONLY source of that verdict. (It used to guess from the gap since a driver last scored a checkpoint;
+-- that heuristic ended a real qualifying under a driver who was still driving -- the same log shows 90 s
+-- between two checkpoints on a normal lap -- and it was removed rather than retuned. See ADR-0014.)
 --
--- A report is ONLY ever a stall claim, never a DNF: it takes a driver out of "can still finish" and puts
--- them straight back in the moment they move again. The DNF still comes from the server's grace expiry.
+-- A report is ONLY ever an AFK claim, never a DNF: it takes a driver out of "can still finish" and puts
+-- them straight back in the moment they move again. The DNF still comes from the server grace expiry.
 
--- Seconds a car's reference pose may stand unbeaten before this client calls it stalled (user decision:
--- the most conservative of the offered values -- with a reversible report a false positive is harmless).
+-- Seconds of continuous standstill before this client reports a car as AFK. Counted ONLY while the finish
+-- timer is running (user decision 2026-09-03: "erst wenn der finish timer laeuft zaehlen die 15 sekunden,
+-- nicht schon vorher"), so 15 s always means 15 s OF THAT TIMER -- a driver who was already parked when it
+-- armed gets the same 15 s as everybody else. Predictable, at the price of a stalled field taking 15 s to
+-- resolve rather than being reported at once.
 stall.WINDOW = 15.0
 
--- Metres a car must cover, in any direction, to beat its reference pose and reset the window.
---
--- Bounded on both sides by numbers already in this file. FAR BELOW driving: quali.HOLD_CREEP_SPEED (0.7
--- m/s) is this codebase's own "a held car is measurably moving" line, and even that crawl covers ~10 m in
--- WINDOW seconds -- so 2 m is 5x under the slowest thing anyone here has called movement. FAR ABOVE
--- wobble: 2 m is under half a car length, and a wreck vibrating on its springs, rocking in a ditch or
--- grinding along a wall does not translate that much ground in 15 s. BeamNG positions come from
--- deterministic physics, not GPS, so there is no noise floor to clear and the whole margin buys real motion.
-stall.MOVE_DIST = 2.0
+-- Seconds of standstill at which the LOCAL player is warned, 5 s before WINDOW. AI get no warning -- there
+-- is nobody to warn.
+stall.WARN_AT = 10.0
 
 -- Client->server verdict, matching the server's stall.MSG: {stalled = bool} for our own car,
 -- {aiId = ..., stalled = bool} for one of the host's AI (the qualiCleared split).
 stall.MSG = "stallReport"
 
--- Advance one car's reference pose and answer whether it has stood unbeaten for WINDOW seconds.
+-- Is this car standing still? THE criterion, and deliberately the very same test the recover/repair hold
+-- uses to decide whether it may run (ADR-0017, is_car_stationary): one predicate, one number, applied to
+-- the local player car and to each of the host AI alike. If you are stopped enough to hit recover, you are
+-- stopped enough to count as AFK -- which is also the rule that is easiest to explain in-game.
 --
--- The reference IS the whole state: beat it and it moves to here-and-now, so "stalled" means nothing else
--- than "this car has not been more than MOVE_DIST from one spot for WINDOW seconds". No ring buffer, no
--- history, no allocation after the first frame. Compared squared to skip the sqrt.
-function stall.track(key, pos, t)
-    local seen = M.state.stall_track
-    if not seen then
-        seen = {}
-        M.state.stall_track = seen
-    end
-    local ref = seen[key]
-    if not ref then
-        seen[key] = {x = pos.x, y = pos.y, z = pos.z, since = t, reported = false}
-        return false
-    end
-    local dx, dy, dz = pos.x - ref.x, pos.y - ref.y, pos.z - ref.z
-    if dx * dx + dy * dy + dz * dz > stall.MOVE_DIST * stall.MOVE_DIST then
-        ref.x, ref.y, ref.z, ref.since = pos.x, pos.y, pos.z, t
-        return false
-    end
-    return t - ref.since >= stall.WINDOW
+-- Body velocity is the right read here BECAUSE it is the recover criterion. The earlier displacement
+-- measure went with the server-side crossing-gap heuristic (ADR-0014, 2026-09-03).
+function stall.is_stopped(veh)
+    local ok, speed = pcall(function() return veh:getVelocity():length() end)
+    return ok and speed ~= nil and speed <= STATIONARY_SPEED
 end
 
 -- Name one measured car for a log line. Built only on a real transition, never per frame.
@@ -2403,36 +2398,68 @@ function stall.who(car)
     return "own car"
 end
 
--- Measure one owned car and report the STALLED / MOVING-AGAIN edges, once each.
+-- Warn the LOCAL player, once per standstill episode, WINDOW - WARN_AT seconds before they are reported.
+-- Same toast seam and shape as the recover/repair feedback (notify_assist_blocked, ADR-0017 amendment),
+-- inlined rather than calling it because that helper is a local defined much further down this file.
+-- Never for an AI: there is nobody to warn.
+function stall.warn_local()
+    guihooks.trigger("toastrMsg", {
+        type = "warning",
+        title = "BeamComp",
+        msg = string.format("AFK in %.0f s -- move now, or you stop holding the finish timer open",
+            stall.WINDOW - stall.WARN_AT),
+    })
+end
+
+-- Run one owned car's standstill clock and report the AFK / MOVING-AGAIN edges, once each.
 --
 -- `car` is nil for the local player's own car and the AI's entry when the host proxies one -- so an AI
--- report carries aiId and ours does not, which is the qualiCleared split verbatim. `armed` is whether the
--- server's finish grace is running: the measurement runs the whole race, but a verdict is only ever SENT
--- inside a grace, so a normal race costs zero traffic (and a driver already stuck when the grace arms is
--- reported at once instead of starting a fresh WINDOW count).
+-- report carries aiId and ours does not, which is the qualiCleared split verbatim.
 --
--- The moving-again branch is deliberately NOT gated on `armed`: putting a driver back into "can still
--- finish" is the fail-safe direction and must never wait on a state check.
-function stall.check(veh, t, armed, car)
+-- Only ever called while the finish timer is armed (stall.step gates on it), so the clock measures
+-- standstill DURING the timer and nothing else -- a driver who was already parked when it started still
+-- gets the full WINDOW.
+--
+-- Moving clears the whole episode: the reversal is reported if we had claimed AFK, and the entry is
+-- dropped, which also cancels a pending warning so a later standstill warns again from scratch.
+function stall.check(veh, t, car)
     local ai_id = car and car.id
     local key = ai_id or "self"
-    local ok, pos = pcall(function() return veh:getPosition() end)
-    if not ok or not pos then
-        return  -- unreadable car: never a stall claim, the same fail-towards-waiting the server applies
+    local seen = M.state.stall_track
+    local entry = seen[key]
+
+    if not stall.is_stopped(veh) then
+        if entry then
+            if entry.reported then
+                send_to_server(stall.MSG, {aiId = ai_id, stalled = false})
+                log("I", RACE_LOG_TAG, string.format(
+                    "stall: %s is moving again -- reported as still running", stall.who(car)))
+            end
+            seen[key] = nil
+        end
+        return
     end
-    local stalled = stall.track(key, pos, t)
-    local ref = M.state.stall_track[key]
-    if stalled and armed and not ref.reported then
-        ref.reported = true
+
+    if not entry then
+        seen[key] = {since = t, warned = false, reported = false}
+        return
+    end
+    if entry.reported then
+        return  -- already claimed; only movement changes anything now
+    end
+
+    local standing = t - entry.since
+    if standing >= stall.WINDOW then
+        entry.reported = true
         send_to_server(stall.MSG, {aiId = ai_id, stalled = true})
         log("I", RACE_LOG_TAG, string.format(
-            "stall: %s has not moved %.1f m in %.0f s -- reported stalled for the finish grace",
-            stall.who(car), stall.MOVE_DIST, stall.WINDOW))
-    elseif ref.reported and not stalled then
-        ref.reported = false
-        send_to_server(stall.MSG, {aiId = ai_id, stalled = false})
-        log("I", RACE_LOG_TAG, string.format("stall: %s is moving again -- reported as still running",
-            stall.who(car)))
+            "stall: %s has been standing still for %.0f s of the finish timer -- reported AFK",
+            stall.who(car), stall.WINDOW))
+    elseif not ai_id and not entry.warned and standing >= stall.WARN_AT then
+        entry.warned = true
+        stall.warn_local()
+        log("I", RACE_LOG_TAG, string.format(
+            "stall: own car standing still for %.0f s -- warned the driver", stall.WARN_AT))
     end
 end
 
@@ -2451,8 +2478,19 @@ function stall.step()
     if not M.state.race or (phase ~= "racing" and phase ~= "qualifying") then
         return
     end
+    -- Nothing counts until the finish timer runs (user decision 2026-09-03). Dropping the table here is
+    -- also precisely what starts every car's 15 s from zero the moment the timer arms, so "15 s" always
+    -- means 15 s of the timer -- and it keeps a normal race completely free of both work and traffic.
+    if not M.state.grace then
+        M.state.stall_track = nil
+        return
+    end
+    local seen = M.state.stall_track
+    if not seen then
+        seen = {}
+        M.state.stall_track = seen
+    end
     local t = os.clockhp()
-    local armed = M.state.grace ~= nil
 
     local detection = M.state.detection
     if detection and not detection.done and not hold.is_held() then
@@ -2461,7 +2499,7 @@ function stall.step()
         -- report a stall for a car the player is no longer in.
         local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
         if own then
-            stall.check(own, t, armed, nil)
+            stall.check(own, t, nil)
         end
     end
 
@@ -2476,7 +2514,7 @@ function stall.step()
         if det and not det.done and not (held and held[car.id]) then
             local veh = be and be:getObjectByID(car.veh_id)
             if veh then
-                stall.check(veh, t, armed, car)
+                stall.check(veh, t, car)
             end
         end
     end
@@ -5851,10 +5889,6 @@ local function clear_assist_arming()
     end
 end
 
--- Speed (m/s) at or below which the car counts as stopped for recover/repair: the countdown only
--- runs while (near) stationary, so it cannot be triggered while driving (ADR-0017).
-local ASSIST_STATIONARY_SPEED = 2.0
-
 -- Min seconds between staging repairs, so a held/mashed Insert re-places + toasts once, not every frame
 -- (os.clock is monotonic CPU seconds -- the same gate the lock's spawn-block toast uses). Not reset per
 -- race: os.clock only climbs, so a new staging is always well past the throttle.
@@ -5874,14 +5908,11 @@ local function assist_setting(kind)
     return assists.recoverEnabled, assists.recoverHoldSeconds
 end
 
--- Whether the local car is stopped enough to begin/continue a recover/repair hold.
+-- Whether the local car is stopped enough to begin/continue a recover/repair hold (ADR-0017). The speed
+-- test itself is stall.is_stopped -- the SAME predicate the AFK detection applies, to the same number.
 local function is_car_stationary()
     local own_car = vehicles.resolve_own_car(M.state.current_vehicle_id)
-    if not own_car then
-        return false
-    end
-    local ok, speed = pcall(function() return own_car:getVelocity():length() end)
-    return ok and speed <= ASSIST_STATIONARY_SPEED
+    return own_car ~= nil and stall.is_stopped(own_car)
 end
 
 -- Lowercase verb for an assist kind, for the failure-feedback toasts ("Hold to <verb>").
@@ -6580,10 +6611,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         ai.step_window(M.state.ai_cars, M.state.ai_window, M.state.quali_ai_held)
         step_detection(dtSim)
         step_ai_detections(dtSim)
-        -- Measure real movement for every car this client owns, and report a verdict to the server while
-        -- a finish-your-run/lap grace is armed (feature stall-detection-client-measured-movement). After
-        -- the detectors on purpose: a driver who crossed the line this frame is already `done` and is not
-        -- measured on the way out.
+        -- Run the AFK clock for every car this client owns and report the verdict to the server, ONLY
+        -- while a finish-your-run/lap timer is running (feature stall-detection-client-measured-movement).
+        -- After the detectors on purpose: a driver who crossed the line this frame is already `done` and
+        -- is not measured on the way out.
         stall.step()
         -- Recover/repair work in qualifying exactly as in the race (ADR-0017): drive the held assist
         -- countdown so a player can reset a spun/stuck car and keep setting lap times.
@@ -6612,9 +6643,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         ai.step_window(M.state.ai_cars, M.state.ai_window, nil)
         -- Host only: step the AI detectors + proxy-report their crossings (ADR-0036). Inert otherwise.
         step_ai_detections(dtSim)
-        -- Measure real movement for every car this client owns, and report a verdict to the server while
-        -- the finish grace is armed (feature stall-detection-client-measured-movement). This is what lets
-        -- the race-blind server stop guessing from checkpoint gaps; outside a grace it sends nothing.
+        -- Run the AFK clock for every car this client owns and report the verdict to the server, ONLY
+        -- while the finish grace is running (feature stall-detection-client-measured-movement). The
+        -- race-blind server has no other source for this; outside a grace nothing is measured or sent.
         stall.step()
         -- F1 light start (ADR-0043): release the AI on their staggered reaction delay, and measure + report
         -- each car's start reaction for the standings React column (both no-op for a normal start).
