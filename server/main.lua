@@ -3091,7 +3091,8 @@ function quali.note_lap_stall(id, reason, threshold)
     end
     q.stall_logged[id] = true
     log_info("beamcomp.race", string.format(
-        "quali: driver %s %s (stall threshold %.1fs) -- no longer holding the finish-your-lap grace open",
+        "circuit quali: driver %s %s (stall threshold %.1fs) -- "
+            .. "no longer holding the finish-your-lap grace open",
         tostring(id), reason, threshold))
 end
 
