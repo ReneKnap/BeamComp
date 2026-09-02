@@ -3072,33 +3072,106 @@ function quali.lap_grace_window()
                     math.min(PHASE_DURATIONS.quali_lap_grace_max, window))
 end
 
+-- Log one driver being discounted from the circuit quali's finish-your-lap grace, ONCE per driver.
+--
+-- The sibling of quali.note_stall for the ADR-0041 circuit quali, and deliberately NOT that function: its
+-- latch (q.stall_logged) is seeded by quali.start_session, which is staged-only, so on a circuit session it
+-- is nil and note_stall would return at its first guard and log nothing at all. Same latch TABLE, created
+-- lazily here -- a session is either staged or circuit, so the two can never collide -- and the same
+-- never-cleared semantics: the tick re-evaluates the predicate for the whole length of the grace, so an
+-- unguarded line would repeat thousands of times and bury the entry the verification looks for.
+function quali.note_lap_stall(id, reason, threshold)
+    local q = session.quali
+    if not q then
+        return
+    end
+    q.stall_logged = q.stall_logged or {}
+    if q.stall_logged[id] then
+        return
+    end
+    q.stall_logged[id] = true
+    log_info("beamcomp.race", string.format(
+        "quali: driver %s %s (stall threshold %.1fs) -- no longer holding the finish-your-lap grace open",
+        tostring(id), reason, threshold))
+end
+
+-- Is anyone still circulating in the circuit quali? The ADR-0041 half of the one liveness predicate --
+-- maybe_end_race and quali.advance_staged ask stall.verdict the same question for their own graces.
+--
+-- The set is session.progress minus the DNF'd and the finished, the same shape maybe_end_race uses.
+-- Excluding `finished` is safe here and was verified rather than assumed: the circuit quali plan is sized
+-- so the field CANNOT run it out (race/start.lua builds it with max(10, ceil(duration / 8)) laps, an
+-- ~8 s/lap floor), so record.finished stays false for everyone for the whole session -- and a driver who
+-- somehow did complete it has a done detector and can set no further lap times anyway.
+-- quali.lap_grace_window, the file's other statement of "who is still circulating", excludes it too.
+--
+-- session.progress rather than build_standings(): it is keyed by the id stall.verdict wants, it does not
+-- sort the whole field on every 250 ms tick, and -- the deciding reason -- it has no `entry.name` filter.
+-- A participant whose identity resolved to nil would be dropped from the standings-based set, i.e. counted
+-- as NOT circulating, which fails towards ending the session early. That direction must stay impossible.
+--
+-- Scans the whole field instead of breaking on the first mover, so every discounted driver gets its one
+-- log line whatever order pairs() happens to walk in.
+function quali.anyone_lapping(t)
+    local threshold = quali.stall_threshold()
+    local anyone = false
+    for id, record in pairs(session.progress or {}) do
+        if not record.dnf and not record.finished then
+            local reason = stall.verdict(id, t, threshold)
+            if reason then
+                quali.note_lap_stall(id, reason, threshold)
+            else
+                anyone = true
+            end
+        end
+    end
+    return anyone
+end
+
 -- Advance the qualifying phase from the tick (ADR-0041): run for session.quali.duration, then arm a
 -- bounded finish-your-lap grace (so an in-progress lap still counts), then broadcast the classification and
 -- enter the results pause. Mirrors the racing finish-grace handling -- handled explicitly (not by the
 -- generic timed advance) so the grace can sit between the clock and the pause.
+--
+-- The grace is gated on somebody actually still circulating, like the other two (ADR-0014 amendment). It
+-- used to arm unconditionally and run its full length whatever the field was doing -- observed live as a
+-- 120 s wait on a session whose AI had long stopped moving. Both ends are gated: an already-stalled field
+-- at clock expiry is never armed at all, and an armed grace ends on the tick where the last mover goes
+-- quiet. The window LENGTH is untouched -- this changes only whether it is armed and when it ends.
+--
+-- Both inputs get their moment. At clock expiry the client has reported nothing yet (it only reports while
+-- the grace is armed), so the checkpoint-gap backstop decides whether to arm at all -- which is what the
+-- qualifying phase-entry stamp exists for. Once armed, the client's own 15 s measurement lands and ends it.
 function quali.advance_qualifying()
     local q = session.quali
     if not q or phase_elapsed() < q.duration then
         return  -- still within the quali clock
     end
+    local t = now()
+    local anyone_out = quali.anyone_lapping(t)
     if not q.lap_grace_deadline then
-        local window = quali.lap_grace_window()
-        q.lap_grace_deadline = now() + window
-        -- Tell clients the finish-your-lap window length so each still-circulating driver sees the timeout
-        -- to be at the finish (reuses the racing finish-grace display, ADR-0014/0041). The window tracks the
-        -- field's slowest best lap, so its length varies with the track/pace rather than being a flat cap.
-        broadcast_event(MSG_FINISH_GRACE, {duration = window})
-        log_info("beamcomp.race",
-            string.format("quali clock expired; finish-your-lap grace armed (%.1fs)", window))
+        if anyone_out then
+            local window = quali.lap_grace_window()
+            q.lap_grace_deadline = t + window
+            -- Tell clients the finish-your-lap window length so each still-circulating driver sees the
+            -- timeout to be at the finish (reuses the racing finish-grace display, ADR-0014/0041). The
+            -- window tracks the field's slowest best lap, so its length varies with the track/pace rather
+            -- than being a flat cap.
+            broadcast_event(MSG_FINISH_GRACE, {duration = window})
+            log_info("beamcomp.race",
+                string.format("quali clock expired; finish-your-lap grace armed (%.1fs)", window))
+            return
+        end
+        q.lap_grace_deadline = t  -- nobody left circulating -> classify immediately, never arm
+    end
+    if anyone_out and t < q.lap_grace_deadline then
         return
     end
-    if now() >= q.lap_grace_deadline then
-        broadcast_event(quali.MSG, quali.snapshot())
-        -- Carry the re-grid lead so the client can split the pause display: a clean "results" countdown
-        -- (pause - lead) before the respawn, then the settle timer (the remaining pause) after it (ADR-0041).
-        enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
-            {regridLead = PHASE_DURATIONS.quali_regrid_lead})
-    end
+    broadcast_event(quali.MSG, quali.snapshot())
+    -- Carry the re-grid lead so the client can split the pause display: a clean "results" countdown
+    -- (pause - lead) before the respawn, then the settle timer (the remaining pause) after it (ADR-0041).
+    enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
+        {regridLead = PHASE_DURATIONS.quali_regrid_lead})
 end
 
 -- Run the quali re-grid once, a lead time before the results pause ends (ADR-0041 amendment). The owner
