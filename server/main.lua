@@ -2553,6 +2553,38 @@ function stall.gap(id, t)
     return t - at
 end
 
+-- THE liveness predicate. Both finish graces ask this one question -- maybe_end_race for the racing grace
+-- (ADR-0014) and quali.advance_staged's anyone_out for the staged sprint's finish-your-run grace
+-- (ADR-0044) -- and get one answer from two inputs:
+--
+--   1. what the driver's own client MEASURED (it can see the world; we cannot), and
+--   2. the crossing gap above, which is all a race-blind server can infer by itself.
+--
+-- Returns nil while the driver still counts as able to finish, or a short reason string when they no
+-- longer do -- so a caller's log line names WHICH input spoke, which is the only way to tell the two apart
+-- in beamng.log/the server log.
+--
+-- The gap arm is deliberately untouched by the client arm: with no report ever arriving, the first branch
+-- is dead and this IS the crossing-gap test exactly as merged, which is its whole job now (the backstop
+-- for an old client, a client that crashed, or an AI whose owner left).
+--
+-- The one place the client input overrides a rule stated above: a report beats "no stamp counts as
+-- progressing". That rule guards against reading the ABSENCE of data as a stall -- a client report is not
+-- absent data, it is a measurement, and it is reversible the moment the car moves again.
+function stall.verdict(id, t, threshold)
+    if session.stall_reported and session.stall_reported[id] then
+        return "reported stalled by its client"
+    end
+    local gap = stall.gap(id, t)
+    if gap and gap > threshold then
+        -- Worded as a predicate about the driver, like the client arm above, so both read naturally in
+        -- either caller's sentence -- and so the staged-quali line stays byte-identical to 928a938's for
+        -- the backstop case, which is the case that must not change.
+        return string.format("has scored no crossing for %.1fs", gap)
+    end
+    return nil
+end
+
 -- Drop every stamp. The stamps are per-race, like session.progress: called at race start and from
 -- reset_to_lobby, so one race's staleness can never be read as the next race's liveness.
 function stall.clear()
@@ -3590,16 +3622,16 @@ end
 -- would repeat thousands of times and bury the very entry the in-game verification looks for. A driver
 -- who somehow resumes, crosses a checkpoint and then stalls again is not logged a second time -- the
 -- guard is deliberately never cleared, because one line per driver is the contract.
-function quali.note_stall(id, gap, threshold)
+function quali.note_stall(id, reason, threshold)
     local q = session.quali
     if not q or not q.stall_logged or q.stall_logged[id] then
         return
     end
     q.stall_logged[id] = true
     log_info("beamcomp.race", string.format(
-        "staged quali: driver %s has scored no crossing for %.1fs (stall threshold %.1fs) -- "
+        "staged quali: driver %s %s (stall threshold %.1fs) -- "
             .. "no longer holding the finish-your-run grace open",
-        tostring(id), gap, threshold))
+        tostring(id), reason, threshold))
 end
 
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
@@ -3695,9 +3727,9 @@ function quali.advance_staged()
         -- one log line whatever order pairs() happens to walk in.
         for id in pairs(session.progress or {}) do
             if q.status[id] == "running" then
-                local gap = stall.gap(id, t)
-                if gap and gap > threshold then
-                    quali.note_stall(id, gap, threshold)
+                local reason = stall.verdict(id, t, threshold)
+                if reason then
+                    quali.note_stall(id, reason, threshold)
                 else
                     -- A missing stamp counts as progressing, never as stalled: the asymmetry above holds
                     -- on the defensive path too -- an unexpected nil must fail towards waiting longer.
@@ -4313,8 +4345,13 @@ local function maybe_end_race()
     -- A driver wrecked or hung on track can no longer finish, but nothing in their record says so:
     -- they stay not-finished and not-dnf for the whole grace, so it ran its full 120 s even when every
     -- driver left out there had stopped moving -- observed as six AI DNF'ing simultaneously, exactly
-    -- 120 s after "finish grace armed". Discount a driver whose last forward progress is older than the
-    -- stall threshold, so this existing early end fires for them too.
+    -- 120 s after "finish grace armed". Discount a driver that stall.verdict no longer counts as running
+    -- -- their own client measured them standing still, or (the backstop) they have scored no crossing
+    -- for longer than the threshold -- so this existing early end fires for them too.
+    --
+    -- Discounting is NOT a DNF and nothing here is terminal: the driver's record is untouched, and a
+    -- client reporting them moving again puts them straight back into `active`. The DNF still arrives
+    -- only from finalize_race when the grace actually expires.
     --
     -- ONLY while the finish grace is armed. This function also runs from /dnf, from a disconnect and
     -- from the first finish, and the block below arms a deadline even when NOBODY has finished (the
@@ -4333,12 +4370,15 @@ local function maybe_end_race()
     local stalled
     for id, record in pairs(session.progress) do
         if not record.finished and not record.dnf then
-            local gap = threshold and stall.gap(id, t)
-            if gap and gap > threshold then
+            -- `threshold and` IS the armed-grace gate described above -- keep it: without it the discount
+            -- would also run from /dnf, a disconnect and the first finish, where it could end a race
+            -- nobody has finished. Nothing below this line is reached with no grace running.
+            local reason = threshold and stall.verdict(id, t, threshold)
+            if reason then
                 stalled = stalled or {}
-                stalled[#stalled + 1] = string.format("%s (%.0fs)", tostring(id), gap)
+                stalled[#stalled + 1] = string.format("%s (%s)", tostring(id), reason)
             else
-                -- Recently stamped, or carrying no stamp at all -- either way this driver still counts.
+                -- Still moving as far as anyone can tell -- measured or inferred -- so this driver counts.
                 active = active + 1
             end
         end
