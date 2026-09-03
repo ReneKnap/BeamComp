@@ -1400,14 +1400,18 @@ local function handle_race_phase(payload)
             if not own then
                 return
             end
-            local placed, reason = vehicles.preplace_for_replacement(own, pose, model_name,
+            local placed, detail = vehicles.preplace_for_replacement(own, pose, model_name,
                 type(opt) == "table" and opt.config or nil)
             if placed then
                 log("I", RACE_LOG_TAG, string.format(
                     "pre-anchored the grid slot for the incoming '%s'", tostring(model_name)))
             else
-                log("I", RACE_LOG_TAG, "swap pre-anchor skipped: " .. tostring(reason))
+                log("I", RACE_LOG_TAG, "swap pre-anchor skipped: " .. tostring(detail))
             end
+            -- Arm the swap probe AFTER the pre-anchor and before the engine runs: the position the
+            -- outgoing car stands at right now is literally what _replaceVehicle hands the replacement,
+            -- so it is the reference every later probe line is measured against. Read-only.
+            vehicles.swap_probe.arm(own, model_name, placed, detail)
         end
         hud.show()
         -- No clock: staging is open-ended and waits for the host (ADR-0021 amendment), so the server
@@ -6248,6 +6252,10 @@ local function restage_swapped_car(dt_real)
         M.state.staging_swap_reverting = M.state.revert_pending == true
         M.state.revert_pending = false
         log("I", RACE_LOG_TAG, "staging vehicle replace detected; re-staging")
+        -- First frame after the engine finished the replace, and the last one before anything of ours
+        -- moves the car: measure where the replacement actually came up relative to the reference point
+        -- the engine was handed. Any gap here belongs to the engine.
+        vehicles.swap_probe.after_replace(vehicles.resolve_own_car(M.state.current_vehicle_id))
     end
 
     if not M.state.restage_pending then
@@ -6282,6 +6290,7 @@ local function restage_swapped_car(dt_real)
         local tries = M.state.restage_preplaced or 0
         if tries < vehicles.PREPLACE_MAX_TRIES then
             local moved, delta, model = vehicles.preplace_at_grid(own, M.state.race and M.state.race.myPose)
+            vehicles.swap_probe.preplaced(moved, delta, model)
             if moved then
                 M.state.restage_preplaced = tries + 1
                 -- One line per cycle, so a test can tell this path apart from the restage safety net
@@ -6295,6 +6304,10 @@ local function restage_swapped_car(dt_real)
         end
         return
     end
+
+    -- The wait is over -- read the position once more before the adoption below re-places the car, so the
+    -- two lines together say whether what is left to correct came from the engine or from us.
+    vehicles.swap_probe.at_wait_end(own, loaded)
 
     -- Mode-3 compliance gate (ADR-0032): the swap-allowed staging lock lets the player replace their car via
     -- the vehicle/parts selector, but must not let them stage a car over the power cap. The jbeam is loaded
@@ -6363,6 +6376,9 @@ local function restage_swapped_car(dt_real)
         -- is genuinely off its slot. A staging swap into a differently sized car still gets its full
         -- correction; a correctly predicted car is left standing where it is.
         local moved, delta = vehicles.restage_at_grid(own, pose)
+        -- The last word on a swap: a teleport here is the correction the player actually sees, and until
+        -- now only the no-move case wrote a line.
+        vehicles.swap_probe.restaged(moved, delta)
         if moved == nil then
             log("W", RACE_LOG_TAG, "could not re-place staging car: " .. tostring(delta))
         elseif not moved then
