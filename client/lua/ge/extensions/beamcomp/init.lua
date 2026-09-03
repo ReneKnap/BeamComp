@@ -1393,6 +1393,9 @@ local function handle_race_phase(payload)
         -- here bails out silently, and preplace_at_grid + the deferred restage stay behind it as the
         -- safety net -- they simply find nothing left to do when this works.
         lock.on_before_replace = function(model_name, opt)
+            -- Cleared before anything that can fail: the lock calls this inside a pcall, and a reading
+            -- left over from an earlier swap must never be adopted as this one's baseline.
+            M.state.restage_prebaseline = nil
             local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
             -- Take the deferred restage's jbeam-load baseline HERE, while the OUTGOING car still stands.
             -- Measured in-game: the replace stalls the game engine for ~2 s loading the new jbeam, so the
