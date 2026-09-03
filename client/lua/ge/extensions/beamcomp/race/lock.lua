@@ -206,15 +206,6 @@ local function guard_core_vehicles(allow_replace)
         if allow_replace then
             core_vehicles.replaceVehicle = function(model_name, opt, ...)
                 M.replace_seen = true
-                -- Say so, loudly, that the swap came through HERE (bug
-                -- staging-swap-into-bigger-car-still-jumps, round 4). BeamMP's MPVehicleGE.replaceRequest
-                -- has a second branch -- falsy vehicle.isLocal, or a vehicle it does not know -- that
-                -- calls the spawnNewVehicle it captured at join instead. That capture predates our guard,
-                -- so such a swap bypasses this wrapper AND the spawn guard without a trace, which is a
-                -- live explanation for the r2/r3 logs holding no replace line at all. A visibly swapped
-                -- car with no line here is that branch; this is the one place that can tell the two apart.
-                log("W", LOG_TAG, "swap-probe replaceVehicle reached the staging wrapper for '"
-                    .. tostring(model_name) .. "'")
                 -- The caller's chance to act on the NEW car before the engine touches anything (ADR-0051
                 -- round 2). _replaceVehicle takes the replacement's spawn position from the OUTGOING car
                 -- (`localOptions.pos = veh:getPosition()`), so a swap into a differently sized car lands
