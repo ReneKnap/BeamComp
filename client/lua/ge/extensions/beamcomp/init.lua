@@ -1544,9 +1544,10 @@ local function handle_race_phase(payload)
         M.state.quali_lap_done = false
         -- Stop qualifying sector tracking; the race scores the real plan (feature: quali-live-sector-delta).
         M.state.sector_track = nil
-        -- Fresh movement references for everyone at the green light, dropping the qualifying phase's with
-        -- them (feature stall-detection-client-measured-movement). The server clears its side of the same
-        -- latch in stall.arm_field(), so no verdict from before the race can follow a driver into it.
+        -- Drop the qualifying phase's standstill clocks at the green light (feature
+        -- stall-detection-client-measured-movement). We cannot lift a verdict we already sent -- no grace
+        -- is running here, so stall.step is inert and sends nothing -- which is why the SERVER clears its
+        -- side at every grace arm (stall.begin_grace), not at this boundary.
         M.state.stall_track = nil
         begin_driving(M.state.race and M.state.race.plan, M.state.race and M.state.race.laps)
         -- Guaranteed rebind pass at GO: by racing the car's VE has been up through the whole countdown, so
