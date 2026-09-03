@@ -272,6 +272,7 @@ M.state = {
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
+    swap_orphan_logged = false,  -- diagnostic latch: the "a replace was flagged while no race car is staged" line has been written for the currently flagged replace (bug staging-swap-into-bigger-car-still-jumps); cleared when the flag clears
     size_track = {},          -- lobby car-footprint poll state {wait, reported} owned by race/vehicles.poll_own_size (ADR-0051 round 2); plain numbers, so it survives a Lua reload
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
@@ -4479,6 +4480,23 @@ function M.onVehicleSpawned(vehicleId)
     -- here too. The guard no-ops for cones, AI, remotes, and any vehicle that is not the player's own race
     -- car -- see onVehicleResetted, the primary hook.
     rearm_own_car_on_reload(vehicleId)
+    -- Report-only (bug staging-swap-into-bigger-car-still-jumps, round 4): a car appearing during the
+    -- staging window is where BeamMP's second replace branch would become visible. MPVehicleGE's
+    -- replaceRequest falls back to the spawnNewVehicle it captured at join -- the raw engine function,
+    -- taken before our guard existed -- so a swap down that branch passes neither our replace wrapper nor
+    -- our spawn guard, and the staging re-stage never runs for it at all.
+    --
+    -- Read it by the ID: a replace keeps the SAME vehicle id, so a line naming our own car is the normal
+    -- path, while a NEW id for a car the player visibly swapped into is that second branch. Props are
+    -- filtered out; a remote player's synced car does appear here and is told apart by the same id.
+    if veh and M.state.race and M.state.phase == "staging"
+            and not cones.is_cone(veh) and not grinders.is_grinder(veh) then
+        local ok_model, model = pcall(function() return veh.JBeam end)
+        log("W", RACE_LOG_TAG, string.format(
+            "swap-probe staging spawn: vehicle %s ('%s') spawned during staging; own car is %s",
+            tostring(vehicleId), ok_model and tostring(model) or "?",
+            tostring(M.state.current_vehicle_id)))
+    end
     if not cones.is_cone(veh) then
         return
     end
@@ -6234,6 +6252,17 @@ end
 -- car the prediction missed, and any staging swap, is still corrected in full.
 local function restage_swapped_car(dt_real)
     if not M.state.race_car_id then
+        -- Report-only (bug staging-swap-into-bigger-car-still-jumps, round 4): without a staged race car
+        -- this returns right here, so lock.consume_replace() is never called and a swap that DID happen
+        -- is silently never re-staged -- the standing explanation for the r2/r3 logs carrying no replace
+        -- line. Read the flag WITHOUT consuming it: the race_car_id state machine works and stays
+        -- untouched. Latched against the flag so it says this once per swap, not once per frame.
+        if not lock.replace_seen then
+            M.state.swap_orphan_logged = false
+        elseif not M.state.swap_orphan_logged then
+            M.state.swap_orphan_logged = true
+            vehicles.swap_probe.orphan()
+        end
         return
     end
 
