@@ -2553,6 +2553,29 @@ function stall.clear()
     session.stall_reported = nil
 end
 
+-- A grace is arming: drop every verdict from before it.
+--
+-- THE invariant: session.stall_reported may only ever describe the grace that is CURRENTLY armed. Each
+-- client starts its 15 s standstill clock the instant it sees the MSG_FINISH_GRACE broadcast, so the
+-- server must hold no flags at that same instant. Otherwise a verdict banked in an EARLIER grace -- a
+-- qualifying session's, most easily -- discounts that driver in the very second the next grace arms, and
+-- the 15 s everybody is promised is silently skipped. Observed exactly that way: four AI discounted at
+-- "finish grace armed" with no report at all between the green light and the arm.
+--
+-- Arming is the one moment the two sides are guaranteed to be in step, which is why the clear belongs
+-- here and not on a phase boundary: the client cannot lift a stale flag itself, because it drops its own
+-- tracking table whenever no grace is running and so never sends the matching "moving again".
+--
+-- Deliberately NOT called from the tick, nor from maybe_end_race's shortening re-broadcast: WITHIN an
+-- armed grace the flags are precisely what the three graces read, and clearing them there would erase
+-- the answer instead of the staleness.
+--
+-- (This is the one job stall.arm_field did alongside seeding the checkpoint-gap stamps. The stamps went
+-- with the heuristic; this responsibility was never re-homed, which is how the bug above got in.)
+function stall.begin_grace()
+    stall.clear()
+end
+
 -- Record or clear a CLIENT-MEASURED stall verdict for one driver (feature
 -- stall-detection-client-measured-movement). The client owns the measurement -- it can see positions and
 -- we cannot (ADR-0005) -- and reports only the two edges, so this is called once when a driver goes still
@@ -3067,6 +3090,7 @@ function quali.advance_qualifying()
     if not q.lap_grace_deadline then
         local window = quali.lap_grace_window()
         q.lap_grace_deadline = t + window
+        stall.begin_grace()
         -- Tell clients the finish-your-lap window length so each still-circulating driver sees the
         -- timeout to be at the finish (reuses the racing finish-grace display, ADR-0014/0041). The
         -- window tracks the field's slowest best lap, so its length varies with the track/pace rather
@@ -3683,7 +3707,14 @@ function quali.advance_staged()
         -- one log line whatever order pairs() happens to walk in.
         for id in pairs(session.progress or {}) do
             if q.status[id] == "running" then
-                local reason = stall.verdict(id)
+                -- Only once THIS grace is armed, the same gate maybe_end_race applies. On the tick that
+                -- decides whether to arm, no client has started its clock yet, so a flag present here
+                -- could only be a leftover from an earlier grace -- and consulting it would discount the
+                -- driver, leave anyone_out false, and classify the session immediately WITHOUT ever
+                -- arming (so the arming clear below could never run). Unreachable today, because the
+                -- window-close arm is the first grace of a staged event and start_race clears; gated so
+                -- it stays impossible by construction rather than by ordering.
+                local reason = q.lap_grace_deadline and stall.verdict(id)
                 if reason then
                     quali.note_stall(id, reason)
                 else
@@ -3697,6 +3728,7 @@ function quali.advance_staged()
         if anyone_out then
             local window = quali.lap_grace_window()
             q.lap_grace_deadline = t + window
+            stall.begin_grace()
             broadcast_event(MSG_FINISH_GRACE, {duration = window})
             log_info("beamcomp.race",
                 string.format("staged quali window closed; finish-your-run grace armed (%.1fs)", window))
@@ -4579,6 +4611,7 @@ local function start_finish_grace()
     end
     session.grace_deadline = now() + PHASE_DURATIONS.finish_grace
     log_info("beamcomp.race", "finish grace armed")
+    stall.begin_grace()
     -- Tell every client the cutoff length so still-racing players can show a live countdown (ADR-0014).
     broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.finish_grace})
 end
