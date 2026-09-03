@@ -518,6 +518,16 @@ function M.log_bbox_report()
         resolved == 0 and " (metadata unavailable)" or ""))
 end
 
+-- Metres the engine may move a car away from the position we asked it to spawn at before it is worth a
+-- line. Above the float noise and the ground snap's horizontal drift, far below a real avoidance shove.
+--
+-- Declared HERE, above its only use. It used to sit with the size constants far below, where it was
+-- invisible to the check that reads it: a Lua chunk binds names lexically, so the read resolved to the
+-- GLOBAL of that name -- nil -- and `gap > nil` raised inside the pcall around it. The instrument
+-- therefore reported its failure branch for every single car and never once measured anything, which is
+-- what left this bug undiagnosed across three rounds (bug staging-swap-into-bigger-car-still-jumps).
+local SPAWN_NUDGE_TOLERANCE = 0.25
+
 -- Spawn one vehicle at a grid pose (plain {pos, rot, forward?} tables). Uses the captured spec when
 -- present, else the engine's default model. Returns the new vehicle, or nil plus a reason.
 local function spawn_vehicle_at(pose, spec)
@@ -591,7 +601,7 @@ local function spawn_vehicle_at(pose, spec)
     -- by the engine is exactly the class of event that cost a whole round on this feature. So measure it:
     -- the horizontal distance from where we asked for the reference point to where it actually is. Z is
     -- deliberately excluded -- the ground snap legitimately changes it.
-    local moved = pcall(function()
+    local checked, check_err = pcall(function()
         local landed = veh:getPosition()
         local dx, dy = landed.x - opt.pos.x, landed.y - opt.pos.y
         local gap = math.sqrt(dx * dx + dy * dy)
@@ -601,8 +611,11 @@ local function spawn_vehicle_at(pose, spec)
                 .. "the grid restage will pull it back", tostring(model), gap))
         end
     end)
-    if not moved then
-        log("W", LOG_TAG, "could not check the spawn position of '" .. tostring(model) .. "'")
+    if not checked then
+        -- With the reason, not without: the reason-less version of this line fired on 5 of 5 cars for
+        -- three rounds and nobody could tell it apart from a genuinely unreadable vehicle handle.
+        log("W", LOG_TAG, "could not check the spawn position of '" .. tostring(model) .. "': "
+            .. tostring(check_err))
     end
     return veh
 end
@@ -1274,10 +1287,6 @@ end
 
 -- Metres of footprint change below which a re-report is not worth sending.
 local SIZE_REPORT_EPSILON = 0.01
-
--- Metres the engine may move a car away from the position we asked it to spawn at before it is worth a
--- line. Above the float noise and the ground snap's horizontal drift, far below a real avoidance shove.
-local SPAWN_NUDGE_TOLERANCE = 0.25
 
 -- Metres by which a live measurement may differ from the car's own config metadata before it is worth a
 -- warning. Generous: a deformed or slightly settled car reads a few centimetres off, a substituted config
