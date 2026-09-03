@@ -6376,6 +6376,12 @@ local function restage_swapped_car(dt_real)
         elseif not moved then
             log("I", RACE_LOG_TAG, string.format(
                 "staging car already on its grid slot (%.3f m); no re-place", delta))
+        else
+            -- The correction itself, which the log could not see before. This teleport is what a player
+            -- watching their swapped car actually notices, so how far it moves -- and whether it still
+            -- moves at all -- is the one number that says whether a staging swap sits right.
+            log("I", RACE_LOG_TAG, "re-placed staging car onto its grid slot ("
+                .. (delta and string.format("%.3f m off", delta) or "deviation unreadable") .. ")")
         end
     end
     vehicles.set_vehicle_frozen(own, true)
