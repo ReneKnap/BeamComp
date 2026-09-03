@@ -239,10 +239,6 @@ local session = {
     phase_started_at = 0,   -- clock seconds at the current phase's entry
     phase_duration = nil,   -- configured length of the current timed phase, or nil if open-ended
     grace_deadline = nil,   -- clock seconds when the finish grace ends (set by start_finish_grace)
-    progress_at = nil,      -- per-id clock seconds of each driver's last forward progress, or nil.
-                            -- Written only through the `stall` namespace; read by both graces to tell a
-                            -- driver still making progress from one wrecked or hung on track. Per-race,
-                            -- like progress itself: cleared at race start and by reset_to_lobby.
     pending_race = nil,      -- race name queued by a /race re-issued while one is active
     pending_owner = nil,     -- player id of the queued race's issuer (owns its shared props), or nil
     pending_overrides = nil, -- queued race's relayed {mode, laps, direction, force, assists} (ADR-0018)
@@ -2502,18 +2498,22 @@ end
 
 
 -- ===== driver liveness =====================================================================
--- One seam for both graces: a per-id wall clock of when each driver last demonstrably moved forward.
+-- One seam for all three finish graces: which drivers their own client has reported as AFK.
 --
--- The server is race-blind (ADR-0005) -- it holds no geometry, no positions and no velocities, and no
--- client sends periodic telemetry -- so a scored checkpoint crossing is the ONLY signal it ever gets
--- from a moving car. "Still driving" can therefore only ever be expressed as "stamped recently", and
--- both finish graces read exactly that: the staged sprint quali's finish-your-run grace (ADR-0044) and
--- the racing finish grace (ADR-0014).
+-- The server is race-blind (ADR-0005) -- no geometry, no positions, no velocities, and no client sends
+-- telemetry -- so it has NO way of its own to tell a parked wreck from someone still driving. The client
+-- can see that and reports it; this namespace is only the record of what was reported.
+--
+-- It used to guess instead, from the gap since a driver's last scored checkpoint. That heuristic ended a
+-- real qualifying under a driver who was still driving, and the same log showed 90 s between two of their
+-- checkpoints on a normal lap -- no fixed or adaptive threshold can separate that from a wreck. It was
+-- removed rather than retuned (2026-09-03; ADR-0014). If no client ever reports, a grace simply runs its
+-- full length, which is the pre-928a938 behaviour and never worse than the bug.
 --
 -- A namespace table rather than a set of top-level locals, because main.lua's main chunk sits near
 -- Lua's 200-local ceiling: a table costs ONE local no matter how many functions it carries.
 --
--- The stamps live on session.progress_at -- deliberately a sibling of session.progress, not a field on
+-- The flags live on session.stall_reported -- deliberately a sibling of session.progress, not a field on
 -- the progress records. build_standings and the run log both read those records, and a new record field
 -- is the shape that leaks into a broadcast or persisted blob; a sibling table cannot, which is what
 -- keeps the wire format byte-identical here.
@@ -2523,45 +2523,112 @@ end
 -- resolve to a nil global inside it.
 local stall = {}
 
--- Stamp a driver as having just moved forward. Lazily allocates the table so no caller has to seed it.
-function stall.note(id)
-    local at = session.progress_at
-    if not at then
-        at = {}
-        session.progress_at = at
-    end
-    at[id] = now()
-end
+-- client->server: {stalled = bool} for the sender's own car, {aiId = ..., stalled = bool} for one of the
+-- owner's AI. THE input to the predicate below -- the only one there is. Kept on the table, not as a
+-- top-level local (200-local ceiling), like quali.MSG_* and track.MSG_*.
+stall.MSG = "stallReport"
 
--- Seconds since this driver last moved forward, or nil when they carry no stamp at all.
+-- THE liveness predicate, and now a pure lookup: all three finish graces ask this one question --
+-- maybe_end_race for the racing grace (ADR-0014), quali.advance_staged for the staged sprint's
+-- finish-your-run grace (ADR-0044) and quali.anyone_lapping for the circuit quali's finish-your-lap
+-- grace (ADR-0041).
 --
--- A nil gap ALWAYS counts as progressing, never as stalled, and every caller must honour that. The two
--- error directions are wildly asymmetric: on the quali side a false positive ends a driver's run early,
--- and on the race side it costs them a DNF, whereas a false negative merely waits a little longer --
--- which is the old behaviour. An unexpected nil must therefore fail towards waiting.
-function stall.gap(id, t)
-    local at = session.progress_at and session.progress_at[id]
-    if not at then
-        return nil
+-- Returns nil while the driver still counts as able to finish, or a short reason string when they do not,
+-- which each caller drops straight into its log line.
+--
+-- There is exactly ONE input, and it is not the server's. A client report is a MEASUREMENT of a car
+-- standing still; the crossing-gap guess that used to sit beside it was measuring nothing and is gone.
+-- Silence therefore means "still driving", always -- an unreported driver holds their grace open for its
+-- full length, which is the safe direction and the pre-928a938 behaviour.
+function stall.verdict(id)
+    if session.stall_reported and session.stall_reported[id] then
+        return "reported stalled by its client"
     end
-    return t - at
+    return nil
 end
 
--- Drop every stamp. The stamps are per-race, like session.progress: called at race start and from
+-- Drop every reported flag. Per-race, like session.progress: called at race start and from
 -- reset_to_lobby, so one race's staleness can never be read as the next race's liveness.
 function stall.clear()
-    session.progress_at = nil
+    session.stall_reported = nil
 end
 
--- Stamp the whole field at the green light. Leaving the line is forward progress -- and without this a
--- driver pinned before their FIRST checkpoint would carry no stamp for the entire race, and a missing
--- stamp counts as progressing forever, so the racing grace could never shorten for exactly the case
--- that motivated it. Deliberately here and not at build_progress time: staging is open-ended (it waits
--- for the host), so a stamp taken then would already be minutes stale when the race actually goes green.
-function stall.arm_field()
-    for id in pairs(session.progress or {}) do
-        stall.note(id)
+-- A grace is arming: drop every verdict from before it.
+--
+-- THE invariant: session.stall_reported may only ever describe the grace that is CURRENTLY armed. Each
+-- client starts its 15 s standstill clock the instant it sees the MSG_FINISH_GRACE broadcast, so the
+-- server must hold no flags at that same instant. Otherwise a verdict banked in an EARLIER grace -- a
+-- qualifying session's, most easily -- discounts that driver in the very second the next grace arms, and
+-- the 15 s everybody is promised is silently skipped. Observed exactly that way: four AI discounted at
+-- "finish grace armed" with no report at all between the green light and the arm.
+--
+-- Arming is the one moment the two sides are guaranteed to be in step, which is why the clear belongs
+-- here and not on a phase boundary: the client cannot lift a stale flag itself, because it drops its own
+-- tracking table whenever no grace is running and so never sends the matching "moving again".
+--
+-- Deliberately NOT called from the tick, nor from maybe_end_race's shortening re-broadcast: WITHIN an
+-- armed grace the flags are precisely what the three graces read, and clearing them there would erase
+-- the answer instead of the staleness.
+--
+-- (This is the one job stall.arm_field did alongside seeding the checkpoint-gap stamps. The stamps went
+-- with the heuristic; this responsibility was never re-homed, which is how the bug above got in.)
+function stall.begin_grace()
+    stall.clear()
+end
+
+-- Record or clear a CLIENT-MEASURED stall verdict for one driver (feature
+-- stall-detection-client-measured-movement). The client owns the measurement -- it can see positions and
+-- we cannot (ADR-0005) -- and reports only the two edges, so this is called once when a driver goes still
+-- and once when they move again, never per frame. Edge-guarded here as well, so a client that lost its own
+-- latch still cannot produce a second log line.
+--
+-- Purely a "stops holding the grace open" claim, and fully reversible: nothing here marks anybody DNF,
+-- touches a progress record, or moves a car. The DNF still comes from finalize_race when the grace expires.
+function stall.set_reported(id, stalled)
+    local flags = session.stall_reported
+    if stalled then
+        if flags and flags[id] then
+            return
+        end
+        flags = flags or {}
+        session.stall_reported = flags
+        flags[id] = true
+        log_info("beamcomp.race", "driver " .. tostring(id)
+            .. " reported stalled by its client -- no longer counts as able to finish")
+        return
     end
+    if not (flags and flags[id]) then
+        return
+    end
+    flags[id] = nil
+    log_info("beamcomp.race", "driver " .. tostring(id)
+        .. " reported moving again by its client -- counts as able to finish once more")
+end
+
+-- Client->server stall verdict (stall.MSG). A player reports its own car; the race owner proxies each of
+-- its AI with aiId -- the same split, and the same validation, as quali.handle_cleared and the checkpoint
+-- proxy: accepted only from the owner and only for a known AI slot, so no client can flag another
+-- participant. Reports outside a race phase, or for an id with no progress record, are dropped.
+function stall.handle_report(player_id, payload)
+    if session.phase ~= PHASE.racing and session.phase ~= PHASE.qualifying then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local subject_id = player_id
+    if payload.aiId ~= nil then
+        if player_id ~= session.owner_id or not is_ai_id(payload.aiId) then
+            log_info("beamcomp.race", "stall report from id " .. tostring(player_id)
+                .. " ignored: not the owner or bad aiId " .. tostring(payload.aiId))
+            return
+        end
+        subject_id = payload.aiId
+    end
+    if not (session.progress and session.progress[subject_id]) then
+        return
+    end
+    stall.set_reported(subject_id, payload.stalled == true)
 end
 -- ===== end driver liveness =================================================================
 
@@ -2605,34 +2672,6 @@ quali.STAGE_GAP = 5.0
 -- STAGE_GAP after the ramp actually emptied -- the cleared-AND-gap release gate is never bypassed. The client
 -- 15 m gate normally fires first. Stays well above STAGE_GAP (5 s) so the two timers never collide.
 quali.STAGE_CLEAR_TIMEOUT = 20.0
-
--- How long a `running` driver may go without a scored crossing before the window-closed branch of
--- quali.advance_staged stops counting them as "still out on track" (staged-quali-stuck-ai-never-requeued).
--- Nothing is ever done TO such a driver -- no requeue, no recover, no teleport, no reset: a wreck stays
--- lying exactly where it is and loses its remaining turns, which is the intended behaviour. They merely
--- stop holding the finish-your-run grace open for the entire field.
---
--- The numbers are deliberately GENEROUS, because the two error directions cost wildly different things.
--- A FALSE POSITIVE -- discounting somebody who is genuinely still driving -- cuts their run short and
--- classifies the session without them; that is the one way this can be worse than the bug it fixes. A
--- FALSE NEGATIVE -- waiting on a wreck a while longer -- is simply today's behaviour, only less of it.
--- So every constant below is sized to the pessimistic side.
---
--- Derived like quali.lap_grace_window (reference -> buffer -> clamp -> fallback) from the only movement
--- data a race-blind server has: q.sector_best, the field-wide best split per sector.
-quali.STALL_BUFFER = 3.0    -- multiplier on the slowest field-best sector. sector_best[k] is the FASTEST
-                            -- split anyone ever drove for that sector, and a driver's own worst pass
-                            -- through it is routinely twice that (a spin, a missed braking point, a slow
-                            -- recovery), so x3 sits well outside normal variance.
-quali.STALL_MIN = 45.0      -- floor, set above the bare minimum on purpose: on a short stage with ~10 s
-                            -- sectors the buffered value would be 30 s, and 30 s is exactly what a driver
-                            -- who spins, stops, reverses and drives on can burn WHILE STILL DRIVING.
-                            -- 45 s buys a 4.5x margin there and costs at most 15 s of extra waiting.
-quali.STALL_MAX = 120.0     -- ceiling: a 60 s field-best sector would otherwise ask for 180 s, i.e. the
-                            -- very multi-minute wait this exists to remove. 120 s still covers a driver
-                            -- taking twice the field best on their slowest sector.
-quali.STALL_FALLBACK = 60.0 -- nobody has scored a crossing anywhere in the session yet (q.sector_best is
-                            -- empty), so there is nothing to derive from: one fixed generous value.
 
 -- Selectable qualifying lengths in minutes for the panel presets (ADR-0041); the chat grammar also accepts
 -- a free quali=<n>. A free value is clamped to [MIN, MAX] seconds.
@@ -2732,11 +2771,10 @@ function quali.begin(duration, staged)
                             -- relayed as `sectorCounts` so a no-reference (white) sector upgrades to
                             -- purple once a second scoring exists (seeded by start_session, same
                             -- fold seam and lifecycle as sector_best)
-        stall_logged = nil, -- per-id guard so the "discounted as stalled" line logs once per driver
-                            -- instead of once per tick -- the tick keeps running for the whole length of
-                            -- the finish-your-run grace (seeded by start_session, like status). The
-                            -- progress stamps themselves are NOT here: they live on session.progress_at,
-                            -- shared with the racing finish grace (see the `stall` namespace)
+        stall_logged = nil, -- per-id guard so the "reported AFK" line logs once per driver instead of
+                            -- once per tick -- the tick keeps running for the whole length of the
+                            -- finish-your-run grace (seeded by start_session, like status). The reported
+                            -- flags themselves live on session.stall_reported (the `stall` namespace)
     }
 end
 
@@ -2971,33 +3009,105 @@ function quali.lap_grace_window()
                     math.min(PHASE_DURATIONS.quali_lap_grace_max, window))
 end
 
+-- Log one driver being discounted from the circuit quali's finish-your-lap grace, ONCE per driver.
+--
+-- The sibling of quali.note_stall for the ADR-0041 circuit quali, and deliberately NOT that function: its
+-- latch (q.stall_logged) is seeded by quali.start_session, which is staged-only, so on a circuit session it
+-- is nil and note_stall would return at its first guard and log nothing at all. Same latch TABLE, created
+-- lazily here -- a session is either staged or circuit, so the two can never collide -- and the same
+-- never-cleared semantics: the tick re-evaluates the predicate for the whole length of the grace, so an
+-- unguarded line would repeat thousands of times and bury the entry the verification looks for.
+function quali.note_lap_stall(id, reason)
+    local q = session.quali
+    if not q then
+        return
+    end
+    q.stall_logged = q.stall_logged or {}
+    if q.stall_logged[id] then
+        return
+    end
+    q.stall_logged[id] = true
+    log_info("beamcomp.race", string.format(
+        "circuit quali: driver %s %s -- no longer holding the finish-your-lap grace open",
+        tostring(id), reason))
+end
+
+-- Is anyone still circulating in the circuit quali? The ADR-0041 half of the one liveness predicate --
+-- maybe_end_race and quali.advance_staged ask stall.verdict the same question for their own graces.
+--
+-- The set is session.progress minus the DNF'd and the finished, the same shape maybe_end_race uses.
+-- Excluding `finished` is safe here and was verified rather than assumed: the circuit quali plan is sized
+-- so the field CANNOT run it out (race/start.lua builds it with max(10, ceil(duration / 8)) laps, an
+-- ~8 s/lap floor), so record.finished stays false for everyone for the whole session -- and a driver who
+-- somehow did complete it has a done detector and can set no further lap times anyway.
+-- quali.lap_grace_window, the file's other statement of "who is still circulating", excludes it too.
+--
+-- session.progress rather than build_standings(): it is keyed by the id stall.verdict wants, it does not
+-- sort the whole field on every 250 ms tick, and -- the deciding reason -- it has no `entry.name` filter.
+-- A participant whose identity resolved to nil would be dropped from the standings-based set, i.e. counted
+-- as NOT circulating, which fails towards ending the session early. That direction must stay impossible.
+--
+-- Scans the whole field instead of breaking on the first mover, so every discounted driver gets its one
+-- log line whatever order pairs() happens to walk in.
+function quali.anyone_lapping()
+    local anyone = false
+    for id, record in pairs(session.progress or {}) do
+        if not record.dnf and not record.finished then
+            local reason = stall.verdict(id)
+            if reason then
+                quali.note_lap_stall(id, reason)
+            else
+                anyone = true
+            end
+        end
+    end
+    return anyone
+end
+
 -- Advance the qualifying phase from the tick (ADR-0041): run for session.quali.duration, then arm a
 -- bounded finish-your-lap grace (so an in-progress lap still counts), then broadcast the classification and
 -- enter the results pause. Mirrors the racing finish-grace handling -- handled explicitly (not by the
 -- generic timed advance) so the grace can sit between the clock and the pause.
+--
+-- The grace is gated on somebody actually still circulating, like the other two (ADR-0014 amendment). It
+-- used to arm unconditionally and run its full length whatever the field was doing -- observed live as a
+-- 120 s wait on a session whose AI had long stopped moving. Both ends are gated: an already-stalled field
+-- at clock expiry is never armed at all, and an armed grace ends on the tick where the last mover goes
+-- quiet. The window LENGTH is untouched -- this changes only whether it is armed and when it ends.
+--
+-- Both inputs get their moment. At clock expiry the client has reported nothing yet (it only reports while
+-- the grace is armed), so the checkpoint-gap backstop decides whether to arm at all -- which is what the
+-- qualifying phase-entry stamp exists for. Once armed, the client's own 15 s measurement lands and ends it.
 function quali.advance_qualifying()
     local q = session.quali
     if not q or phase_elapsed() < q.duration then
         return  -- still within the quali clock
     end
+    local t = now()
+    -- ALWAYS arm. Nobody can be reported AFK at this instant: the clients only start their standstill
+    -- clock when this very broadcast reaches them, so asking the predicate here could only ever say
+    -- "everyone is still going". The gate below is where it earns its keep.
     if not q.lap_grace_deadline then
         local window = quali.lap_grace_window()
-        q.lap_grace_deadline = now() + window
-        -- Tell clients the finish-your-lap window length so each still-circulating driver sees the timeout
-        -- to be at the finish (reuses the racing finish-grace display, ADR-0014/0041). The window tracks the
-        -- field's slowest best lap, so its length varies with the track/pace rather than being a flat cap.
+        q.lap_grace_deadline = t + window
+        stall.begin_grace()
+        -- Tell clients the finish-your-lap window length so each still-circulating driver sees the
+        -- timeout to be at the finish (reuses the racing finish-grace display, ADR-0014/0041). The
+        -- window tracks the field's slowest best lap, so its length varies with the track/pace rather
+        -- than being a flat cap.
         broadcast_event(MSG_FINISH_GRACE, {duration = window})
         log_info("beamcomp.race",
             string.format("quali clock expired; finish-your-lap grace armed (%.1fs)", window))
         return
     end
-    if now() >= q.lap_grace_deadline then
-        broadcast_event(quali.MSG, quali.snapshot())
-        -- Carry the re-grid lead so the client can split the pause display: a clean "results" countdown
-        -- (pause - lead) before the respawn, then the settle timer (the remaining pause) after it (ADR-0041).
-        enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
-            {regridLead = PHASE_DURATIONS.quali_regrid_lead})
+    if quali.anyone_lapping() and t < q.lap_grace_deadline then
+        return
     end
+    broadcast_event(quali.MSG, quali.snapshot())
+    -- Carry the re-grid lead so the client can split the pause display: a clean "results" countdown
+    -- (pause - lead) before the respawn, then the settle timer (the remaining pause) after it (ADR-0041).
+    enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
+        {regridLead = PHASE_DURATIONS.quali_regrid_lead})
 end
 
 -- Run the quali re-grid once, a lead time before the results pause ends (ADR-0041 amendment). The owner
@@ -3204,10 +3314,8 @@ function quali.start_session()
     -- Companion crossing counter per sector (r4), same fold seam: `sectorCounts` lets the client
     -- upgrade a no-reference (white) sector to purple once at least one FURTHER scoring exists.
     q.sector_count = {}
-    -- Once-per-driver guard for the "discounted as stalled" line. The progress stamps it pairs with
-    -- live on session.progress_at (the `stall` namespace), shared with the racing grace and stamped by
-    -- the GO flip -- nothing to seed here, since everyone starts `queued` and only a `running` driver
-    -- is ever measured.
+    -- Once-per-driver guard for the "reported AFK" line; the flags it pairs with live on
+    -- session.stall_reported (the `stall` namespace), written only by a client report.
     q.stall_logged = {}
     for _, id in ipairs(ids) do
         q.status[id] = "queued"
@@ -3493,44 +3601,20 @@ function quali.finish_session()
         {regridLead = PHASE_DURATIONS.quali_regrid_lead})
 end
 
--- How long a staged driver may go without a scored crossing before they count as stalled rather than
--- still running (staged-quali-stuck-ai-never-requeued). Same shape as quali.lap_grace_window: derive from
--- what the field has actually driven, buffer it, clamp it, and fall back to a fixed generous value while
--- there is no data. The reference is the SLOWEST entry in q.sector_best -- the longest sector anyone has
--- managed even at their best -- so the threshold scales with the stage instead of being a flat guess.
--- Race-blind (ADR-0005): reads client-reported split times already folded onto the quali table, no
--- geometry, no positions. See the quali.STALL_* constants for why every bound leans generous.
-function quali.stall_threshold()
-    local q = session.quali
-    local slowest
-    for _, split in pairs((q and q.sector_best) or {}) do
-        local sector = tonumber(split)
-        if sector and sector > 0 and (not slowest or sector > slowest) then
-            slowest = sector
-        end
-    end
-    if not slowest then
-        return quali.STALL_FALLBACK
-    end
-    return math.max(quali.STALL_MIN,
-                    math.min(quali.STALL_MAX, slowest * quali.STALL_BUFFER))
-end
-
 -- Log one driver being discounted from the finish-your-run grace, ONCE per driver per session. The tick
 -- re-evaluates the predicate continuously for the whole length of that grace, so an unguarded line here
 -- would repeat thousands of times and bury the very entry the in-game verification looks for. A driver
 -- who somehow resumes, crosses a checkpoint and then stalls again is not logged a second time -- the
 -- guard is deliberately never cleared, because one line per driver is the contract.
-function quali.note_stall(id, gap, threshold)
+function quali.note_stall(id, reason)
     local q = session.quali
     if not q or not q.stall_logged or q.stall_logged[id] then
         return
     end
     q.stall_logged[id] = true
     log_info("beamcomp.race", string.format(
-        "staged quali: driver %s has scored no crossing for %.1fs (stall threshold %.1fs) -- "
-            .. "no longer holding the finish-your-run grace open",
-        tostring(id), gap, threshold))
+        "staged quali: driver %s %s -- no longer holding the finish-your-run grace open",
+        tostring(id), reason))
 end
 
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
@@ -3558,9 +3642,6 @@ function quali.advance_staged()
     -- now driving (running + scored) but still block the ramp until they clear it + the gap passes.
     if q.staging_id and t >= (q.staged_at or 0) + quali.STAGE_COUNTDOWN then
         q.status[q.staging_id] = "running"
-        -- Launching IS forward progress: a driver released seconds before the window closes has not
-        -- reached checkpoint 1 yet, and must not read as stalled merely for want of a crossing.
-        stall.note(q.staging_id)
         q.clearing_id = q.staging_id
         q.launched_at = t
         q.cleared = false
@@ -3610,28 +3691,34 @@ function quali.advance_staged()
     -- Window closed: let any driver still counting at the ramp / clearing / running finish their run, then
     -- classify. (A staged driver mid-count still gets to launch + run; the flip above runs before this.)
     --
-    -- "Still out" means still PROGRESSING, not merely present (staged-quali-stuck-ai-never-requeued). A
+    -- "Still out" means still DRIVING, not merely present (staged-quali-stuck-ai-never-requeued). A
     -- driver who wrecked or hung mid-stage keeps `running` for the rest of the window -- by design nothing
-    -- recovers them -- and counting them armed this grace even when nobody left on track would ever cross
-    -- another checkpoint, then held it to its FULL deadline (minutes, on a sprint) while the whole field
-    -- watched a car that would never move again. So a `running` driver counts only while their last
-    -- progress stamp is within the stall threshold. The stalled driver is otherwise untouched: same
-    -- status, same HUD row, same banked best time and checkpoint progress -- they just stop making
-    -- everyone else wait. The ramp roles on the first line are deliberately NOT filtered: staging_id is
-    -- bounded by STAGE_COUNTDOWN and clearing_id by STAGE_CLEAR_TIMEOUT, so neither can hold this long.
+    -- recovers them -- and counting them armed this grace even when nobody left on track would ever move
+    -- again, then held it to its FULL deadline (minutes, on a sprint) while the whole field watched a car
+    -- that would never move again. So a `running` driver counts only while their own client has not
+    -- reported them AFK. That driver is otherwise untouched: same status, same HUD row, same banked best
+    -- time and checkpoint progress -- they just stop making everyone else wait, and they start counting
+    -- again the moment they move. The ramp roles on the first line are deliberately NOT filtered:
+    -- staging_id is bounded by STAGE_COUNTDOWN and clearing_id by STAGE_CLEAR_TIMEOUT, so neither can
+    -- hold this long.
     local anyone_out = q.staging_id ~= nil or q.clearing_id ~= nil
     if not anyone_out then
-        local threshold = quali.stall_threshold()
-        -- Scans the whole field instead of breaking on the first mover, so every stalled driver gets its
+        -- Scans the whole field instead of breaking on the first mover, so every AFK driver gets its
         -- one log line whatever order pairs() happens to walk in.
         for id in pairs(session.progress or {}) do
             if q.status[id] == "running" then
-                local gap = stall.gap(id, t)
-                if gap and gap > threshold then
-                    quali.note_stall(id, gap, threshold)
+                -- Only once THIS grace is armed, the same gate maybe_end_race applies. On the tick that
+                -- decides whether to arm, no client has started its clock yet, so a flag present here
+                -- could only be a leftover from an earlier grace -- and consulting it would discount the
+                -- driver, leave anyone_out false, and classify the session immediately WITHOUT ever
+                -- arming (so the arming clear below could never run). Unreachable today, because the
+                -- window-close arm is the first grace of a staged event and start_race clears; gated so
+                -- it stays impossible by construction rather than by ordering.
+                local reason = q.lap_grace_deadline and stall.verdict(id)
+                if reason then
+                    quali.note_stall(id, reason)
                 else
-                    -- A missing stamp counts as progressing, never as stalled: the asymmetry above holds
-                    -- on the defensive path too -- an unexpected nil must fail towards waiting longer.
+                    -- No report counts as still driving, always -- the server has no opinion of its own.
                     anyone_out = true
                 end
             end
@@ -3641,6 +3728,7 @@ function quali.advance_staged()
         if anyone_out then
             local window = quali.lap_grace_window()
             q.lap_grace_deadline = t + window
+            stall.begin_grace()
             broadcast_event(MSG_FINISH_GRACE, {duration = window})
             log_info("beamcomp.race",
                 string.format("staged quali window closed; finish-your-run grace armed (%.1fs)", window))
@@ -4241,35 +4329,33 @@ local function maybe_end_race()
     if session.phase ~= PHASE.racing or not session.progress then
         return
     end
-    -- A driver wrecked or hung on track can no longer finish, but nothing in their record says so:
+    -- A driver wrecked or parked on track can no longer finish, but nothing in their record says so:
     -- they stay not-finished and not-dnf for the whole grace, so it ran its full 120 s even when every
     -- driver left out there had stopped moving -- observed as six AI DNF'ing simultaneously, exactly
-    -- 120 s after "finish grace armed". Discount a driver whose last forward progress is older than the
-    -- stall threshold, so this existing early end fires for them too.
+    -- 120 s after "finish grace armed". Discount a driver whose own client has reported them AFK, so
+    -- this existing early end fires for them too.
     --
-    -- ONLY while the finish grace is armed. This function also runs from /dnf, from a disconnect and
-    -- from the first finish, and the block below arms a deadline even when NOBODY has finished (the
-    -- ADR-0014 all-DNF path) -- so an ungated discount could end a race that nobody had finished yet and
-    -- DNF the whole field over one quiet moment. Gated, the discount can only ever shorten a grace that
-    -- is already running, which is exactly the reported complaint.
-    local threshold, t
-    if session.grace_deadline then
-        -- The one adaptive sizing seam (quali.stall_threshold). A normal race never folds sector bests,
-        -- so with no quali session it returns the fixed STALL_FALLBACK -- 60 s of total silence, half
-        -- the 120 s that was observed. Deliberately no second constant set for the racing path.
-        threshold = quali.stall_threshold()
-        t = now()
-    end
+    -- Discounting is NOT a DNF and nothing here is terminal: the driver's record is untouched, and a
+    -- client reporting them moving again puts them straight back into `active`. The DNF still arrives
+    -- only from finalize_race when the grace actually expires.
+    --
+    -- ONLY while the finish grace is armed, and the gate is EXPLICIT because it has to be. This function
+    -- also runs from /dnf, from a disconnect and from the first finish, and the block below arms a
+    -- deadline even when NOBODY has finished (the ADR-0014 all-DNF path) -- so an ungated discount could
+    -- end a race that nobody had finished yet and DNF the whole field over one quiet moment. Gated, the
+    -- discount can only ever shorten a grace that is already running. (It used to ride on `threshold and`
+    -- being nil, which was easy to lose when the threshold itself was deleted.)
+    local grace_armed = session.grace_deadline ~= nil
     local active = 0
     local stalled
     for id, record in pairs(session.progress) do
         if not record.finished and not record.dnf then
-            local gap = threshold and stall.gap(id, t)
-            if gap and gap > threshold then
+            local reason = grace_armed and stall.verdict(id)
+            if reason then
                 stalled = stalled or {}
-                stalled[#stalled + 1] = string.format("%s (%.0fs)", tostring(id), gap)
+                stalled[#stalled + 1] = string.format("%s (%s)", tostring(id), reason)
             else
-                -- Recently stamped, or carrying no stamp at all -- either way this driver still counts.
+                -- Nobody has reported this driver standing still, so they still count.
                 active = active + 1
             end
         end
@@ -4291,9 +4377,8 @@ local function maybe_end_race()
         -- Fires exactly once: after this the stored deadline IS the short one, so a later
         -- now() + all_done_grace is no longer smaller than it and the branch is dead.
         log_info("beamcomp.race", stalled
-            and string.format(
-                "grace shortened to results window; %d stalled driver(s) discounted: %s (threshold %.1fs)",
-                #stalled, table.concat(stalled, ", "), threshold)
+            and string.format("grace shortened to results window; %d AFK driver(s) discounted: %s",
+                #stalled, table.concat(stalled, ", "))
             or "all players accounted for; grace shortened to results window")
     end
 end
@@ -4526,6 +4611,7 @@ local function start_finish_grace()
     end
     session.grace_deadline = now() + PHASE_DURATIONS.finish_grace
     log_info("beamcomp.race", "finish grace armed")
+    stall.begin_grace()
     -- Tell every client the cutoff length so still-racing players can show a live countdown (ADR-0014).
     broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.finish_grace})
 end
@@ -5411,11 +5497,6 @@ local function tick()
             enter_phase(PHASE.qualifying, session.quali.duration)
         else
             enter_phase(PHASE.racing, nil)
-            -- The green light is forward progress for the whole field. Without it a driver pinned
-            -- before their first checkpoint would carry no stamp for the entire race, and an unstamped
-            -- driver always counts as progressing -- so the grace could never shorten for precisely the
-            -- case this exists to fix. (The staged quali stamps per driver at its own GO flip instead.)
-            stall.arm_field()
         end
         broadcast_standings()
     elseif phase == PHASE.quali_results then
@@ -6648,11 +6729,6 @@ local function handle_checkpoint_report(player_id, payload)
     end
     record.splits[record.completed] = time
     record.total_time = time
-    -- A scored crossing is the driver's proof of life, in every phase: it is the only signal a
-    -- race-blind server ever gets from a moving car, and both finish graces read it to tell a driver
-    -- still going from one wrecked or hung on track. Deliberately outside the staged-quali gate below
-    -- -- a normal race has no session.quali at all, and it needs this just as much.
-    stall.note(subject_id)
 
     local final = record.count and (record.completed >= record.count)
     if final then
@@ -7401,6 +7477,10 @@ local function handle_client_event(player_id, data)
     elseif decoded.type == quali.MSG_CLEARED then
         -- Staged sprint quali (ADR-0044/Round4): the launched driver cleared the ramp (>=15 m gate).
         quali.handle_cleared(player_id, decoded.payload)
+    elseif decoded.type == stall.MSG then
+        -- A client-measured movement verdict for its own car, or one of the owner's AI: the second input
+        -- to the liveness predicate both finish graces read (ADR-0014 amendment).
+        stall.handle_report(player_id, decoded.payload)
     elseif decoded.type == "raceControl" then
         -- Panel-triggered race stop (ADR-0038 amendment): delegate to the existing chat-command handlers so
         -- the admin gate, phase guards, chat replies and logging are reused. Inlined (not a named handler)
