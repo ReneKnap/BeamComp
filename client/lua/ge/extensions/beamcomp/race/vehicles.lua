@@ -907,8 +907,9 @@ end
 --
 -- Uses the SUBSTITUTING config box (metadata_anchored_target), deliberately unlike the footprint reader:
 -- for placement an unknown config key resolving to the model default is a few centimetres of error, which
--- beats not placing at all. Returns true, or nil plus a reason -- every failure path means "leave the car
--- alone", and the deferred restage stays the safety net behind this.
+-- beats not placing at all. Returns true PLUS the target it aimed at, or nil plus a reason -- every
+-- failure path means "leave the car alone", and the deferred restage stays the safety net behind this.
+-- The target is returned for the swap probe below, which reports it next to where the car really is.
 function M.preplace_for_replacement(veh, pose, model, config)
     if not veh then
         return nil, "no vehicle"
@@ -930,7 +931,154 @@ function M.preplace_for_replacement(veh, pose, model, config)
     if not ok then
         return nil, "pre-position failed: " .. tostring(err)
     end
-    return true
+    return true, target
+end
+
+-- The staging swap currently being watched by M.swap_probe, or nil between swaps. Module scope on
+-- purpose, not a field of init.lua's serialized M.state: it lives for the few seconds one swap takes, and
+-- a Lua reload losing a half-finished diagnostic costs nothing.
+local swap_watch = nil
+
+-- A metre reading for a log line, or "unknown" -- so a probe line can report an unreadable position
+-- instead of erroring inside the very measurement that is supposed to explain the bug.
+local function format_metres(value)
+    if type(value) ~= "number" or value ~= value then
+        return "unknown"
+    end
+    return string.format("%.3f m", value)
+end
+
+-- (public) The staging-swap probe (bug staging-swap-into-bigger-car-still-jumps, round 4).
+--
+-- Three rounds of fixes were shipped at this swap without a single measurement behind them: the only
+-- instrument that existed watched the FRESH-SPAWN path -- and it never worked, because it compared
+-- against a constant declared below it. This watches the path the reported bug actually takes and answers
+-- four questions per swap:
+--
+--   1. Where does the replacement start from? BeamNG's _replaceVehicle takes the replacement's spawn
+--      position from the OUTGOING car (`localOptions.pos = veh:getPosition()`), so wherever the outgoing
+--      car stands the moment the replace fires IS the reference point the engine is handed. `arm` reads
+--      exactly that, which keeps the reference meaningful even when the pre-anchor could not compute a
+--      target -- and, next to the target it did ask for, also shows whether the pre-anchor's teleport had
+--      landed by the time the engine read the position.
+--   2. Where does the new car come up? (`after_replace`, first frame afterwards) -- a gap here is the
+--      ENGINE having moved it, the suspected cause of the jump.
+--   3. Where does it stand at the end of the jbeam load wait? (`at_wait_end`)
+--   4. Who moves it last? (`restaged`) -- if our own restage still teleports at the end of the wait, that
+--      teleport is what the player sees, and the fix belongs there rather than at the engine.
+--
+-- Every line carries the literal marker "swap-probe" so one grep collects a whole session, and every one
+-- is a warning so it survives a log busy enough to be cut short. One swap costs at most five lines from
+-- here: the probe is armed by the handoff, each stage speaks once, and the restage disarms it.
+--
+-- A handoff position that cannot be read gives up on the whole swap rather than reporting gaps against a
+-- missing reference -- the failure line says so, and a swap nobody could measure is a finding too.
+--
+-- Reads only. Nothing in here may change what the swap does; every entry point is a no-op while no swap
+-- is armed, so the fresh-spawn arming path through the same restage stays silent.
+M.swap_probe = {}
+
+-- Start watching the swap that is about to happen. `placed`/`detail` are M.preplace_for_replacement's
+-- return pair -- (true, target) or (nil, reason) -- so the line can say what we asked for as well as what
+-- the engine is actually being handed. Discards any previous watch: an unfinished one belongs to a swap
+-- that never reached its restage, which is itself visible as its missing lines.
+function M.swap_probe.arm(veh, model, placed, detail)
+    swap_watch = nil
+    local ok, pos = pcall(function() return veh:getPosition() end)
+    if not ok or not pos then
+        log("W", LOG_TAG, "swap-probe handoff: outgoing position of '" .. tostring(model)
+            .. "' unreadable; this swap cannot be measured")
+        return
+    end
+    swap_watch = {model = model, handoff = {x = pos.x, y = pos.y, z = pos.z}}
+    local aim
+    if placed and detail then
+        local dx, dy = pos.x - detail.x, pos.y - detail.y
+        aim = string.format("pre-anchor asked for (%.2f, %.2f, %.2f), %s away",
+            detail.x, detail.y, detail.z, format_metres(math.sqrt(dx * dx + dy * dy)))
+    else
+        aim = "no pre-anchor (" .. tostring(detail) .. ")"
+    end
+    log("W", LOG_TAG, string.format(
+        "swap-probe handoff: '%s' inherits (%.2f, %.2f, %.2f); %s",
+        tostring(model), pos.x, pos.y, pos.z, aim))
+end
+
+-- The measurement this whole round exists for: how far the replacement came up from the reference point
+-- the engine was handed. Called on the first frame after the replace, before anything of ours moves it.
+function M.swap_probe.after_replace(veh)
+    if not swap_watch or swap_watch.replace_reported then
+        return
+    end
+    swap_watch.replace_reported = true
+    local gap = veh and horizontal_gap(veh, swap_watch.handoff)
+    local verdict = ""
+    if type(gap) == "number" and gap > SPAWN_NUDGE_TOLERANCE then
+        verdict = " -- the ENGINE moved it"
+    end
+    log("W", LOG_TAG, string.format("swap-probe after replace: '%s' came up %s from the reference point"
+        .. " it was handed%s", tostring(swap_watch.model), format_metres(gap), verdict))
+end
+
+-- What the early metadata pre-placement made of the new car, once per swap. `moved`/`delta`/`model` are
+-- M.preplace_at_grid's return triple, so a nil `moved` carries a reason in `delta`. The model is the
+-- interesting half: it says which identity the car reported that early, and therefore which footprint the
+-- correction was computed from.
+function M.swap_probe.preplaced(moved, delta, model)
+    if not swap_watch or swap_watch.preplace_reported then
+        return
+    end
+    swap_watch.preplace_reported = true
+    if moved == nil then
+        log("W", LOG_TAG, "swap-probe pre-place: skipped (" .. tostring(delta) .. ")")
+        return
+    end
+    log("W", LOG_TAG, string.format(
+        "swap-probe pre-place: the car reports '%s' and stood %s off that model's metadata target (%s)",
+        tostring(model), format_metres(delta), moved and "teleported" or "left alone"))
+end
+
+-- Where the car stands when the jbeam load wait ends -- read before the adoption re-places it, so the two
+-- lines together attribute any remaining movement to us rather than to the engine.
+function M.swap_probe.at_wait_end(veh, is_jbeam_loaded)
+    if not swap_watch or swap_watch.wait_end_reported then
+        return
+    end
+    swap_watch.wait_end_reported = true
+    log("W", LOG_TAG, string.format("swap-probe at load-wait end: '%s' stands %s from the reference"
+        .. " point (%s)", tostring(swap_watch.model),
+        format_metres(veh and horizontal_gap(veh, swap_watch.handoff)),
+        is_jbeam_loaded and "new jbeam detected" or "wait timed out"))
+end
+
+-- The last word on a swap: whether OUR restage still had to teleport the car at the end of the wait, and
+-- by how much. `moved`/`delta` are M.restage_at_grid's return pair. Disarms the probe.
+function M.swap_probe.restaged(moved, delta)
+    if not swap_watch then
+        return
+    end
+    local model = swap_watch.model
+    swap_watch = nil
+    if moved == nil then
+        log("W", LOG_TAG, "swap-probe restage: could not re-place '" .. tostring(model) .. "' ("
+            .. tostring(delta) .. ")")
+        return
+    end
+    if moved then
+        log("W", LOG_TAG, string.format("swap-probe restage: MOVED '%s' %s at the end of the wait --"
+            .. " this teleport is the one the player sees", tostring(model), format_metres(delta)))
+        return
+    end
+    log("W", LOG_TAG, string.format("swap-probe restage: left '%s' standing (%s off) -- no correction"
+        .. " from here", tostring(model), format_metres(delta)))
+end
+
+-- A replace was flagged while init.lua has no staged race car, so its restage returns before consuming
+-- the flag and the swapped car is never re-staged at all (investigation finding 3). Pure report: the
+-- caller reads the flag without consuming it and changes nothing.
+function M.swap_probe.orphan()
+    log("W", LOG_TAG, "swap-probe orphan: a staging replace was flagged while no race car is staged;"
+        .. " the re-stage never ran for it")
 end
 
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
