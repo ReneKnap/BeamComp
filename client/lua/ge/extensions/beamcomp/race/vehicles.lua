@@ -329,11 +329,57 @@ local function pose_orientation(pose)
     return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
 end
 
+-- The config KEY out of whatever a caller was handed: a plain preset name, a .pc path, or a table
+-- carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves to the
+-- model's default config downstream (the right answer: that is what would spawn).
+--
+-- With `model` known this applies the ENGINE'S OWN rule, taken verbatim from core/vehicles.lua
+-- getVehicleDetails: `config_key = pc_file:match("vehicles/<model>/(.*).pc")` -- the path RELATIVE to the
+-- model folder, which keeps a config living in a SUBFOLDER keyed the way core_vehicles keys it. The
+-- basename fallback below is for a caller that has no model to match against.
+--
+-- Plain find rather than a pattern, so a model key never has to be escaped.
+local function config_key(config, model)
+    if type(config) == "table" then
+        config = config.linkedPCFile
+    end
+    if type(config) ~= "string" or config == "" then
+        return nil
+    end
+    if type(model) == "string" and model ~= "" then
+        local prefix = "vehicles/" .. model .. "/"
+        local at = config:find(prefix, 1, true)
+        if at then
+            local relative = config:sub(at + #prefix):gsub("%.pc$", "")
+            if relative ~= "" then
+                return relative
+            end
+        end
+    end
+    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
+    -- the config key core_vehicles indexes its configs by.
+    local key = config:match("([^/]+)$") or config
+    key = key:gsub("%.pc$", "")
+    if key == "" then
+        return nil
+    end
+    return key
+end
+
 -- The (model, config-key) pair identifying which stock config's metadata box describes `veh`, read off
 -- the vehicle itself the way capture_spec does -- so a placement path can reach the box without a new
 -- parameter threaded through every caller. `config` is a NAMED preset only: an inline parts table (a
 -- tuned car) and a serialized partsTree blob both come back nil, which vehiclespecs resolves to the
 -- model's stock config. pcall-guarded; nil model when the read fails.
+--
+-- The key is NORMALIZED, and that is not cosmetic. veh.partConfig holds the full .pc PATH --
+-- "vehicles/md_series/md_70_prisonbus.pc" -- while core_vehicles keys its configs by "md_70_prisonbus",
+-- so handing the raw string on missed EVERY lookup: config_bbox then silently substituted the model's
+-- DEFAULT config, and config_bbox_exact (the footprint reader's fallback) could never resolve at all.
+-- Measured in-game on a staging swap into an md_series prison bus: the anchor was computed from the
+-- 6.39 m default dump truck instead of the 10.91 m bus. The replace path already normalized
+-- (preplace_for_replacement); this brings the read-off-the-vehicle path in line, so the two metadata
+-- paths can no longer answer the same question with two different boxes.
 local function model_config_of(veh)
     if not veh then
         return nil
@@ -345,27 +391,7 @@ local function model_config_of(veh)
     if not ok or type(model) ~= "string" or model == "" then
         return nil
     end
-    return model, config
-end
-
--- The config KEY out of whatever a replaceVehicle caller was handed: a plain preset name, a .pc path, or
--- a table carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves
--- to the model's default config downstream (the right answer: that is what would spawn).
-local function config_key(config)
-    if type(config) == "table" then
-        config = config.linkedPCFile
-    end
-    if type(config) ~= "string" or config == "" then
-        return nil
-    end
-    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
-    -- the config key core_vehicles indexes its configs by.
-    local key = config:match("([^/]+)$") or config
-    key = key:gsub("%.pc$", "")
-    if key == "" then
-        return nil
-    end
-    return key
+    return model, config_key(config, model)
 end
 
 -- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
@@ -920,7 +946,7 @@ function M.preplace_for_replacement(veh, pose, model, config)
     if type(model) ~= "string" or model == "" then
         return nil, "no replacement model"
     end
-    local target = metadata_anchored_target(pose, model, config_key(config))
+    local target = metadata_anchored_target(pose, model, config_key(config, model))
     if not target then
         return nil, "no config box for '" .. model .. "'"
     end
