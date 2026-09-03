@@ -1504,6 +1504,27 @@ function M.spec_size(model, config)
     return usable_size(box.max.y - box.min.y, box.max.x - box.min.x)
 end
 
+-- (public) Forward half-length (metres) of a vehicle's spawn bounding box, or nil when the box cannot be
+-- read (no vehicle, jbeam not up yet, bbox API gone). The same measurement front_anchored_target anchors
+-- the car's front from, and the same box car_size measures -- which is why it lives here with them rather
+-- than in the caller.
+--
+-- The deferred restage uses it as a JBEAM-LOADED PROBE: the value changes the moment a replaced car's own
+-- jbeam comes up, so a caller that took a reading BEFORE the replace can tell the new car from the old.
+-- pcall: the bbox API is engine-version-coupled, so a mismatch reads as "unknown" rather than erroring.
+function M.spawn_oobb_forward(veh)
+    if not veh then
+        return nil
+    end
+    local ok, half_y = pcall(function()
+        return veh:getSpawnWorldOOBB():getHalfExtents().y
+    end)
+    if ok and type(half_y) == "number" then
+        return half_y
+    end
+    return nil
+end
+
 -- (public) A LIVE car's grid footprint (length, width in metres) plus where the number came from, or
 -- nil when neither source reads.
 --
