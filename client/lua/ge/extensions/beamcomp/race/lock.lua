@@ -61,7 +61,8 @@ local HOLD_ACTION_GROUP = "beamcomp_race_hold_lock"
 -- the VE override and so are intentionally absent here; every other switch / spawn / reset / recover
 -- route is blocked, including the onDown-only reset keys (reset_physics, reset_all_physics, loadHome)
 -- which cannot support a hold (ADR-0017). The two car-selector actions live in SELECTOR_ACTIONS below
--- so the swap-allowed mode can leave them open; everything here is blocked in both modes.
+-- so the swap-allowed mode can leave them open, and the node-grabber actions are resolved from the engine
+-- at install time (nodegrabber_actions below); everything here is blocked in both modes.
 local BLOCKED_ACTIONS = {
     "switch_next_vehicle",
     "switch_previous_vehicle",
@@ -76,15 +77,32 @@ local BLOCKED_ACTIONS = {
     "saveHome",
     "dropPlayerAtCamera",
     "dropPlayerAtCameraNoReset",
-    -- Node grabber (Ctrl + drag): applies an external force the soft start-freeze does not resist, so
-    -- it could drag the car off its grid slot during the lock (countdown-lock-leaks Finding #4). Its
-    -- render/activation action is blocked here. NOTE: the exact action name(s) for BeamNG 0.38.5 are to
-    -- be confirmed in-game (dump core_input_actionFilter / the inputmaps) -- a wrong name silently
-    -- no-ops the filter rather than erroring. If the grabber is not a filterable input action, disable
-    -- the GE-side grabber for the lock span instead.
-    "nodegrabRender",
-    "nodegrabStrength",
-    "nodegrabFixedFrame",
+}
+
+-- The node grabber (Ctrl + drag) applies an external force the soft start-freeze does not resist, so it can
+-- drag the car off its grid slot for as long as the lock is meant to be holding it (ADR-0017,
+-- countdown-lock-leaks Finding #4). It IS a filterable input action -- the game's own career mode blocks it
+-- through the same setGroup/addAction path this file already uses (career.lua updateNodegrabberBlocking),
+-- so it needs no second, GE-side mechanism.
+--
+-- The names are read from the ENGINE's action template at install time rather than written out here (bug
+-- nodegrabber-action-names-wrong). This list started life as three invented names -- "nodegrabRender",
+-- "nodegrabStrength", "nodegrabFixedFrame" -- that no engine version has ever known, and an unknown name is
+-- a silent no-op in ActionMap.addToFilter: no error, no warning, no log. The block therefore did nothing at
+-- all from the day it was added until someone read the engine source. Taking the names from the engine is
+-- what survives the next rename; the list below is only the fallback for an engine that no longer offers
+-- the template, and falling back to it is warned about (report_nodegrabber_block).
+local NODEGRABBER_TEMPLATE = "nodegrabber"
+
+-- Verbatim from the engine's actionTemplates.nodegrabber (core/input/actionFilter.lua, BeamNG.drive 0.39):
+-- six actions, the last two gamepad variants.
+local NODEGRABBER_ACTIONS = {
+    "nodegrabberAction",
+    "nodegrabberGrab",
+    "nodegrabberRender",
+    "nodegrabberStrength",
+    "nodegrabberPadGrab",
+    "nodegrabberPadMode",
 }
 
 -- The car-selector input actions. Blocked in the full lock (no swap during countdown/racing), but left
@@ -130,38 +148,137 @@ local function notify_spawn_blocked()
     log("I", LOG_TAG, "blocked a vehicle spawn/replace during the race")
 end
 
--- Build the blocked-action list for the requested mode: always BLOCKED_ACTIONS, plus the two selector
--- actions unless replace is allowed (swap-allowed staging mode leaves the selector open).
-local function blocked_actions_for(allow_replace)
-    if allow_replace then
-        return BLOCKED_ACTIONS
+-- The node-grabber actions to block, preferring the engine's own template over the built-in list.
+-- Returns (actions, is_from_template).
+--
+-- getActionTemplates hands back the RAW actionTemplates table, not a copy (core/input/actionFilter.lua), so
+-- this only ever reads it and copies the names out -- inserting into or reordering that table would change
+-- what every other subsystem blocks.
+--
+-- Every step degrades instead of throwing: a missing API, a missing template, or a template of an
+-- unexpected shape all fall back to NODEGRABBER_ACTIONS, because losing the grabber names must not also
+-- lose the thirteen other actions that share the group. The fallback is not silent -- see
+-- report_nodegrabber_block.
+local function nodegrabber_actions()
+    local from_template
+    pcall(function()
+        if type(core_input_actionFilter.getActionTemplates) ~= "function" then
+            return
+        end
+        local templates = core_input_actionFilter.getActionTemplates()
+        if type(templates) ~= "table" or type(templates[NODEGRABBER_TEMPLATE]) ~= "table" then
+            return
+        end
+        local names = {}
+        for _, action in ipairs(templates[NODEGRABBER_TEMPLATE]) do
+            if type(action) == "string" and action ~= "" then
+                names[#names + 1] = action
+            end
+        end
+        if #names > 0 then
+            from_template = names
+        end
+    end)
+    if from_template then
+        return from_template, true
     end
+    return NODEGRABBER_ACTIONS, false
+end
+
+-- Build the blocked-action list for the requested mode: always BLOCKED_ACTIONS plus the node-grabber
+-- actions, plus the two selector actions unless replace is allowed (the swap-allowed staging mode leaves
+-- the selector open -- there the player may change car, but still must not drag it off its slot, ADR-0021).
+--
+-- Always a fresh array, in both modes: setGroup stores the array BY REFERENCE (actionGroups[name] =
+-- arrayValues) and serializes it across Lua reloads, so the engine must never be handed one of this
+-- module's own constant tables to hold on to.
+local function blocked_actions_for(allow_replace, grabber_actions)
     local actions = {}
     for _, action in ipairs(BLOCKED_ACTIONS) do
         actions[#actions + 1] = action
     end
-    for _, action in ipairs(SELECTOR_ACTIONS) do
+    for _, action in ipairs(grabber_actions) do
         actions[#actions + 1] = action
     end
+    if not allow_replace then
+        for _, action in ipairs(SELECTOR_ACTIONS) do
+            actions[#actions + 1] = action
+        end
+    end
     return actions
+end
+
+-- One line per lock install (ADR-0017 amendment, nodegrabber-action-names-wrong) reporting how much of the
+-- node-grabber block the engine says is live. Deliberately once per install and never per frame: the client
+-- log goes blind after ~15k entries and BeamMP fills it on its own, so a per-frame line would destroy the
+-- very evidence it exists to provide.
+--
+-- Read the count for exactly what it is. isActionBlocked answers from blockedActions[filter][name], which
+-- addToFilter writes for EVERY name it is handed, real or not. So "6 of 6" proves that our group reached
+-- the filter and that nobody cleared filter 0 out from under us -- it does NOT prove the six names exist.
+-- Name validity is what reading them from the engine template buys, which is why a fallback to the
+-- built-in list is the warning worth reacting to.
+local function report_nodegrabber_block(grabber_actions, is_from_template, allow_replace)
+    if not is_from_template then
+        log("W", LOG_TAG, "node grabber block: engine action template '" .. NODEGRABBER_TEMPLATE
+            .. "' unavailable, using the built-in name list -- re-check it against the engine's"
+            .. " core/input/actionFilter.lua")
+    end
+    if type(core_input_actionFilter.isActionBlocked) ~= "function" then
+        return
+    end
+    local ok, filtered, unfiltered = pcall(function()
+        local count, gaps = 0, {}
+        for _, action in ipairs(grabber_actions) do
+            if core_input_actionFilter.isActionBlocked(action) then
+                count = count + 1
+            else
+                gaps[#gaps + 1] = action
+            end
+        end
+        return count, gaps
+    end)
+    if not ok then
+        log("W", LOG_TAG, "node grabber block: could not read the filter state: " .. tostring(filtered))
+        return
+    end
+    local summary = string.format(
+        "node grabber block: %d of %d actions filtered (%s lock, names from %s)",
+        filtered, #grabber_actions, allow_replace and "swap-allowed" or "full",
+        is_from_template and "the engine template" or "the built-in fallback")
+    if #unfiltered == 0 then
+        log("I", LOG_TAG, summary)
+    else
+        log("W", LOG_TAG, summary .. "; not filtered: " .. table.concat(unfiltered, ", "))
+    end
 end
 
 -- Block or unblock the input-action group. setGroup defines the action list; addAction toggles it on
 -- our shared filter. Re-calling setGroup redefines the group, so upgrading the swap-allowed mode to the
 -- full lock (countdown) just re-blocks with the selector actions added. Wrapped in pcall: the input API
--- is engine-version-coupled, so a mismatch warns once rather than breaking the phase handler.
+-- is engine-version-coupled, so a mismatch warns once rather than breaking the phase handler -- and the
+-- node-grabber template read rides inside that same guard.
 local function set_action_filter(blocked, allow_replace)
     if type(core_input_actionFilter) ~= "table" then
         return
     end
+    local grabber_actions, is_from_template
     local ok, err = pcall(function()
         if blocked then
-            core_input_actionFilter.setGroup(ACTION_GROUP, blocked_actions_for(allow_replace))
+            grabber_actions, is_from_template = nodegrabber_actions()
+            core_input_actionFilter.setGroup(ACTION_GROUP,
+                blocked_actions_for(allow_replace, grabber_actions))
         end
         core_input_actionFilter.addAction(FILTER_ID, ACTION_GROUP, blocked)
     end)
     if not ok then
         log("W", LOG_TAG, "action filter update failed: " .. tostring(err))
+        return
+    end
+    -- Only after addAction: it is addAction -> updateFilters that actually applies the group, so what
+    -- this reads back is the filter state the lock just produced.
+    if blocked then
+        report_nodegrabber_block(grabber_actions, is_from_template, allow_replace)
     end
 end
 
