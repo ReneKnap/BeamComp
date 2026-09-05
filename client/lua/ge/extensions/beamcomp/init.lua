@@ -220,7 +220,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "afk-recover-criterion/2026-09-03"
+local BUILD_MARKER = "swap-anchor-fix/2026-09-04"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -268,7 +268,8 @@ M.state = {
     assist_notice = nil,   -- which abort reason was last toasted this hold ("moving"), latches one-shot
     freeze_hold_armed = false,  -- whether the VE EV-throttle clamp has been armed for the frozen phases (ADR-0017 amendment)
     restage_pending = false,  -- a staging car (swap or fresh-spawn default) awaits re-placement at the grid slot once its bbox is ready
-    restage_baseline = nil,   -- spawn-bbox forward half-length recorded on the first pending frame, to detect the new jbeam loading
+    restage_baseline = nil,   -- spawn-bbox forward half-length the jbeam-load detection compares against: taken off the OUTGOING car by the replace wrapper for a swap, recorded on the first pending frame for a fresh spawn
+    restage_prebaseline = nil,  -- that pre-replace reading, parked by on_before_replace until the replace is consumed one or more frames later; nil outside a swap
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
@@ -1392,12 +1393,21 @@ local function handle_race_phase(payload)
         -- here bails out silently, and preplace_at_grid + the deferred restage stay behind it as the
         -- safety net -- they simply find nothing left to do when this works.
         lock.on_before_replace = function(model_name, opt)
-            local pose = M.state.race and M.state.race.myPose
-            if not pose then
-                return
-            end
+            -- Cleared before anything that can fail: the lock calls this inside a pcall, and a reading
+            -- left over from an earlier swap must never be adopted as this one's baseline.
+            M.state.restage_prebaseline = nil
             local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
-            if not own then
+            -- Take the deferred restage's jbeam-load baseline HERE, while the OUTGOING car still stands.
+            -- Measured in-game: the replace stalls the game engine for ~2 s loading the new jbeam, so the
+            -- first frame restage_swapped_car gets afterwards already sees the NEW car's bounding box.
+            -- Recording the baseline there compared the new box against itself, the "box changed = jbeam
+            -- loaded" test could never fire, and every single swap fell through to the RESTAGE_MAX_WAIT
+            -- timeout -- putting the correction as late as it can possibly be (4.5 s after the swap in
+            -- the measured case). Read one frame earlier, against the car being replaced, the test has an
+            -- actual before-value and fires on the first frame instead.
+            M.state.restage_prebaseline = own and vehicles.spawn_oobb_forward(own) or nil
+            local pose = M.state.race and M.state.race.myPose
+            if not pose or not own then
                 return
             end
             local placed, reason = vehicles.preplace_for_replacement(own, pose, model_name,
@@ -6114,19 +6124,6 @@ local function step_assist(dt_real)
     end
 end
 
--- Forward half-length (metres) of a vehicle's spawn bounding box, or nil if the API is unavailable.
--- This is the same measurement front_anchored_target uses to anchor the car's front on the grid line.
--- pcall: the bbox API is engine-version-coupled, so a mismatch reads as "unknown" rather than erroring.
-local function spawn_oobb_forward(veh)
-    local ok, half_y = pcall(function()
-        return veh:getSpawnWorldOOBB():getHalfExtents().y
-    end)
-    if ok and type(half_y) == "number" then
-        return half_y
-    end
-    return nil
-end
-
 -- os.clock() reading of the last over-cap staging-swap toast, throttled by CAP_SWAP_TOAST_THROTTLE. A
 -- plain file-scope local (a Lua reload resets it -- at worst one extra toast), mirroring last_block_toast_at.
 local last_cap_swap_toast_at = 0
@@ -6220,9 +6217,17 @@ end
 -- The grid re-placement is DEFERRED: a freshly replaced or spawned car keeps reporting a stale bounding
 -- box for a moment while its jbeam loads, so front-anchoring immediately uses the wrong footprint and
 -- lands a differently-sized car offset (confirmed in-game: small -> large swap sat too far forward). We
--- record the footprint on the first pending frame and wait until the spawn bbox's forward half-length
--- changes by RESTAGE_MIN_DELTA (new jbeam loaded), or until RESTAGE_MAX_WAIT elapses (same-size swap,
--- where placing with the unchanged box is correct anyway).
+-- wait until the spawn bbox's forward half-length changes by RESTAGE_MIN_DELTA against a baseline (new
+-- jbeam loaded), or until RESTAGE_MAX_WAIT elapses (same-size swap, where placing with the unchanged box
+-- is correct anyway).
+--
+-- WHERE THE BASELINE COMES FROM is what makes that test work at all. For a SWAP the replace wrapper takes
+-- it off the outgoing car before the engine runs (on_before_replace); this function only adopts it. It
+-- cannot be recorded here, because the replace stalls the engine for ~2 s loading the new jbeam and the
+-- first frame we get afterwards already reports the NEW car's box -- measured in-game, and it made the
+-- detection compare the new box against itself, so every swap ran into the timeout and got its correction
+-- as late as the design allows. A fresh spawn has no outgoing car and still records on its first pending
+-- frame, where the stale-box premise does hold.
 --
 -- The wait is unchanged, but the placement at the end of it is now a CHECK: a freshly spawned car was
 -- already front-anchored from its config bounding box, so it is normally standing on its slot by the time
@@ -6237,7 +6242,11 @@ local function restage_swapped_car(dt_real)
     -- the new jbeam is loaded -- queueing to a still-loading VE would be lost.
     if lock.consume_replace() then
         M.state.restage_pending = true
-        M.state.restage_baseline = nil
+        -- Adopt the baseline the replace wrapper took off the OUTGOING car (on_before_replace). Only a
+        -- swap has one; the fresh-spawn arming path leaves it nil and the first pending frame records the
+        -- baseline itself, exactly as before.
+        M.state.restage_baseline = M.state.restage_prebaseline
+        M.state.restage_prebaseline = nil
         M.state.restage_wait = RESTAGE_MAX_WAIT
         M.state.restage_preplaced = 0
         -- Scope the compliance-gate skip to THIS restage cycle only (ADR-0032): if this consumed replace is
@@ -6259,9 +6268,11 @@ local function restage_swapped_car(dt_real)
         return
     end
 
-    -- Record the footprint on the first pending frame (still the old car), then wait for it to change
-    -- (new jbeam loaded) or for the fallback timeout.
-    local current = spawn_oobb_forward(own)
+    -- Wait for the footprint to change (new jbeam loaded) or for the fallback timeout. A SWAP brought its
+    -- baseline with it, taken off the outgoing car before the replace -- on the first pending frame the
+    -- car here is already the new one, so recording it now would compare the new box against itself.
+    -- Only the fresh-spawn arming path (handle_race_start), which has no outgoing car, records here.
+    local current = vehicles.spawn_oobb_forward(own)
     if M.state.restage_baseline == nil then
         M.state.restage_baseline = current
     end
@@ -6368,6 +6379,12 @@ local function restage_swapped_car(dt_real)
         elseif not moved then
             log("I", RACE_LOG_TAG, string.format(
                 "staging car already on its grid slot (%.3f m); no re-place", delta))
+        else
+            -- The correction itself, which the log could not see before. This teleport is what a player
+            -- watching their swapped car actually notices, so how far it moves -- and whether it still
+            -- moves at all -- is the one number that says whether a staging swap sits right.
+            log("I", RACE_LOG_TAG, "re-placed staging car onto its grid slot ("
+                .. (delta and string.format("%.3f m off", delta) or "deviation unreadable") .. ")")
         end
     end
     vehicles.set_vehicle_frozen(own, true)
@@ -6519,7 +6536,7 @@ local function step_dashboard_refresh(dt)
         return
     end
     local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
-    if not own or spawn_oobb_forward(own) == nil then
+    if not own or vehicles.spawn_oobb_forward(own) == nil then
         -- No seated own car yet, or its jbeam is still loading: keep waiting (the settle timer only counts
         -- down once the car is bindable, so a slow spawn never fires the rebind against a not-ready VE).
         return

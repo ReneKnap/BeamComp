@@ -329,11 +329,57 @@ local function pose_orientation(pose)
     return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
 end
 
+-- The config KEY out of whatever a caller was handed: a plain preset name, a .pc path, or a table
+-- carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves to the
+-- model's default config downstream (the right answer: that is what would spawn).
+--
+-- With `model` known this applies the ENGINE'S OWN rule, taken verbatim from core/vehicles.lua
+-- getVehicleDetails: `config_key = pc_file:match("vehicles/<model>/(.*).pc")` -- the path RELATIVE to the
+-- model folder, which keeps a config living in a SUBFOLDER keyed the way core_vehicles keys it. The
+-- basename fallback below is for a caller that has no model to match against.
+--
+-- Plain find rather than a pattern, so a model key never has to be escaped.
+local function config_key(config, model)
+    if type(config) == "table" then
+        config = config.linkedPCFile
+    end
+    if type(config) ~= "string" or config == "" then
+        return nil
+    end
+    if type(model) == "string" and model ~= "" then
+        local prefix = "vehicles/" .. model .. "/"
+        local at = config:find(prefix, 1, true)
+        if at then
+            local relative = config:sub(at + #prefix):gsub("%.pc$", "")
+            if relative ~= "" then
+                return relative
+            end
+        end
+    end
+    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
+    -- the config key core_vehicles indexes its configs by.
+    local key = config:match("([^/]+)$") or config
+    key = key:gsub("%.pc$", "")
+    if key == "" then
+        return nil
+    end
+    return key
+end
+
 -- The (model, config-key) pair identifying which stock config's metadata box describes `veh`, read off
 -- the vehicle itself the way capture_spec does -- so a placement path can reach the box without a new
 -- parameter threaded through every caller. `config` is a NAMED preset only: an inline parts table (a
 -- tuned car) and a serialized partsTree blob both come back nil, which vehiclespecs resolves to the
 -- model's stock config. pcall-guarded; nil model when the read fails.
+--
+-- The key is NORMALIZED, and that is not cosmetic. veh.partConfig holds the full .pc PATH --
+-- "vehicles/md_series/md_70_prisonbus.pc" -- while core_vehicles keys its configs by "md_70_prisonbus",
+-- so handing the raw string on missed EVERY lookup: config_bbox then silently substituted the model's
+-- DEFAULT config, and config_bbox_exact (the footprint reader's fallback) could never resolve at all.
+-- Measured in-game on a staging swap into an md_series prison bus: the anchor was computed from the
+-- 6.39 m default dump truck instead of the 10.91 m bus. The replace path already normalized
+-- (preplace_for_replacement); this brings the read-off-the-vehicle path in line, so the two metadata
+-- paths can no longer answer the same question with two different boxes.
 local function model_config_of(veh)
     if not veh then
         return nil
@@ -345,27 +391,7 @@ local function model_config_of(veh)
     if not ok or type(model) ~= "string" or model == "" then
         return nil
     end
-    return model, config
-end
-
--- The config KEY out of whatever a replaceVehicle caller was handed: a plain preset name, a .pc path, or
--- a table carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves
--- to the model's default config downstream (the right answer: that is what would spawn).
-local function config_key(config)
-    if type(config) == "table" then
-        config = config.linkedPCFile
-    end
-    if type(config) ~= "string" or config == "" then
-        return nil
-    end
-    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
-    -- the config key core_vehicles indexes its configs by.
-    local key = config:match("([^/]+)$") or config
-    key = key:gsub("%.pc$", "")
-    if key == "" then
-        return nil
-    end
-    return key
+    return model, config_key(config, model)
 end
 
 -- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
@@ -518,6 +544,16 @@ function M.log_bbox_report()
         resolved == 0 and " (metadata unavailable)" or ""))
 end
 
+-- Metres the engine may move a car away from the position we asked it to spawn at before it is worth a
+-- line. Above the float noise and the ground snap's horizontal drift, far below a real avoidance shove.
+--
+-- Declared HERE, above its only use. It used to sit with the size constants far below, where it was
+-- invisible to the check that reads it: a Lua chunk binds names lexically, so the read resolved to the
+-- GLOBAL of that name -- nil -- and `gap > nil` raised inside the pcall around it. The instrument
+-- therefore reported its failure branch for every single car and never once measured anything, which is
+-- what left this bug undiagnosed across three rounds (bug staging-swap-into-bigger-car-still-jumps).
+local SPAWN_NUDGE_TOLERANCE = 0.25
+
 -- Spawn one vehicle at a grid pose (plain {pos, rot, forward?} tables). Uses the captured spec when
 -- present, else the engine's default model. Returns the new vehicle, or nil plus a reason.
 local function spawn_vehicle_at(pose, spec)
@@ -591,7 +627,7 @@ local function spawn_vehicle_at(pose, spec)
     -- by the engine is exactly the class of event that cost a whole round on this feature. So measure it:
     -- the horizontal distance from where we asked for the reference point to where it actually is. Z is
     -- deliberately excluded -- the ground snap legitimately changes it.
-    local moved = pcall(function()
+    local checked, check_err = pcall(function()
         local landed = veh:getPosition()
         local dx, dy = landed.x - opt.pos.x, landed.y - opt.pos.y
         local gap = math.sqrt(dx * dx + dy * dy)
@@ -601,8 +637,11 @@ local function spawn_vehicle_at(pose, spec)
                 .. "the grid restage will pull it back", tostring(model), gap))
         end
     end)
-    if not moved then
-        log("W", LOG_TAG, "could not check the spawn position of '" .. tostring(model) .. "'")
+    if not checked then
+        -- With the reason, not without: the reason-less version of this line fired on 5 of 5 cars for
+        -- three rounds and nobody could tell it apart from a genuinely unreadable vehicle handle.
+        log("W", LOG_TAG, "could not check the spawn position of '" .. tostring(model) .. "': "
+            .. tostring(check_err))
     end
     return veh
 end
@@ -906,7 +945,7 @@ function M.preplace_for_replacement(veh, pose, model, config)
     if type(model) ~= "string" or model == "" then
         return nil, "no replacement model"
     end
-    local target = metadata_anchored_target(pose, model, config_key(config))
+    local target = metadata_anchored_target(pose, model, config_key(config, model))
     if not target then
         return nil, "no config box for '" .. model .. "'"
     end
@@ -1275,10 +1314,6 @@ end
 -- Metres of footprint change below which a re-report is not worth sending.
 local SIZE_REPORT_EPSILON = 0.01
 
--- Metres the engine may move a car away from the position we asked it to spawn at before it is worth a
--- line. Above the float noise and the ground snap's horizontal drift, far below a real avoidance shove.
-local SPAWN_NUDGE_TOLERANCE = 0.25
-
 -- Metres by which a live measurement may differ from the car's own config metadata before it is worth a
 -- warning. Generous: a deformed or slightly settled car reads a few centimetres off, a substituted config
 -- box is metres off.
@@ -1319,6 +1354,27 @@ function M.spec_size(model, config)
         return nil, nil
     end
     return usable_size(box.max.y - box.min.y, box.max.x - box.min.x)
+end
+
+-- (public) Forward half-length (metres) of a vehicle's spawn bounding box, or nil when the box cannot be
+-- read (no vehicle, jbeam not up yet, bbox API gone). The same measurement front_anchored_target anchors
+-- the car's front from, and the same box car_size measures -- which is why it lives here with them rather
+-- than in the caller.
+--
+-- The deferred restage uses it as a JBEAM-LOADED PROBE: the value changes the moment a replaced car's own
+-- jbeam comes up, so a caller that took a reading BEFORE the replace can tell the new car from the old.
+-- pcall: the bbox API is engine-version-coupled, so a mismatch reads as "unknown" rather than erroring.
+function M.spawn_oobb_forward(veh)
+    if not veh then
+        return nil
+    end
+    local ok, half_y = pcall(function()
+        return veh:getSpawnWorldOOBB():getHalfExtents().y
+    end)
+    if ok and type(half_y) == "number" then
+        return half_y
+    end
+    return nil
 end
 
 -- (public) A LIVE car's grid footprint (length, width in metres) plus where the number came from, or
