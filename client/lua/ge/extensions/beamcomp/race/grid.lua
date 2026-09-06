@@ -62,8 +62,8 @@ local DEFAULT_MIRROR = false         -- lateral side flip: off reproduces the hi
 -- wide -- or, pinned the other way round, how deep -- a grid may be authored.
 --
 -- Exported because the editor's knob constraint has to READ this number instead of keeping a copy of it
--- (race/grideditor.lua): the hand-written copy is what broke -- it named a constant no file in this mod
--- defines, so it reads nil and leaves rows and columns with no upper clamp at all.
+-- (race/grideditor.lua). A copy is precisely what broke: the editor's own KNOBS table named a constant no
+-- file in this mod defines, its `max` therefore read nil, and the rows/columns knobs went unbounded.
 --
 -- The server mirrors it as grid_fit.AXIS_CAPACITY for the ADR-0051 slot reservation, which has to
 -- reproduce this side's column count exactly. The two move together, or the reservation punches its
