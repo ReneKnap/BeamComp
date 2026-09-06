@@ -28,7 +28,7 @@ angular.module('beamng.apps')
   // together the next time either moves. It has to be declared ABOVE LAYOUT_KNOBS, which reads it while
   // it is being built -- a `var` further down hoists as undefined, and an undefined bound is silently no
   // bound at all, which is the defect this closes.
-  var AXIS_PIN_MAX = 8;
+  var AXIS_PIN_MAX = 32;
 
   // The NUMERIC tunable knobs (ADR-0023) in display order, split into the two sections that render them.
   // Each continuous knob has a fine (0.05) and a coarse (1.0) stepper pair; integer knobs (rows/columns)

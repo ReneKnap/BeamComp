@@ -1569,12 +1569,21 @@ grid_fit.SAFETY_MARGIN = 0.5
 -- Mirrors of race/grid.lua's layout defaults, for a race with NO custom grid (the procedural fallback).
 -- Reading the stored grid params numerically is the server's second documented exception to ADR-0023's
 -- relay-verbatim rule -- the first is previewCount. Keep in step with DEFAULT_COLUMNS / DEFAULT_ROW_GAP /
--- DEFAULT_COL_GAP / GRID_CAPACITY over there; a drift costs a slightly wrong reservation, never a
+-- DEFAULT_COL_GAP / MAX_AXIS_PIN over there; a drift costs a slightly wrong reservation, never a
 -- desync (the server's slot map stays the single truth and the client derives its layout from it).
+--
+-- AXIS_CAPACITY is the odd one out: not a default the server falls back to, but the CLAMP a stored
+-- rows/columns pin is cut to before the column count is derived from it -- and the one of the four whose
+-- drift is not slight. A server clamping tighter than the client reserves its holes in a grid of a
+-- different width than the one the client lays out, which is a wrong reservation for every pin between
+-- the two bounds. It moved from 8 to 32 with the client's pin cap (bug
+-- grideditor-knobs-missing-upper-clamp). MAX_PASSES below is unaffected by that: a columns-pinned
+-- segment's geometry does not depend on the extent at all, and a rows-pinned one still maps the extent
+-- through ceil(count / rows) -- a wider range of pins, not a new way for the fixpoint to oscillate.
 grid_fit.DEFAULT_COLUMNS = 2
 grid_fit.DEFAULT_ROW_GAP = 8.0
 grid_fit.DEFAULT_COL_GAP = 4.0
-grid_fit.AXIS_CAPACITY = 8
+grid_fit.AXIS_CAPACITY = 32
 
 -- Safety rails.
 --   MAX_PASSES -- the allocation is a fixpoint: a ROWS-pinned segment derives its column count from how

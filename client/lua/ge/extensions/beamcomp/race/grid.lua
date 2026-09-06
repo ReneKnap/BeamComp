@@ -68,7 +68,12 @@ local DEFAULT_MIRROR = false         -- lateral side flip: off reproduces the hi
 -- The server mirrors it as grid_fit.AXIS_CAPACITY for the ADR-0051 slot reservation, which has to
 -- reproduce this side's column count exactly. The two move together, or the reservation punches its
 -- holes into a grid that nobody lays out.
-local MAX_AXIS_PIN = 8
+--
+-- 32 is a generous bound, not a physical one: at the default 4 m column gap a 32-wide grid is 124 m
+-- across and the per-column stagger (row_gap / columns) shrinks to 0.25 m. That is absurd on most tracks
+-- and it is still the admin's call -- the editor previews the field he asked for. The bound exists so an
+-- absurd number cannot pass itself off as a reasonable one, not to decide what fits on a road.
+local MAX_AXIS_PIN = 32
 M.MAX_AXIS_PIN = MAX_AXIS_PIN
 
 -- The rows a param set falls back to when it pins NEITHER axis. Deliberately a plain number and NOT
