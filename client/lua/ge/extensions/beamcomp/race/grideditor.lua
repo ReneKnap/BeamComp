@@ -36,8 +36,8 @@ local LOG_TAG = "beamcomp.grid"
 -- How big a field this grid was AUTHORED for (ADR-0023 amendment 2026-08-02). It is saved with the grid
 -- and restored when the grid is opened, and it has exactly two jobs: it is the slot count the editor
 -- previews, and it is the threshold above which the race start warns the admin who started the race.
--- It is NOT an input to the layout -- the layout stays count-independent (grid.poses grows the field
--- above grid.LAYOUT_CAPACITY to fill whatever count arrives), so this number never moves a spawned pose.
+-- It is NOT an input to the layout -- the layout stays count-independent (grid.poses lays out whatever
+-- count arrives, however far past the previewed field that is), so this number never moves a spawned pose.
 -- A brand-new grid starts at 16 so a large grid reads clearly while tuning, even with no players present;
 -- the count is tunable (M.set_preview_count, clamped to [MIN_PREVIEW_COUNT, MAX_PREVIEW_COUNT]).
 local DEFAULT_PREVIEW_COUNT = 16
