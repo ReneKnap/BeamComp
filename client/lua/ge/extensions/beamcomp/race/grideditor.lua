@@ -6,7 +6,7 @@
 -- nothing to clean up.
 --
 -- Authoring side of named parametric grids (ADR-0023). The admin enters edit mode against a race on the
--- current map; the editor anchors a PREVIEW_COUNT-car grid to that race's real start line (via
+-- current map; the editor anchors a preview-count-sized grid to that race's real start line (via
 -- race/start.anchor) and recomputes the preview poses with race/grid as the knobs are tuned over the GE
 -- console or the panel. Separate forward/reverse blocks are accumulated; reverse is only authored if the
 -- admin switches to it. M.snapshot() hands the blocks -- plus the authored preview count, part of the grid
@@ -36,8 +36,8 @@ local LOG_TAG = "beamcomp.grid"
 -- How big a field this grid was AUTHORED for (ADR-0023 amendment 2026-08-02). It is saved with the grid
 -- and restored when the grid is opened, and it has exactly two jobs: it is the slot count the editor
 -- previews, and it is the threshold above which the race start warns the admin who started the race.
--- It is NOT an input to the layout -- the layout stays count-independent (grid.poses grows the field
--- above grid.LAYOUT_CAPACITY to fill whatever count arrives), so this number never moves a spawned pose.
+-- It is NOT an input to the layout -- the layout stays count-independent (grid.poses lays out whatever
+-- count arrives, however far past the previewed field that is), so this number never moves a spawned pose.
 -- A brand-new grid starts at 16 so a large grid reads clearly while tuning, even with no players present;
 -- the count is tunable (M.set_preview_count, clamped to [MIN_PREVIEW_COUNT, MAX_PREVIEW_COUNT]).
 local DEFAULT_PREVIEW_COUNT = 16
@@ -48,13 +48,26 @@ local MAX_PREVIEW_COUNT = 32
 -- empty segment, so this only guards against absurd values). Segment 0 always starts at slot 0.
 local MAX_BREAKPOINT_SLOT = MAX_PREVIEW_COUNT
 
+-- Upper bound for the rows/columns knobs, READ from the spawn maths rather than written down again here:
+-- race/grid.lua clamps a stored pin to the same number, and an editor bound that disagrees with it is a
+-- field that lies about what will spawn. The previous copy was written down here, as `max = PREVIEW_COUNT`
+-- -- a name no file in this mod defines. It read nil, M.set's `if constraint.max` branch never fired, and
+-- rows/columns took whatever an admin typed (bug grideditor-knobs-missing-upper-clamp). Nothing about that
+-- is visible from the panel, so the one way this can break again is called out loud instead.
+local MAX_AXIS_PIN = grid.MAX_AXIS_PIN
+if type(MAX_AXIS_PIN) ~= "number" then
+    -- No second copy of the number as a fallback: a bound the spawn does not share is the same lie in a
+    -- different place. What was missing the first time round was the noise, so that is what is added.
+    log("E", LOG_TAG, "grid.MAX_AXIS_PIN is missing -- the rows/columns knobs have no upper clamp")
+end
+
 -- Tunable knobs (camelCase, matching the stored/wire param keys) and their constraints. Offsets and
--- heading are unrestricted; gaps are non-negative; rows and columns are positive integers. rows and
--- columns are two ways to express the same width and are mutually exclusive (see M.set): pinning one axis
--- drops the other, which then becomes the dynamic axis derived from the field at spawn (grid.poses).
--- offsetHeight is the POST-grounding lift and castHeight the pre-grounding SEARCH-WINDOW shift (ADR-0023
--- amendment 2026-09-01), both unrestricted. The internal anchorHeight is deliberately absent here: it has
--- no editing surface and no writer left (see M.select_segment), so M.set rejects it.
+-- heading are unrestricted; gaps are non-negative; rows and columns are integers in [1, MAX_AXIS_PIN].
+-- rows and columns are two ways to express the same width and are mutually exclusive (see M.set): pinning
+-- one axis drops the other, which then becomes the dynamic axis derived from the field at spawn
+-- (grid.poses). offsetHeight is the POST-grounding lift and castHeight the pre-grounding SEARCH-WINDOW
+-- shift (ADR-0023 amendment 2026-09-01), both unrestricted. The internal anchorHeight is deliberately
+-- absent here: it has no editing surface and no writer left (see M.select_segment), so M.set rejects it.
 local KNOBS = {
     offsetForward = {},
     offsetLateral = {},
@@ -63,8 +76,8 @@ local KNOBS = {
     headingDeg = {},
     rowGap = {min = 0},
     colGap = {min = 0},
-    rows = {min = 1, max = PREVIEW_COUNT, integer = true},
-    columns = {min = 1, max = PREVIEW_COUNT, integer = true},
+    rows = {min = 1, max = MAX_AXIS_PIN, integer = true},
+    columns = {min = 1, max = MAX_AXIS_PIN, integer = true},
 }
 
 -- The knobs that are switches, not numbers: the lateral flip and the two placement switches of the

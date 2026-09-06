@@ -57,12 +57,32 @@ local DEFAULT_ROW_GAP = 8.0          -- longitudinal gap between rows (metres)
 local DEFAULT_COL_GAP = 4.0          -- lateral gap between adjacent columns (metres)
 local DEFAULT_MIRROR = false         -- lateral side flip: off reproduces the historical pole-left layout
 
--- The editor's default preview field size and the rows clamp/fallback. With the columns-pinned default a
--- slot's pose is count-independent (slot k -> a fixed row/column from k alone), so the editor's 8-car
--- preview matches the real spawn. NOTE: this is no longer a layout floor -- when rows are pinned instead,
--- the columns derive from the ACTUAL field size (grid.poses), so that layout grows/shrinks with the count.
-local GRID_CAPACITY = 8
-M.LAYOUT_CAPACITY = GRID_CAPACITY
+-- The upper bound of an explicit WIDTH PIN. rows and columns are the two ways to pin a grid's width and
+-- resolved_params clamps whichever one is given to [1, MAX_AXIS_PIN], so this single number decides how
+-- wide -- or, pinned the other way round, how deep -- a grid may be authored.
+--
+-- Exported because the editor's knob constraint has to READ this number instead of keeping a copy of it
+-- (race/grideditor.lua). A copy is precisely what broke: the editor's own KNOBS table named a constant no
+-- file in this mod defines, its `max` therefore read nil, and the rows/columns knobs went unbounded.
+--
+-- The server mirrors it as grid_fit.AXIS_CAPACITY for the ADR-0051 slot reservation, which has to
+-- reproduce this side's column count exactly. The two move together, or the reservation punches its
+-- holes into a grid that nobody lays out.
+--
+-- 32 is a generous bound, not a physical one: at the default 4 m column gap a 32-wide grid is 124 m
+-- across and the per-column stagger (row_gap / columns) shrinks to 0.25 m. That is absurd on most tracks
+-- and it is still the admin's call -- the editor previews the field he asked for. The bound exists so an
+-- absurd number cannot pass itself off as a reasonable one, not to decide what fits on a road.
+local MAX_AXIS_PIN = 32
+M.MAX_AXIS_PIN = MAX_AXIS_PIN
+
+-- The rows a param set falls back to when it pins NEITHER axis. Deliberately a plain number and NOT
+-- derived from MAX_AXIS_PIN: this is a DEFAULT, not a clamp, and for as long as it was spelled
+-- ceil(CAPACITY / DEFAULT_COLUMNS) every move of the cap silently dragged the default along with it.
+-- The value is unobservable today -- resolved_params leaves `columns` nil only when `rows` is explicitly
+-- pinned, and that pinned number is the only p.rows compute_segment ever divides by -- so its one job is
+-- to keep the resolved `rows` a usable number instead of nil.
+local DEFAULT_ROWS = 4
 
 -- BeamNG vehicle-forward axis in object space, used only by the no-gate-normal fallback: the grid
 -- lays cars out along this once it is rotated into the world by the placement rotation. +Y is the
@@ -161,7 +181,7 @@ end
 -- exclusive: an explicit `columns` PINS the column count (poses uses it verbatim, the rows grow with the
 -- field); an explicit `rows` pins the row count (poses derives the columns from the live field size). When
 -- NEITHER is given -- the bare fallback / no-custom-grid case -- the default pins DEFAULT_COLUMNS columns.
--- Both pins clamp to [1, GRID_CAPACITY]; rows always gets a value (used only when columns is nil/derived).
+-- Both pins clamp to [1, MAX_AXIS_PIN]; rows always gets a value (used only when columns is nil/derived).
 -- `mirror` is a boolean (not a number): only a genuine `true` enables the lateral flip, so an absent or
 -- false flag reproduces today's pole-left layout bit-for-bit (0/1 would misfire -- 0 is truthy in Lua).
 -- A shallow copy of a table (nil-tolerant), so a stored grid block / param set can be re-based into the
@@ -184,7 +204,7 @@ local function resolved_params(params)
 
     local columns
     if has_columns then
-        columns = math.max(1, math.min(GRID_CAPACITY, math.floor(params.columns)))
+        columns = math.max(1, math.min(MAX_AXIS_PIN, math.floor(params.columns)))
     elseif not has_rows then
         columns = DEFAULT_COLUMNS
     else
@@ -193,9 +213,9 @@ local function resolved_params(params)
 
     local rows = params.rows
     if type(rows) ~= "number" or rows < 1 then
-        rows = math.ceil(GRID_CAPACITY / DEFAULT_COLUMNS)
+        rows = DEFAULT_ROWS
     end
-    rows = math.max(1, math.min(GRID_CAPACITY, math.floor(rows)))
+    rows = math.max(1, math.min(MAX_AXIS_PIN, math.floor(rows)))
 
     return {
         offset_forward = params.offsetForward or DEFAULT_OFFSET_FORWARD,

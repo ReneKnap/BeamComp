@@ -21,6 +21,15 @@
 // list, ng-click): native <select> does not open in the BeamNG CEF overlay.
 angular.module('beamng.apps')
 .directive('beamCompGridEditor', [function () {
+  // The upper bound of the two width pins (rows/columns), hand-mirrored from grid.MAX_AXIS_PIN in
+  // race/grid.lua the way PREVIEW_MIN/PREVIEW_MAX mirror their GE constants. Deliberately its OWN
+  // constant even where it holds the same number as PREVIEW_MAX: that one is how many cars the preview
+  // draws, this one is how wide a grid may be authored, and one shared constant would chain the two
+  // together the next time either moves. It has to be declared ABOVE LAYOUT_KNOBS, which reads it while
+  // it is being built -- a `var` further down hoists as undefined, and an undefined bound is silently no
+  // bound at all, which is the defect this closes.
+  var AXIS_PIN_MAX = 32;
+
   // The NUMERIC tunable knobs (ADR-0023) in display order, split into the two sections that render them.
   // Each continuous knob has a fine (0.05) and a coarse (1.0) stepper pair; integer knobs (rows/columns)
   // step by 1 only. rows and columns are mutually exclusive width pins: pinning one drops the other (GE
@@ -28,8 +37,8 @@ angular.module('beamng.apps')
   // `auto: true` so whichever is unpinned reads "auto". The boolean params are in neither list -- they
   // render as their own On/Off toggles (see BOOL_KNOBS below).
   //
-  // `min` mirrors the Lua constraint of the same name in race/grideditor.lua's own KNOBS table, because
-  // a held stepper clamps locally now (see clampKnob) instead of letting GE clamp and echo back.
+  // `min` and `max` mirror the Lua constraints of the same name in race/grideditor.lua's own KNOBS table,
+  // because a held stepper clamps locally now (see clampKnob) instead of letting GE clamp and echo back.
   // `tip` is the knob's hover help (ADR-0049), rendered by bc-grid-tip straight off this entry. It lives
   // here rather than in the ng-repeat markup for the same reason `label` and `min` do: a knob and its
   // explanation belong together, and the repeat then renders ONE text instead of one per row.
@@ -45,10 +54,10 @@ angular.module('beamng.apps')
       tip: 'Distance from one row of cars to the next. It also sets how far the columns are staggered.' },
     { key: 'colGap', label: 'Col gap (m)', min: 0,
       tip: 'Distance between two cars standing side by side.' },
-    { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1,
+    { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
       tip: 'Fix how many rows there are and let the width follow the number of cars. Setting this clears '
         + 'Columns -- only one of the two can be fixed.' },
-    { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1,
+    { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
       tip: 'Fix how many cars stand side by side and let the rows follow the number of cars. Setting this '
         + 'clears Rows -- only one of the two can be fixed.' },
   ];
@@ -182,20 +191,20 @@ angular.module('beamng.apps')
   var SEND_INTERVAL = 100;
 
   // Clamp one accumulator tick exactly the way grideditor.set would clamp the same value (its KNOBS
-  // table plus M.set): integer knobs floor, `min` mirrors the Lua constraint of the same name, and
-  // continuous knobs round to 2 decimals so 0.05 steps do not accumulate float noise at 25 steps/s.
+  // table plus M.set): integer knobs floor, `min` and `max` mirror the Lua constraints of the same name,
+  // and continuous knobs round to 2 decimals so 0.05 steps do not accumulate float noise at 25 steps/s.
   // This has to run PER TICK on the accumulator -- otherwise holding `-` on a gap runs it to -40 and
   // then takes 40 steps to come back to where the field actually stops.
   //
-  // There is deliberately NO upper bound. rows/columns declare `max = PREVIEW_COUNT` in grideditor.lua,
-  // but PREVIEW_COUNT is not a local in that file (its constants are DEFAULT_/MIN_/MAX_PREVIEW_COUNT),
-  // so it reads nil, M.set's `if constraint.max` branch never fires, and GE really will hold rows = 47.
-  // Mirroring the INTENDED 32 here would park the field at a bound GE does not enforce. That defect is
-  // the separate backlog item `grideditor-knobs-missing-upper-clamp` -- mirror reality until it is fixed.
+  // Only rows and columns carry a `max`. Offsets, gaps and heading are unbounded above on purpose and on
+  // both sides, so a knob with no `max` has to stay unbounded here too rather than pick a bound up.
   function clampKnob(knob, value) {
     var next = knob.integer ? Math.floor(value) : Math.round(value * 100) / 100;
     if (knob.min !== undefined && next < knob.min) {
       next = knob.min;
+    }
+    if (knob.max !== undefined && next > knob.max) {
+      next = knob.max;
     }
     return next;
   }
