@@ -30,6 +30,18 @@
 -- New with 0.39: an added entry lives in the user's current layout file between show and remove --
 -- acceptable, and every close path sweeps the entry back out.
 --
+-- The pair is deliberately ASYMMETRIC (bug ui-glitches-after-ingame-menu-resize): ensure_visible adds
+-- to the current layout only, remove sweeps EVERY layout on disk. "The current layout" is resolved
+-- independently at each call and can change in between -- opening the radial menu switches it for as
+-- long as the menu is up (core/quickAccess.lua show() -> setGameState(nil,'radial') -> GameStateUpdate
+-- -> the Vue store's useLayout -> ui_appLayouts.setUsedLayout), and the HUD-apps layout browser
+-- switches it on a preview. A show landing in one layout and the matching hide sweeping another leaves
+-- the entry behind forever; that is how a beamCompHud entry ended up parked in the user's
+-- radial.uilayout.json. Sweeping all layouts on the way out is the stateless fix -- a record of where
+-- we added would go stale on a GE Lua reload and could not clean an entry that is already on disk.
+-- The add is NOT widened to match: one direction closes the loop (a stray add is found by the next
+-- remove), while a widened add would start deleting entries out of layouts the user is not even in.
+--
 -- Placement (round 2): 0.39 renders every layout-hosted app from its placement through a px
 -- resolver (ui/ui-vue/src/modules/apps/placementResolve.js) that parses ONLY number/px/%/em/rem
 -- values -- CSS functions (min/clamp/calc) and vw/vh yield null, the dimension collapses to 0 and
@@ -437,8 +449,36 @@ local function do_ensure_visible(app_name)
     return true
 end
 
--- The appContainer:removeApp replacement: take every instance of app_name out of the current
--- layout. True when the app is (or already was) gone.
+-- Every layout on disk that currently carries app_name. Writable ones only: a layout with no
+-- filename cannot be addressed by the removeApp API.
+local function layouts_carrying(api, app_name)
+    local carrying = {}
+    for _, layout in ipairs(api.getAvailableLayouts() or {}) do
+        if type(layout.filename) == "string" and #app_indices(layout, app_name) > 0 then
+            carrying[#carrying + 1] = layout
+        end
+    end
+    return carrying
+end
+
+-- Take every instance of app_name out of ONE layout. Back-to-front, so the earlier positions stay
+-- valid across the successive writes (each removeApp re-reads the file from disk). The API expects
+-- 0-based indices, hence the -1. Returns whether anything was written.
+local function remove_from_layout(api, layout, app_name)
+    local removed = false
+    local indices = app_indices(layout, app_name)
+    for i = #indices, 1, -1 do
+        if api.removeApp(layout.filename, indices[i] - 1) == true then
+            removed = true
+        end
+    end
+    return removed
+end
+
+-- The appContainer:removeApp replacement: take every instance of app_name out of EVERY layout on
+-- disk, not just the current one (see the asymmetry note in the header). True when the app is (or
+-- already was) gone. Layouts that do not carry the app are never written, so an original-only layout
+-- -- which getAvailableLayouts reports under its not-yet-existing user path -- is not materialised.
 local function do_remove(app_name)
     local api = layout_api()
     if not api then
@@ -449,28 +489,24 @@ local function do_remove(app_name)
         log("I", LOG_TAG, "not removing '" .. app_name .. "': HUD layout editor is open")
         return false
     end
-    local layout, reason = current_layout_from_disk(api)
-    if not layout then
-        log("W", LOG_TAG, "cannot remove '" .. app_name .. "': " .. reason)
-        return false
-    end
-    local indices = app_indices(layout, app_name)
-    if #indices == 0 then
+    local carrying = layouts_carrying(api, app_name)
+    if #carrying == 0 then
         return true
     end
-    -- Back-to-front, so the earlier positions stay valid across the successive writes (each
-    -- removeApp re-reads the file). The API expects 0-based indices, hence the -1.
-    local removed = false
-    for i = #indices, 1, -1 do
-        if api.removeApp(layout.filename, indices[i] - 1) == true then
-            removed = true
+    local cleaned = {}
+    for _, layout in ipairs(carrying) do
+        if remove_from_layout(api, layout, app_name) then
+            cleaned[#cleaned + 1] = tostring(layout.filename)
         end
     end
-    if removed then
-        notify_layouts_changed()
-        log("I", LOG_TAG, "removed '" .. app_name .. "' from layout " .. tostring(layout.filename))
+    if #cleaned == 0 then
+        log("W", LOG_TAG, "removeApp refused every instance of '" .. app_name .. "'")
+        return false
     end
-    return removed
+    notify_layouts_changed()
+    log("I", LOG_TAG, "removed '" .. app_name .. "' from " .. #cleaned .. " layout(s): "
+        .. table.concat(cleaned, ", "))
+    return #cleaned == #carrying
 end
 
 -- Public, crash-proof entry points (see the defensive-posture note in the header).
