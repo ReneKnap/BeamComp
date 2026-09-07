@@ -36,11 +36,28 @@
 -- is clamped up to the app's min-width/min-height, a quarter-size box. The app.json css is NOT
 -- applied to layout entries. ensure_visible therefore guarantees an explicit, parseable placement:
 -- derived from the app's own app.json css (function expressions evaluated to px against a
--- 1920x1080 reference viewport -- the render-time clamp bounds it into the real frame, and any
--- user drag/resize rewrites it with real px). An entry already on the layout gets its placement
--- repaired when it is missing (a stale round-1 add) or still carries css functions (the editor's
--- own manual add passes the css through verbatim); a plain-value placement is user-authored (the
--- 0.39 editor writes pure px) and is never touched.
+-- 1920x1080 reference viewport -- the render-time clamp bounds it into the real frame, and a user
+-- drag/resize rewrites it wholesale). An entry already on the layout gets its placement repaired
+-- when it is missing (a stale round-1 add) or still carries css functions (the editor's own manual
+-- add passes the css through verbatim); any other plain-value placement counts as user-authored and
+-- is never touched (ADR-0012 par. 3).
+--
+-- What the editor actually writes (corrected 2026-09-08, bug ui-glitches-after-ingame-menu-resize --
+-- this paragraph used to claim "pure px", which is false): placementResolve.js writes **em** for all
+-- sizes and non-centre positions and "50%" for a centred axis (its own file header line 13;
+-- rectPxToPlacement -> pxToEm / encodeAxis). The CLASSIFICATION is unaffected either way --
+-- is_parseable_value accepts em, so such an entry reads as "custom" and we leave it alone -- only the
+-- stated reason was wrong. Plain px in a layout file is still a supported LEGACY form: the overlay
+-- detects it (usesOverlayUnitsOnly) and converts it at render time against a fixed 16 px base
+-- (legacyPxToEm), which is why our px-derived placements render at their design size.
+--
+-- Consequence worth knowing but NOT ours to fix: the render-time clamp reads min-/max-width from the
+-- CATALOGUE app, not from the layout entry -- readSizeConstraint(app, key, ...) with app = item.app,
+-- whose lookup order is app[key] / app.placement[key] / app.css[key], and a catalogue entry has no
+-- placement. So the clamp floor always comes from app.json css in px while the width it clamps came
+-- through em, for every app in the game. The min-width/min-height derive_placement writes into the
+-- entry are read by nothing at all (no consumer in ui/ui-vue/src/modules/apps/); they are kept
+-- because they cost nothing and make an entry recognisably ours.
 --
 -- Defensive posture: both entry points are reached from onUpdate watchdog ticks, so every engine
 -- call is pcall-wrapped (mirrors race/hud.lua's trigger_ui) -- a missing API or failed file write
@@ -324,8 +341,9 @@ end
 -- Classify an existing entry's placement:
 --   "missing" -- absent/empty (a stale round-1 add)      -> repair with a derived placement
 --   "legacy"  -- carries css-function values ("(")       -> repair by normalizing in place
---   "custom"  -- plain values (the 0.39 editor writes    -> never touched
---                pure px on drag/resize)
+--   "custom"  -- any other parseable form: em/50% from   -> never touched
+--                a drag/resize, px from us or a legacy
+--                layout (see the header)
 local function placement_state(placement)
     if type(placement) ~= "table" or next(placement) == nil then
         return "missing"
