@@ -4,7 +4,18 @@
        top-right: big lap/CP + time block) so the readouts sit in the screen corners rather than in
        the draggable app frame; the finished results card is a centered fixed panel. A separate
        screen-centered countdown overlay (.bc-countdown, ADR-0021) is pushed by race/countdown.lua.
-       All are fed GE -> UI via guihooks (race/hud.lua, BeamCompHudUpdate). -->
+       All are fed GE -> UI via guihooks (race/hud.lua, BeamCompHudUpdate).
+
+       The app FRAME must stay input-transparent, and app.json says so with "interactive": "no"
+       (bug ui-focus-blocks-scroll-after-button-press). All three BeamComp apps are anchored at the
+       same top: 90px / left: 50px, so this 400x200 frame sits exactly on the top-left corner of the
+       setup panel and the grid editor. It paints nothing -- every readout below is position:fixed --
+       but BeamNG 0.39 gives an app host pointer-events:auto unless app.json opts out
+       (ui/apps.lua getAvailableAppList, AppHost.vue), and hud.show() appends the HUD AFTER those
+       panels in the layout, so the invisible frame won the hit test and swallowed every wheel and
+       click over that corner. Consequence for this file: anything clickable or scrollable has to
+       re-enable pointer-events on itself or on its enclosing panel -- the frame no longer hands it
+       down. -->
   <style>
     .beamcomp-root {
       height: 100%;
@@ -396,6 +407,8 @@
       max-width: 90vw;
       max-height: 85vh;
       overflow-y: auto;
+      /* the frame is pointer-events:none (app.json "interactive": "no"), so the card takes its own */
+      pointer-events: auto;
       background: rgba(0, 0, 0, 0.7);
       border-radius: 6px;
       padding: 8px 14px;
@@ -589,6 +602,7 @@
       position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
       background: rgba(20, 22, 26, 0.85); color: #cde; border: 1px solid rgba(255, 255, 255, 0.25);
       border-radius: 4px; padding: 4px 12px; cursor: pointer; font-weight: bold; font-size: 13px;
+      pointer-events: auto;
     }
     /* Championship table on the finished card (ADR-0040): a compact second table under the final
        standings; the podium tints + AI italics reuse the standings row classes. */
@@ -653,6 +667,7 @@
       max-width: 96vw;
       max-height: 92vh;
       overflow: auto;
+      pointer-events: auto;
       background: rgba(0, 0, 0, 0.82);
       border-radius: 6px;
       padding: 10px 16px;
