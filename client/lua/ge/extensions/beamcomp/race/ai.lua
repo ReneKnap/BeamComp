@@ -1486,8 +1486,19 @@ end
 -- A sequence that fits inside a single block is armed exactly as it was before the window existed, byte
 -- for byte, and registers no window entry.
 --
--- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph was installed (the
--- caller restores the real one at teardown via M.restore_map).
+-- One more opts field, for the repeated single-car arming a staged quali does (ADR-0044):
+--   * opts.mapLive    -- the custom race map THIS caller installed on an earlier arming is still live, so
+--                        the `direct` variant reuses it instead of rebuilding the navgraph per launch
+--                        (map.reset = map.loadMap: all derived structures plus a full map pushed to every
+--                        vehicle, on the frame a driver is released). This module stays STATELESS -- it
+--                        never remembers a map, it is told. The caller's obligations, all three:
+--                        the same `route` and `closed` as the arming that installed it (the bc1..bcN names
+--                        below are rebuilt from `route` and must match what is live); the flag comes from
+--                        a customMap=true return, never from a guess; and it is dropped the moment the
+--                        caller restores the real map (init.lua's four M.restore_map sites).
+--
+-- Returns a summary for the chat notice, incl. customMap=true when a custom navgraph IS live -- installed
+-- by this call, or reused via opts.mapLive. The caller restores the real one at teardown (M.restore_map).
 function M.drive(cars, route, laps, params, closed, opts)
     if type(cars) ~= "table" then
         return
@@ -1544,13 +1555,24 @@ function M.drive(cars, route, laps, params, closed, opts)
             first = math.max(2, 1 + skip), rest_start = 1, dedup = false,
             laps = lap_count, back_laps = tonumber(opts.backLaps) or lap_count, tail = tail,
         })
-        if not install_custom_race_map(nodes, closed) then
+        -- A map the caller says is already live is NOT re-installed: `nodes` is rebuilt from the same
+        -- route and `closed` (see opts.mapLive), so a second map.reset would rebuild the identical
+        -- navgraph. The failure path keeps its chance regardless -- a live map can only come from an
+        -- install that already succeeded on these nodes, so the skip can never hide a degraded `span`.
+        local reused_map = opts.mapLive and true or false
+        local map_ready = reused_map or install_custom_race_map(nodes, closed)
+        if not map_ready then
             -- No custom navgraph, no bc nodes to drive: span the road network so the car still moves.
             span_only = true
             source = "span"
         else
             source = "direct"
             custom_map = true
+            if reused_map then
+                log("I", LOG_TAG, string.format(
+                    "custom race map already live: reusing it for %d node(s) instead of rebuilding",
+                    #nodes))
+            end
         end
     else
         -- The drive targets are the SNAPPED navgraph nodes, so the leading-target check runs on their own
@@ -1634,7 +1656,8 @@ function M.drive(cars, route, laps, params, closed, opts)
         end
     end
     -- Summary for the owner's race-start chat notice (which route variant the AI actually got); customMap
-    -- tells the caller a custom navgraph is live so it restores the real one at teardown (M.restore_map).
+    -- tells the caller a custom navgraph is live -- freshly installed or reused via opts.mapLive -- so it
+    -- restores the real one at teardown (M.restore_map).
     return {source = source, perLap = per_lap, total = total, laps = lap_count, customMap = custom_map}
 end
 
