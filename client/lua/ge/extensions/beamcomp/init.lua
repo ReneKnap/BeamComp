@@ -354,7 +354,7 @@ M.state = {
     -- The qualifying HOLD (bug quali-hold-reset-and-repaint-leak, ADR-0017 amendment). hold.is_held() is
     -- the single truth; these two carry the state it cannot derive from the fields above.
     quali_lap_done = false,    -- circuit quali: the local driver's lap closed inside the finish-your-lap grace, so their session is over and the car is held (ADR-0041 amendment)
-    quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. Kept in M.state (not a file local): it survives a Lua reload in lockstep with the engine's own serialized filter state
+    quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. A cache of an engine state that DOES outlive a GE Lua reload (core/input/actionFilter.lua serializes its action groups) while this flag does not, so it is re-asserted in onExtensionLoaded rather than trusted -- the first sync after a load must never compare against a guessed value
     -- Per-owned-car standstill clock for the client-measured AFK verdict (feature
     -- stall-detection-client-measured-movement), keyed "self" for the local car and by AI id for each
     -- host-driven AI: {since, warned, reported} -- when this car last started standing still, and the two
@@ -1353,8 +1353,10 @@ end
 --
 -- The engine call only fires on a real edge: comparing against the last pushed value keeps the per-frame
 -- net down to a boolean compare, and the engine's filter update is not free (it rebuilds the filter and
--- broadcasts an extension hook). The record lives in M.state, which survives a Lua reload in lockstep with
--- the engine's own serialized filter state -- a file-local flag would reset and could strand the block.
+-- broadcasts an extension hook). The record lives in M.state so the whole race teardown can reset it in
+-- one place -- it does NOT survive a GE Lua reload, and the engine's own filter state does (see
+-- lock.set_recover_blocked), so onExtensionLoaded re-asserts the released state rather than letting this
+-- comparison run against a value the literal guessed.
 function hold.sync()
     local held = hold.is_held()
     if held == M.state.quali_hold_locked then
@@ -4195,9 +4197,22 @@ function M.onExtensionLoaded()
     setExtensionUnloadMode(M, "manual")
     envelope.set_codec(jsonEncode, jsonDecode)
     -- A Lua reload drops BeamMP's handler table, so always re-register from a clean slate
-    -- rather than trusting the serialized flag.
+    -- rather than trusting the flag the fresh M.state literal came back with.
     M.state.registered = false
     ensure_registered()
+    -- Same treatment for the qualifying hold's recover-key block, and for the same reason. This one is
+    -- the sharper case: the engine's input filter DOES survive a GE Lua reload (core/input/
+    -- actionFilter.lua defines onSerialize/onDeserialized) while our record of what we last pushed to it
+    -- does not, so trusting the fresh `false` would mean comparing against a guess. hold.sync only calls
+    -- the engine on an edge, so a guess that happened to match would skip the correction entirely.
+    -- Releasing is always the right state to land on here: a hold needs a race and the qualifying phase,
+    -- both nil at load, and hold.sync re-blocks on the next transition. Costs one filter update per load.
+    -- Safe on the SHARED filter 0 (every subsystem toggles its own group there, see lock.lua): releasing
+    -- a group makes the engine rebuild the filter from its whole group table, and ge/main.lua's init()
+    -- restores that table (importPersistentData) BEFORE the mod manager mounts mods and loads us -- so
+    -- this rebuilds from the complete restored set and cannot drop another subsystem's block.
+    M.state.quali_hold_locked = false
+    lock.set_recover_blocked(false)
     -- Seed the current-vehicle tracker; onVehicleSwitched keeps it current from here on.
     local own = be and be:getPlayerVehicle(0)
     if own then

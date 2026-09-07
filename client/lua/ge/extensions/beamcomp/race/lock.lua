@@ -415,9 +415,17 @@ end
 -- A separate group from the race lock, so the in-run recover-requeue (ADR-0044) and the in-race assists
 -- keep both keys in every state that is NOT held.
 --
--- Deliberately unconditional (no internal "already applied" flag): a Lua reload resets this module's state
--- while the engine's filter state survives (actionFilter serializes it), so an internal flag could desync
--- and strand the keys blocked. The caller owns the change detection against its own reload-surviving state.
+-- Deliberately unconditional (no internal "already applied" flag): a GE Lua reload resets this module's
+-- state while the engine's filter state survives -- core/input/actionFilter.lua really does define
+-- onSerialize/onDeserialized and carries its action groups over -- so an internal flag could desync and
+-- strand the keys blocked.
+--
+-- The caller owns the change detection, in M.state.quali_hold_locked. That flag is NOT reload-surviving
+-- either (an earlier version of this comment claimed it was): a reload rebuilds M.state from its literal.
+-- What keeps the two sides in step is that the same reload runs init.lua's onExtensionUnloaded ->
+-- teardown_race_world -> M.remove(), which releases this group before the flag resets, and that
+-- onExtensionLoaded re-asserts the released state instead of trusting the fresh flag. Keep both ends: a
+-- cache of an engine state that outlives the reload has to be re-established at load, never guessed.
 function M.set_recover_blocked(blocked)
     set_hold_filter(blocked == true)
     log("I", LOG_TAG, "recover keys " .. (blocked and "blocked (quali hold)" or "released"))
