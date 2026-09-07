@@ -3,7 +3,8 @@
 -- Lives at lua/ge/extensions/beamcomp/race/ai.lua inside the client mod zip. Target: client GE
 -- (LuaJIT 5.1). Stateless and reload-safe: this module holds no file-scope mutable state -- the caller
 -- (init.lua) owns the tracked AI-car list, the remote id sets and the rolling-route-window store in its
--- reload-surviving M.state and passes them back in, exactly like race/cones.lua.
+-- M.state and passes them back in, exactly like race/cones.lua. (M.state itself does not survive a GE
+-- Lua reload -- see its header in init.lua; what makes this module reload-safe is holding nothing.)
 --
 -- An AI opponent is "a cone that drives itself" (ADR-0036): only the race owner (the /race issuer,
 -- flagged with aiSlots in its raceStart) spawns the AI cars, BeamMP propagates them to every other
@@ -1010,9 +1011,9 @@ local REACH_RADIUS = 10.0
 local REACH_LATERAL = 30.0
 
 -- A route-supply descriptor: the recipe the window materialises the drive-target sequence from, one lap
--- at a time. Plain data -- no closures, no engine handles -- so it can live in the caller's
--- reload-surviving state, and it is shared by reference between the cars of one arming (they all drive
--- the same route with the same field-wide leading skip). Fields:
+-- at a time. Plain data -- no closures, no engine handles -- so it can live in the caller's M.state
+-- with nothing in it that can go stale, and it is shared by reference between the cars of one arming
+-- (they all drive the same route with the same field-wide leading skip). Fields:
 --   variant/closed/route -- what the end decoration is (see window.append_tail)
 --   lap / lap_pos        -- one lap's drive targets and their world positions (false = unmeasurable)
 --   first / rest_start   -- where lap 1 and every later lap start inside `lap`

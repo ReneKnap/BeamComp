@@ -1,8 +1,9 @@
 -- BeamComp -- client-side circuit lap timer (GE side).
 --
 -- Lives at lua/ge/extensions/beamcomp/race/laptimer.lua inside the client mod zip. Target: client GE
--- (LuaJIT 5.1). Stateless module: the per-race lap-timing progress lives in the caller's
--- reload-surviving M.state (init.lua) and is stepped here one frame at a time.
+-- (LuaJIT 5.1). Stateless module: the per-race lap-timing progress lives in the caller's M.state
+-- (init.lua) and is stepped here one frame at a time. (M.state does not survive a GE Lua reload -- see
+-- its header in init.lua; holding no state of its own is what makes this module reload-safe.)
 --
 -- Circuit races only. A racing-style lap clock runs line->line: the current lap's time is measured
 -- from the last start/finish-line crossing. The detector (race/checkpoints.lua) already scores a
@@ -20,7 +21,8 @@ local M = {}
 local checkpoints = require("beamcomp/race/checkpoints")
 
 -- A fresh lap-timer state for a circuit, watching `start_cp` (the start/finish checkpoint). Held in
--- the caller's reload-surviving M.state; all fields are plain serializable values.
+-- the caller's M.state; all fields are plain values -- no closures, no engine handles, so nothing in it
+-- can go stale.
 function M.new(start_cp)
     return {
         start_cp = start_cp,  -- the start/finish checkpoint to watch (pos/radius/normal; reversed-safe)
