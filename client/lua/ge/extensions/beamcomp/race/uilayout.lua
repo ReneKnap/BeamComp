@@ -71,9 +71,33 @@
 -- entry are read by nothing at all (no consumer in ui/ui-vue/src/modules/apps/); they are kept
 -- because they cost nothing and make an entry recognisably ours.
 --
+-- While BeamNG's HUD-apps UI has the layout, we do not write it -- and we no longer FORGET the call
+-- either (bug ui-glitches-after-ingame-menu-resize). The editor works on an unpersisted draft and
+-- replaces it wholesale from disk on any UiAppLayoutsChanged, so writing into that window clobbers
+-- the user's unsaved drag; but every BeamComp caller spends a one-shot (M.close_setup removes once,
+-- setup.step spends its single restore, hud.show/hide are plain calls), so a swallowed call used to
+-- be lost for good. A swallowed call is now recorded as a deferred intent and replayed by M.step
+-- once the UI is done -- both directions, last intent per app wins, and a call that DID get through
+-- clears the app's record so a stale intent can never undo a newer decision. Replaying our own
+-- dropped call is deliberately narrower than reconciling against a desired state: it can never
+-- delete an app the player added by hand, which ADR-0012 par. 3 keeps as the guaranteed baseline.
+--
+-- "The UI has the layout" is wider than ui_appLayouts.isEditing(). Pressing "Add app" inside the
+-- editor turns editing OFF while the draft stays alive (PauseHudAppsEditLayout.vue openSelector ->
+-- setEditing(false, {preserveSnapshot: true}) -> the store still reports isDraftSession), and the
+-- layout browser switches the current layout on a mere preview. Both windows are guarded by also
+-- refusing while the player is anywhere in the pause.hudApps route family. A route name is a string
+-- the engine never validates, so if ui_router is missing or the family is ever renamed this degrades
+-- to the editing flag alone -- today's behaviour, never worse -- and the deferral log names which of
+-- the two sources answered. The exit side is ordered in our favour: the editor's Save runs before
+-- editing is turned off (PauseHudAppsShell.vue confirmDirtyEditExit awaits save(), then navigates;
+-- the view's onBeforeUnmount then calls setEditing(false)), so a replay cannot be clobbered by the
+-- editor's whole-document saveLayout.
+--
 -- Defensive posture: both entry points are reached from onUpdate watchdog ticks, so every engine
 -- call is pcall-wrapped (mirrors race/hud.lua's trigger_ui) -- a missing API or failed file write
--- logs and returns false, never breaks the caller's frame.
+-- logs and returns false, never breaks the caller's frame. M.step, which runs every frame, follows
+-- the same rule and isolates each replayed call on its own.
 
 local M = {}
 
@@ -95,11 +119,86 @@ local function layout_api()
     return api
 end
 
--- True while the user is inside the HUD-apps layout editor. The editor works on an unpersisted
--- draft (the Vue store skips the Lua write during an edit session), so a programmatic file write +
--- refresh in that window would clobber the draft or get lost on save -- callers skip and retry.
+-- True while the user is inside the HUD-apps layout editor proper. The editor works on an
+-- unpersisted draft (the Vue store skips the Lua write during an edit session), so a programmatic
+-- file write + refresh in that window would clobber the draft.
 local function is_user_editing(api)
     return type(api.isEditing) == "function" and api.isEditing() == true
+end
+
+-- BeamNG's HUD-apps menu family as route names (ui/ge/extensions/ui/router/routes/pause.lua):
+-- pause.hudApps (the layout browser), .editlayout, .editlayout.transform and .selector. Matched
+-- lower-cased as a prefix, so a future sub-route of the family is covered without a code change.
+local HUD_APPS_ROUTE_PREFIX = "pause.hudapps"
+
+-- The UI route the player is on, or nil when the router cannot answer. ui_router is a core startup
+-- extension and indexing `extensions` auto-loads it; the pcalls absorb a missing build or a throwing
+-- loader, exactly like layout_api above.
+local function current_ui_route()
+    local ok, router = pcall(function()
+        return extensions.ui_router
+    end)
+    if not ok or type(router) ~= "table" or type(router.getCurrent) ~= "function" then
+        return nil
+    end
+    local got, entry = pcall(router.getCurrent)
+    if not got or type(entry) ~= "table" then
+        return nil
+    end
+    local name = type(entry.request) == "table" and entry.request.name or nil
+    if type(name) ~= "string" then
+        name = type(entry.resolved) == "table" and entry.resolved.name or nil
+    end
+    return type(name) == "string" and name or nil
+end
+
+-- Why a layout write must not happen right now, or nil when it may -- the wider window described in
+-- the header. The reason doubles as the log line's source marker: which of the two sources answered
+-- matters more than the fact that one did, because the route name is unvalidated by the engine.
+local function layout_ui_blocked_by(api)
+    if is_user_editing(api) then
+        return "HUD layout editor is open"
+    end
+    local route = current_ui_route()
+    if route and route:lower():sub(1, #HUD_APPS_ROUTE_PREFIX) == HUD_APPS_ROUTE_PREFIX then
+        return "HUD-apps menu is open (route " .. route .. ")"
+    end
+    return nil
+end
+
+-- The calls the HUD-apps UI swallowed: app name -> the LAST intent for it, "add" or "remove". nil
+-- while nothing is pending, which is the normal state and makes M.step a single nil check.
+--
+-- ADR-0052: this is NOT an edge-detection cache on engine state -- no previous value of isEditing is
+-- ever stored or compared. An entry can only be written from inside the guard, so a non-empty book
+-- already means "the UI had the layout when we tried", and the replay just waits for the guard to
+-- read clear. A GE Lua reload does drop the book (a module local; extensions.lua serializes only a
+-- module's `state` field, and only for a module defining onSerialize/onDeserialize/onDeserialized --
+-- this one defines none), and that costs a replay, never a wrong branch: the layout keeps a stale
+-- entry or misses one exactly as it did before this file existed, and the same reload runs
+-- init.lua's teardown_race_world -> hud.hide() while the next /raceui re-asserts the panel.
+local deferred = nil
+
+-- Logged only when the recorded intent actually changes: the HUD watchdog re-asserts on a backoff,
+-- so an unchanged repeat says nothing new and a long editor session should not fill the log.
+local function defer(app_name, action, reason)
+    deferred = deferred or {}
+    if deferred[app_name] ~= action then
+        log("I", LOG_TAG, "deferring " .. action .. " of '" .. app_name .. "': " .. reason)
+    end
+    deferred[app_name] = action
+end
+
+-- A call that got through settles the question for that app, so an older deferred intent can never
+-- be replayed over a newer decision.
+local function clear_deferred(app_name)
+    if not deferred then
+        return
+    end
+    deferred[app_name] = nil
+    if next(deferred) == nil then
+        deferred = nil
+    end
 end
 
 -- The current layout as freshly read from disk: filename from the (possibly stale) in-memory
@@ -422,10 +521,12 @@ local function do_ensure_visible(app_name)
         log("W", LOG_TAG, "cannot show '" .. app_name .. "': ui_appLayouts unavailable")
         return false
     end
-    if is_user_editing(api) then
-        log("I", LOG_TAG, "not adding '" .. app_name .. "': HUD layout editor is open")
+    local blocked = layout_ui_blocked_by(api)
+    if blocked then
+        defer(app_name, "add", blocked)
         return false
     end
+    clear_deferred(app_name)
     local layout, reason = current_layout_from_disk(api)
     if not layout then
         log("W", LOG_TAG, "cannot show '" .. app_name .. "': " .. reason)
@@ -485,10 +586,12 @@ local function do_remove(app_name)
         log("W", LOG_TAG, "cannot remove '" .. app_name .. "': ui_appLayouts unavailable")
         return false
     end
-    if is_user_editing(api) then
-        log("I", LOG_TAG, "not removing '" .. app_name .. "': HUD layout editor is open")
+    local blocked = layout_ui_blocked_by(api)
+    if blocked then
+        defer(app_name, "remove", blocked)
         return false
     end
+    clear_deferred(app_name)
     local carrying = layouts_carrying(api, app_name)
     if #carrying == 0 then
         return true
@@ -509,7 +612,63 @@ local function do_remove(app_name)
     return #cleaned == #carrying
 end
 
+-- ===== deferred replay (see the header) ==================================================
+
+local function replay_one(app_name, action)
+    log("I", LOG_TAG, "replaying deferred " .. action .. " of '" .. app_name
+        .. "' (HUD-apps UI released the layout)")
+    if action == "add" then
+        return do_ensure_visible(app_name)
+    end
+    return do_remove(app_name)
+end
+
+-- Retry every call the HUD-apps UI swallowed, once it is out of the way. The book is taken first, so
+-- a replayed call that finds the UI busy again simply re-defers itself; each replay is isolated, so
+-- one failing app cannot strand the others.
+local function replay_deferred()
+    local api = layout_api()
+    if not api then
+        deferred = nil
+        return
+    end
+    if layout_ui_blocked_by(api) then
+        return
+    end
+    local todo = deferred
+    deferred = nil
+    for app_name, action in pairs(todo) do
+        local ok, err = pcall(replay_one, app_name, action)
+        if not ok then
+            log("W", LOG_TAG, "replay of " .. action .. " '" .. app_name .. "' failed: "
+                .. tostring(err))
+        end
+    end
+end
+
 -- Public, crash-proof entry points (see the defensive-posture note in the header).
+
+-- Per-frame tick from init.lua's onUpdate. One nil check while nothing is pending.
+function M.step()
+    if not deferred then
+        return
+    end
+    local ok, err = pcall(replay_deferred)
+    if not ok then
+        log("W", LOG_TAG, "deferred replay failed: " .. tostring(err))
+    end
+end
+
+-- Whether a layout write would be swallowed right now. The seam checks this itself; public so the
+-- state is readable from the GE console as beamcomp_init.uilayout.is_layout_ui_open().
+function M.is_layout_ui_open()
+    local api = layout_api()
+    if not api then
+        return false
+    end
+    local ok, reason = pcall(layout_ui_blocked_by, api)
+    return ok and reason ~= nil
+end
 
 function M.ensure_visible(app_name)
     if type(app_name) ~= "string" or app_name == "" then
