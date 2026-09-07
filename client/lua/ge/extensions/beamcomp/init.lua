@@ -2098,7 +2098,10 @@ end
 
 -- Owner: release + drive one AI at the end of its per-driver count (ADR-0044/0036). Arms its proxy detector
 -- so step_ai_detections scores + reports it, and re-arms the ramp-clear report for this AI. Single-car
--- ai.drive; the default snap route does not swap the navgraph, so repeated staged launches do not thrash it.
+-- ai.drive, and the ONLY ai.drive a staged session makes -- the staged branch skips begin_driving, so
+-- everything begin_driving does for the field at the gun has to happen here for this one car. The default
+-- snap route swaps no navgraph; the opt-in airoute=direct installs one, and the live-map flag handed back
+-- in below keeps that install to once per session instead of once per released driver.
 function quali.launch_ai(car_id)
     if M.state.quali_ai_runs then
         M.state.quali_ai_runs[car_id] = nil
@@ -2116,9 +2119,25 @@ function quali.launch_ai(car_id)
     -- Same rolling window as the race start, for this one car: ai.drive replaces (or clears) only this
     -- car's entry, so a relaunch never refills against the route it drove on its previous run.
     M.state.ai_window = M.state.ai_window or {}
-    ai.drive({car}, M.state.race.routePoints or M.state.race.checkpoints,
+    -- Passing the live-map flag in is what makes the custom navgraph (airoute=direct) a once-per-session
+    -- install: route and `closed` are constant across a session's launches -- routePoints is written once
+    -- at prepare, `closed` is the literal false below -- so the map a later launch would build is the one
+    -- that is already live. A re-issued /race restores the map and clears the flag before it re-arms
+    -- anything, so the flag can never outlive the map it describes.
+    local ai_route = ai.drive({car}, M.state.race.routePoints or M.state.race.checkpoints,
         M.state.race.laps, params, false,
-        {store = M.state.ai_window, backLaps = M.state.race.laps})
+        {store = M.state.ai_window, backLaps = M.state.race.laps,
+            mapLive = M.state.ai_custom_map})
+    -- LATCH, never mirror. This is the one ai.drive caller that runs many times per session (once per
+    -- released driver), so it only ever SETS the flag; the four `if M.state.ai_custom_map then
+    -- ai.restore_map()` sites stay the only place that clears it. Copying begin_driving's
+    -- `= customMap or nil` would clear the flag on any launch reporting no custom map -- and since that
+    -- flag gates every restore, the line-only navgraph would then leak until the level changes. Dropping
+    -- the return value entirely was exactly that bug (staged-quali-ai-custom-map-never-restored);
+    -- begin_driving may mirror because it arms the whole field exactly once.
+    if ai_route and ai_route.customMap then
+        M.state.ai_custom_map = true
+    end
     M.state.ai_detections = M.state.ai_detections or {}
     if M.state.race.plan then
         M.state.ai_detections[car.id] = checkpoints.new(M.state.race.plan)
