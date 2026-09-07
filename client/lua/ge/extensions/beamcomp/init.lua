@@ -220,7 +220,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "hud-frame-input-transparent/2026-09-07"
+local BUILD_MARKER = "ge-state-reload-reassert/2026-09-07"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -235,7 +235,26 @@ local STATIONARY_SPEED = 2.0
 -- on the host, so a larger field is heavier on the owner's machine.
 local AI_PERF_HINT_THRESHOLD = 6
 
--- Reload-surviving state (BeamNG serializes M.state across a Lua reload).
+-- The extension's whole mutable state. It does NOT survive a GE Lua reload -- a comment here claimed
+-- the opposite for a long time and the mistake spread as an idiom, so the reasoning is spelled out once,
+-- here, and nowhere else (refactor ge-state-not-reload-surviving-comment-wrong).
+--
+-- BeamNG really does have an M.state serialization convention: lua/common/extensions.lua takes a
+-- module's `state` field as its serialized part. But only for a module that defines onSerialize,
+-- onDeserialize or onDeserialized -- that is the gate the old comment missed. This extension defines
+-- none of the three, so it is skipped in BOTH directions and a GE Lua reload rebuilds this table from
+-- the literal below. Every field comes back at its default.
+--
+-- A VE reload -- vehicle respawn, reset, config/tuning re-apply -- is a DIFFERENT event in a different
+-- Lua VM and does not touch this table at all. Comments about state surviving THAT are correct and mean
+-- something else (rearm_own_car_on_reload & co.); do not "fix" them.
+--
+-- Why losing it all is safe, and the invariant to keep: the same event runs M.onExtensionUnloaded ->
+-- teardown_race_world(), which puts every system this table mirrors back to its default -- input filter,
+-- VE overrides, spawned scenery, AI cars + navgraph, HUD, start freeze. After a reload there is nothing
+-- left for this state to describe. So do not add a field whose correctness needs its own previous value
+-- to survive: either re-assert it in onExtensionLoaded (see `registered` and `quali_hold_locked`), or
+-- make sure the teardown resets the thing it mirrors.
 M.state = {
     last_event_at = 0,
     registered = false,
@@ -262,6 +281,8 @@ M.state = {
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
     staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
     countdown = nil,     -- start-countdown {remaining = seconds}, ticked locally to drive the 8s count (ADR-0021), or nil
+    f1 = nil,            -- F1 light start (ADR-0043): grid baselines, first-movement times and report latches for the own car and (host) each AI, plus lights_out_at; nil outside an F1 start
+    ai_release = nil,    -- host only: F1 staggered release schedule {[ai id] = os.clockhp when that car is unfrozen}, dropped once all are out (ADR-0043), or nil
     assist_armed = false,  -- whether the VE forwarders have been armed for this race (ADR-0017)
     assist_held = nil,     -- kind ("recover"/"repair") of the assist key currently held, or nil (ADR-0017)
     assist_arming = nil,   -- active recover/repair countdown {kind, remaining}, or nil (ADR-0017)
@@ -273,7 +294,7 @@ M.state = {
     restage_wait = 0,         -- seconds left to wait for the staging car's jbeam before placing anyway
     restage_plate = nil,      -- player's plate to re-apply to a forced/fresh-spawned car on the restage (jbeam regenerates it), or nil
     restage_preplaced = 0,    -- metadata front-anchor teleports already spent this restage cycle, capped at vehicles.PREPLACE_MAX_TRIES
-    size_track = {},          -- lobby car-footprint poll state {wait, reported} owned by race/vehicles.poll_own_size (ADR-0051 round 2); plain numbers, so it survives a Lua reload
+    size_track = {},          -- lobby car-footprint poll state {wait, reported} owned by race/vehicles.poll_own_size (ADR-0051 round 2); plain numbers, so no engine handle can go stale in it
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
@@ -333,12 +354,13 @@ M.state = {
     -- The qualifying HOLD (bug quali-hold-reset-and-repaint-leak, ADR-0017 amendment). hold.is_held() is
     -- the single truth; these two carry the state it cannot derive from the fields above.
     quali_lap_done = false,    -- circuit quali: the local driver's lap closed inside the finish-your-lap grace, so their session is over and the car is held (ADR-0041 amendment)
-    quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. Kept in M.state (not a file local): it survives a Lua reload in lockstep with the engine's own serialized filter state
+    quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. A cache of an engine state that DOES outlive a GE Lua reload (core/input/actionFilter.lua serializes its action groups) while this flag does not, so it is re-asserted in onExtensionLoaded rather than trusted -- the first sync after a load must never compare against a guessed value
     -- Per-owned-car standstill clock for the client-measured AFK verdict (feature
     -- stall-detection-client-measured-movement), keyed "self" for the local car and by AI id for each
     -- host-driven AI: {since, warned, reported} -- when this car last started standing still, and the two
-    -- one-shot latches. A number and two booleans on purpose, so a Lua reload carries it intact (like
-    -- size_track) and no engine handle can go stale in it. Exists ONLY while M.state.grace is armed:
+    -- one-shot latches. A number and two booleans on purpose, so no engine handle can go stale in it
+    -- (like size_track); a GE Lua reload drops it with the rest of M.state, which costs nothing here --
+    -- it is re-seeded from zero the next time the finish timer arms. Exists ONLY while M.state.grace is armed:
     -- stall.step drops the whole table whenever the finish timer is not running, which is also what makes
     -- every car start its 15 s from zero the instant the timer arms. nil the rest of the time
     stall_track = nil,
@@ -1331,8 +1353,10 @@ end
 --
 -- The engine call only fires on a real edge: comparing against the last pushed value keeps the per-frame
 -- net down to a boolean compare, and the engine's filter update is not free (it rebuilds the filter and
--- broadcasts an extension hook). The record lives in M.state, which survives a Lua reload in lockstep with
--- the engine's own serialized filter state -- a file-local flag would reset and could strand the block.
+-- broadcasts an extension hook). The record lives in M.state so the whole race teardown can reset it in
+-- one place -- it does NOT survive a GE Lua reload, and the engine's own filter state does (see
+-- lock.set_recover_blocked), so onExtensionLoaded re-asserts the released state rather than letting this
+-- comparison run against a value the literal guessed.
 function hold.sync()
     local held = hold.is_held()
     if held == M.state.quali_hold_locked then
@@ -4173,9 +4197,22 @@ function M.onExtensionLoaded()
     setExtensionUnloadMode(M, "manual")
     envelope.set_codec(jsonEncode, jsonDecode)
     -- A Lua reload drops BeamMP's handler table, so always re-register from a clean slate
-    -- rather than trusting the serialized flag.
+    -- rather than trusting the flag the fresh M.state literal came back with.
     M.state.registered = false
     ensure_registered()
+    -- Same treatment for the qualifying hold's recover-key block, and for the same reason. This one is
+    -- the sharper case: the engine's input filter DOES survive a GE Lua reload (core/input/
+    -- actionFilter.lua defines onSerialize/onDeserialized) while our record of what we last pushed to it
+    -- does not, so trusting the fresh `false` would mean comparing against a guess. hold.sync only calls
+    -- the engine on an edge, so a guess that happened to match would skip the correction entirely.
+    -- Releasing is always the right state to land on here: a hold needs a race and the qualifying phase,
+    -- both nil at load, and hold.sync re-blocks on the next transition. Costs one filter update per load.
+    -- Safe on the SHARED filter 0 (every subsystem toggles its own group there, see lock.lua): releasing
+    -- a group makes the engine rebuild the filter from its whole group table, and ge/main.lua's init()
+    -- restores that table (importPersistentData) BEFORE the mod manager mounts mods and loads us -- so
+    -- this rebuilds from the complete restored set and cannot drop another subsystem's block.
+    M.state.quali_hold_locked = false
+    lock.set_recover_blocked(false)
     -- Seed the current-vehicle tracker; onVehicleSwitched keeps it current from here on.
     local own = be and be:getPlayerVehicle(0)
     if own then

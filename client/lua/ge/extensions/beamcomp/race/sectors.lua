@@ -1,8 +1,9 @@
 -- BeamComp -- client-side qualifying sector-split delta (GE side).
 --
 -- Lives at lua/ge/extensions/beamcomp/race/sectors.lua inside the client mod zip. Target: client GE
--- (LuaJIT 5.1). Stateless module: the per-lap sector-tracking progress lives in the caller's
--- reload-surviving M.state (init.lua) and is stepped here one crossing at a time.
+-- (LuaJIT 5.1). Stateless module: the per-lap sector-tracking progress lives in the caller's M.state
+-- (init.lua) and is stepped here one crossing at a time. (M.state does not survive a GE Lua reload --
+-- see its header in init.lua; holding no state of its own is what makes this module reload-safe.)
 --
 -- Qualifying only (ADR-0041). Each checkpoint crossing closes a "sector" -- the segment from the
 -- previous checkpoint to this one (ADR-0010 detector; each CP is a sector boundary). The live sector
@@ -72,8 +73,8 @@ local function laps_from_splits(splits, cps, run_up)
 end
 
 -- A fresh sector tracker for a circuit qualifying session. `cps` is the number of checkpoints per lap
--- (the sector count). Held in the caller's reload-surviving M.state; all fields are plain serializable
--- values.
+-- (the sector count). Held in the caller's M.state; all fields are plain values -- no closures, no
+-- engine handles, so nothing in it can go stale.
 function M.new(cps)
     return {
         cps = cps,            -- checkpoints per lap == sectors per lap (ADR-0013 circuit plan)

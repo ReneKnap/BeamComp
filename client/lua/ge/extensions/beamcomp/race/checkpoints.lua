@@ -2,7 +2,8 @@
 --
 -- Lives at lua/ge/extensions/beamcomp/race/checkpoints.lua inside the client mod zip. Target:
 -- client GE (LuaJIT 5.1). Stateless module: the per-race detection progress lives in the caller's
--- reload-surviving M.state (init.lua), and is stepped here one frame at a time.
+-- M.state (init.lua), and is stepped here one frame at a time. (M.state does not survive a GE Lua
+-- reload -- see its header in init.lua; holding no state of its own is what makes this module reload-safe.)
 --
 -- Detects when the local player's car passes the next expected checkpoint, using an own lightweight
 -- swept test against the parser's normalized checkpoints (stable 0-based index, ADR-0005) rather than
@@ -125,8 +126,8 @@ function M.reverse(checkpoints, closed)
 end
 
 -- A fresh detection-state table for a traversal plan, armed before the first plan entry with no
--- elapsed time. Held in the caller's reload-surviving M.state; all fields are plain serializable
--- values.
+-- elapsed time. Held in the caller's M.state; all fields are plain values -- no closures, no engine
+-- handles, so nothing in it can go stale.
 function M.new(plan)
     return {
         plan = plan,     -- the traversal plan from M.plan ({entries, count}; ADR-0013)
