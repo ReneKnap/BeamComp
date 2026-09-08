@@ -220,7 +220,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ui-layout-defer-replay/2026-09-08"
+local BUILD_MARKER = "stats-hidden-switch/2026-09-08"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -274,6 +274,7 @@ M.state = {
     results_min = false,     -- local-only: finished results card minimized to a small restore bar; toggled by /results + the on-card Minimize/restore buttons (ADR-0012/0041 minimize pattern)
     race_records = nil,      -- pre-run PB + track record for the post-race analysis overlay (server raceRecords, ADR-0028), or nil
     analysis_open = false,   -- local-only toggle: show the post-race analysis overlay via /analysis or the card button (ADR-0028)
+    stats_enabled = false,   -- whether the SERVER has the statistics subsystem switched on (payload.statsEnabled from raceStart, ADR-0053). Gates analysis_available and M.toggle_analysis. Default false and that is the load-bearing part: unknown MUST mean off, so a rejoin into a finished phase, an older server or any dropped field hides the analysis UI rather than showing a button with nothing behind it. Mirrors a server setting, not race state -- re-asserted on every raceStart, cleared by teardown_race_world, so the ADR-0052 rebuild-on-reload lands on exactly the teardown value
     provisional_open = true,  -- local-only per-player: auto-show the provisional results card once the local player is finished/DNF while the race still runs; toggled by the HUD buttons / racing-phase /results, reset per race
     interval_mode = "self",  -- local-only live-standings interval reference: "self" | "ahead" | "leader"; cycled by the HUD toggle, session-persistent (not reset per race)
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
@@ -424,6 +425,15 @@ end
 -- Resolve + lay out the race for this client, store the state, and surface the slot. On any
 -- failure (the server cannot validate the name, ADR-0005) warn and toast the reason.
 local function handle_race_start(payload)
+    -- Adopt the server's statistics setting (ADR-0053) before anything else in this handler. Position is
+    -- deliberate: BOTH per-race clear blocks below -- the resolve-failure path and the accept path -- run
+    -- after this point, and this is a property of the SERVER, not of a race we may have failed to resolve,
+    -- so it must survive either of them. Not added to those clear lists for the same reason.
+    --
+    -- The `== true` is the entire "unknown means off" rule: an absent field, an older server, a truthy
+    -- non-boolean -- every one of them leaves the analysis UI hidden. Absence never resurrects the feature.
+    M.state.stats_enabled = type(payload) == "table" and payload.statsEnabled == true
+
     -- A starting race ends any in-progress grid edit so its preview pillars never bleed into the race
     -- (the ADR-0023 editor is a lobby-only authoring tool); clear its reference props and drop the panel.
     if grideditor.state.active then
@@ -949,6 +959,12 @@ local function teardown_race_world()
     M.state.car_info = nil
     M.state.race_records = nil
     M.state.analysis_open = false
+    -- Back to "unknown", which means OFF (ADR-0053). Cleared HERE and not in handle_race_start's per-race
+    -- blocks, so this is the ADR-0052 contract for the field: a GE Lua reload rebuilds M.state from its
+    -- literal, and the literal's `false` is exactly the value this teardown leaves behind. Safe to clear
+    -- between races because teardown also drops M.state.standings, so it provably cannot run between
+    -- racing and finished -- the finished card would be empty. The next raceStart re-asserts the truth.
+    M.state.stats_enabled = false
     M.state.provisional_open = true
     M.state.grace = nil
     M.state.stall_track = nil
@@ -2730,6 +2746,14 @@ end
 -- analysisToggle handler. The overlay only renders in the finished phase (the snapshot gates it), so a
 -- flip in any other phase is inert -- it is reset to closed on each racing start and on lobby teardown.
 function M.toggle_analysis()
+    -- A no-op while the server has statistics switched off (ADR-0053). The button is already hidden and
+    -- the server never relays /analysis, so this is only reachable through a direct bngApi.engineLua call
+    -- or a stale UI frame -- but it is the single entry point that could force analysis_open true, and
+    -- the overlay's own ng-if reads exactly that flag.
+    if not M.state.stats_enabled then
+        log("I", RACE_LOG_TAG, "analysis overlay ignored: statistics are disabled on this server")
+        return
+    end
     M.state.analysis_open = not M.state.analysis_open
     log("I", RACE_LOG_TAG, "analysis overlay " .. (M.state.analysis_open and "shown" or "hidden"))
 end
@@ -5575,7 +5599,11 @@ local function build_hud_snapshot()
     -- live frame) skips the work entirely (ADR-0028/0030). `analysisAvailable` is the cheap flag the card
     -- button shows on, so the button appears without building the whole block.
     local is_circuit = (race and race.mode == "circuit") or false
-    local analysis_available = phase == "finished" and #entries > 0
+    -- The server's statistics switch comes FIRST (ADR-0053), so a server with the feature off can never
+    -- show the button whatever the phase and entry count say. Note this condition never depended on
+    -- records at all: withholding the raceRecords push alone would have left the button on screen over an
+    -- empty overlay, which is worse than leaving the feature on.
+    local analysis_available = M.state.stats_enabled and phase == "finished" and #entries > 0
     local analysis = nil
     if analysis_available and M.state.analysis_open then
         analysis = build_analysis(entries, M.state.race_records, race)

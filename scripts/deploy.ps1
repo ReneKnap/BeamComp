@@ -135,6 +135,17 @@ try {
     # plugin writes at each race end (ADR-0050), and the ONLY copy of every best time and track record
     # there is -- the aggregate is derived from it in RAM and never written back. Preserve it identically,
     # or a redeploy wipes the whole history.
+    #
+    # NOTE: the repo deliberately carries NO seed file for this any more (ADR-0053). It used to ship an
+    # empty, tracked server\beamcomp.runs.jsonl, and since the server copy below takes the whole server\
+    # tree, EVERY deploy created the statistics file on the target -- no matter what the plugin code did.
+    # Statistics are off by default now, and "off" has to mean the file does not appear at all, so the
+    # seed was deleted. Do not restore it: the plugin creates the log on demand via runlog.resolve_path
+    # once enableStatistics is turned on.
+    #
+    # The preserve logic below needs no change for that and must not get one -- both halves are guarded by
+    # Test-Path, so a live server's real history is still copied out before the wipe and restored after,
+    # while a fresh target simply gets no file. That guard is what protects months of accumulated runs.
     $runsTarget = Join-Path $serverOut 'beamcomp.runs.jsonl'
     $runsBackup = $null
     if (Test-Path -LiteralPath $runsTarget) {

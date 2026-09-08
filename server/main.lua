@@ -267,7 +267,7 @@ local session = {
                               -- while staging, so that this specific admin leaving cancels the race nobody else will
                               -- start. Seeded at the staging entry, dropped by enter_phase on any other phase.
     ai_roster = nil,          -- named AI roster for the active race (ADR-0047): [k] = {name, car?} for AI id "ai:<k>", sanitized from the panel's overrides.ai.roster; nil on the chat path (classic "AI <k>" labels). Per-race, cleared by reset_to_lobby
-    runs_logged = nil,        -- whether this race's runs already went into the run log (ADR-0050). Set by runlog.capture, cleared per race, so the finish seam and the two abort paths cannot log the same race twice
+    runs_logged = nil,        -- whether this race's runs already went into the run log (ADR-0050). Set by runlog.capture, cleared per race, so the finish seam and the two abort paths cannot log the same race twice. Stays nil for the WHOLE race while statistics are off (ADR-0053): runlog.capture returns before it would set this, so the guard reads a consistent "nothing was logged" instead of a half-armed state
     race_event = nil,         -- id shared by every logged run of THIS race instance (ADR-0050), so field size, start slot and finishing position can be related across rows; assigned in start_race
 }
 
@@ -288,10 +288,19 @@ local CONFIG_CANDIDATE_PATHS = {
 --   * `use_client_name` -- whether player identity resolves to the client-reported BeamNG name instead
 --     of the BeamMP name (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the
 --     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
+--   * `stats_enabled` -- whether the per-run statistics subsystem exists at all (ADR-0053): the run log,
+--     best times, track records, the bestNotice toast, the raceRecords push, the analysis overlay and
+--     /analysis. JSON key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
+--     use_client_name above: only an explicit `true` enables it, so a missing key, a missing file, a
+--     malformed file or a non-boolean value all leave the feature dead. A suppression switch has to fail
+--     closed. The key is DELIBERATELY ABSENT from the shipped beamcomp.config.json -- it is documented
+--     here and in ADR-0053, not in the file users read, so the feature does not exist to anyone who was
+--     not told about it. Do not "helpfully" add it to the shipped config.
 local cfg = {
     admins = {},
     admin_gate_active = false,
     use_client_name = true,
+    stats_enabled = false,
 }
 
 -- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
@@ -452,6 +461,7 @@ local function load_config()
     cfg.admins = {}
     cfg.admin_gate_active = false
     cfg.use_client_name = true
+    cfg.stats_enabled = false
 
     local config, path, err = read_config()
     if not config then
@@ -462,12 +472,21 @@ local function load_config()
             log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
         end
         log_info("beamcomp.cfg", "useClientName=on (default; no config)")
+        log_info("beamcomp.cfg", "enableStatistics=off (default; no config)")
         return
     end
 
     -- Default on (ADR-0031): only an explicit false turns it off; a missing key stays on.
     cfg.use_client_name = config.useClientName ~= false
     log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
+
+    -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: ONLY an explicit true
+    -- enables the statistics subsystem. A missing key, a truthy non-boolean, the string "true" -- all
+    -- stay off. Read here rather than below because the raceAdmins early return is next, so a config
+    -- carrying enableStatistics but no raceAdmins array must still be honoured. This log line is the
+    -- one place the switch is observable; it is the acceptance check after a deploy.
+    cfg.stats_enabled = config.enableStatistics == true
+    log_info("beamcomp.cfg", "enableStatistics=" .. (cfg.stats_enabled and "on" or "off"))
 
     if type(config.raceAdmins) ~= "table" then
         log_info("beamcomp.cfg", "config at " .. path
@@ -1026,6 +1045,15 @@ end
 -- candidate that can be created wins. Mirrors the config/grids candidate-path strategy (ADR-0016), which
 -- tolerates the unverified runtime working directory. Returns the path, or nil when none is writable.
 function runlog.resolve_path()
+    -- Layer 0 of the statistics gate (ADR-0053), and the one that turns "the file is never created" from
+    -- a claim about a checklist into a property of the code: the SECOND loop below probes candidates with
+    -- io.open(path, "a"), which CREATES an empty beamcomp.runs.jsonl as a side effect. Every other run-log
+    -- function reaches the file through this one, so even a caller the switch failed to gate cannot bring
+    -- the file into existence. Do not move this below the runlog.path cache -- a path resolved while the
+    -- feature was on must not keep answering after it is turned off.
+    if not cfg.stats_enabled then
+        return nil
+    end
     if runlog.path then
         return runlog.path
     end
@@ -1054,6 +1082,13 @@ end
 -- runtime. Every line is newline-terminated, so a crash mid-write can only damage the last line, which
 -- readers skip. Returns true when the block reached disk.
 function runlog.append(runs)
+    -- Layer 1 of the statistics gate (ADR-0053): the write itself. resolve_path below already refuses
+    -- while off, so this is redundant by construction -- it is stated anyway because this is the single
+    -- line the whole acceptance test hangs on, and a reader should not have to trace two calls deep to
+    -- convince themselves nothing is written.
+    if not cfg.stats_enabled then
+        return false
+    end
     if #runs == 0 then
         return true
     end
@@ -1096,6 +1131,15 @@ end
 -- runlog.replay is assigned further down (after the fold helpers it needs); by the time anything calls
 -- this, the chunk has fully executed.
 function runlog.ensure()
+    -- Layer 1 of the statistics gate (ADR-0053): no replay while off, so runlog.store stays empty and
+    -- nothing downstream can derive a best time from a log we are not reading. Gating here covers all
+    -- three callers at once (on_init, snapshot_prerun_section_bests, capture_records).
+    --
+    -- Deliberately does NOT set runlog.loaded on the way out: turning the key back on and reloading the
+    -- plugin must replay for real, not find a "already loaded" latch left behind by the disabled run.
+    if not cfg.stats_enabled then
+        return
+    end
     if runlog.loaded then
         return
     end
@@ -4603,6 +4647,14 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- Qualifying event (ADR-0041): present only for order=quali, carrying the session length so
                 -- the client builds an unbounded-lap quali plan + shows the quali clock. nil = normal race.
                 quali = session.quali and {duration = session.quali.duration} or nil,
+                -- Whether the statistics subsystem exists on this server (ADR-0053). Gates the client's
+                -- results-card Analysis button and the whole analysis overlay. Shipped as a plain setting
+                -- and never interpreted here, so race-blindness holds (ADR-0005); it rides the existing
+                -- raceStart envelope rather than a new message type (ADR-0011) so re-enabling restores the
+                -- UI without a new client build. Always sent explicitly -- the client treats an ABSENT
+                -- field as off, so an older server degrades to "no statistics UI" rather than to a button
+                -- with nothing behind it.
+                statsEnabled = cfg.stats_enabled,
             })
         end
     end
@@ -5150,6 +5202,13 @@ end
 -- set by the two abort seams; see runlog.any_real_progress.
 function runlog.capture(require_progress)
     local logged = {}
+    -- Layer 2 of the statistics gate (ADR-0053). Returns BEFORE session.runs_logged is set, deliberately:
+    -- the flag then stays nil for the entire race, so the double-log guard shared by the finish seam and
+    -- the two abort seams (ADR-0038) sees a consistent "nothing was ever logged" rather than a half-armed
+    -- state that claims a capture happened.
+    if not cfg.stats_enabled then
+        return logged
+    end
     if not session.race or not session.progress or session.runs_logged then
         return logged
     end
@@ -5208,6 +5267,11 @@ end
 -- before capture_records mutates the store; returns a map keyed by player id.
 local function snapshot_prerun_section_bests()
     local snapshot = {}
+    -- Layer 2 of the statistics gate (ADR-0053): with no store to diff against there is nothing to
+    -- snapshot, and the empty table it returns is exactly what send_race_records already expects.
+    if not cfg.stats_enabled then
+        return snapshot
+    end
     if not session.race or not session.progress then
         return snapshot
     end
@@ -5299,7 +5363,9 @@ end
 local function compute_driver_totals(identity, car_key)
     local any_car = {run_count = 0, time_sum = 0, records_held = 0}
     local this_car = {run_count = 0, time_sum = 0, records_held = 0}
-    if not identity then
+    -- Layer 2 of the statistics gate (ADR-0053). Only reachable from send_race_records, which is gated
+    -- itself; stated here so this cannot start answering out of an empty store if a later caller appears.
+    if not cfg.stats_enabled or not identity then
         return {anyCar = any_car, thisCar = this_car}
     end
     for _, race_record in pairs(runlog.store) do
@@ -5337,6 +5403,12 @@ end
 -- pre-run "best lap with the car" references the Race section diffs against. Read-only here; identity
 -- resolves via session.identities with the progress name as fallback.
 local function send_race_records(prerun)
+    -- Layer 2 of the statistics gate (ADR-0053): no raceRecords event leaves the server while off. The
+    -- client defaults its own flag to off too, but this is the half that must not be shipped in the first
+    -- place -- an absent message is what makes the feature undetectable from a client's side.
+    if not cfg.stats_enabled then
+        return
+    end
     if not session.race or not session.progress then
         return
     end
@@ -5377,6 +5449,11 @@ end
 -- identity/vehicle, keyed on session.race, so race-blindness (ADR-0005) holds. Improved finishers get
 -- a bestNotice.
 local function capture_records()
+    -- Layer 2 of the statistics gate (ADR-0053): no fold, and above all no bestNotice. This is where the
+    -- "new personal best" toast originates, so gating here is what keeps a fast lap silent while off.
+    if not cfg.stats_enabled then
+        return
+    end
     if not session.race or not session.progress then
         return
     end
@@ -6584,7 +6661,12 @@ local function on_chat_message(player_id, player_name, message)
         return 1  -- suppress the command's own chat echo
     end
 
-    if command == CHAT_COMMAND_ANALYSIS then
+    -- Layer 3 of the statistics gate (ADR-0053): while off the command is not RECOGNISED at all. Falling
+    -- through here reaches the "not a BeamComp command" return at the end of this function, so /analysis
+    -- relays into chat as an ordinary message -- exactly like any other unknown command. Suppressing the
+    -- echo instead would be the one observable difference that proves the feature exists, which is why
+    -- the condition sits on the dispatch rather than inside handle_analysis_command.
+    if cfg.stats_enabled and command == CHAT_COMMAND_ANALYSIS then
         handle_analysis_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
@@ -7515,6 +7597,10 @@ local function on_init()
     load_config()
     ensure_grids_loaded()
     grid_store.ensure_presets_loaded()
+    -- Replay the run log into the derived aggregate. A no-op while statistics are switched off
+    -- (ADR-0053): runlog.ensure self-gates, so the log is neither read nor -- via resolve_path's
+    -- io.open(path, "a") probe -- created at startup. No call-site condition here on purpose; one gate
+    -- inside ensure covers all three of its callers and cannot fall out of step with them.
     runlog.ensure()
     -- Start the always-on state-machine tick. Deferred to onInit (not load) so the engine is
     -- fully up; the tick is a no-op while the session sits in lobby.
