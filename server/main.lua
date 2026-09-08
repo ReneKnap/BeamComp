@@ -4647,6 +4647,14 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- Qualifying event (ADR-0041): present only for order=quali, carrying the session length so
                 -- the client builds an unbounded-lap quali plan + shows the quali clock. nil = normal race.
                 quali = session.quali and {duration = session.quali.duration} or nil,
+                -- Whether the statistics subsystem exists on this server (ADR-0053). Gates the client's
+                -- results-card Analysis button and the whole analysis overlay. Shipped as a plain setting
+                -- and never interpreted here, so race-blindness holds (ADR-0005); it rides the existing
+                -- raceStart envelope rather than a new message type (ADR-0011) so re-enabling restores the
+                -- UI without a new client build. Always sent explicitly -- the client treats an ABSENT
+                -- field as off, so an older server degrades to "no statistics UI" rather than to a button
+                -- with nothing behind it.
+                statsEnabled = cfg.stats_enabled,
             })
         end
     end
