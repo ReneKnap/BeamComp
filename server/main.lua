@@ -6340,6 +6340,44 @@ function identity.apply(player_id, requested)
     return unique, changed
 end
 
+-- /name <x>: the player picks the name everyone sees (ADR-0054). Open to every player -- it changes only
+-- how that player is labelled, never what he may do. parse_command already hands over the trimmed
+-- remainder of the line, so "/name Max Mustermann" arrives whole and spaces need no handling here.
+--
+-- The phase gate sits AHEAD of the content rules on purpose: during a race the reason a /name is refused
+-- is the lock, and answering "your name is too long" instead would send the player off fixing something
+-- that was never going to be accepted either way. Read off the PHASE table, so a renamed phase is a load
+-- error rather than a silently dead comparison.
+function identity.handle_command(player_id, player_name, argument)
+    if argument == nil or argument == "" then
+        MP.SendChatMessage(player_id, identity.USAGE)
+        return
+    end
+
+    if session.phase ~= PHASE.lobby and session.phase ~= PHASE.staging then
+        MP.SendChatMessage(player_id, "BeamComp: too late to change your name -- "
+            .. identity.CHAT_COMMAND .. " works in the lobby and while the field is staging")
+        return
+    end
+
+    local ok, reason = identity.validate(argument)
+    if not ok then
+        MP.SendChatMessage(player_id, reason)
+        return
+    end
+
+    local unique = identity.apply(player_id, argument)
+    log_info("beamcomp.records", string.format("%s by %s (id=%s) -> %s", identity.CHAT_COMMAND,
+        tostring(player_name), tostring(player_id), unique))
+    -- Send back what the player TYPED, not the suffixed form that took effect: the client persists this
+    -- value, and storing "SPEEDY2" would strand him on the suffix forever, while re-requesting "SPEEDY"
+    -- each session correctly drops it once the colliding player is gone.
+    send_event(player_id, identity.MSG_SET, {name = argument})
+    MP.SendChatMessage(player_id, unique == argument
+        and ("BeamComp: you race as " .. unique)
+        or ("BeamComp: name taken -- you race as " .. unique))
+end
+
 -- Store a client's reported player-set name for identity resolution (ADR-0054). Connection-scoped: kept
 -- across races and lobby resets, cleared on disconnect, so the name is available from join onward. The
 -- value is opaque to the server (race-blind, ADR-0005) -- only echoed back as a display/record key.
@@ -6747,6 +6785,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_PING then
         handle_ping_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == identity.CHAT_COMMAND then
+        identity.handle_command(player_id, player_name, argument)
         return 1  -- suppress the command's own chat echo
     end
 
