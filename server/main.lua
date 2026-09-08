@@ -288,10 +288,19 @@ local CONFIG_CANDIDATE_PATHS = {
 --   * `use_client_name` -- whether player identity resolves to the client-reported BeamNG name instead
 --     of the BeamMP name (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the
 --     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
+--   * `stats_enabled` -- whether the per-run statistics subsystem exists at all (ADR-0053): the run log,
+--     best times, track records, the bestNotice toast, the raceRecords push, the analysis overlay and
+--     /analysis. JSON key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
+--     use_client_name above: only an explicit `true` enables it, so a missing key, a missing file, a
+--     malformed file or a non-boolean value all leave the feature dead. A suppression switch has to fail
+--     closed. The key is DELIBERATELY ABSENT from the shipped beamcomp.config.json -- it is documented
+--     here and in ADR-0053, not in the file users read, so the feature does not exist to anyone who was
+--     not told about it. Do not "helpfully" add it to the shipped config.
 local cfg = {
     admins = {},
     admin_gate_active = false,
     use_client_name = true,
+    stats_enabled = false,
 }
 
 -- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
@@ -452,6 +461,7 @@ local function load_config()
     cfg.admins = {}
     cfg.admin_gate_active = false
     cfg.use_client_name = true
+    cfg.stats_enabled = false
 
     local config, path, err = read_config()
     if not config then
@@ -462,12 +472,21 @@ local function load_config()
             log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
         end
         log_info("beamcomp.cfg", "useClientName=on (default; no config)")
+        log_info("beamcomp.cfg", "enableStatistics=off (default; no config)")
         return
     end
 
     -- Default on (ADR-0031): only an explicit false turns it off; a missing key stays on.
     cfg.use_client_name = config.useClientName ~= false
     log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
+
+    -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: ONLY an explicit true
+    -- enables the statistics subsystem. A missing key, a truthy non-boolean, the string "true" -- all
+    -- stay off. Read here rather than below because the raceAdmins early return is next, so a config
+    -- carrying enableStatistics but no raceAdmins array must still be honoured. This log line is the
+    -- one place the switch is observable; it is the acceptance check after a deploy.
+    cfg.stats_enabled = config.enableStatistics == true
+    log_info("beamcomp.cfg", "enableStatistics=" .. (cfg.stats_enabled and "on" or "off"))
 
     if type(config.raceAdmins) ~= "table" then
         log_info("beamcomp.cfg", "config at " .. path
