@@ -189,8 +189,12 @@ local function defer(app_name, action, reason)
     deferred[app_name] = action
 end
 
--- A call that got through settles the question for that app, so an older deferred intent can never
--- be replayed over a newer decision.
+-- A call that got past the guard settles the question for that app, so an older deferred intent can
+-- never be replayed over a newer decision. Cleared on the way IN, i.e. whatever the call's outcome:
+-- a call that then fails for an unrelated reason (no current layout selected yet, addApp refused)
+-- drops the intent exactly as it did before this book existed. Deliberate -- keeping a failure
+-- pending would make M.step retry it every single frame, and each retry re-reads every layout file
+-- off disk.
 local function clear_deferred(app_name)
     if not deferred then
         return
