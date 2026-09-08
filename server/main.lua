@@ -5544,6 +5544,9 @@ end
 local function tick()
     expire_stale_validation()
     maybe_warn_cleanup()
+    -- Ahead of the lobby early return below: a player who just joined and has no name is sitting in the
+    -- lobby, which is precisely where his hint has to reach him (ADR-0054).
+    identity.step()
 
     local phase = session.phase
     if phase == PHASE.lobby then
@@ -6340,6 +6343,44 @@ function identity.apply(player_id, requested)
     return unique, changed
 end
 
+-- Arm the one-time join hint for a player who has no name yet (ADR-0054). Called from the join events,
+-- NOT emitting anything itself: a client that HAS a stored name reports it a moment after joining, so
+-- hinting at the join instant would write to exactly the people who are about to be named. identity.step
+-- emits it once the grace has passed and the player is still without an entry.
+--
+-- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
+-- events safe (see the MP.RegisterEvent block at the end of the file).
+function identity.arm_hint(player_id)
+    if client_names[player_id] then
+        return
+    end
+    identity.pending[player_id] = now() + identity.HINT_DELAY
+end
+
+-- Emit any join hint whose grace has run out. Called from the top of tick(), ABOVE its lobby early
+-- return: the lobby is exactly where a joining player is.
+--
+-- The `client_names[id] == nil` test here is the ONE place that decides whether a hint is still
+-- warranted -- neither /name nor the connect report clears the pending entry, so there is no list of
+-- accept paths that has to stay complete for the rule to hold. Clearing the entry before the send makes
+-- it a one-shot even if the send throws; a player who is named by now, or gone, gets nothing.
+function identity.step()
+    if next(identity.pending) == nil then
+        return
+    end
+    local due = now()
+    local players = MP.GetPlayers()
+    for player_id, deadline in pairs(identity.pending) do
+        if due >= deadline then
+            identity.pending[player_id] = nil
+            if client_names[player_id] == nil and players[player_id] then
+                MP.SendChatMessage(player_id, identity.HINT)
+                log_info("beamcomp.records", "hinted id " .. tostring(player_id) .. " to set a name")
+            end
+        end
+    end
+end
+
 -- /name <x>: the player picks the name everyone sees (ADR-0054). Open to every player -- it changes only
 -- how that player is labelled, never what he may do. parse_command already hands over the trimmed
 -- remainder of the line, so "/name Max Mustermann" arrives whole and spaces need no handling here.
@@ -6674,8 +6715,10 @@ end
 -- A player leaving mid-race is marked DNF so the race can still settle; if they were the last one
 -- there is no one to race, so fall back to lobby instead (ADR-0014).
 local function on_player_disconnect(player_id)
-    -- Drop the connection-scoped name regardless of phase (ADR-0031) -- a player may leave in lobby too.
+    -- Drop the connection-scoped name regardless of phase (ADR-0054) -- a player may leave in lobby too,
+    -- and with it any join hint still waiting out its grace.
     client_names[player_id] = nil
+    identity.pending[player_id] = nil
     -- Same for the lobby footprint (ADR-0051 round 2); a reconnecting player re-reports it.
     grid_fit.client_sizes[player_id] = nil
     if session.phase == PHASE.lobby then
@@ -7765,6 +7808,11 @@ function beamcomp_on_tick()
 end
 
 -- BeamMP event handler (must be global)
+function beamcomp_on_join(player_id)
+    return identity.arm_hint(player_id)
+end
+
+-- BeamMP event handler (must be global)
 function beamcomp_on_disconnect(player_id)
     return on_player_disconnect(player_id)
 end
@@ -7776,6 +7824,18 @@ end
 
 MP.RegisterEvent("onChatMessage", "beamcomp_on_chat")
 MP.RegisterEvent("onInit", "beamcomp_on_init")
+-- BOTH join events, onto the same handler (ADR-0054). MP.RegisterEvent takes any string, and an event
+-- name the server does not know is a SILENT no-op -- the same class of trap as the engine input-action
+-- names in CLAUDE.md, with no error and no log line to notice it by.
+--   * onPlayerJoin is the intended one: BeamMP-Server v3.9.2 carries it as a standalone string literal
+--     immediately after its " is now synced!" log line, i.e. the sync-complete path fires it.
+--   * onPlayerJoining is the only join event our own references/beammp-server-api.md documents, and it
+--     exists in the binary too (it fires earlier, right after the mod download).
+-- Arming is idempotent and a re-arm only pushes the deadline later, so when both fire the grace ends up
+-- anchored on the later one. Registering both costs a line and removes the whole "did we pick the right
+-- name" failure mode.
+MP.RegisterEvent("onPlayerJoin", "beamcomp_on_join")
+MP.RegisterEvent("onPlayerJoining", "beamcomp_on_join")
 MP.RegisterEvent("onPlayerDisconnect", "beamcomp_on_disconnect")
 MP.RegisterEvent(TICK_EVENT, "beamcomp_on_tick")
 MP.RegisterEvent(EVENT_CHANNEL, "beamcomp_on_client_event")
