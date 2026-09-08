@@ -6282,8 +6282,8 @@ end
 -- admin-name rule bypassable with a text editor. A name that /name accepted always passes here, so this
 -- rejects nothing legitimate.
 function identity.validate(candidate)
-    if type(candidate) ~= "string" or candidate == "" then
-        return false, identity.USAGE
+    if type(candidate) ~= "string" then
+        return false, identity.USAGE  -- defensive: /name and the report both hand over a string
     end
     -- Bytes, not characters -- see identity.MAX_BYTES.
     if #candidate < identity.MIN_BYTES or #candidate > identity.MAX_BYTES then
@@ -6362,7 +6362,7 @@ end
 -- client_names entirely, so a name set here would change nothing anywhere. Everything the feature shows
 -- the player -- the command, the join hint, the admin's list -- goes through this, so an operator who
 -- turns identity off gets a server that says so rather than one that quietly ignores /name.
-function identity.enabled()
+function identity.is_enabled()
     return cfg.use_client_name == true
 end
 
@@ -6375,7 +6375,7 @@ end
 -- in the admin's list until the next unrelated change.
 function identity.unnamed_list(leaving_id)
     local rows = {}
-    if not identity.enabled() then
+    if not identity.is_enabled() then
         return rows  -- nobody is "unnamed" when a set name would not be shown anyway
     end
     for player_id, beammp_name in pairs(MP.GetPlayers()) do
@@ -6410,7 +6410,7 @@ function identity.handle_remind(player_id)
     end
     if not is_race_admin(player_name) then
         MP.SendChatMessage(player_id, "BeamComp: you are not allowed to remind players")
-        log_info("beamcomp.records", "denied " .. identity.MSG_REMIND .. " from " .. player_name
+        log_info("beamcomp.identity", "denied " .. identity.MSG_REMIND .. " from " .. player_name
             .. " (not a race admin)")
         return
     end
@@ -6420,7 +6420,7 @@ function identity.handle_remind(player_id)
         MP.SendChatMessage(row.id, identity.HINT)
     end
     MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d player(s) to set a name", #rows))
-    log_info("beamcomp.records", string.format("%s by %s reached %d player(s)", identity.MSG_REMIND,
+    log_info("beamcomp.identity", string.format("%s by %s reached %d player(s)", identity.MSG_REMIND,
         player_name, #rows))
 end
 
@@ -6432,7 +6432,7 @@ end
 -- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
 -- events safe (see the MP.RegisterEvent block at the end of the file).
 function identity.arm_hint(player_id)
-    if client_names[player_id] or not identity.enabled() then
+    if client_names[player_id] or not identity.is_enabled() then
         return
     end
     identity.pending[player_id] = now() + identity.HINT_DELAY
@@ -6457,7 +6457,7 @@ function identity.step()
             identity.pending[player_id] = nil
             if client_names[player_id] == nil and players[player_id] then
                 MP.SendChatMessage(player_id, identity.HINT)
-                log_info("beamcomp.records", "hinted id " .. tostring(player_id) .. " to set a name")
+                log_info("beamcomp.identity", "hinted id " .. tostring(player_id) .. " to set a name")
                 hinted = true
             end
         end
@@ -6479,7 +6479,7 @@ end
 -- that was never going to be accepted either way. Read off the PHASE table, so a renamed phase is a load
 -- error rather than a silently dead comparison.
 function identity.handle_command(player_id, player_name, argument)
-    if not identity.enabled() then
+    if not identity.is_enabled() then
         MP.SendChatMessage(player_id, "BeamComp: this server shows BeamMP names -- "
             .. identity.CHAT_COMMAND .. " is switched off")
         return
@@ -6502,7 +6502,7 @@ function identity.handle_command(player_id, player_name, argument)
     end
 
     local unique = identity.apply(player_id, argument)
-    log_info("beamcomp.records", string.format("%s by %s (id=%s) -> %s", identity.CHAT_COMMAND,
+    log_info("beamcomp.identity", string.format("%s by %s (id=%s) -> %s", identity.CHAT_COMMAND,
         tostring(player_name), tostring(player_id), unique))
     -- Send back what the player TYPED, not the suffixed form that took effect: the client persists this
     -- value, and storing "SPEEDY2" would strand him on the suffix forever, while re-requesting "SPEEDY"
@@ -6526,13 +6526,13 @@ local function handle_client_identity(player_id, payload)
     local requested = payload.name
     local ok, reason = identity.validate(requested)
     if not ok then
-        log_info("beamcomp.records", string.format("clientIdentity id=%s rejected: %s (name=%s)",
+        log_info("beamcomp.identity", string.format("clientIdentity id=%s rejected: %s (name=%s)",
             tostring(player_id), reason, requested))
         return
     end
 
     local unique, changed = identity.apply(player_id, requested)
-    log_info("beamcomp.records", string.format("clientIdentity id=%s name=%s%s",
+    log_info("beamcomp.identity", string.format("clientIdentity id=%s name=%s%s",
         tostring(player_id), unique,
         unique ~= requested and (" (requested " .. requested .. ")") or ""))
     -- Tell the player the adjusted name when it was suffixed, so the standings name is not a silent surprise.
@@ -6814,9 +6814,14 @@ end
 local function on_player_disconnect(player_id)
     -- Drop the connection-scoped name regardless of phase (ADR-0054) -- a player may leave in lobby too,
     -- and with it any join hint still waiting out its grace.
+    local was_unnamed = client_names[player_id] == nil
     client_names[player_id] = nil
     identity.pending[player_id] = nil
-    identity.broadcast_unnamed(player_id)
+    -- Only when the leaver was actually ON the list: a named player leaving does not change it, and
+    -- broadcast_event would be writing to a socket that is going away for nothing.
+    if was_unnamed then
+        identity.broadcast_unnamed(player_id)
+    end
     -- Same for the lobby footprint (ADR-0051 round 2); a reconnecting player re-reports it.
     grid_fit.client_sizes[player_id] = nil
     if session.phase == PHASE.lobby then
