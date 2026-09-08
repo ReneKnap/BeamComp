@@ -220,7 +220,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "staged-quali-custom-map/2026-09-07"
+local BUILD_MARKER = "ui-layout-defer-replay/2026-09-08"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -2961,7 +2961,9 @@ function setup.step(dt)
     log("I", RACE_LOG_TAG, "race-setup panel went silent -- re-adding it once")
     -- The compat seam self-guards and pcalls every engine call (race/uilayout.lua), so this onUpdate
     -- tick can never be taken down. The latch is already set above, so a failure costs the one
-    -- restore rather than repeating every frame -- unchanged semantics.
+    -- restore rather than repeating every frame -- and spending it is safe even when the player is
+    -- sitting in BeamNG's HUD-apps menu: the seam defers a call it cannot make there and replays it
+    -- itself (M.uilayout.step, bug ui-glitches-after-ingame-menu-resize).
     M.uilayout.ensure_visible("beamCompSetup")
 end
 
@@ -6632,6 +6634,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if M.state.setup_open then
         setup.step(dtReal)
     end
+    -- Phase-independent: retry whatever BeamNG's HUD-apps layout UI swallowed while it owned the
+    -- layout document (bug ui-glitches-after-ingame-menu-resize). Every panel show/close in this file
+    -- is a one-shot, so a call that lands in that window used to be lost for good -- the seam now
+    -- records it and replays it here once the UI is done. One nil check when nothing is pending.
+    M.uilayout.step()
     -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
     -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
     -- polling lives in race/vehicles (it is a measurement of the car); this is only the wiring, kept
