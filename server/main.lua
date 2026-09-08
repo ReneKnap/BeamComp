@@ -6653,7 +6653,12 @@ local function on_chat_message(player_id, player_name, message)
         return 1  -- suppress the command's own chat echo
     end
 
-    if command == CHAT_COMMAND_ANALYSIS then
+    -- Layer 3 of the statistics gate (ADR-0053): while off the command is not RECOGNISED at all. Falling
+    -- through here reaches the "not a BeamComp command" return at the end of this function, so /analysis
+    -- relays into chat as an ordinary message -- exactly like any other unknown command. Suppressing the
+    -- echo instead would be the one observable difference that proves the feature exists, which is why
+    -- the condition sits on the dispatch rather than inside handle_analysis_command.
+    if cfg.stats_enabled and command == CHAT_COMMAND_ANALYSIS then
         handle_analysis_command(player_id, player_name)
         return 1  -- suppress the command's own chat echo
     end
