@@ -151,6 +151,14 @@
     .bc-row > span.bc-roster-carshown { flex: 1 1 auto; min-width: 0; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
     .bc-swatch-inline { display: inline-block; vertical-align: middle; width: 14px; height: 14px; }
+    /* Players without a set name (ADR-0054). The box has a FIXED height range, not an auto one: the list
+       changes on every join, leave and /name, and a box that grows with it would shove the Tournament and
+       Presets sections up and down under the admin's cursor while he is using them. Three rows fit; a
+       longer list scrolls inside the box. */
+    .bc-unnamed-list { min-height: 54px; max-height: 54px; overflow-y: auto; margin: 4px 0;
+      background: #20242b; border: 1px solid rgba(255,255,255,0.12); border-radius: 3px; padding: 2px 6px; }
+    .bc-unnamed-row { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bc-unnamed-empty { padding: 1px 0; opacity: 0.7; font-style: italic; }
     /* Hover help (bcSetupTip, ADR-0049). Native title= renders NOTHING in BeamNG -- the UI is drawn in an
        off-screen CEF and native tooltips are painted by browser chrome an off-screen renderer does not
        have -- so the help text is a box in our own DOM instead. One per panel, reused, positioned by the
@@ -527,6 +535,25 @@
           <label class="bc-row" bc-setup-tip="tip('aiRubber')"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="{{aiParamHint('rubber')}}"></label>
           <label class="bc-row bc-check" bc-setup-tip="tip('aiAvoid')"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
         </div>
+      </div>
+    </div>
+
+    <!-- Players (ADR-0054): who is still racing under the name BeamMP gave them, so the admin sees before
+         the start whether the standings will be full of guest names. The list is the connected players
+         minus everyone who has picked a name with /name; Remind chat-hints exactly those on it (the server
+         admin-gates that). Sits above Tournament so it is seen on the way down the panel. -->
+    <div class="bc-section">
+      <div class="bc-section-title">Players</div>
+      <!-- track by p.id: two guests can carry the same BeamMP name, which a bare ng-repeat rejects
+           outright ("Duplicates in a repeater"), and it also keeps Angular from stamping $$hashKey onto
+           rows that came straight off the wire. -->
+      <div class="bc-unnamed-list" bc-setup-tip="tip('unnamed')">
+        <div class="bc-unnamed-row" ng-repeat="p in unnamed track by p.id">{{p.name}}</div>
+        <div class="bc-unnamed-empty" ng-if="!unnamed.length">everyone has picked a name</div>
+      </div>
+      <div class="bc-row">
+        <button class="bc-refresh" ng-disabled="!unnamed.length" ng-click="remindUnnamed()"
+          bc-setup-tip="tip('remindUnnamed')">Remind ({{unnamed.length}})</button>
       </div>
     </div>
 

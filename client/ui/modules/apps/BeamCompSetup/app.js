@@ -267,6 +267,11 @@ angular.module('beamng.apps')
     tourReset: 'Put everyone back in the fastest class and start the ladder again. The tournament keeps '
       + 'running -- to stop it, set Mode to off.',
 
+    // --- Players ---
+    unnamed: 'Players who have not picked a name yet. They show up in the standings under the name '
+      + 'BeamMP gave them. Anyone can pick one by typing "/name <their name>" in chat.',
+    remindUnnamed: 'Send everyone on this list a chat line telling them how to pick a name.',
+
     // --- Presets ---
     presetSave: 'Save everything on this panel under a name you can load again later.',
     presetLoad: 'Show the setups saved for this map.',
@@ -1320,6 +1325,22 @@ angular.module('beamng.apps')
         geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
       };
 
+      // Players without a set name (ADR-0054): GE pushes the list when the panel opens and whenever it
+      // changes -- somebody picks a name, joins, or leaves. Kept as an array so the empty state is simply
+      // a length of zero.
+      scope.unnamed = [];
+      scope.$on('BeamCompUnnamed', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.unnamed = (payload && payload.players) || [];
+        });
+      });
+
+      // Remind: the server sends every listed player the same chat line a joining player gets. Admin-gated
+      // server-side like the grid messages, so a non-admin panel simply gets a refusal in chat.
+      scope.remindUnnamed = function () {
+        geCall('remind_unnamed');
+      };
+
       // Class-drop tournament state (ADR-0042): GE pushes the table + classes on open and on every change.
       // When a tournament is active, reflect it in the mode selector so the panel opens on the right section.
       scope.$on('BeamCompTournament', function (event, payload) {
@@ -2097,6 +2118,7 @@ angular.module('beamng.apps')
       geCall('request_championship');
       geCall('request_tournament');
       geCall('request_race_phase');
+      geCall('request_unnamed');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars
