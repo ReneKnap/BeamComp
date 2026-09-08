@@ -6333,6 +6333,7 @@ function identity.apply(player_id, requested)
         suffix = suffix + 1
         unique = requested .. tostring(suffix)
     end
+    local was_unnamed = client_names[player_id] == nil
     local changed = client_names[player_id] ~= unique
     client_names[player_id] = unique
     -- A name arriving after the race started refreshes the live board, so the standings switch from the
@@ -6340,7 +6341,68 @@ function identity.apply(player_id, requested)
     if changed and session.progress then
         broadcast_standings()
     end
+    -- The panel's list shrinks the moment a player names himself. Here rather than at the two call
+    -- sites: this is the only place a client_names entry is created, so the push cannot be forgotten by
+    -- a third entry point later.
+    if was_unnamed then
+        identity.broadcast_unnamed()
+    end
     return unique, changed
+end
+
+-- The connected players who have no set name, as {id, name} sorted by the name they currently show
+-- (ADR-0054). Derived from MP.GetPlayers() minus client_names on every call -- there is no second
+-- bookkeeping table to keep in step with reality.
+--
+-- `leaving_id` drops one player from the result. The disconnect path needs it: onPlayerDisconnect may or
+-- may not still list the leaving player (see is_server_empty_without), so without it a leaver could stay
+-- in the admin's list until the next unrelated change.
+function identity.unnamed_list(leaving_id)
+    local rows = {}
+    for player_id, beammp_name in pairs(MP.GetPlayers()) do
+        if client_names[player_id] == nil and player_id ~= leaving_id then
+            rows[#rows + 1] = {id = player_id, name = beammp_name}
+        end
+    end
+    table.sort(rows, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+    end)
+    return rows
+end
+
+-- Push the unnamed-player list to every client (ADR-0054), so an open race-setup panel reflects reality.
+-- Broadcast rather than sent to admins only: the list carries names that are already on everyone's
+-- standings board, and filtering per player would mean tracking who is an admin -- new bookkeeping for
+-- nothing. Only the admin-gated panel renders it.
+function identity.broadcast_unnamed(leaving_id)
+    broadcast_event(identity.MSG_UNNAMED, {players = identity.unnamed_list(leaving_id)})
+end
+
+-- The Remind button in the race-setup panel (ADR-0054): send the join hint to everyone still without a
+-- name, so the admin can fix a grid full of guest names before the start instead of after it.
+-- Admin-gated like the grid messages (ADR-0023) -- it writes to every player's chat.
+--
+-- Reads the caller's name straight off MP.GetPlayers rather than through player_name_of: that local is
+-- declared further down the chunk, so a closure created here could not see it.
+function identity.handle_remind(player_id)
+    local player_name = MP.GetPlayers()[player_id]
+    if not player_name then
+        return
+    end
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to remind players")
+        log_info("beamcomp.records", "denied " .. identity.MSG_REMIND .. " from " .. player_name
+            .. " (not a race admin)")
+        return
+    end
+
+    local rows = identity.unnamed_list()
+    for _, row in ipairs(rows) do
+        MP.SendChatMessage(row.id, identity.HINT)
+    end
+    MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d player(s) to set a name", #rows))
+    log_info("beamcomp.records", string.format("%s by %s reached %d player(s)", identity.MSG_REMIND,
+        player_name, #rows))
 end
 
 -- Arm the one-time join hint for a player who has no name yet (ADR-0054). Called from the join events,
@@ -6370,14 +6432,22 @@ function identity.step()
     end
     local due = now()
     local players = MP.GetPlayers()
+    local hinted = false
     for player_id, deadline in pairs(identity.pending) do
         if due >= deadline then
             identity.pending[player_id] = nil
             if client_names[player_id] == nil and players[player_id] then
                 MP.SendChatMessage(player_id, identity.HINT)
                 log_info("beamcomp.records", "hinted id " .. tostring(player_id) .. " to set a name")
+                hinted = true
             end
         end
+    end
+    -- A joiner enters the panel's list here, not at the join instant: until his grace has run out we do
+    -- not know whether he is about to report a stored name, and listing him meanwhile would make the
+    -- admin's list flicker on every join.
+    if hinted then
+        identity.broadcast_unnamed()
     end
 end
 
@@ -6685,6 +6755,9 @@ local function handle_raceui_command(player_id, player_name)
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.
     send_event(player_id, champ.MSG, champ.snapshot())
     send_event(player_id, tour.MSG, tour.snapshot())
+    -- Same deal for the players who have not set a name (ADR-0054): seed the freshly opened panel, then
+    -- let identity.broadcast_unnamed keep it current.
+    send_event(player_id, identity.MSG_UNNAMED, {players = identity.unnamed_list()})
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
@@ -6719,6 +6792,7 @@ local function on_player_disconnect(player_id)
     -- and with it any join hint still waiting out its grace.
     client_names[player_id] = nil
     identity.pending[player_id] = nil
+    identity.broadcast_unnamed(player_id)
     -- Same for the lobby footprint (ADR-0051 round 2); a reconnecting player re-reports it.
     grid_fit.client_sizes[player_id] = nil
     if session.phase == PHASE.lobby then
@@ -7712,6 +7786,8 @@ local function handle_client_event(player_id, data)
         handle_client_info(player_id, decoded.payload)
     elseif decoded.type == MSG_CLIENT_IDENTITY then
         handle_client_identity(player_id, decoded.payload)
+    elseif decoded.type == identity.MSG_REMIND then
+        identity.handle_remind(player_id)
     elseif decoded.type == grid_fit.MSG_SIZE then
         grid_fit.handle_size(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
