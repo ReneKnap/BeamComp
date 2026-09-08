@@ -6292,8 +6292,15 @@ function identity.validate(candidate)
     end
     -- Defensive: the chat lines and standings entries around this name are assembled by hand, and a
     -- newline or a terminal escape inside one would corrupt them.
-    if candidate:find("[%z\1-\31]") then
-        return false, "BeamComp: a name may not contain control characters"
+    --
+    -- A byte scan, not a pattern: the obvious "[%z\1-\31]" leans on the %z class, which Lua 5.2 REMOVED
+    -- (this server runs 5.3.5, where an unknown class letter is documented to match that literal
+    -- character -- so on a stricter build the class would silently start rejecting every name containing
+    -- a "z" instead of a control character). This loop cannot drift with the interpreter.
+    for i = 1, #candidate do
+        if candidate:byte(i) < 0x20 then
+            return false, "BeamComp: a name may not contain control characters"
+        end
     end
     local normalized = normalize_name(candidate)
     -- A player calling himself "guest…" would look unnamed and so escape the join hint and the admin's
