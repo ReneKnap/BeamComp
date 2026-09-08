@@ -6357,6 +6357,15 @@ function identity.apply(player_id, requested)
     return unique, changed
 end
 
+-- Whether player-set names do anything on this server (ADR-0054). `useClientName` is an operator-editable
+-- key in the shipped beamcomp.config.json (ADR-0031 §4): with it off, resolve_identity ignores
+-- client_names entirely, so a name set here would change nothing anywhere. Everything the feature shows
+-- the player -- the command, the join hint, the admin's list -- goes through this, so an operator who
+-- turns identity off gets a server that says so rather than one that quietly ignores /name.
+function identity.enabled()
+    return cfg.use_client_name == true
+end
+
 -- The connected players who have no set name, as {id, name} sorted by the name they currently show
 -- (ADR-0054). Derived from MP.GetPlayers() minus client_names on every call -- there is no second
 -- bookkeeping table to keep in step with reality.
@@ -6366,6 +6375,9 @@ end
 -- in the admin's list until the next unrelated change.
 function identity.unnamed_list(leaving_id)
     local rows = {}
+    if not identity.enabled() then
+        return rows  -- nobody is "unnamed" when a set name would not be shown anyway
+    end
     for player_id, beammp_name in pairs(MP.GetPlayers()) do
         if client_names[player_id] == nil and player_id ~= leaving_id then
             rows[#rows + 1] = {id = player_id, name = beammp_name}
@@ -6420,7 +6432,7 @@ end
 -- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
 -- events safe (see the MP.RegisterEvent block at the end of the file).
 function identity.arm_hint(player_id)
-    if client_names[player_id] then
+    if client_names[player_id] or not identity.enabled() then
         return
     end
     identity.pending[player_id] = now() + identity.HINT_DELAY
@@ -6467,6 +6479,11 @@ end
 -- that was never going to be accepted either way. Read off the PHASE table, so a renamed phase is a load
 -- error rather than a silently dead comparison.
 function identity.handle_command(player_id, player_name, argument)
+    if not identity.enabled() then
+        MP.SendChatMessage(player_id, "BeamComp: this server shows BeamMP names -- "
+            .. identity.CHAT_COMMAND .. " is switched off")
+        return
+    end
     if argument == nil or argument == "" then
         MP.SendChatMessage(player_id, identity.USAGE)
         return
