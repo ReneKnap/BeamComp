@@ -303,14 +303,55 @@ local cfg = {
     stats_enabled = false,
 }
 
--- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
--- and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is per race --
--- so resolve_identity has the name from join onward. An opaque client string (race-blind, ADR-0005).
+-- Connection-scoped player-set name per player id (ADR-0054), reported once on connect via
+-- clientIdentity and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is
+-- per race -- so resolve_identity has the name from join onward. An opaque client string (race-blind,
+-- ADR-0005).
+--
+-- A PLAIN player_id -> name MAP, walked with pairs() by the collision check and the disconnect clear.
+-- NEVER hang a function, a flag or any other non-name field on it: it would be read as somebody's
+-- player name. New identity code goes on the `identity` namespace below instead.
 local client_names = {}
 
--- The canonical display/record identity for a player (ADR-0031): the client-reported BeamNG name when
--- the option is on and one was reported, else the BeamMP name. The single chokepoint every name read
--- goes through -- the option and the fallback live here only. nil only if BeamMP has no name for the id.
+-- Everything the player-set identity needs (ADR-0054, superseding ADR-0031): the /name command, its
+-- validation, the shared collision suffix, the delayed join hint and the admin-facing "who has no name"
+-- surface.
+--
+-- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
+-- (see the f1 / grid_store / runlog namespaces above), and a table costs ONE local no matter how much it
+-- carries. Message-type strings and chat texts are top-level locals too when written as `local MSG_...`,
+-- so they ride here as fields as well.
+--
+-- Constants and state live here; the functions are assigned in a later block, after the locals they
+-- close over (send_event, broadcast_event, broadcast_standings, is_race_admin, normalize_name). A table
+-- field needs no forward declaration and every cross-call is a runtime lookup, so the order is free.
+local identity = {
+    CHAT_COMMAND = "/name",
+    MSG_SET = "nameSet",              -- server -> client: the accepted REQUESTED name, for the client to persist
+    MSG_UNNAMED = "unnamedPlayers",   -- server -> clients: who currently has no set name (setup panel)
+    MSG_REMIND = "remindUnnamed",     -- client -> server: admin asks us to hint every unnamed player
+    -- Name length in BYTES (#name), not codepoints: a name with umlauts therefore reaches the cap sooner
+    -- than 20 visible characters. Deliberate -- a UTF-8-aware count is not worth its complexity for a
+    -- display name, and the byte bound is what keeps the hand-assembled chat/standings lines sane. Do not
+    -- "fix" this to a utf8.len.
+    MIN_BYTES = 2,
+    MAX_BYTES = 20,
+    -- Seconds between a player joining and the hint being emitted. A client that HAS a stored name
+    -- reports it a moment after the join, so an immediate check would hint at exactly the people who are
+    -- about to be named; the grace lets that report land first.
+    HINT_DELAY = 8,
+    -- player_id -> deadline (now()) for a hint that is armed but not yet due.
+    pending = {},
+}
+identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHAT_COMMAND
+    .. " <your name>\" to pick the name everyone sees"
+identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
+    .. identity.MIN_BYTES .. "-" .. identity.MAX_BYTES .. " characters, spaces allowed)"
+
+-- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
+-- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
+-- name read goes through -- the option and the fallback live here only. nil only if BeamMP has no name
+-- for the id.
 local function resolve_identity(player_id)
     if cfg.use_client_name then
         local name = client_names[player_id]
@@ -6229,21 +6270,52 @@ local function handle_client_info(player_id, payload)
     grid_fit.apply("clientInfo")
 end
 
--- Store a client's reported BeamNG name for identity resolution (ADR-0031). Connection-scoped: kept
--- across races and lobby resets, cleared on disconnect, so the name is available from join onward. The
--- value is opaque to the server (race-blind, ADR-0005) -- only echoed back as a display/record key.
--- Logged once so the unverified client name source is visible in the server console.
-local function handle_client_identity(player_id, payload)
-    if type(payload) ~= "table" or type(payload.name) ~= "string" or payload.name == "" then
-        return
+-- Whether `candidate` may be used as a player-set name (ADR-0054). Returns true, or false plus the chat
+-- line explaining what is wrong -- the /name handler posts that line verbatim, so each rejection reads as
+-- its own reason instead of one generic refusal.
+--
+-- Runs on BOTH entry points: the /name command AND the connect report. The client persists its name in a
+-- player-editable JSON file, so validating only the command would leave the `guest` disguise rule and the
+-- admin-name rule bypassable with a text editor. A name that /name accepted always passes here, so this
+-- rejects nothing legitimate.
+function identity.validate(candidate)
+    if type(candidate) ~= "string" or candidate == "" then
+        return false, identity.USAGE
     end
-    -- Disambiguate a name that collides with ANOTHER connected player's identity (ADR-0031 amendment):
-    -- staging-time plate changes make accidental same-name collisions easy, which would silently merge two
-    -- players' live standings and this session's records. Append the lowest free integer (SPEEDY -> SPEEDY2
-    -- -> SPEEDY3). The own entry is skipped, so an unchanged re-report keeps its name and reverting to a
-    -- now-free name drops the suffix. Cross-session/historical record collisions stay accepted (decision 5).
-    -- Function-local only -- no new top-level local (the main.lua local ceiling is full).
-    local requested = payload.name
+    -- Bytes, not characters -- see identity.MAX_BYTES.
+    if #candidate < identity.MIN_BYTES or #candidate > identity.MAX_BYTES then
+        return false, string.format("BeamComp: a name is %d-%d characters long (yours is %d)",
+            identity.MIN_BYTES, identity.MAX_BYTES, #candidate)
+    end
+    -- Defensive: the chat lines and standings entries around this name are assembled by hand, and a
+    -- newline or a terminal escape inside one would corrupt them.
+    if candidate:find("[%z\1-\31]") then
+        return false, "BeamComp: a name may not contain control characters"
+    end
+    local normalized = normalize_name(candidate)
+    -- A player calling himself "guest…" would look unnamed and so escape the join hint and the admin's
+    -- reminder list -- the one hole that would defeat the whole discovery mechanism.
+    if normalized:sub(1, 5) == "guest" then
+        return false, "BeamComp: a name may not start with \"guest\""
+    end
+    -- Wearing an admin's name visually. Meaningful only while the gate is active: a server with no admins
+    -- configured has an empty allowlist and nothing to protect (ADR-0016).
+    if cfg.admins[normalized] == true then
+        return false, "BeamComp: that name belongs to a race admin"
+    end
+    return true
+end
+
+-- Store `requested` as this player's identity, disambiguated against the other connected players
+-- (ADR-0054, carrying over the ADR-0031 amendment). Returns the name that took effect plus whether it
+-- changed. The single implementation both entry points -- /name and the connect report -- go through, so
+-- the two can never drift apart.
+--
+-- Append the lowest free integer on a collision (SPEEDY -> SPEEDY2 -> SPEEDY3); without it two connected
+-- players with one name would silently merge in the live standings and in this session's records. The own
+-- entry is skipped, so an unchanged re-report keeps its name and reverting to a now-free name drops the
+-- suffix. Cross-session/historical collisions stay accepted (ADR-0031 decision 5).
+function identity.apply(player_id, requested)
     local function taken(candidate)
         for id, name in pairs(client_names) do
             if id ~= player_id and name == candidate then
@@ -6260,6 +6332,33 @@ local function handle_client_identity(player_id, payload)
     end
     local changed = client_names[player_id] ~= unique
     client_names[player_id] = unique
+    -- A name arriving after the race started refreshes the live board, so the standings switch from the
+    -- BeamMP name to the set name without waiting for the next checkpoint.
+    if changed and session.progress then
+        broadcast_standings()
+    end
+    return unique, changed
+end
+
+-- Store a client's reported player-set name for identity resolution (ADR-0054). Connection-scoped: kept
+-- across races and lobby resets, cleared on disconnect, so the name is available from join onward. The
+-- value is opaque to the server (race-blind, ADR-0005) -- only echoed back as a display/record key.
+--
+-- The client sends this once at connect from its settings file, so a rejection here is a tampered or
+-- stale file rather than a player action: log it and drop it, no chat line.
+local function handle_client_identity(player_id, payload)
+    if type(payload) ~= "table" or type(payload.name) ~= "string" then
+        return
+    end
+    local requested = payload.name
+    local ok, reason = identity.validate(requested)
+    if not ok then
+        log_info("beamcomp.records", string.format("clientIdentity id=%s rejected: %s (name=%s)",
+            tostring(player_id), reason, requested))
+        return
+    end
+
+    local unique, changed = identity.apply(player_id, requested)
     log_info("beamcomp.records", string.format("clientIdentity id=%s name=%s%s",
         tostring(player_id), unique,
         unique ~= requested and (" (requested " .. requested .. ")") or ""))
@@ -6268,11 +6367,6 @@ local function handle_client_identity(player_id, payload)
     -- (the suffix is announced once, when it first takes effect).
     if changed and unique ~= requested then
         MP.SendChatMessage(player_id, "BeamComp: name taken, using " .. unique)
-    end
-    -- A name arriving mid-race (license name is reported at spawn) refreshes the live board so the
-    -- standings switch from the BeamMP name to the client name without waiting for the next checkpoint.
-    if changed and session.progress then
-        broadcast_standings()
     end
 end
 
