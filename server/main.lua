@@ -328,8 +328,8 @@ local client_names = {}
 local identity = {
     CHAT_COMMAND = "/name",
     MSG_SET = "nameSet",              -- server -> client: the accepted REQUESTED name, for the client to persist
-    MSG_UNNAMED = "unnamedPlayers",   -- server -> clients: who currently has no set name (setup panel)
-    MSG_REMIND = "remindUnnamed",     -- client -> server: admin asks us to hint every unnamed player
+    MSG_PLAYERS = "playerList",       -- server -> clients: every connected player + whether his name is temporary (setup panel)
+    MSG_REMIND = "remindUnnamed",     -- client -> server: admin asks us to hint every player still on a temporary name
     -- Name length in BYTES (#name), not codepoints: a name with umlauts therefore reaches the cap sooner
     -- than 20 visible characters. Deliberate -- a UTF-8-aware count is not worth its complexity for a
     -- display name, and the byte bound is what keeps the hand-assembled chat/standings lines sane. Do not
@@ -6340,7 +6340,6 @@ function identity.apply(player_id, requested)
         suffix = suffix + 1
         unique = requested .. tostring(suffix)
     end
-    local was_unnamed = client_names[player_id] == nil
     local changed = client_names[player_id] ~= unique
     client_names[player_id] = unique
     -- A name arriving after the race started refreshes the live board, so the standings switch from the
@@ -6348,11 +6347,12 @@ function identity.apply(player_id, requested)
     if changed and session.progress then
         broadcast_standings()
     end
-    -- The panel's list shrinks the moment a player names himself. Here rather than at the two call
-    -- sites: this is the only place a client_names entry is created, so the push cannot be forgotten by
-    -- a third entry point later.
-    if was_unnamed then
-        identity.broadcast_unnamed()
+    -- The panel's row for this player changes on ANY accepted name, not only on his first one: the list
+    -- shows every connected player, so a rename moves the row's text and its sort group. Here rather than
+    -- at the two call sites -- this is the only place a client_names entry is written, so the push cannot
+    -- be forgotten by a third entry point later.
+    if changed then
+        identity.broadcast_players()
     end
     return unique, changed
 end
@@ -6366,40 +6366,58 @@ function identity.is_enabled()
     return cfg.use_client_name == true
 end
 
--- The connected players who have no set name, as {id, name} sorted by the name they currently show
--- (ADR-0054). Derived from MP.GetPlayers() minus client_names on every call -- there is no second
--- bookkeeping table to keep in step with reality.
+-- EVERY connected player as {id, name, temporary}, for the race-setup panel's Players section
+-- (ADR-0054, round 2). `name` is the name the player is actually shown under -- resolve_identity, the
+-- same chokepoint the standings read -- and `temporary` marks a name BeamMP handed out that he can still
+-- replace with /name.
+--
+-- `temporary` is deliberately NOT simply "he has no client_names entry": with useClientName off nobody
+-- can change his name, so marking it temporary would be an instruction he cannot follow. The field says
+-- exactly what the marker in the panel claims, under both settings.
+--
+-- Derived from MP.GetPlayers() on every call -- there is no second bookkeeping table to keep in step with
+-- reality.
+--
+-- Sorted temporary-first, then alphabetically inside each group: the temporary names are the admin's
+-- reason to open this list, and a deterministic order keeps rows from jumping between pushes.
 --
 -- `leaving_id` drops one player from the result. The disconnect path needs it: onPlayerDisconnect may or
--- may not still list the leaving player (see is_server_empty_without), so without it a leaver could stay
--- in the admin's list until the next unrelated change.
-function identity.unnamed_list(leaving_id)
+-- may not still list the leaving player (see is_server_empty_without), so without it a leaver could
+-- linger in the admin's list until the next unrelated change.
+function identity.player_list(leaving_id)
     local rows = {}
-    if not identity.is_enabled() then
-        return rows  -- nobody is "unnamed" when a set name would not be shown anyway
-    end
+    local enabled = identity.is_enabled()
     for player_id, beammp_name in pairs(MP.GetPlayers()) do
-        if client_names[player_id] == nil and player_id ~= leaving_id then
-            rows[#rows + 1] = {id = player_id, name = beammp_name}
+        if player_id ~= leaving_id then
+            rows[#rows + 1] = {
+                id = player_id,
+                name = resolve_identity(player_id) or beammp_name,
+                temporary = enabled and client_names[player_id] == nil,
+            }
         end
     end
     table.sort(rows, function(a, b)
+        if a.temporary ~= b.temporary then
+            return a.temporary
+        end
         return tostring(a.name) < tostring(b.name)
     end)
     return rows
 end
 
--- Push the unnamed-player list to every client (ADR-0054), so an open race-setup panel reflects reality.
+-- Push the player list to every client (ADR-0054), so an open race-setup panel reflects reality.
 -- Broadcast rather than sent to admins only: the list carries names that are already on everyone's
 -- standings board, and filtering per player would mean tracking who is an admin -- new bookkeeping for
 -- nothing. Only the admin-gated panel renders it.
-function identity.broadcast_unnamed(leaving_id)
-    broadcast_event(identity.MSG_UNNAMED, {players = identity.unnamed_list(leaving_id)})
+function identity.broadcast_players(leaving_id)
+    broadcast_event(identity.MSG_PLAYERS, {players = identity.player_list(leaving_id)})
 end
 
--- The Remind button in the race-setup panel (ADR-0054): send the join hint to everyone still without a
--- name, so the admin can fix a grid full of guest names before the start instead of after it.
--- Admin-gated like the grid messages (ADR-0023) -- it writes to every player's chat.
+-- The Remind button in the race-setup panel (ADR-0054): send the join hint to everyone still on a
+-- temporary name, so the admin can fix a grid full of guest names before the start instead of after it.
+-- The panel lists ALL players but Remind targets only the temporary ones -- it filters the very list the
+-- panel renders, so the button can never reach somebody the panel does not mark.
+-- Admin-gated like the grid messages (ADR-0023) -- it writes to every targeted player's chat.
 --
 -- Reads the caller's name straight off MP.GetPlayers rather than through player_name_of: that local is
 -- declared further down the chunk, so a closure created here could not see it.
@@ -6415,23 +6433,32 @@ function identity.handle_remind(player_id)
         return
     end
 
-    local rows = identity.unnamed_list()
-    for _, row in ipairs(rows) do
-        MP.SendChatMessage(row.id, identity.HINT)
+    local reminded = 0
+    for _, row in ipairs(identity.player_list()) do
+        if row.temporary then
+            MP.SendChatMessage(row.id, identity.HINT)
+            reminded = reminded + 1
+        end
     end
-    MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d player(s) to set a name", #rows))
+    MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d player(s) to set a name", reminded))
     log_info("beamcomp.identity", string.format("%s by %s reached %d player(s)", identity.MSG_REMIND,
-        player_name, #rows))
+        player_name, reminded))
 end
 
--- Arm the one-time join hint for a player who has no name yet (ADR-0054). Called from the join events,
--- NOT emitting anything itself: a client that HAS a stored name reports it a moment after joining, so
--- hinting at the join instant would write to exactly the people who are about to be named. identity.step
--- emits it once the grace has passed and the player is still without an entry.
+-- A player joined (ADR-0054): put him on the panel's list and arm his one-time hint.
+--
+-- The two halves have DIFFERENT timing on purpose. The list is pushed NOW, because the panel shows every
+-- connected player and a join changes it immediately -- he appears at once marked `temporary name`, and
+-- loses the marker seconds later when his stored name arrives. The HINT waits out a grace instead: a
+-- client that HAS a stored name reports it a moment after joining, so hinting at the join instant would
+-- write to exactly the people who are about to be named. identity.step emits it once the grace has
+-- passed and the player is still without an entry.
 --
 -- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
--- events safe (see the MP.RegisterEvent block at the end of the file).
-function identity.arm_hint(player_id)
+-- events safe (see the MP.RegisterEvent block at the end of the file). The second call re-pushes the list
+-- as well, which also covers an earlier event that fired before MP.GetPlayers knew the id.
+function identity.handle_join(player_id)
+    identity.broadcast_players()
     if client_names[player_id] or not identity.is_enabled() then
         return
     end
@@ -6451,23 +6478,17 @@ function identity.step()
     end
     local due = now()
     local players = MP.GetPlayers()
-    local hinted = false
     for player_id, deadline in pairs(identity.pending) do
         if due >= deadline then
             identity.pending[player_id] = nil
             if client_names[player_id] == nil and players[player_id] then
                 MP.SendChatMessage(player_id, identity.HINT)
                 log_info("beamcomp.identity", "hinted id " .. tostring(player_id) .. " to set a name")
-                hinted = true
             end
         end
     end
-    -- A joiner enters the panel's list here, not at the join instant: until his grace has run out we do
-    -- not know whether he is about to report a stored name, and listing him meanwhile would make the
-    -- admin's list flicker on every join.
-    if hinted then
-        identity.broadcast_unnamed()
-    end
+    -- No list push here. The grace belongs to the HINT, not to the display: the player has been on the
+    -- panel's list since he joined, marked `temporary name`, and a chat line changes nothing about the row.
 end
 
 -- /name <x>: the player picks the name everyone sees (ADR-0054). Open to every player -- it changes only
@@ -6779,9 +6800,9 @@ local function handle_raceui_command(player_id, player_name)
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.
     send_event(player_id, champ.MSG, champ.snapshot())
     send_event(player_id, tour.MSG, tour.snapshot())
-    -- Same deal for the players who have not set a name (ADR-0054): seed the freshly opened panel, then
-    -- let identity.broadcast_unnamed keep it current.
-    send_event(player_id, identity.MSG_UNNAMED, {players = identity.unnamed_list()})
+    -- Same deal for the connected players (ADR-0054): seed the freshly opened panel, then let
+    -- identity.broadcast_players keep it current.
+    send_event(player_id, identity.MSG_PLAYERS, {players = identity.player_list()})
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
@@ -6814,14 +6835,12 @@ end
 local function on_player_disconnect(player_id)
     -- Drop the connection-scoped name regardless of phase (ADR-0054) -- a player may leave in lobby too,
     -- and with it any join hint still waiting out its grace.
-    local was_unnamed = client_names[player_id] == nil
     client_names[player_id] = nil
     identity.pending[player_id] = nil
-    -- Only when the leaver was actually ON the list: a named player leaving does not change it, and
-    -- broadcast_event would be writing to a socket that is going away for nothing.
-    if was_unnamed then
-        identity.broadcast_unnamed(player_id)
-    end
+    -- Unconditional: the panel lists EVERY connected player, so any leave changes it -- including a
+    -- leaver who had a set name. The id is passed because onPlayerDisconnect may or may not still list
+    -- him (see is_server_empty_without); without it he could linger in the admin's list.
+    identity.broadcast_players(player_id)
     -- Same for the lobby footprint (ADR-0051 round 2); a reconnecting player re-reports it.
     grid_fit.client_sizes[player_id] = nil
     if session.phase == PHASE.lobby then
@@ -7914,7 +7933,7 @@ end
 
 -- BeamMP event handler (must be global)
 function beamcomp_on_join(player_id)
-    return identity.arm_hint(player_id)
+    return identity.handle_join(player_id)
 end
 
 -- BeamMP event handler (must be global)
