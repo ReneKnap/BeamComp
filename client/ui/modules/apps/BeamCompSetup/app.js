@@ -108,6 +108,12 @@ angular.module('beamng.apps')
   //
   // An entry may be a FUNCTION of the scope where the useful answer depends on live state (see scope.tip).
   var TIPS = {
+    // --- Password lock (ADR-0056) ---
+    lockPassword: 'The password this server was given by whoever runs it. It is not your account '
+      + 'password and it is not saved -- you enter it once per session.',
+    lockSubmit: 'Check the password. If it is right, you can start races, edit grids and run the '
+      + 'championship until you leave the server.',
+
     // --- Toolbar ---
     settings: 'Settings for this panel. They are not part of the race.',
     includeDeprecated: 'Also list races from the old quickrace source. They still work, but they are no '
@@ -1213,6 +1219,69 @@ angular.module('beamng.apps')
         geCall('close_setup');
       };
 
+      // ----- Password lock (ADR-0056) ---------------------------------------------------------------
+      // A server with a racePassword answers /raceui from a player who has not unlocked yet with a
+      // LOCKED open: the whole panel is replaced by a password box (see app.html) until the server says
+      // otherwise.
+      //
+      // The panel decides nothing here. `scope.locked` is only ever written from a GE push, which is
+      // only ever written from a server message, and it is never cached anywhere that outlives the
+      // scope. That is not the security boundary anyway -- all 14 server-side admin checks re-verify
+      // every action, so a forced-open panel buys nothing. This is an operating gate and the discovery
+      // path for the password.
+      //
+      // `scope.lock` is a SEPARATE object from `scope.form` on purpose: formJson() serialises the form
+      // into the blob GE remembers and into a preset the server writes to beamcomp.presets.json. A
+      // password on the form would be persisted in plaintext and handed to every panel that loads that
+      // preset. Do not move these fields onto `form`, and do not put the password in localStorage --
+      // the grant deliberately ends when the player leaves the server.
+      scope.locked = false;
+      scope.lock = { password: '', error: '' };
+
+      scope.submitPassword = function () {
+        if (!scope.lock.password) {
+          return;
+        }
+        geLuaArg('submit_setup_password', scope.lock.password);
+        // Cleared on submit, not on the answer: the field is masked but the string still sits in the
+        // DOM, and a wrong password is retyped rather than corrected.
+        scope.lock.password = '';
+        scope.lock.error = '';
+      };
+
+      // GE pushes the lock state on the locked open, on a successful unlock, and as the answer to the
+      // link-time pull below -- a freshly-added app links after the open-time push, the same timing hole
+      // request_setup_data already covers.
+      scope.$on('BeamCompSetupLock', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.locked = !!(payload && payload.locked);
+          if (!scope.locked) {
+            scope.lock.password = '';
+            scope.lock.error = '';
+          }
+        });
+      });
+
+      // The server's verdict on an attempt. It ships the reason and the numbers; the wording lives here
+      // with the rest of the panel's copy. A success needs no line -- the panel simply opens.
+      scope.$on('BeamCompSetupUnlock', function (event, payload) {
+        scope.$evalAsync(function () {
+          var result = payload || {};
+          if (result.ok) {
+            scope.lock.error = '';
+            return;
+          }
+          if (result.reason === 'lockout') {
+            scope.lock.error = 'Too many wrong tries. Wait ' + (result.wait || 0)
+              + ' s and try again.';
+          } else if (result.reason === 'unavailable') {
+            scope.lock.error = 'This server has no password set.';
+          } else {
+            scope.lock.error = 'Wrong password. ' + (result.triesLeft || 0) + ' left before a cooldown.';
+          }
+        });
+      });
+
       // ----- Session autosave (bug setup-panel-settings-survive-ui-reload) ---------------------------
       // GE remembers the form for the session (ADR-0037), but the ONLY save used to be the Close button
       // above -- so a UI timeout/reload, which destroys this scope without ever running close(), threw
@@ -2128,6 +2197,10 @@ angular.module('beamng.apps')
       rebuildModeOpts();
       scope.refresh();
       geCall('request_setup_form');
+      // Whether this open was a LOCKED one (ADR-0056). Pulled like everything else on link, because a
+      // freshly-added app links after the open-time push. Until the answer arrives the panel renders
+      // unlocked -- which is only ever a display state; the server refuses every action regardless.
+      geCall('request_setup_lock');
       geCall('request_championship');
       geCall('request_tournament');
       geCall('request_race_phase');

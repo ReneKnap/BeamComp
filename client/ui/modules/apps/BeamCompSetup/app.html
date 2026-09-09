@@ -184,14 +184,61 @@
       background: #10131a; color: #e8eef5; border: 1px solid rgba(143, 211, 255, 0.35);
       border-radius: 3px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
       font-size: 12px; line-height: 1.35; white-space: normal; }
+    /* Password lock (ADR-0056). The one box that shows while `locked`, in place of the whole panel.
+       display: flex is what ng-show restores when it removes .ng-hide (which is display: none
+       !important), so this must stay a real display rule and not an inline style. It takes the
+       .bc-setup-scroll slot in the flex column, hence the same `flex: 1 1 auto`. */
+    .bc-lock { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center;
+      gap: 10px; padding: 16px 20px; overflow-y: auto; }
+    .bc-lock-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      font-size: 11px; color: #8fd3ff; }
+    .bc-lock-text { font-size: 12px; line-height: 1.4; opacity: 0.85; }
+    .bc-lock-row { display: flex; align-items: center; gap: 8px; }
+    .bc-lock-row input { flex: 1 1 auto; min-width: 0; background: #2a2e35; color: #f0f0f0;
+      border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 3px 6px; }
+    .bc-lock-ok { flex: 0 0 auto; background: #2e7d32; color: #fff; border: none; border-radius: 3px;
+      padding: 3px 14px; font-weight: 700; cursor: pointer; }
+    .bc-lock-ok[disabled] { background: #444; color: #999; cursor: default; }
+    .bc-lock-error { font-size: 12px; color: #f0a0a0; min-height: 16px; }
   </style>
+
+  <!-- Password lock (ADR-0056). This server has a racePassword and the player has not entered it yet, so
+       the whole panel is replaced by a password box until the server says otherwise.
+
+       The panel's four existing top-level children (toolbar, scrolling body, and both action rows, all
+       further down this file) carry ng-show="!locked", NOT ng-if, deliberately: an ng-if creates a child scope, and
+       this file already carries three warnings about ng-model on a bare primitive under an ng-if being
+       written onto that child scope and lost (presetName / presetSaveOpen are exactly that shape).
+       ng-show only toggles display, so nothing about the existing panel changes.
+
+       `locked` is set only from GE, which is set only by the server. The panel decides nothing -- and it
+       does not need to: every button it could show is re-checked server-side anyway. -->
+  <div class="bc-lock" ng-show="locked">
+    <div class="bc-lock-title">Server password</div>
+    <div class="bc-lock-text">This server is protected. Enter the server password to control races for
+      the rest of this session. Ask whoever runs the server for it.</div>
+    <div class="bc-lock-row">
+      <!-- type=password so the field is masked. It binds to `lock`, NEVER to `form`: formJson() (app.js)
+           serialises `form` into the blob GE remembers AND into a preset the server writes to
+           beamcomp.presets.json and hands to every panel that loads it. A password on `form` would be
+           persisted in plaintext and shipped around. Keep this on its own object. -->
+      <input type="password" ng-model="lock.password" placeholder="server password"
+        ng-keydown="$event.keyCode === 13 && submitPassword()" bc-setup-tip="tip('lockPassword')">
+      <button type="button" class="bc-lock-ok" ng-disabled="!lock.password" ng-click="submitPassword()"
+        bc-setup-tip="tip('lockSubmit')">Unlock</button>
+    </div>
+    <div class="bc-lock-error">{{lock.error}}</div>
+  </div>
+  <div class="bc-actions" ng-show="locked">
+    <button class="bc-close" ng-click="close()" bc-setup-tip="tip('close')">Close</button>
+  </div>
 
   <!-- Settings popover (setup-settings-menu): a gear on the right of the toolbar reuses the .bc-dd
        open/close + outside-click infra (scope.toggle / scope.open / closeOnOutsideClick). The .bc-dd
        wrapper is exactly what closeOnOutsideClick exempts, so a toggle click inside keeps it open while
        an outside click closes it -- no JS change. It houses the relocated "incl. deprecated" (keeps its
        ng-change="refresh()") and "Force" toggles. -->
-  <div class="bc-toolbar">
+  <div class="bc-toolbar" ng-show="!locked">
     <div class="bc-dd bc-settings">
       <button type="button" class="bc-dd-head bc-settings-head" ng-click="toggle('settings')" bc-setup-tip="tip('settings')">&#x2699;</button>
       <div class="bc-dd-list bc-settings-list" ng-if="open === 'settings'">
@@ -207,7 +254,7 @@
     </div>
   </div>
 
-  <div class="bc-setup-scroll">
+  <div class="bc-setup-scroll" ng-show="!locked">
 
     <!-- Basics -->
     <div class="bc-section">
@@ -756,7 +803,7 @@
 
   </div>
 
-  <div class="bc-actions">
+  <div class="bc-actions" ng-show="!locked">
     <!-- Label and code diverge on purpose: the button says "Confirm & Build Grid" (the press commits every
          setting in this panel AND spawns the field), while the handler stays prepareRace(), the flag
          `prepared` and the class .bc-prepare. Renaming those would be churn with no user-visible value and
@@ -773,7 +820,7 @@
   <!-- Race control (ADR-0038 amendment): stop the running race straight from the panel. Always present, but
        phase-gated -- Cancel is live in any non-lobby phase (incl. finished, to clear results + despawn);
        End & score only during racing. One-click, no confirm. The server still admin-gates and guards. -->
-  <div class="bc-actions bc-rc-actions">
+  <div class="bc-actions bc-rc-actions" ng-show="!locked">
     <button class="bc-cancel" ng-disabled="!canCancel()" ng-click="cancelRace()" bc-setup-tip="tip('cancelRace')">Cancel race</button>
     <button class="bc-end" ng-disabled="phase !== 'racing'" ng-click="endRace()" bc-setup-tip="tip('endRace')">End &amp; score</button>
   </div>
