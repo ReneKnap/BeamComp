@@ -267,6 +267,13 @@ angular.module('beamng.apps')
     tourReset: 'Put everyone back in the fastest class and start the ladder again. The tournament keeps '
       + 'running -- to stop it, set Mode to off.',
 
+    // --- Players ---
+    players: 'Everyone on the server right now. "temporary name" means BeamMP handed that name out and '
+      + 'the player has not picked his own yet -- he can, by typing "/name <his name>" in chat, and it '
+      + 'then sticks across restarts.',
+    remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick '
+      + 'their own. Nobody else is written to.',
+
     // --- Presets ---
     presetSave: 'Save everything on this panel under a name you can load again later.',
     presetLoad: 'Show the setups saved for this map.',
@@ -1320,6 +1327,33 @@ angular.module('beamng.apps')
         geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
       };
 
+      // Everyone on the server (ADR-0054): GE pushes the list when the panel opens and whenever it
+      // changes -- somebody picks a name, joins, or leaves. Kept as an array so the empty state is simply
+      // a length of zero. The server sorts it (temporary names first, alphabetical inside each group), so
+      // the rows do not reorder here.
+      scope.players = [];
+      scope.temporaryCount = 0;
+      scope.$on('BeamCompPlayers', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.players = (payload && payload.players) || [];
+          // Counted once per push, not from the template: an ng-disabled or a label that filtered the
+          // array would re-run on every digest.
+          var n = 0;
+          for (var i = 0; i < scope.players.length; i++) {
+            if (scope.players[i].temporary) { n++; }
+          }
+          scope.temporaryCount = n;
+        });
+      });
+
+      // Remind: the server sends the same chat line a joining player gets, to the players marked
+      // temporary and to nobody else -- it filters the very list it sent us, so the button can never
+      // reach somebody this panel does not mark. Admin-gated server-side like the grid messages, so a
+      // non-admin panel simply gets a refusal in chat.
+      scope.remindUnnamed = function () {
+        geCall('remind_unnamed');
+      };
+
       // Class-drop tournament state (ADR-0042): GE pushes the table + classes on open and on every change.
       // When a tournament is active, reflect it in the mode selector so the panel opens on the right section.
       scope.$on('BeamCompTournament', function (event, payload) {
@@ -2097,6 +2131,7 @@ angular.module('beamng.apps')
       geCall('request_championship');
       geCall('request_tournament');
       geCall('request_race_phase');
+      geCall('request_players');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars

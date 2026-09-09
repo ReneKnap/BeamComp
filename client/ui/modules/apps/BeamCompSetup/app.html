@@ -151,6 +151,27 @@
     .bc-row > span.bc-roster-carshown { flex: 1 1 auto; min-width: 0; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
     .bc-swatch-inline { display: inline-block; vertical-align: middle; width: 14px; height: 14px; }
+    /* The connected players (ADR-0054). The box has a FIXED height range, not an auto one, and min and
+       max stay equal: the list changes on every join, leave and /name, and a box that grows with it would
+       shove the Tournament and Presets sections up and down under the admin's cursor while he is using
+       them. A longer list scrolls inside the box.
+
+       "Five rows" is arithmetic here, not an estimate: the row pins its own line-height (16px) and adds
+       2px of padding, so a row is exactly 18px and the content box is exactly 5 x 18 = 90px. Without the
+       explicit line-height the row height would follow the font's default leading and the fit would be a
+       guess -- and a guess that lands one pixel over shows a permanent scrollbar for five players. */
+    .bc-players-list { min-height: 90px; max-height: 90px; overflow-y: auto; margin: 4px 0;
+      background: #20242b; border: 1px solid rgba(255,255,255,0.12); border-radius: 3px; padding: 2px 6px; }
+    /* One row, one line: the name takes the space and ellipsis-clips, the marker keeps its own width on
+       the right so a long name can never push it out of the box. align-items: center, not baseline --
+       baseline alignment of two different font sizes grows the line box by their descender difference,
+       which would quietly break the 18px arithmetic above. */
+    .bc-player-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; line-height: 16px; }
+    .bc-player-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; }
+    .bc-player-temp { flex: 0 0 auto; opacity: 0.65; font-style: italic; font-size: 11px;
+      white-space: nowrap; }
+    .bc-players-empty { padding: 1px 0; line-height: 16px; opacity: 0.7; font-style: italic; }
     /* Hover help (bcSetupTip, ADR-0049). Native title= renders NOTHING in BeamNG -- the UI is drawn in an
        off-screen CEF and native tooltips are painted by browser chrome an off-screen renderer does not
        have -- so the help text is a box in our own DOM instead. One per panel, reused, positioned by the
@@ -527,6 +548,33 @@
           <label class="bc-row" bc-setup-tip="tip('aiRubber')"><span>Rubberband</span><input type="number" min="0" max="1" step="0.05" ng-model="form.aiRubber" placeholder="{{aiParamHint('rubber')}}"></label>
           <label class="bc-row bc-check" bc-setup-tip="tip('aiAvoid')"><input type="checkbox" ng-model="form.aiAvoid"><span>Avoid cars</span></label>
         </div>
+      </div>
+    </div>
+
+    <!-- Players (ADR-0054, round 2): everyone on the server, with the ones still on a BeamMP-assigned
+         name marked, so the admin sees before the start whether the standings will be full of guest
+         names. Remind chat-hints exactly the marked ones and nobody else (the server admin-gates it and
+         decides who, from the same list it sent). Sits above Tournament so it is seen on the way down
+         the panel. -->
+    <div class="bc-section">
+      <div class="bc-section-title">Players</div>
+      <!-- track by p.id: two guests can carry the same BeamMP name, which a bare ng-repeat rejects
+           outright ("Duplicates in a repeater"), and it also keeps Angular from stamping $$hashKey onto
+           rows that came straight off the wire. The server owns the order (temporary first, then
+           alphabetical), so there is no orderBy here to fight it. -->
+      <div class="bc-players-list" bc-setup-tip="tip('players')">
+        <div class="bc-player-row" ng-repeat="p in players track by p.id">
+          <span class="bc-player-name">{{p.name}}</span>
+          <span class="bc-player-temp" ng-if="p.temporary">temporary name</span>
+        </div>
+        <div class="bc-players-empty" ng-if="!players.length">nobody connected</div>
+      </div>
+      <!-- The count and the disabled state hang on the TEMPORARY players, not on the list length: the
+           list is non-empty as soon as anyone is on the server, but Remind has nobody to write to unless
+           somebody is still on a name BeamMP gave him. -->
+      <div class="bc-row">
+        <button class="bc-refresh" ng-disabled="!temporaryCount" ng-click="remindUnnamed()"
+          bc-setup-tip="tip('remindUnnamed')">Remind ({{temporaryCount}})</button>
       </div>
     </div>
 

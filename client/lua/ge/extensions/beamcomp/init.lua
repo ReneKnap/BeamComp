@@ -102,10 +102,15 @@ M.uilayout = require("beamcomp/race/uilayout")
 --          in server/main.lua, which folds this verdict and its own checkpoint-gap backstop into ONE
 --          predicate. Deliberately not a field on `quali`: this runs in the racing phase too, where
 --          there is no qualifying session at all.
+-- identity -- the player-set name (ADR-0054): the settings file it is persisted in, the one report to
+--          the server at connect, and the admin panel's "who has no name" list. It carries NO cached
+--          copy of the name -- the file is the truth and is re-read on load, which is what makes a GE
+--          Lua reload a non-event here (ADR-0052).
 local quali = {}
 local hold = {}
 local setup = {}
 local stall = {}
+local identity = {}
 -- ===== end namespace tables =============================================================
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
@@ -220,7 +225,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "stats-hidden-switch/2026-09-08"
+local BUILD_MARKER = "player-list-panel/2026-09-09"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -302,7 +307,6 @@ M.state = {
     staged_spec = nil,        -- spec {model, config, paint...} of the last COMPLIANT staged car, to revert an over-cap staging swap back to (ADR-0032), or nil
     revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
     staging_swap_reverting = false,  -- true only for the restage cycle that our revert started, so its known-compliant car is adopted without re-gating; recomputed from revert_pending at each consume (prevents a revert loop, ADR-0032)
-    reported_name = nil,      -- the license name last sent to the server (ADR-0031 amendment); the staging poll re-reports only when the plate changes from this
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
     ai_config = nil,          -- host only: relayed AI difficulty/vehicle config {preset, car, params} (ADR-0036 Etappe B), or nil
     ai_policy = nil,          -- host only: the vehicle policy used for the AI car chain (ADR-0032), kept so a quali re-grid can re-spawn fresh AI (ADR-0041), or nil
@@ -331,6 +335,7 @@ M.state = {
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
+    player_list = nil,        -- latest server-broadcast list of the connected players {{id, name, temporary}, ...} (ADR-0054), or nil; rendered in the setup panel's Players section. Safe at nil across a GE reload: the panel then shows its empty state until the next broadcast, and the server pushes on every join, leave and accepted name
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
     qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
     quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
@@ -397,14 +402,6 @@ end
 -- Client->server send primitive; defined below but forward-declared so the event handlers (and the
 -- HANDLERS table) above its definition can reference it.
 local send_to_server
-
--- Reports this client's BeamNG license name as the canonical identity (ADR-0031); defined far below but
--- called from handle_race_start (at spawn) above its definition, so forward-declared here.
-local report_identity
-
--- Re-reads the own car's plate during staging and re-reports it on a change (ADR-0031 amendment); defined
--- far below but called from handle_race_phase's countdown branch above its definition, so forward-declared.
-local poll_staging_identity
 
 -- Disarms the seated car's VE recovery override; defined far below (next to the assist push) but used
 -- earlier in handle_race_phase's lobby teardown, so forward-declared here (ADR-0017).
@@ -776,7 +773,7 @@ local function handle_race_start(payload)
     -- message, not piggybacked on the ack above, so the spawnReady contract stays narrow. Echo
     -- payload.race like the ack so the server's race-guard matches. Sent unconditionally;
     -- collect_client_info degrades every field to nil on a spawn hiccup. The player identity rides a
-    -- separate clientIdentity message (below), since it is connection-scoped, not per-race (ADR-0031).
+    -- separate clientIdentity message (at connect), since it is connection-scoped, not per-race (ADR-0054).
     local client_info = vehicles.collect_client_info(race_car)
     send_to_server("clientInfo", {
         race = payload.race,
@@ -789,12 +786,6 @@ local function handle_race_start(payload)
         carLength = client_info.car_length,
         carWidth = client_info.car_width,
     })
-
-    -- Refresh the canonical identity from the race car now that it exists (ADR-0031): the license name
-    -- needs a vehicle, and this is the reliable point where one is guaranteed -- the connect-time report
-    -- is only best-effort. The server resolves identities live, so a name arriving here updates the
-    -- standings/records for this race.
-    report_identity(race_car)
 
     -- Host only: spawn the AI opponents the server assigned this client (ADR-0036). Only the owner's
     -- raceStart carries aiSlots, so non-owners skip this entirely -- they just receive the synced cars and
@@ -1478,10 +1469,6 @@ local function handle_race_phase(payload)
         -- each whole second and plays the final beeps on the centered overlay (ADR-0021).
         lock.install()
         M.state.staging = nil
-        -- Lock in a license name the player changed in the final staging moment (ADR-0031 amendment): the
-        -- per-frame poll is throttled, so force one last re-read at the GO boundary -- "last value at GO
-        -- wins". After this, no re-read runs (the poll is staging-gated), so an in-race change has no effect.
-        poll_staging_identity(true)
         -- Anchor the count to a wall clock (os.clockhp) rather than accumulating the clamped per-frame dt,
         -- so a spawn/despawn hitch at the quali seam can't make it finish behind the server's wall-time
         -- phase (ADR-0041); the quali re-grid now re-spawns the AI a lead time earlier, so this count is
@@ -1512,12 +1499,11 @@ local function handle_race_phase(payload)
         if quali_state and quali_state.staged then
             -- Rally staged sprint quali (ADR-0044/Round3): nobody drives at the gun and there is NO global
             -- pre-quali countdown -- the server sent us straight from staging into qualifying. Upgrade to the
-            -- full fixed-car lock (normally done at the countdown phase we skipped) and lock in the license
-            -- name now; keep the car frozen at its slot. The server places the field: it stages the front
-            -- driver at P1 (qualiStage) and holds the rest on slots 2..N (qualiHold). No detector, lap clock,
-            -- or sector tracker until this driver launches; clear the overlay for the per-driver counts.
+            -- full fixed-car lock (normally done at the countdown phase we skipped); keep the car frozen at
+            -- its slot. The server places the field: it stages the front driver at P1 (qualiStage) and holds
+            -- the rest on slots 2..N (qualiHold). No detector, lap clock, or sector tracker until this
+            -- driver launches; clear the overlay for the per-driver counts.
             lock.install()
-            poll_staging_identity(true)
             M.state.staging = nil
             M.state.countdown = nil
             M.state.quali_staged = true
@@ -2904,6 +2890,23 @@ function M.request_tournament()
     end
 end
 
+-- Re-push the last-known player list to the panel (UI -> GE, ADR-0054), mirroring request_championship
+-- so a freshly linked or reopened panel fills without waiting for the next server broadcast. Public as
+-- beamcomp_init.request_players.
+function M.request_players()
+    if guihooks then
+        guihooks.trigger("BeamCompPlayers", {players = M.state.player_list or {}})
+    end
+end
+
+-- The panel's Remind button (ADR-0054): ask the server to chat-hint every player still on a temporary
+-- name. The panel lists everyone, but Remind deliberately targets only those -- the server decides who,
+-- from the same list it sent us. Admin-gated server-side like the grid messages. Public as
+-- beamcomp_init.remind_unnamed.
+function M.remind_unnamed()
+    send_to_server("remindUnnamed", {})
+end
+
 -- Push one model's configs to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this when
 -- the car model changes; configs are probed lazily per model since an all-models probe is heavy. Public
 -- so the app can reach it as beamcomp_init.request_car_configs.
@@ -3803,6 +3806,26 @@ local HANDLERS = {
             end
         end
     end,
+    -- The server accepted a /name (ADR-0054): persist what the player TYPED, so the next session reports
+    -- it without him typing anything. The command is entered into chat, which this Lua never sees, so the
+    -- server telling us is the only way we can learn it. Defined inline -- a table field costs no
+    -- top-level local, and the identity block that owns save() is assigned further down this chunk.
+    nameSet = function(payload)
+        if type(payload) == "table" then
+            identity.save(payload.name)
+        end
+    end,
+    -- Every connected player plus whether his name is a temporary one (ADR-0054), seeded on /raceui and
+    -- re-broadcast on every join, leave and accepted name. Cache it and push it straight to the setup
+    -- panel, exactly like handle_championship -- the panel is not on the per-frame HUD path, so it needs
+    -- the immediate push.
+    playerList = function(payload)
+        M.state.player_list = (type(payload) == "table" and type(payload.players) == "table")
+            and payload.players or {}
+        if guihooks then
+            guihooks.trigger("BeamCompPlayers", {players = M.state.player_list})
+        end
+    end,
     championship = handle_championship,
     tournament = handle_tournament,
     quali = quali.handle_snapshot,
@@ -4170,71 +4193,56 @@ local function ensure_registered()
     log("I", LOG_TAG, "registered handler on channel " .. EVENT_CHANNEL)
 end
 
--- This client's BeamNG license name for the canonical identity (ADR-0031), or nil. The license name is
--- what the player sets in BeamNG's options -- the same identity BeamNG's own race highscores use
--- (raceHighscoresLap.lua). Read off the given vehicle's plate, pcall-guarded (the global is unverified
--- under BeamMP). nil when there is no vehicle, no name set, or the read fails -- the server then falls
--- back to the BeamMP name. Steam/online profile names are empty under BeamMP's guest login, so the
--- license name is the only persistent client-side identity available (verified in-game 2026-06-06).
-local function collect_player_name(veh)
-    if not veh then
+-- Where the player-set name lives (ADR-0054). A settings file, so it survives a game restart and travels
+-- with the player to any BeamComp server -- the same mechanism and path shape BeamMP's own MPConfig uses
+-- for /settings/BeamMP/config.json (MPConfig.lua:189/276/296), so it is proven in exactly this
+-- environment.
+identity.PATH = "/settings/beamcomp_identity.json"
+
+-- The stored name, or nil. A missing file, a malformed file or an unexpected shape all mean "no name
+-- set" -- never an error (jsonReadFile returns nil for all three, lua/common/utils.lua:476).
+--
+-- Read from disk on every call rather than cached in a local: the file is the single truth, so a GE Lua
+-- reload cannot leave a stale copy behind (ADR-0052) and there is no field whose correctness depends on
+-- its own previous value.
+function identity.load()
+    local ok, data = pcall(jsonReadFile, identity.PATH)
+    if not ok or type(data) ~= "table" or type(data.name) ~= "string" or data.name == "" then
         return nil
     end
-    local ok, name = pcall(function()
-        if type(core_vehicles) == "table"
-                and type(core_vehicles.getVehicleLicenseText) == "function" then
-            return core_vehicles.getVehicleLicenseText(veh)
-        end
-        return nil
-    end)
-    if ok and type(name) == "string" and name ~= "" then
-        return name
-    end
-    return nil
+    return data.name
 end
 
--- Report this client's BeamNG license name to the server (ADR-0031), so it keys every identity -- live
--- standings, results, records -- on the persistent license name instead of the rotating BeamMP guest
--- name. Called at connect (the player's freeroam car, best-effort) and at race spawn (the race car), so
--- a name set before the race is picked up early and reliably refreshed once the race car exists. A nil
--- name is not sent and the server falls back to the BeamMP name. send_to_server is a no-op until the MP
--- client is connected. Assigns the forward-declared local so handle_race_start can call it.
-function report_identity(veh)
-    local name = collect_player_name(veh)
-    if name then
-        log("I", LOG_TAG, "reporting client identity: " .. name)
-        send_to_server("clientIdentity", {name = name})
-        -- Remember what we sent so the staging poll only re-reports on an actual change (ADR-0031 amendment).
-        M.state.reported_name = name
+-- Persist the name the server accepted (ADR-0054). The value is what the player TYPED, not the
+-- collision-suffixed form that took effect: storing "SPEEDY2" would strand him on the suffix long after
+-- the colliding player left, while re-requesting "SPEEDY" each session correctly drops it once free.
+-- Skips the write when nothing changed, so a normal session touches the disk zero times.
+function identity.save(name)
+    if type(name) ~= "string" or name == "" or name == identity.load() then
+        return
+    end
+    local ok, written = pcall(jsonWriteFile, identity.PATH, {name = name}, true)
+    if ok and written then
+        log("I", LOG_TAG, "stored race name '" .. name .. "' in " .. identity.PATH)
     else
-        log("W", LOG_TAG, "no client name available; server will use the BeamMP name")
+        log("W", LOG_TAG, "could not store the race name in " .. identity.PATH)
     end
 end
 
--- os.clock() reading of the last staging identity poll, throttling the per-frame plate re-read below.
-local last_identity_poll_at = 0
-local STAGING_IDENTITY_POLL_INTERVAL = 0.75
-
--- Pick up a license-name change the player makes during the staging wait (ADR-0031 amendment): the name is
--- otherwise reported only at connect and at spawn (handle_race_start), so a plate edited via BeamNG's
--- vehicle/parts config after spawn never reaches the server. Re-read the own car's plate and re-report when
--- it differs from the last sent name. `force` skips the throttle for the staging->countdown lock-in ("last
--- value at GO wins"); the per-frame onUpdate call throttles. Only runs in staging (the caller gates phase),
--- so an in-race name change still has no effect. Re-resolve the own car each time -- a staging config-respawn
--- replaces the handle (memory beamcomp-respawn-own-at-traps); the restage repoints current_vehicle_id first.
-function poll_staging_identity(force)
-    if not force and os.clock() - last_identity_poll_at < STAGING_IDENTITY_POLL_INTERVAL then
+-- Report the stored name to the server so it keys every identity -- live standings, results, the grid
+-- roster -- on the name the player picked instead of his rotating BeamMP guest name (ADR-0054).
+--
+-- Once, at connect. There is nothing to re-read later: the name is a file, not a property of a car, so
+-- the ADR-0031 spawn report, staging poll and GO lock-in are all gone. No stored name means we send
+-- nothing and the server shows the BeamMP name -- and hints the player about /name.
+function identity.report()
+    local name = identity.load()
+    if not name then
+        log("I", LOG_TAG, "no race name set; the server will show the BeamMP name")
         return
     end
-    last_identity_poll_at = os.clock()
-    local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
-    if not own then
-        return
-    end
-    local name = collect_player_name(own)
-    if name and name ~= M.state.reported_name then
-        report_identity(own)
-    end
+    log("I", LOG_TAG, "reporting race name: " .. name)
+    send_to_server("clientIdentity", {name = name})
 end
 
 function M.onExtensionLoaded()
@@ -4263,10 +4271,10 @@ function M.onExtensionLoaded()
     if own then
         M.state.current_vehicle_id = own:getId()
     end
-    -- Report our BeamNG license name so the server can use it as the canonical identity (ADR-0031).
-    -- Best-effort from the current freeroam car; refreshed reliably from the race car at spawn. Fires on
-    -- a Lua reload / reconnect too, so a reconnecting client re-reports.
-    report_identity(own)
+    -- Report the name the player set with /name, so the server keys every identity on it (ADR-0054).
+    -- Read from the settings file, so it needs no vehicle and no later refresh. Fires on a Lua reload /
+    -- reconnect too, so a reconnecting client re-reports.
+    identity.report()
     -- Include a distinctive build marker so a redeploy can be confirmed live in beamng.log before trusting
     -- an in-game result -- the BeamMP client mod cache can serve a stale zip (memory
     -- beammp-client-mod-cache-stale).
@@ -5405,7 +5413,7 @@ local function build_hud_snapshot()
                 end
             end
             -- Stable per-row key for the client's position-gain flash (keyed across frames, independent of
-            -- the standings windowing): the server slot when present, else the canonical name (ADR-0031).
+            -- the standings windowing): the server slot when present, else the canonical name (ADR-0054).
             entries[i] = {
                 id = (e.slot ~= nil and "s" .. tostring(e.slot)) or ("n" .. tostring(e.name)),
                 position = e.position,
@@ -6479,13 +6487,12 @@ local function restage_swapped_car(dt_real)
     -- The new car's jbeam is loaded now (the restage waited for it), so its licenseplate init has
     -- already run -- apply the player's captured plate here, where it sticks instead of being
     -- regenerated. Only a forced/fresh spawn set restage_plate; a staging swap leaves it nil and keeps
-    -- its own plate. The plate is the canonical identity (ADR-0031), so re-report it once corrected.
+    -- its own plate. Purely cosmetic since ADR-0054: the plate carries no identity any more, it just
+    -- keeps the player's car looking like his car across a forced respawn.
     if M.state.restage_plate then
         local applied, plate_err = vehicles.apply_plate(own, M.state.restage_plate)
         if not applied then
             log("W", RACE_LOG_TAG, "could not apply plate to restaged car: " .. tostring(plate_err))
-        else
-            report_identity(own)
         end
         M.state.restage_plate = nil
     end
@@ -6800,11 +6807,6 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing"
         or M.state.phase == "qualifying" or M.state.phase == "qualiResults") and M.state.race then
         push_assist_arm()
-    end
-    -- Pick up a license-name change made during the staging wait (ADR-0031 amendment). Staging only, so an
-    -- in-race name change still has no effect; the GO boundary forces a final re-read (handle_race_phase).
-    if M.state.phase == "staging" and M.state.race then
-        poll_staging_identity(false)
     end
     -- Arm the EV start-freeze throttle clamp over the frozen phases (staging + countdown), so it lifts on
     -- racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs. Skip it during an F1

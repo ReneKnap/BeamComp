@@ -127,7 +127,7 @@ local MSG_VEHICLE_LIST = "vehicleList"  -- a client's /cars reply: pre-formatted
 local MSG_RACE_VALIDATION = "raceValidation"  -- the issuer's pre-flight verdict on /race options (ADR-0019)
 local MSG_SPAWN_READY = "spawnReady"  -- a client's "car spawned + seated" ack, gating spawning (ADR-0006 amendment)
 local MSG_CLIENT_INFO = "clientInfo"  -- a client's vehicle metadata for best-times records (ADR-0027)
-local MSG_CLIENT_IDENTITY = "clientIdentity"  -- a client's BeamNG name, reported on connect, for identity resolution (ADR-0031)
+local MSG_CLIENT_IDENTITY = "clientIdentity"  -- a client's player-set name, reported on connect, for identity resolution (ADR-0054)
 local MSG_GRID_SAVE = "gridSave"      -- editor saves a named grid for a race (ADR-0023; admin-gated)
 local MSG_GRID_ASSIGN = "gridAssign"  -- editor sets a race's default grid (ADR-0023; admin-gated)
 local MSG_GRID_DELETE = "gridDelete"  -- editor deletes one of a race's saved grids (ADR-0023; admin-gated)
@@ -250,7 +250,7 @@ local session = {
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
     spawn_pending = nil,      -- set of rostered player ids whose spawnReady ack is still awaited (ADR-0006 amendment)
     spawn_ready_count = 0,    -- how many distinct clients acked spawnReady this race (0 at timeout = empty race)
-    identities = nil,         -- per-player {vehicle, pwr, car_length, car_width} reported via clientInfo, for records (ADR-0027) + start-order (ADR-0033) + slot reservation (ADR-0051); name moved to client_names (ADR-0031)
+    identities = nil,         -- per-player {vehicle, pwr, car_length, car_width} reported via clientInfo, for records (ADR-0027) + start-order (ADR-0033) + slot reservation (ADR-0051); name moved to client_names (ADR-0054)
     grid_record = nil,        -- the active race's resolved grid record (ADR-0023), kept so the slot reservation can read its gaps + column pin (ADR-0051); per-race
     grid_direction = nil,     -- the active race's relayed travel direction, picking the grid record's forward/reverse block exactly as the clients do
     grid_ramp = nil,          -- true when the clients split a P1 start ramp off the front of the layout (staged sprint quali, ADR-0044): participant slot k sits at layout index k + 1
@@ -285,8 +285,8 @@ local CONFIG_CANDIDATE_PATHS = {
 -- costs one local no matter how many settings it grows.
 --   * `admins` / `admin_gate_active` -- normalized (trimmed, lowercased) admin names -> true, and
 --     whether the race-admin gate is on at all (no admins configured = everyone may start races).
---   * `use_client_name` -- whether player identity resolves to the client-reported BeamNG name instead
---     of the BeamMP name (ADR-0031). Default on -- a missing or unparseable config keeps it on, so the
+--   * `use_client_name` -- whether player identity resolves to the client-reported player-set name
+--     instead of the BeamMP name (ADR-0054). Default on -- a missing/unparseable config keeps it on, so the
 --     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
 --   * `stats_enabled` -- whether the per-run statistics subsystem exists at all (ADR-0053): the run log,
 --     best times, track records, the bestNotice toast, the raceRecords push, the analysis overlay and
@@ -303,14 +303,55 @@ local cfg = {
     stats_enabled = false,
 }
 
--- Connection-scoped BeamNG name per player id (ADR-0031), reported once on connect via clientIdentity
--- and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is per race --
--- so resolve_identity has the name from join onward. An opaque client string (race-blind, ADR-0005).
+-- Connection-scoped player-set name per player id (ADR-0054), reported once on connect via
+-- clientIdentity and cleared on disconnect. Survives lobby resets -- unlike session.identities, which is
+-- per race -- so resolve_identity has the name from join onward. An opaque client string (race-blind,
+-- ADR-0005).
+--
+-- A PLAIN player_id -> name MAP, walked with pairs() by the collision check and the disconnect clear.
+-- NEVER hang a function, a flag or any other non-name field on it: it would be read as somebody's
+-- player name. New identity code goes on the `identity` namespace below instead.
 local client_names = {}
 
--- The canonical display/record identity for a player (ADR-0031): the client-reported BeamNG name when
--- the option is on and one was reported, else the BeamMP name. The single chokepoint every name read
--- goes through -- the option and the fallback live here only. nil only if BeamMP has no name for the id.
+-- Everything the player-set identity needs (ADR-0054, superseding ADR-0031): the /name command, its
+-- validation, the shared collision suffix, the delayed join hint and the admin-facing "who has no name"
+-- surface.
+--
+-- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
+-- (see the f1 / grid_store / runlog namespaces above), and a table costs ONE local no matter how much it
+-- carries. Message-type strings and chat texts are top-level locals too when written as `local MSG_...`,
+-- so they ride here as fields as well.
+--
+-- Constants and state live here; the functions are assigned in a later block, after the locals they
+-- close over (send_event, broadcast_event, broadcast_standings, is_race_admin, normalize_name). A table
+-- field needs no forward declaration and every cross-call is a runtime lookup, so the order is free.
+local identity = {
+    CHAT_COMMAND = "/name",
+    MSG_SET = "nameSet",              -- server -> client: the accepted REQUESTED name, for the client to persist
+    MSG_PLAYERS = "playerList",       -- server -> clients: every connected player + whether his name is temporary (setup panel)
+    MSG_REMIND = "remindUnnamed",     -- client -> server: admin asks us to hint every player still on a temporary name
+    -- Name length in BYTES (#name), not codepoints: a name with umlauts therefore reaches the cap sooner
+    -- than 20 visible characters. Deliberate -- a UTF-8-aware count is not worth its complexity for a
+    -- display name, and the byte bound is what keeps the hand-assembled chat/standings lines sane. Do not
+    -- "fix" this to a utf8.len.
+    MIN_BYTES = 2,
+    MAX_BYTES = 20,
+    -- Seconds between a player joining and the hint being emitted. A client that HAS a stored name
+    -- reports it a moment after the join, so an immediate check would hint at exactly the people who are
+    -- about to be named; the grace lets that report land first.
+    HINT_DELAY = 8,
+    -- player_id -> deadline (now()) for a hint that is armed but not yet due.
+    pending = {},
+}
+identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHAT_COMMAND
+    .. " <your name>\" to pick the name everyone sees"
+identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
+    .. identity.MIN_BYTES .. "-" .. identity.MAX_BYTES .. " characters, spaces allowed)"
+
+-- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
+-- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
+-- name read goes through -- the option and the fallback live here only. nil only if BeamMP has no name
+-- for the id.
 local function resolve_identity(player_id)
     if cfg.use_client_name then
         local name = client_names[player_id]
@@ -476,7 +517,7 @@ local function load_config()
         return
     end
 
-    -- Default on (ADR-0031): only an explicit false turns it off; a missing key stays on.
+    -- Default on (ADR-0054): only an explicit false turns it off; a missing key stays on.
     cfg.use_client_name = config.useClientName ~= false
     log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
 
@@ -2105,7 +2146,7 @@ end
 
 -- The roster shipped to every client: each player's slot + name, in slot order. Used
 -- client-side for the full grid layout and marker labels. The name resolves through resolve_identity
--- (ADR-0031), so the grid labels show the client name like every other surface.
+-- (ADR-0054), so the grid labels show the player-set name like every other surface.
 local function build_roster(slots)
     local roster = {}
     for _, entry in ipairs(slots) do
@@ -2123,8 +2164,8 @@ local function build_progress(slots)
     local progress = {}
     for _, entry in ipairs(slots) do
         progress[entry.id] = {
-            -- The BeamMP name as a baseline (ADR-0031); standings and records resolve the canonical
-            -- client name live via resolve_identity, since it may only arrive at spawn (license name).
+            -- The BeamMP name as a baseline (ADR-0054); standings and records resolve the canonical
+            -- player-set name live via resolve_identity, since a player may still set one mid-session.
             name = entry.name,
             slot = entry.slot,
             completed = 0,
@@ -2219,8 +2260,8 @@ local function build_standings(final)
             id = item.id,
             position = i,
             slot = record.slot,
-            -- Resolve the canonical identity live (ADR-0031): the license name may have arrived only at
-            -- spawn, after this player's progress baseline was seeded with the BeamMP name.
+            -- Resolve the canonical identity live (ADR-0054): a player may set his name after this
+            -- progress baseline was seeded with the BeamMP name.
             name = resolve_identity(item.id) or record.name,
             completed = record.completed,
             count = record.count or known_count,
@@ -5503,6 +5544,9 @@ end
 local function tick()
     expire_stale_validation()
     maybe_warn_cleanup()
+    -- Ahead of the lobby early return below: a player who just joined and has no name is sitting in the
+    -- lobby, which is precisely where his hint has to reach him (ADR-0054).
+    identity.step()
 
     local phase = session.phase
     if phase == PHASE.lobby then
@@ -6154,7 +6198,7 @@ end
 -- the spawnReady ack -- accepted only during an active race for the matching race name -- so a stale
 -- report from a previous race is dropped. The values are opaque to the server (race-blind, ADR-0005);
 -- they are read at the finish capture. Identity is no longer carried here -- it is reported once on
--- connect via clientIdentity (ADR-0031). Logged once so the unverified vehicle globals are visible.
+-- connect via clientIdentity (ADR-0054). Logged once so the unverified vehicle globals are visible.
 local function handle_client_info(player_id, payload)
     if session.phase == PHASE.lobby or type(payload) ~= "table"
         or payload.race ~= session.race then
@@ -6229,21 +6273,59 @@ local function handle_client_info(player_id, payload)
     grid_fit.apply("clientInfo")
 end
 
--- Store a client's reported BeamNG name for identity resolution (ADR-0031). Connection-scoped: kept
--- across races and lobby resets, cleared on disconnect, so the name is available from join onward. The
--- value is opaque to the server (race-blind, ADR-0005) -- only echoed back as a display/record key.
--- Logged once so the unverified client name source is visible in the server console.
-local function handle_client_identity(player_id, payload)
-    if type(payload) ~= "table" or type(payload.name) ~= "string" or payload.name == "" then
-        return
+-- Whether `candidate` may be used as a player-set name (ADR-0054). Returns true, or false plus the chat
+-- line explaining what is wrong -- the /name handler posts that line verbatim, so each rejection reads as
+-- its own reason instead of one generic refusal.
+--
+-- Runs on BOTH entry points: the /name command AND the connect report. The client persists its name in a
+-- player-editable JSON file, so validating only the command would leave the `guest` disguise rule and the
+-- admin-name rule bypassable with a text editor. A name that /name accepted always passes here, so this
+-- rejects nothing legitimate.
+function identity.validate(candidate)
+    if type(candidate) ~= "string" then
+        return false, identity.USAGE  -- defensive: /name and the report both hand over a string
     end
-    -- Disambiguate a name that collides with ANOTHER connected player's identity (ADR-0031 amendment):
-    -- staging-time plate changes make accidental same-name collisions easy, which would silently merge two
-    -- players' live standings and this session's records. Append the lowest free integer (SPEEDY -> SPEEDY2
-    -- -> SPEEDY3). The own entry is skipped, so an unchanged re-report keeps its name and reverting to a
-    -- now-free name drops the suffix. Cross-session/historical record collisions stay accepted (decision 5).
-    -- Function-local only -- no new top-level local (the main.lua local ceiling is full).
-    local requested = payload.name
+    -- Bytes, not characters -- see identity.MAX_BYTES.
+    if #candidate < identity.MIN_BYTES or #candidate > identity.MAX_BYTES then
+        return false, string.format("BeamComp: a name is %d-%d characters long (yours is %d)",
+            identity.MIN_BYTES, identity.MAX_BYTES, #candidate)
+    end
+    -- Defensive: the chat lines and standings entries around this name are assembled by hand, and a
+    -- newline or a terminal escape inside one would corrupt them.
+    --
+    -- A byte scan, not a pattern: the obvious "[%z\1-\31]" leans on the %z class, which Lua 5.2 REMOVED
+    -- (this server runs 5.3.5, where an unknown class letter is documented to match that literal
+    -- character -- so on a stricter build the class would silently start rejecting every name containing
+    -- a "z" instead of a control character). This loop cannot drift with the interpreter.
+    for i = 1, #candidate do
+        if candidate:byte(i) < 0x20 then
+            return false, "BeamComp: a name may not contain control characters"
+        end
+    end
+    local normalized = normalize_name(candidate)
+    -- A player calling himself "guest…" would look unnamed and so escape the join hint and the admin's
+    -- reminder list -- the one hole that would defeat the whole discovery mechanism.
+    if normalized:sub(1, 5) == "guest" then
+        return false, "BeamComp: a name may not start with \"guest\""
+    end
+    -- Wearing an admin's name visually. Meaningful only while the gate is active: a server with no admins
+    -- configured has an empty allowlist and nothing to protect (ADR-0016).
+    if cfg.admins[normalized] == true then
+        return false, "BeamComp: that name belongs to a race admin"
+    end
+    return true
+end
+
+-- Store `requested` as this player's identity, disambiguated against the other connected players
+-- (ADR-0054, carrying over the ADR-0031 amendment). Returns the name that took effect plus whether it
+-- changed. The single implementation both entry points -- /name and the connect report -- go through, so
+-- the two can never drift apart.
+--
+-- Append the lowest free integer on a collision (SPEEDY -> SPEEDY2 -> SPEEDY3); without it two connected
+-- players with one name would silently merge in the live standings and in this session's records. The own
+-- entry is skipped, so an unchanged re-report keeps its name and reverting to a now-free name drops the
+-- suffix. Cross-session/historical collisions stay accepted (ADR-0031 decision 5).
+function identity.apply(player_id, requested)
     local function taken(candidate)
         for id, name in pairs(client_names) do
             if id ~= player_id and name == candidate then
@@ -6260,7 +6342,218 @@ local function handle_client_identity(player_id, payload)
     end
     local changed = client_names[player_id] ~= unique
     client_names[player_id] = unique
-    log_info("beamcomp.records", string.format("clientIdentity id=%s name=%s%s",
+    -- A name arriving after the race started refreshes the live board, so the standings switch from the
+    -- BeamMP name to the set name without waiting for the next checkpoint.
+    if changed and session.progress then
+        broadcast_standings()
+    end
+    -- The panel's row for this player changes on ANY accepted name, not only on his first one: the list
+    -- shows every connected player, so a rename moves the row's text and its sort group. Here rather than
+    -- at the two call sites -- this is the only place a client_names entry is written, so the push cannot
+    -- be forgotten by a third entry point later.
+    if changed then
+        identity.broadcast_players()
+    end
+    return unique, changed
+end
+
+-- Whether player-set names do anything on this server (ADR-0054). `useClientName` is an operator-editable
+-- key in the shipped beamcomp.config.json (ADR-0031 §4): with it off, resolve_identity ignores
+-- client_names entirely, so a name set here would change nothing anywhere. Everything the feature shows
+-- the player -- the command, the join hint, the admin's list -- goes through this, so an operator who
+-- turns identity off gets a server that says so rather than one that quietly ignores /name.
+function identity.is_enabled()
+    return cfg.use_client_name == true
+end
+
+-- EVERY connected player as {id, name, temporary}, for the race-setup panel's Players section
+-- (ADR-0054, round 2). `name` is the name the player is actually shown under -- resolve_identity, the
+-- same chokepoint the standings read -- and `temporary` marks a name BeamMP handed out that he can still
+-- replace with /name.
+--
+-- `temporary` is deliberately NOT simply "he has no client_names entry": with useClientName off nobody
+-- can change his name, so marking it temporary would be an instruction he cannot follow. The field says
+-- exactly what the marker in the panel claims, under both settings.
+--
+-- Derived from MP.GetPlayers() on every call -- there is no second bookkeeping table to keep in step with
+-- reality.
+--
+-- Sorted temporary-first, then alphabetically inside each group: the temporary names are the admin's
+-- reason to open this list, and a deterministic order keeps rows from jumping between pushes.
+--
+-- `leaving_id` drops one player from the result. The disconnect path needs it: onPlayerDisconnect may or
+-- may not still list the leaving player (see is_server_empty_without), so without it a leaver could
+-- linger in the admin's list until the next unrelated change.
+function identity.player_list(leaving_id)
+    local rows = {}
+    local enabled = identity.is_enabled()
+    for player_id, beammp_name in pairs(MP.GetPlayers()) do
+        if player_id ~= leaving_id then
+            rows[#rows + 1] = {
+                id = player_id,
+                name = resolve_identity(player_id) or beammp_name,
+                temporary = enabled and client_names[player_id] == nil,
+            }
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.temporary ~= b.temporary then
+            return a.temporary
+        end
+        return tostring(a.name) < tostring(b.name)
+    end)
+    return rows
+end
+
+-- Push the player list to every client (ADR-0054), so an open race-setup panel reflects reality.
+-- Broadcast rather than sent to admins only: the list carries names that are already on everyone's
+-- standings board, and filtering per player would mean tracking who is an admin -- new bookkeeping for
+-- nothing. Only the admin-gated panel renders it.
+function identity.broadcast_players(leaving_id)
+    broadcast_event(identity.MSG_PLAYERS, {players = identity.player_list(leaving_id)})
+end
+
+-- The Remind button in the race-setup panel (ADR-0054): send the join hint to everyone still on a
+-- temporary name, so the admin can fix a grid full of guest names before the start instead of after it.
+-- The panel lists ALL players but Remind targets only the temporary ones -- it filters the very list the
+-- panel renders, so the button can never reach somebody the panel does not mark.
+-- Admin-gated like the grid messages (ADR-0023) -- it writes to every targeted player's chat.
+--
+-- Reads the caller's name straight off MP.GetPlayers rather than through player_name_of: that local is
+-- declared further down the chunk, so a closure created here could not see it.
+function identity.handle_remind(player_id)
+    local player_name = MP.GetPlayers()[player_id]
+    if not player_name then
+        return
+    end
+    if not is_race_admin(player_name) then
+        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to remind players")
+        log_info("beamcomp.identity", "denied " .. identity.MSG_REMIND .. " from " .. player_name
+            .. " (not a race admin)")
+        return
+    end
+
+    local reminded = 0
+    for _, row in ipairs(identity.player_list()) do
+        if row.temporary then
+            MP.SendChatMessage(row.id, identity.HINT)
+            reminded = reminded + 1
+        end
+    end
+    MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d player(s) to set a name", reminded))
+    log_info("beamcomp.identity", string.format("%s by %s reached %d player(s)", identity.MSG_REMIND,
+        player_name, reminded))
+end
+
+-- A player joined (ADR-0054): put him on the panel's list and arm his one-time hint.
+--
+-- The two halves have DIFFERENT timing on purpose. The list is pushed NOW, because the panel shows every
+-- connected player and a join changes it immediately -- he appears at once marked `temporary name`, and
+-- loses the marker seconds later when his stored name arrives. The HINT waits out a grace instead: a
+-- client that HAS a stored name reports it a moment after joining, so hinting at the join instant would
+-- write to exactly the people who are about to be named. identity.step emits it once the grace has
+-- passed and the player is still without an entry.
+--
+-- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
+-- events safe (see the MP.RegisterEvent block at the end of the file). The second call re-pushes the list
+-- as well, which also covers an earlier event that fired before MP.GetPlayers knew the id.
+function identity.handle_join(player_id)
+    identity.broadcast_players()
+    if client_names[player_id] or not identity.is_enabled() then
+        return
+    end
+    identity.pending[player_id] = now() + identity.HINT_DELAY
+end
+
+-- Emit any join hint whose grace has run out. Called from the top of tick(), ABOVE its lobby early
+-- return: the lobby is exactly where a joining player is.
+--
+-- The `client_names[id] == nil` test here is the ONE place that decides whether a hint is still
+-- warranted -- neither /name nor the connect report clears the pending entry, so there is no list of
+-- accept paths that has to stay complete for the rule to hold. Clearing the entry before the send makes
+-- it a one-shot even if the send throws; a player who is named by now, or gone, gets nothing.
+function identity.step()
+    if next(identity.pending) == nil then
+        return
+    end
+    local due = now()
+    local players = MP.GetPlayers()
+    for player_id, deadline in pairs(identity.pending) do
+        if due >= deadline then
+            identity.pending[player_id] = nil
+            if client_names[player_id] == nil and players[player_id] then
+                MP.SendChatMessage(player_id, identity.HINT)
+                log_info("beamcomp.identity", "hinted id " .. tostring(player_id) .. " to set a name")
+            end
+        end
+    end
+    -- No list push here. The grace belongs to the HINT, not to the display: the player has been on the
+    -- panel's list since he joined, marked `temporary name`, and a chat line changes nothing about the row.
+end
+
+-- /name <x>: the player picks the name everyone sees (ADR-0054). Open to every player -- it changes only
+-- how that player is labelled, never what he may do. parse_command already hands over the trimmed
+-- remainder of the line, so "/name Max Mustermann" arrives whole and spaces need no handling here.
+--
+-- The phase gate sits AHEAD of the content rules on purpose: during a race the reason a /name is refused
+-- is the lock, and answering "your name is too long" instead would send the player off fixing something
+-- that was never going to be accepted either way. Read off the PHASE table, so a renamed phase is a load
+-- error rather than a silently dead comparison.
+function identity.handle_command(player_id, player_name, argument)
+    if not identity.is_enabled() then
+        MP.SendChatMessage(player_id, "BeamComp: this server shows BeamMP names -- "
+            .. identity.CHAT_COMMAND .. " is switched off")
+        return
+    end
+    if argument == nil or argument == "" then
+        MP.SendChatMessage(player_id, identity.USAGE)
+        return
+    end
+
+    if session.phase ~= PHASE.lobby and session.phase ~= PHASE.staging then
+        MP.SendChatMessage(player_id, "BeamComp: too late to change your name -- "
+            .. identity.CHAT_COMMAND .. " works in the lobby and while the field is staging")
+        return
+    end
+
+    local ok, reason = identity.validate(argument)
+    if not ok then
+        MP.SendChatMessage(player_id, reason)
+        return
+    end
+
+    local unique = identity.apply(player_id, argument)
+    log_info("beamcomp.identity", string.format("%s by %s (id=%s) -> %s", identity.CHAT_COMMAND,
+        tostring(player_name), tostring(player_id), unique))
+    -- Send back what the player TYPED, not the suffixed form that took effect: the client persists this
+    -- value, and storing "SPEEDY2" would strand him on the suffix forever, while re-requesting "SPEEDY"
+    -- each session correctly drops it once the colliding player is gone.
+    send_event(player_id, identity.MSG_SET, {name = argument})
+    MP.SendChatMessage(player_id, unique == argument
+        and ("BeamComp: you race as " .. unique)
+        or ("BeamComp: name taken -- you race as " .. unique))
+end
+
+-- Store a client's reported player-set name for identity resolution (ADR-0054). Connection-scoped: kept
+-- across races and lobby resets, cleared on disconnect, so the name is available from join onward. The
+-- value is opaque to the server (race-blind, ADR-0005) -- only echoed back as a display/record key.
+--
+-- The client sends this once at connect from its settings file, so a rejection here is a tampered or
+-- stale file rather than a player action: log it and drop it, no chat line.
+local function handle_client_identity(player_id, payload)
+    if type(payload) ~= "table" or type(payload.name) ~= "string" then
+        return
+    end
+    local requested = payload.name
+    local ok, reason = identity.validate(requested)
+    if not ok then
+        log_info("beamcomp.identity", string.format("clientIdentity id=%s rejected: %s (name=%s)",
+            tostring(player_id), reason, requested))
+        return
+    end
+
+    local unique, changed = identity.apply(player_id, requested)
+    log_info("beamcomp.identity", string.format("clientIdentity id=%s name=%s%s",
         tostring(player_id), unique,
         unique ~= requested and (" (requested " .. requested .. ")") or ""))
     -- Tell the player the adjusted name when it was suffixed, so the standings name is not a silent surprise.
@@ -6268,11 +6561,6 @@ local function handle_client_identity(player_id, payload)
     -- (the suffix is announced once, when it first takes effect).
     if changed and unique ~= requested then
         MP.SendChatMessage(player_id, "BeamComp: name taken, using " .. unique)
-    end
-    -- A name arriving mid-race (license name is reported at spawn) refreshes the live board so the
-    -- standings switch from the BeamMP name to the client name without waiting for the next checkpoint.
-    if changed and session.progress then
-        broadcast_standings()
     end
 end
 
@@ -6512,6 +6800,9 @@ local function handle_raceui_command(player_id, player_name)
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.
     send_event(player_id, champ.MSG, champ.snapshot())
     send_event(player_id, tour.MSG, tour.snapshot())
+    -- Same deal for the connected players (ADR-0054): seed the freshly opened panel, then let
+    -- identity.broadcast_players keep it current.
+    send_event(player_id, identity.MSG_PLAYERS, {players = identity.player_list()})
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
@@ -6542,8 +6833,14 @@ end
 -- A player leaving mid-race is marked DNF so the race can still settle; if they were the last one
 -- there is no one to race, so fall back to lobby instead (ADR-0014).
 local function on_player_disconnect(player_id)
-    -- Drop the connection-scoped name regardless of phase (ADR-0031) -- a player may leave in lobby too.
+    -- Drop the connection-scoped name regardless of phase (ADR-0054) -- a player may leave in lobby too,
+    -- and with it any join hint still waiting out its grace.
     client_names[player_id] = nil
+    identity.pending[player_id] = nil
+    -- Unconditional: the panel lists EVERY connected player, so any leave changes it -- including a
+    -- leaver who had a set name. The id is passed because onPlayerDisconnect may or may not still list
+    -- him (see is_server_empty_without); without it he could linger in the admin's list.
+    identity.broadcast_players(player_id)
     -- Same for the lobby footprint (ADR-0051 round 2); a reconnecting player re-reports it.
     grid_fit.client_sizes[player_id] = nil
     if session.phase == PHASE.lobby then
@@ -6653,6 +6950,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == CHAT_COMMAND_PING then
         handle_ping_command(player_id, player_name)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == identity.CHAT_COMMAND then
+        identity.handle_command(player_id, player_name, argument)
         return 1  -- suppress the command's own chat echo
     end
 
@@ -7532,6 +7834,8 @@ local function handle_client_event(player_id, data)
         handle_client_info(player_id, decoded.payload)
     elseif decoded.type == MSG_CLIENT_IDENTITY then
         handle_client_identity(player_id, decoded.payload)
+    elseif decoded.type == identity.MSG_REMIND then
+        identity.handle_remind(player_id)
     elseif decoded.type == grid_fit.MSG_SIZE then
         grid_fit.handle_size(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
@@ -7628,6 +7932,11 @@ function beamcomp_on_tick()
 end
 
 -- BeamMP event handler (must be global)
+function beamcomp_on_join(player_id)
+    return identity.handle_join(player_id)
+end
+
+-- BeamMP event handler (must be global)
 function beamcomp_on_disconnect(player_id)
     return on_player_disconnect(player_id)
 end
@@ -7639,6 +7948,18 @@ end
 
 MP.RegisterEvent("onChatMessage", "beamcomp_on_chat")
 MP.RegisterEvent("onInit", "beamcomp_on_init")
+-- BOTH join events, onto the same handler (ADR-0054). MP.RegisterEvent takes any string, and an event
+-- name the server does not know is a SILENT no-op -- the same class of trap as the engine input-action
+-- names in CLAUDE.md, with no error and no log line to notice it by.
+--   * onPlayerJoin is the intended one: BeamMP-Server v3.9.2 carries it as a standalone string literal
+--     immediately after its " is now synced!" log line, i.e. the sync-complete path fires it.
+--   * onPlayerJoining is the only join event our own references/beammp-server-api.md documents, and it
+--     exists in the binary too (it fires earlier, right after the mod download).
+-- Arming is idempotent and a re-arm only pushes the deadline later, so when both fire the grace ends up
+-- anchored on the later one. Registering both costs a line and removes the whole "did we pick the right
+-- name" failure mode.
+MP.RegisterEvent("onPlayerJoin", "beamcomp_on_join")
+MP.RegisterEvent("onPlayerJoining", "beamcomp_on_join")
 MP.RegisterEvent("onPlayerDisconnect", "beamcomp_on_disconnect")
 MP.RegisterEvent(TICK_EVENT, "beamcomp_on_tick")
 MP.RegisterEvent(EVENT_CHANNEL, "beamcomp_on_client_event")

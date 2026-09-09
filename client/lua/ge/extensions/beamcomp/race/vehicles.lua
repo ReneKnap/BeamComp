@@ -1516,7 +1516,7 @@ end
 -- resolved race car (the caller already holds it). Every engine read is pcall-guarded and degrades to
 -- nil: the BeamNG globals for vehicle details are UNVERIFIED under BeamMP, so any gap yields a nil field
 -- rather than an error -- the server stores nil vehicle fields. Player identity is no longer collected
--- here -- it is reported separately on connect (ADR-0031). Returns {vehicle = {model, type, variant,
+-- here -- it is reported separately on connect (ADR-0054). Returns {vehicle = {model, type, variant,
 -- modified}}.
 function M.collect_client_info(veh)
     local info = {vehicle = {model = nil, type = nil, variant = nil, modified = nil}}
