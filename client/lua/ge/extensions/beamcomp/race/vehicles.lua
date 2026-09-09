@@ -962,8 +962,10 @@ end
 -- (public) Read a vehicle's current license-plate text, so the race-start path can capture the player's
 -- plate BEFORE a forced/substitute spawn despawns their car, then re-apply it to the new car once its
 -- jbeam has loaded (M.apply_plate). pcall-guarded -- core_vehicles.getVehicleLicenseText is unverified
--- under BeamMP (the same read collect_player_name uses in init.lua). Returns a non-empty string, or nil
--- when there is no vehicle, no plate set, or the read fails (nil -> keep the generated plate).
+-- under BeamMP. This is now the ONLY plate read left in the mod: the plate stopped being the player's
+-- identity with ADR-0054, and what survives here is purely cosmetic plate preservation across a
+-- respawn. Returns a non-empty string, or nil when there is no vehicle, no plate set, or the read
+-- fails (nil -> keep the generated plate).
 function M.read_plate(veh)
     if not veh then
         return nil
