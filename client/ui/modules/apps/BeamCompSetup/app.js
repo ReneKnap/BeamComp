@@ -268,9 +268,11 @@ angular.module('beamng.apps')
       + 'running -- to stop it, set Mode to off.',
 
     // --- Players ---
-    unnamed: 'Players who have not picked a name yet. They show up in the standings under the name '
-      + 'BeamMP gave them. Anyone can pick one by typing "/name <their name>" in chat.',
-    remindUnnamed: 'Send everyone on this list a chat line telling them how to pick a name.',
+    players: 'Everyone on the server right now. "temporary name" means BeamMP handed that name out and '
+      + 'the player has not picked his own yet -- he can, by typing "/name <his name>" in chat, and it '
+      + 'then sticks across restarts.',
+    remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick '
+      + 'their own. Nobody else is written to.',
 
     // --- Presets ---
     presetSave: 'Save everything on this panel under a name you can load again later.',
@@ -1325,18 +1327,29 @@ angular.module('beamng.apps')
         geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
       };
 
-      // Players without a set name (ADR-0054): GE pushes the list when the panel opens and whenever it
+      // Everyone on the server (ADR-0054): GE pushes the list when the panel opens and whenever it
       // changes -- somebody picks a name, joins, or leaves. Kept as an array so the empty state is simply
-      // a length of zero.
-      scope.unnamed = [];
-      scope.$on('BeamCompUnnamed', function (event, payload) {
+      // a length of zero. The server sorts it (temporary names first, alphabetical inside each group), so
+      // the rows do not reorder here.
+      scope.players = [];
+      scope.temporaryCount = 0;
+      scope.$on('BeamCompPlayers', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.unnamed = (payload && payload.players) || [];
+          scope.players = (payload && payload.players) || [];
+          // Counted once per push, not from the template: an ng-disabled or a label that filtered the
+          // array would re-run on every digest.
+          var n = 0;
+          for (var i = 0; i < scope.players.length; i++) {
+            if (scope.players[i].temporary) { n++; }
+          }
+          scope.temporaryCount = n;
         });
       });
 
-      // Remind: the server sends every listed player the same chat line a joining player gets. Admin-gated
-      // server-side like the grid messages, so a non-admin panel simply gets a refusal in chat.
+      // Remind: the server sends the same chat line a joining player gets, to the players marked
+      // temporary and to nobody else -- it filters the very list it sent us, so the button can never
+      // reach somebody this panel does not mark. Admin-gated server-side like the grid messages, so a
+      // non-admin panel simply gets a refusal in chat.
       scope.remindUnnamed = function () {
         geCall('remind_unnamed');
       };
@@ -2118,7 +2131,7 @@ angular.module('beamng.apps')
       geCall('request_championship');
       geCall('request_tournament');
       geCall('request_race_phase');
-      geCall('request_unnamed');
+      geCall('request_players');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars

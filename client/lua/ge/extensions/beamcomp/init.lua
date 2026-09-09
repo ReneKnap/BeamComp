@@ -335,7 +335,7 @@ M.state = {
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
-    unnamed = nil,            -- latest server-broadcast list of players with no set name {{id, name}, ...} (ADR-0054), or nil; rendered in the setup panel's Players section. Safe at nil across a GE reload: the panel then shows its empty state until the next broadcast, and the server pushes on every change
+    player_list = nil,        -- latest server-broadcast list of the connected players {{id, name, temporary}, ...} (ADR-0054), or nil; rendered in the setup panel's Players section. Safe at nil across a GE reload: the panel then shows its empty state until the next broadcast, and the server pushes on every join, leave and accepted name
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
     qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
     quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
@@ -2890,17 +2890,19 @@ function M.request_tournament()
     end
 end
 
--- Re-push the last-known unnamed-player list to the panel (UI -> GE, ADR-0054), mirroring
--- request_championship so a freshly linked or reopened panel fills without waiting for the next server
--- broadcast. Public as beamcomp_init.request_unnamed.
-function M.request_unnamed()
+-- Re-push the last-known player list to the panel (UI -> GE, ADR-0054), mirroring request_championship
+-- so a freshly linked or reopened panel fills without waiting for the next server broadcast. Public as
+-- beamcomp_init.request_players.
+function M.request_players()
     if guihooks then
-        guihooks.trigger("BeamCompUnnamed", {players = M.state.unnamed or {}})
+        guihooks.trigger("BeamCompPlayers", {players = M.state.player_list or {}})
     end
 end
 
--- The panel's Remind button (ADR-0054): ask the server to chat-hint every player who has not set a name.
--- The server admin-gates it, like the grid messages. Public as beamcomp_init.remind_unnamed.
+-- The panel's Remind button (ADR-0054): ask the server to chat-hint every player still on a temporary
+-- name. The panel lists everyone, but Remind deliberately targets only those -- the server decides who,
+-- from the same list it sent us. Admin-gated server-side like the grid messages. Public as
+-- beamcomp_init.remind_unnamed.
 function M.remind_unnamed()
     send_to_server("remindUnnamed", {})
 end
@@ -3813,14 +3815,15 @@ local HANDLERS = {
             identity.save(payload.name)
         end
     end,
-    -- Who currently has no set name (ADR-0054), seeded on /raceui and re-broadcast on every change.
-    -- Cache it and push it straight to the setup panel, exactly like handle_championship -- the panel is
-    -- not on the per-frame HUD path, so it needs the immediate push.
-    unnamedPlayers = function(payload)
-        M.state.unnamed = (type(payload) == "table" and type(payload.players) == "table")
+    -- Every connected player plus whether his name is a temporary one (ADR-0054), seeded on /raceui and
+    -- re-broadcast on every join, leave and accepted name. Cache it and push it straight to the setup
+    -- panel, exactly like handle_championship -- the panel is not on the per-frame HUD path, so it needs
+    -- the immediate push.
+    playerList = function(payload)
+        M.state.player_list = (type(payload) == "table" and type(payload.players) == "table")
             and payload.players or {}
         if guihooks then
-            guihooks.trigger("BeamCompUnnamed", {players = M.state.unnamed})
+            guihooks.trigger("BeamCompPlayers", {players = M.state.player_list})
         end
     end,
     championship = handle_championship,
