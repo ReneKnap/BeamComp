@@ -333,6 +333,7 @@ M.state = {
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
+    setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
     player_list = nil,        -- latest server-broadcast list of the connected players {{id, name, temporary}, ...} (ADR-0054), or nil; rendered in the setup panel's Players section. Safe at nil across a GE reload: the panel then shows its empty state until the next broadcast, and the server pushes on every join, leave and accepted name
@@ -2968,6 +2969,9 @@ function setup.clear()
     M.state.setup_seen = false
     M.state.setup_ack_gap = 0
     M.state.setup_restored = false
+    -- The next open re-asserts this from the server, so forgetting it here is the safe direction
+    -- (ADR-0056): a closed panel cannot be locked, and a reopen decides afresh.
+    M.state.setup_locked = false
 end
 
 -- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
@@ -3231,12 +3235,80 @@ local function handle_setup_open(_payload)
     push_setup_data(false)
     -- Ensure the panel app is on the current layout (ADR-0012 best-effort auto-add); dedups by appName.
     M.uilayout.ensure_visible("beamCompSetup")
+    -- A normal open is BY DEFINITION an authorized open -- the server sends setupOpen only downstream of
+    -- its admin check -- so it also lifts the lock (ADR-0056). Clearing it here as well as in the unlock
+    -- verdict is what makes the unlock order-independent: whichever of the two messages lands first, the
+    -- panel ends up unlocked.
+    M.state.setup_locked = false
+    setup.push_lock()
     -- Remember this (server-authorized) open, so a UI reload that drops the app can be recovered once.
     setup.arm()
     -- Auto-minimize the final standings card so the opening panel has a clear view. Only visible in the
     -- finished phase (the snapshot gates it), so this is inert otherwise; manual restore via
     -- M.toggle_results_min and the per-race reset (driving-phase start) stay the counter-force.
     M.state.results_min = true
+end
+
+-- ===== race-setup panel password lock (ADR-0056) ==================================================
+-- A server with a racePassword answers /raceui from a non-admin with setupLocked instead of a refusal:
+-- the panel opens showing only a password box, the player submits, and the server either grants him
+-- race admin for the rest of his connection or refuses.
+--
+-- GE is a relay here and decides nothing. The lock state is set only by a server message, the password
+-- is passed through without being kept or logged, and the verdict's wording is left to the panel. Two
+-- functions on the existing `setup` namespace rather than two new top-level locals -- init.lua sits at
+-- LuaJIT's 200-local ceiling. Both are assigned above the HANDLERS table, which reads them at load.
+
+-- The client -> server message type carrying a password attempt. A field rather than a literal because
+-- send_to_server has to recognise it too, to keep its payload-size instrumentation off this one message
+-- (see there) -- and two copies of the string is exactly how that exemption would quietly stop matching.
+setup.MSG_UNLOCK = "raceUnlock"
+
+-- Tell the panel whether it is locked. Also the answer to its link-time pull: a freshly-added app links
+-- AFTER the open-time push, exactly as with the setup dataset, so the panel asks for this itself too.
+function setup.push_lock()
+    guihooks.trigger("BeamCompSetupLock", {locked = M.state.setup_locked})
+end
+
+-- Open the panel in its LOCKED state (server -> client, setupLocked). Deliberately does not push the
+-- setup dataset: the panel pulls what it needs on link, and withholding it would buy nothing anyway --
+-- the same data is broadcast to every client. The presence watchdog is armed exactly as for a normal
+-- open, so a locked panel lost to a UI reload comes back locked.
+function setup.handle_locked(_payload)
+    M.uilayout.ensure_visible("beamCompSetup")
+    M.state.setup_locked = true
+    setup.push_lock()
+    setup.arm()
+end
+
+-- The server's verdict on a password attempt (server -> client, unlockResult). On success the server
+-- also sends the normal open, which fills the panel and clears the lock on its own -- doing it here as
+-- well is what makes the two messages order-independent. The payload's numbers (triesLeft, wait) are
+-- relayed verbatim; the panel words them.
+function setup.handle_result(payload)
+    if type(payload) == "table" and payload.ok then
+        M.state.setup_locked = false
+        setup.push_lock()
+    end
+    guihooks.trigger("BeamCompSetupUnlock", payload or {})
+end
+
+-- Submit a password attempt (UI -> GE, ADR-0056). Public as beamcomp_init.submit_setup_password.
+--
+-- The string is forwarded and forgotten: never stored in M.state, never written to the setup form (which
+-- GE remembers and the server persists as a preset), and NEVER logged -- not the value, not its length,
+-- not even on a failure. The server logs who tried, which is the part an operator needs.
+function M.submit_setup_password(password)
+    if type(password) ~= "string" or password == "" then
+        return
+    end
+    send_to_server(setup.MSG_UNLOCK, {password = password})
+end
+
+-- Push the lock state on demand (UI -> GE): the panel's link-time pull. Public as
+-- beamcomp_init.request_setup_lock.
+function M.request_setup_lock()
+    setup.push_lock()
 end
 
 -- Push the dataset on demand (UI -> GE, ADR-0037): the panel calls this on link -- so a freshly-added app
@@ -3852,6 +3924,9 @@ local HANDLERS = {
     bestNotice = handle_best_notice,
     raceRecords = handle_race_records,
     setupOpen = handle_setup_open,
+    -- Race-setup panel password lock (ADR-0056): the locked open and the verdict on an attempt.
+    setupLocked = setup.handle_locked,
+    unlockResult = setup.handle_result,
     gridSetupOpen = handle_grid_setup_open,
 }
 
@@ -4626,7 +4701,14 @@ function send_to_server(message_type, payload)
     -- The envelope is already encoded here, so its size is free to take (bug offroad-race-massive-
     -- network-payload-lag): this is the client->server measurement point -- it is what shows the
     -- raceValidation weighing tens of KB, and what proves the ADR-0046 gate brought it down.
-    netsize.note(message_type, #encoded)
+    --
+    -- ONE exemption: the password attempt (ADR-0056). netsize.note logs a "payload peak" line naming the
+    -- type and the byte count, and this envelope is otherwise fixed-size -- so the number would put the
+    -- password's LENGTH in the client log. There is nothing to diagnose here either: it is a one-shot
+    -- message of a few dozen bytes, while the instrumentation exists for the multi-kilobyte ones.
+    if message_type ~= setup.MSG_UNLOCK then
+        netsize.note(message_type, #encoded)
+    end
     local sent, err = pcall(TriggerServerEvent, EVENT_CHANNEL, encoded)
     if not sent then
         log("W", LOG_TAG, "TriggerServerEvent failed for '" .. message_type .. "': "
