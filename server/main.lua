@@ -271,35 +271,38 @@ local session = {
     race_event = nil,         -- id shared by every logged run of THIS race instance (ADR-0050), so field size, start slot and finishing position can be related across rows; assigned in start_race
 }
 
--- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race, /raceend and
--- /raceclear; it is loaded on init from the plugin config file. Candidate paths tolerate the unverified
--- runtime working directory (recon TODO #4) -- server root first, then the plugin folder. An empty,
--- missing, or unparseable config leaves the gate inactive (opt-in: everyone may start/end races).
+-- Race-command permissions / plugin settings (ADR-0016, format superseded by ADR-0056). The race-admin
+-- allowlist gates /race, /raceend and /raceclear; it is loaded on init from the plugin settings file.
+-- Candidate paths tolerate the unverified runtime working directory (recon TODO #4) -- server root
+-- first, then the plugin folder. A missing file, or one that sets nothing, leaves the gate inactive
+-- (opt-in: everyone may start/end races).
 local CONFIG_CANDIDATE_PATHS = {
-    "Resources/Server/BeamComp/beamcomp.config.json",
-    "beamcomp.config.json",
+    "Resources/Server/BeamComp/beamcomp.config.ini",
+    "beamcomp.config.ini",
 }
 
--- The plugin config, as read from beamcomp.config.json (ADR-0016). One namespace table rather than a
--- local per setting: main.lua lives at LuaJIT's 200-local ceiling (see grid_store / f1), and a table
--- costs one local no matter how many settings it grows.
+-- The plugin settings, as read from beamcomp.config.ini (ADR-0016; the format is ADR-0056 round 3).
+-- One namespace table rather than a local per setting: main.lua lives at LuaJIT's 200-local ceiling
+-- (see grid_store / f1), and a table costs one local no matter how many settings -- or, since round 3,
+-- how many parser helpers -- it grows.
 --   * `admins` / `admin_gate_active` -- normalized (trimmed, lowercased) admin names -> true, and
 --     whether the race-admin gate is on at all (no admins configured = everyone may start races).
 --   * `use_client_name` -- whether player identity resolves to the client-reported player-set name
---     instead of the BeamMP name (ADR-0054). Default on -- a missing/unparseable config keeps it on, so the
---     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
+--     instead of the BeamMP name (ADR-0054). Default on -- a missing file or an unreadable line keeps it on, so the
+--     guest-name fix applies out of the box. Set false in beamcomp.config.ini to fall back everywhere.
 --   * `stats_enabled` -- whether the per-run statistics subsystem exists at all (ADR-0053): the run log,
 --     best times, track records, the bestNotice toast, the raceRecords push, the analysis overlay and
---     /analysis. JSON key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
---     use_client_name above: only an explicit `true` enables it, so a missing key, a missing file, a
---     malformed file or a non-boolean value all leave the feature dead. A suppression switch has to fail
---     closed. The key is DELIBERATELY ABSENT from the shipped beamcomp.config.json -- it is documented
---     here and in ADR-0053, not in the file users read, so the feature does not exist to anyone who was
---     not told about it. Do not "helpfully" add it to the shipped config.
+--     /analysis. Settings key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
+--     use_client_name above: only an explicit `true` enables it, so a missing key, an empty value, a
+--     missing file or a typo all leave the feature dead. A suppression switch has to fail closed. The
+--     key is DELIBERATELY ABSENT from the shipped beamcomp.config.ini -- it is documented here and in
+--     ADR-0053, not in the file users read, so the feature does not exist to anyone who was not told
+--     about it. Do not "helpfully" add it to the shipped settings file, not even with a nice comment:
+--     now that the format HAS comments, that is exactly the tempting mistake. Its absence is the feature.
 --   * `password` -- the server password that turns any player into a race admin for the duration of his
---     connection (ADR-0056). JSON key `racePassword`, nil when unset. Trimmed on read: a trailing space
---     in a JSON string is invisible in every editor and would lock the operator out of his own server
---     with no symptom to see. Lives on cfg (it is config, like `admins` above); the GRANTS it hands out
+--     connection (ADR-0056). Settings key `racePassword`, nil when unset. Trimmed on read: a trailing
+--     space is invisible in every editor and would lock the operator out of his own server with no
+--     symptom to see. The format has no quoting, so a value simply cannot start or end with one. Lives on cfg (it is config, like `admins` above); the GRANTS it hands out
 --     live on `access` below, because those are what the session accumulates. That split is what makes
 --     "a Lua-state reload drops every grant" true by construction -- the reload rebuilds both literals,
 --     load_config refills this one and access comes back empty.
@@ -521,23 +524,122 @@ function access.trim(text)
     return (text:gsub("^%s*(.-)%s*$", "%1"))
 end
 
--- Read and JSON-decode the plugin config from the first candidate path that opens. Returns the decoded
--- table plus the resolved path, or nil plus the resolved path and an error label ("parse"/"missing").
--- The decode is pcall-guarded so a malformed file can never crash the plugin load.
+-- Parse the settings file into a key -> trimmed-string map (ADR-0056 round 3). BeamComp parses this
+-- itself because the server exposes no reader that could: measured at runtime, `Util` offers JSON
+-- helpers and nothing else, and `MP.Settings` is a fixed enum for the server's own TOML. So the choice
+-- was JSON-with-no-comments or a format we read ourselves.
+--
+-- The format is deliberately LINE-ORIENTED, and that is the whole point of the change. JSON is
+-- all-or-nothing: one stray character invalidates the entire document, which is why this used to need a
+-- shouted "your password is NOT in effect" line. Here a bad line is one bad line -- it is skipped with
+-- its line NUMBER, and every other setting, including a password below it, still applies.
+--
+-- Rules, each with a reason:
+--   * `key = value`, split on the FIRST `=` only. A password may contain `=`, and everything after the
+--     first one belongs to the value.
+--   * `#` and `;` start a comment ONLY at the start of a line (after optional whitespace). NOT
+--     mid-line: a password may contain `#`, and stripping a "trailing comment" would silently truncate
+--     it -- the operator would be locked out by a password he can see in the file.
+--   * Key and value are trimmed at both ends. There is no quoting, so a value cannot begin or end with
+--     a space. Same rule and same reason as the old JSON read: an invisible trailing space would lock
+--     the owner out of his own server with no symptom to see.
+--   * An empty value means "not set" (see cfg.value).
+--   * `[section]` headers are ignored, not rejected -- this format is flat, but somebody will write one.
+--   * A duplicate key warns and the LAST one wins, which is what a reader expects of a file read
+--     top to bottom.
+--
+-- Split on "\n" alone and let the trim eat a "\r": that handles CRLF without a second pattern.
+function cfg.parse_ini(contents, path)
+    local settings = {}
+    local number = 0
+    for raw_line in (contents .. "\n"):gmatch("(.-)\n") do
+        number = number + 1
+        local line = access.trim(raw_line)
+        local first = line:sub(1, 1)
+        if line == "" or first == "#" or first == ";" or first == "[" then
+            -- blank, comment, or a section header we do not need
+        else
+            local key, value = line:match("^([^=]*)=(.*)$")
+            key = key and access.trim(key)
+            if not key or key == "" then
+                -- Never fatal, and never silent: name the file and the line so it can be found.
+                log_info("beamcomp.cfg", "  " .. path .. " line " .. number
+                    .. ": cannot read this line, skipping it (expected 'key = value' or a '#' comment)")
+            else
+                if settings[key] ~= nil then
+                    log_info("beamcomp.cfg", "  " .. path .. " line " .. number
+                        .. ": '" .. key .. "' is set more than once; the last one wins")
+                end
+                settings[key] = access.trim(value)
+            end
+        end
+    end
+    return settings
+end
+
+-- The value for a key, or nil when the key is absent or its value is empty -- "empty = not set", so
+-- `racePassword =` in the shipped file means exactly what a missing key means.
+function cfg.value(settings, key)
+    local value = settings[key]
+    if value == nil or value == "" then
+        return nil
+    end
+    return value
+end
+
+-- A boolean setting: `true`/`false`, case-insensitive. Anything else keeps the documented default and
+-- says so -- a typo must not silently flip a setting, and it must not take the file down with it either.
+function cfg.boolean(settings, key, default)
+    local value = cfg.value(settings, key)
+    if value == nil then
+        return default
+    end
+    local lowered = value:lower()
+    if lowered == "true" then
+        return true
+    end
+    if lowered == "false" then
+        return false
+    end
+    log_info("beamcomp.cfg", "  " .. key .. " is '" .. value .. "', which is not true or false; using "
+        .. tostring(default))
+    return default
+end
+
+-- The settings file BeamComp replaced. Nothing reads it any more, and a SILENT fallback would hide that
+-- from whoever is still editing it -- so its presence is called out loudly when no .ini was found.
+cfg.LEGACY_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.config.json",
+    "beamcomp.config.json",
+}
+
+function cfg.warn_legacy_json()
+    for _, path in ipairs(cfg.LEGACY_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            file:close()
+            log_info("beamcomp.cfg", "!! " .. path .. " is still here and is NOT read any more."
+                .. " BeamComp now reads beamcomp.config.ini -- nothing in the old file is in effect.")
+            return
+        end
+    end
+end
+
+-- Read the plugin settings from the first candidate path that opens. Returns the parsed key -> value
+-- map plus the resolved path, or nil twice when no settings file exists at all.
+--
+-- io.open(path, "r"), never "a". An append-mode probe CREATES the file as a side effect -- the trap
+-- ADR-0053 layer 0 is built around.
 local function read_config()
     for _, path in ipairs(CONFIG_CANDIDATE_PATHS) do
         local file = io.open(path, "r")
         if file then
             local contents = file:read("*a")
             file:close()
-            local ok, decoded = pcall(Util.JsonDecode, contents)
-            if not ok or type(decoded) ~= "table" then
-                return nil, path, "parse"
-            end
-            return decoded, path, nil
+            return cfg.parse_ini(contents, path), path
         end
     end
-    return nil, nil, "missing"
+    return nil, nil
 end
 
 -- Populate the race-admin allowlist from the plugin config (ADR-0016). An empty list, a missing file,
@@ -551,72 +653,48 @@ local function load_config()
     cfg.stats_enabled = false
     cfg.password = nil
 
-    local config, path, err = read_config()
-    if not config then
-        if err == "parse" then
-            -- Name the CAUSE, not just the symptom. Every operator's first instinct on a settings file
-            -- is to comment a line out, and JSON has no comment syntax at all: //, /* */, #, -- and a
-            -- trailing comma are ALL rejected. Measured against this server's own Lua 5.3.5 with a
-            -- plain-JSON control arm, not assumed (ADR-0056).
-            --
-            -- The second added line is the one that matters. A parse error invalidates the file as a
-            -- WHOLE, so an operator who set a password and then typo'd the file is running completely
-            -- unprotected -- and the boxed no-protection warning that follows at startup would
-            -- otherwise read as if he had simply never configured anything.
-            log_info("beamcomp.cfg", "config at " .. tostring(path)
-                .. " is not valid JSON; race-admin gate inactive")
-            log_info("beamcomp.cfg", "  likely cause: JSON has no comments -- //, /* */, # and -- are"
-                .. " all rejected, and so is a trailing comma. Use the \"_\" note keys instead.")
-            log_info("beamcomp.cfg", "  CONSEQUENCE: any racePassword in this file is NOT in effect.")
-        else
-            log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
-        end
-        log_info("beamcomp.cfg", "useClientName=on (default; no config)")
-        log_info("beamcomp.cfg", "enableStatistics=off (default; no config)")
+    local settings, path = read_config()
+    if not settings then
+        -- Only when NO settings file was found: if an .ini is in place it is the file the operator is
+        -- being told about, and a note about a leftover .json would be noise.
+        cfg.warn_legacy_json()
+        log_info("beamcomp.cfg", "no settings file found; race-admin gate inactive")
+        log_info("beamcomp.cfg", "useClientName=on (default; no settings file)")
+        log_info("beamcomp.cfg", "enableStatistics=off (default; no settings file)")
         return
     end
 
     -- The server password (ADR-0056). Read HERE, above the raceAdmins handling, for the same reason
-    -- enableStatistics is: the next block returns early when raceAdmins is missing or empty -- and empty
-    -- is exactly the config of a server that relies on the password, so a read placed below those
-    -- returns would be dead code on every server that needs it.
+    -- enableStatistics is: the next block returns early when no admins are listed -- and none listed is
+    -- exactly the config of a server that relies on the password, so a read placed below that return
+    -- would be dead code on every server that needs it.
     --
-    -- Trimmed at both ends, and so is every attempt (access.trim). normalize_name is unusable here: it
-    -- lowercases, and a password is case-sensitive. An empty string, a missing key or a non-string all
-    -- mean "no password configured". The VALUE is never logged, here or anywhere else.
-    if type(config.racePassword) == "string" then
-        local password = access.trim(config.racePassword)
-        if password ~= "" then
-            cfg.password = password
-        end
-    end
+    -- Already trimmed at both ends by the parser, and so is every attempt (access.trim). normalize_name
+    -- is unusable here: it lowercases, and a password is case-sensitive. An empty value and a missing
+    -- key both mean "no password configured". The VALUE is never logged, here or anywhere else.
+    cfg.password = cfg.value(settings, "racePassword")
 
     -- Default on (ADR-0054): only an explicit false turns it off; a missing key stays on.
-    cfg.use_client_name = config.useClientName ~= false
+    cfg.use_client_name = cfg.boolean(settings, "useClientName", true)
     log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
 
-    -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: ONLY an explicit true
-    -- enables the statistics subsystem. A missing key, a truthy non-boolean, the string "true" -- all
-    -- stay off. Read here rather than below because the raceAdmins early return is next, so a config
-    -- carrying enableStatistics but no raceAdmins array must still be honoured. This log line is the
-    -- one place the switch is observable; it is the acceptance check after a deploy.
-    cfg.stats_enabled = config.enableStatistics == true
+    -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: only an explicit true
+    -- enables the statistics subsystem. A missing key, an empty value, a typo -- all stay off, because
+    -- cfg.boolean falls back to the default it is given and this one is false. A suppression switch has
+    -- to fail closed. Read here rather than below because the raceAdmins return is next, so a file
+    -- carrying enableStatistics but no admins must still be honoured. This log line is the one place
+    -- the switch is observable; it is the acceptance check after a deploy.
+    cfg.stats_enabled = cfg.boolean(settings, "enableStatistics", false)
     log_info("beamcomp.cfg", "enableStatistics=" .. (cfg.stats_enabled and "on" or "off"))
 
-    if type(config.raceAdmins) ~= "table" then
-        log_info("beamcomp.cfg", "config at " .. path
-            .. " has no raceAdmins array; race-admin gate inactive")
-        return
-    end
-
     local count = 0
-    for _, name in ipairs(config.raceAdmins) do
-        if type(name) == "string" then
-            local normalized = normalize_name(name)
-            if normalized ~= "" and not cfg.admins[normalized] then
-                cfg.admins[normalized] = true
-                count = count + 1
-            end
+    for entry in (cfg.value(settings, "raceAdmins") or ""):gmatch("[^,]+") do
+        -- normalize_name trims and lowercases, so a spaced-out list reads the same as a tight one and a
+        -- stray comma contributes nothing.
+        local normalized = normalize_name(entry)
+        if normalized ~= "" and not cfg.admins[normalized] then
+            cfg.admins[normalized] = true
+            count = count + 1
         end
     end
 
@@ -695,13 +773,13 @@ function access.log_startup_state()
     if not cfg.admin_gate_active and not cfg.password then
         -- Boxed because it has to survive a scrolling BeamMP console. This is the release-visible half
         -- of the "unconfigured stays open" decision: the behaviour is unchanged, the silence is not.
-        log_info("beamcomp.cfg", "############################################################")
+        log_info("beamcomp.cfg", "#############################################################")
         log_info("beamcomp.cfg", "#  NO ADMIN PROTECTION IS ACTIVE                            #")
         log_info("beamcomp.cfg", "#  EVERY player on this server may start and abort races,   #")
         log_info("beamcomp.cfg", "#  overwrite and delete saved grids and presets, and run    #")
         log_info("beamcomp.cfg", "#  the championship and tournament.                         #")
-        log_info("beamcomp.cfg", "#  Set \"racePassword\" in beamcomp.config.json and restart.  #")
-        log_info("beamcomp.cfg", "############################################################")
+        log_info("beamcomp.cfg", "#  Set \"racePassword\" in beamcomp.config.ini and restart.   #")
+        log_info("beamcomp.cfg", "#############################################################")
         return
     end
 
@@ -6507,7 +6585,7 @@ function identity.apply(player_id, requested)
 end
 
 -- Whether player-set names do anything on this server (ADR-0054). `useClientName` is an operator-editable
--- key in the shipped beamcomp.config.json (ADR-0031 §4): with it off, resolve_identity ignores
+-- key in the shipped beamcomp.config.ini (ADR-0031 §4): with it off, resolve_identity ignores
 -- client_names entirely, so a name set here would change nothing anywhere. Everything the feature shows
 -- the player -- the command, the join hint, the admin's list -- goes through this, so an operator who
 -- turns identity off gets a server that says so rather than one that quietly ignores /name.

@@ -50,7 +50,7 @@ time** (duplicated only in the built output, never in the committed tree).
 ## Race admin: who may start races
 
 Starting and aborting races, saving and deleting grids and presets, and running the
-championship/tournament are **admin-gated**. `server/beamcomp.config.json` offers two ways to be an
+championship/tournament are **admin-gated**. `server/beamcomp.config.ini` offers two ways to be an
 admin, and they work side by side:
 
 - **`racePassword`** — the practical one. Set it to any string; a player types `/raceui`, the setup
@@ -66,14 +66,29 @@ admin, and they work side by side:
 **With neither set, every connected player may do all of the above** — the deliberate, non-breaking
 default. The server logs a boxed warning at startup when that is the case.
 
-Three things to know about the file itself:
+### The settings file
 
-- **You cannot comment in it.** JSON has no comment syntax, and `Util.JsonDecode` rejects every form of
-  it — `//`, `/* */`, `#`, `--` and a trailing comma all make the file invalid. It is invalid as a
-  *whole*, so one commented-out line silently disables **every** setting in it, including a password you
-  thought was protecting the server. The `"_"`-prefixed keys (`_note`, `_raceAdmins`, `_racePassword`)
-  are the notes instead; the plugin ignores them. If you do break the file, the server says so at
-  startup, names this as the likely cause, and warns that no password is in effect.
+`server/beamcomp.config.ini` is a plain `key = value` file:
+
+```ini
+# Lines starting with # are comments.
+raceAdmins = Alice, Bob
+racePassword = hunter2
+useClientName = true
+```
+
+The format is BeamComp's own, and it is line-oriented on purpose: **a line it cannot read is skipped
+with a warning naming the line number, and every other setting still applies.** A typo costs you that
+one line, not the password three lines below it. (It used to be JSON, which is all-or-nothing — one
+stray character there disabled every setting in the file, silently.)
+
+Worth knowing:
+
+- A `#` (or `;`) starts a comment **only at the start of a line**. Mid-line it is an ordinary
+  character, so a password may contain one.
+- The value is everything after the **first** `=`, trimmed at both ends. So a password may contain
+  `=`, but cannot begin or end with a space — there is no quoting.
+- `raceAdmins` is a comma-separated list. An empty value means "not set", for every key.
 - It is read **at server start only**. Change the password, restart the server.
 - It is **tracked in git and not preserved by the deploy**: `scripts/deploy.ps1` wipes and recopies
   `Resources/Server/BeamComp/` from the repo (only `beamcomp.grids.json`, `beamcomp.runs.jsonl` and
