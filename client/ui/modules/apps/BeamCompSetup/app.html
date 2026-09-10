@@ -376,7 +376,7 @@
         <span bc-setup-tip="tip('qualiMinutes')">Qualifying length</span>
         <span class="bc-quali-len">
           <input type="number" min="1" max="30" ng-model="form.qualiMinutes" bc-setup-tip="tip('qualiMinutes')"> min
-          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets" bc-setup-tip="tip('qualiPreset')"
+          <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
             ng-class="{sel: form.qualiMinutes === m}" ng-click="form.qualiMinutes = m">{{m}}</button>
         </span>
       </div>
@@ -416,7 +416,13 @@
          configurable time penalty. Off = the default lock countdown. -->
     <div class="bc-section">
       <div class="bc-section-title">Start</div>
-      <label class="bc-row bc-check" bc-setup-tip="tip('f1Start')"><input type="checkbox" ng-model="form.f1Start"><span>Start with starting lights</span></label>
+      <!-- The label carries the part that actually surprises people (ADR-0043 decision 2): under this mode
+           the car is NOT frozen while the lights are lit, so the launch is the driver's. "you launch
+           yourself" says that without reading as "the mod does less" -- the lights stay server-synchronized
+           and the jump penalty is still scored. The tooltip carries what the freedom costs.
+           Exactly as long as the label it replaces (26 chars), which is what keeps it on one line in the
+           capped `.bc-row > span` label column. -->
+      <label class="bc-row bc-check" bc-setup-tip="tip('f1Start')"><input type="checkbox" ng-model="form.f1Start"><span>F1 start (launch yourself)</span></label>
       <label class="bc-row" ng-if="form.f1Start" bc-setup-tip="tip('jumpPenalty')">
         <span>Jump-start penalty (sec)</span>
         <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="15">
@@ -674,7 +680,7 @@
           <span class="bc-quali-len">
             <input type="number" min="1" max="30" ng-model="form.champQualiMinutes" bc-setup-tip="tip('champQualiMinutes')"
               ng-blur="championshipLive()" ng-keydown="$event.keyCode === 13 && championshipLive()"> min
-            <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets" bc-setup-tip="tip('qualiPreset')"
+            <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
               ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m; championshipLive()">{{m}}</button>
           </span>
         </div>

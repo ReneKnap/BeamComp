@@ -109,16 +109,22 @@ angular.module('beamng.apps')
   // An entry may be a FUNCTION of the scope where the useful answer depends on live state (see scope.tip).
   var TIPS = {
     // --- Password lock (ADR-0056) ---
-    lockPassword: 'The password this server was given by whoever runs it. It is not your account '
-      + 'password and it is not saved -- you enter it once per session.',
-    lockSubmit: 'Check the password. If it is right, you can start races, edit grids and run the '
-      + 'championship until you leave the server.',
+    lockPassword: 'The race password of this server, set by whoever runs it. Not your account password, '
+      + 'and not stored -- you type it once per session.',
+    lockSubmit: 'With the right password you may start races, edit grids and run the championship until '
+      + 'you leave the server.',
 
     // --- Toolbar ---
     settings: 'Settings for this panel. They are not part of the race.',
-    includeDeprecated: 'Also list races from the old quickrace source. They still work, but they are no '
-      + 'longer maintained, so they are hidden by default.',
-    force: 'Start the race even when the check says the track cannot do it. The race may behave oddly.',
+    // Names what the player gets, not the internal source the races come from (ADR-0026: the quickrace
+    // set is second-class -- best-effort props, and display names that collide with the curated ones).
+    includeDeprecated: 'Also list the older tracks the mod normally hides. They still run, but their '
+      + 'props and starts are less reliable, and some names appear twice.',
+    // The two things validation actually refuses (ADR-0019): circuit on a track that is not a loop, and
+    // reverse on a track with no reverse route. Says that the refusal is the default, which is the part
+    // a "Force" label cannot carry.
+    force: 'Start anyway when the track cannot do what you picked -- laps on a track that is not a loop, '
+      + 'or Reverse without a reverse route. Without this, such a start is refused.',
     tooltips: 'Show these help boxes when the mouse rests on a control. Applies to the grid editor too, '
       + 'and is remembered between sessions.',
 
@@ -140,32 +146,48 @@ angular.module('beamng.apps')
       return base + 'This track is built as a ' + recommended + ', so that is preselected. You can still '
         + 'pick the other one.';
     },
-    laps: 'How many laps the race runs. Leave it empty to use the track\'s own lap count.',
-    reverse: 'Drive the route backwards. Only tracks that come with a reverse route accept this; the rest '
-      + 'are refused unless you also set Force.',
+    // The label already says "Laps", so the text is only the part it cannot say. The track's own count is
+    // NOT named: it never reaches this panel (BeamCompRaceMeta carries `closed` and nothing else), and a
+    // guessed number would be worse than none.
+    laps: 'Leave it empty and the track\'s own lap count applies.',
+    // Forced reverse keeps the FORWARD grid anchor (ADR-0019: the default start selector is used when the
+    // track has no reverse one), so the cars line up facing the wrong way. That is what Force costs here.
+    reverse: 'Drive the route backwards. A track without its own reverse route refuses this -- Force '
+      + 'starts it anyway, but then the cars line up facing the wrong way.',
 
     // --- Vehicles ---
-    carModel: 'The car everyone drives. "keep own" leaves each player in the car they are already in. '
-      + 'Picking one car ignores the power and weight limits below.',
+    carModel: 'The car everyone drives. "keep own" leaves each player in the car he is already in. Pick '
+      + 'one car and the limits below disappear.',
     carConfig: 'Which factory version of that car to spawn.',
     carRandomTrim: 'Give each drawn car a random factory version instead of the standard one.',
-    carNoBigCars: 'Leave buses, trucks and vans out of the draw, going by weight.',
-    restrictVehicles: 'Limit which cars may race, by power and weight. Does nothing when everyone drives '
-      + 'the same fixed car.',
-    maxhp: 'Turn away cars with more power than this. Empty means no limit.',
-    maxpwr: 'Turn away cars with more horsepower per kilo than this. It catches light quick cars that a '
-      + 'plain power limit lets through. Empty means no limit.',
-    minkg: 'Turn away cars lighter than this. Empty means no limit.',
-    maxkg: 'Turn away cars heavier than this. Empty means no limit.',
+    // The filter is a curb-weight ceiling (vehiclespecs.BIG_CAR_MAX_WEIGHT), not a vehicle class, so a
+    // heavy pickup near the boundary really can get through. Saying so beats an absolute promise.
+    carNoBigCars: 'Leave buses, trucks and vans out of the draw. It goes by weight, so a very heavy '
+      + 'pickup can still slip through.',
+    // NOBODY IS TURNED AWAY. race/vehicles.lua respawn_for_cap: an own car over the limit is SUBSTITUTED
+    // with the first compliant one, and if no installed car fits, the default car spawns over the limit
+    // anyway (ADR-0032 section 5 superseded -- "no more abort"). The old copy promised a rejection that
+    // has not happened since 2026-07-07; the five texts below now say what really happens.
+    restrictVehicles: 'Limit which cars may race, by power and weight. Nobody is left out: a car over the '
+      + 'limit is swapped for one that fits, or for the standard car if nothing fits.',
+    maxhp: 'A car with more power than this is swapped for one that fits. Empty means no limit.',
+    maxpwr: 'A car with more horsepower per kilo than this is swapped for one that fits. It catches light '
+      + 'quick cars that a plain power limit lets through. Empty means no limit.',
+    minkg: 'A car lighter than this is swapped for one that fits. Empty means no limit.',
+    maxkg: 'A car heavier than this is swapped for one that fits. Empty means no limit.',
     orderMode: 'Who starts where on the grid. A running championship or class-drop sets this itself.',
-    orderLockedChampionship: 'The running championship builds the grid from its points table, so this '
-      + 'picker does nothing. Set Tournament mode to off to get it back.',
-    orderLockedTournament: 'The running class-drop builds the grid from each driver\'s class, so this '
-      + 'picker does nothing. Set Tournament mode to off to get it back.',
+    // These two sit on the text that REPLACES the picker, so "this picker does nothing" described a
+    // control the player cannot see. They now say who decides instead, and how to take it back.
+    orderLockedChampionship: 'The running championship builds the grid from its points table. Set '
+      + 'Tournament mode to off to choose the order yourself again.',
+    orderLockedTournament: 'The running class-drop builds the grid from each driver\'s class. Set '
+      + 'Tournament mode to off to choose the order yourself again.',
     qualiStart: 'The order drivers go out in for qualifying. The race grid comes from the qualifying '
       + 'result, not from this.',
-    qualiMinutes: 'How long qualifying runs. Very short or very long values are pulled back into range.',
-    qualiPreset: 'A common qualifying length.',
+    // The range is the server's quali.MIN_SECONDS/MAX_SECONDS pair (60 s / 1800 s), the same clamp the
+    // field's own min/max mirror. A fixed pair of numbers, so it belongs in the string -- a function
+    // entry here would be code that can break for a value that never changes.
+    qualiMinutes: 'How long qualifying runs, from 1 to 30 minutes. Anything outside that is pulled back in.',
     orderRev: 'Flip the order, so the fastest start at the back.',
     // Names the grid this race actually starts on. The Edit button next to it is how that is changed, so
     // the sentence points at it instead of explaining what a default grid is.
@@ -183,11 +205,22 @@ angular.module('beamng.apps')
     // --- Assists ---
     // These four name the key the assist really sits on, read from the game's own bindings. When nothing
     // is bound the key is left out and the game's own name for the control is given instead -- a guessed
-    // key would be worse than none.
+    // key would be worse than none, and that game name is the ONLY string that lets a player find the
+    // binding again in BeamNG's own settings, so it stays verbatim however clumsy it reads.
+    //
+    // DO NOT "STRAIGHTEN" WHICH FIELD EACH ONE READS. The mapping is inverted on purpose (ADR-0017
+    // decision 3, race/lock.lua M.assist_controls): BeamComp's REPAIR sits on the game's plain
+    // `recover_vehicle`, BeamComp's RECOVER on `recover_vehicle_alt`. lock.lua has already swapped them,
+    // so `assistKeys.recover` IS the alternate key and `assistKeys.repair` IS the plain one. Pairing
+    // `recover` with `.repair` because it reads more sensibly prints the WRONG key into the panel.
+    //
+    // Both also name the one condition that is invisible from the checkbox: the hold only runs while the
+    // car is stopped (init.lua is_car_stationary), and held while rolling it is cancelled with a toast.
     recover: function (scope) {
       var key = keyLabel((scope.data.assistKeys || {}).recover);
-      return 'Lets drivers put a stuck or flipped car back on the track during the race. They hold '
-        + (key || 'the game\'s "Repair / Rewind (alternate version)" key') + ' to do it.';
+      return 'Lets drivers put a stuck or flipped car back on the track during the race: stop, then hold '
+        + (key || 'the game\'s "Repair / Rewind (alternate version)" key')
+        + '. Nothing happens while the car is still rolling.';
     },
     recoverSecs: function (scope) {
       var key = keyLabel((scope.data.assistKeys || {}).recover);
@@ -196,8 +229,9 @@ angular.module('beamng.apps')
     },
     repair: function (scope) {
       var key = keyLabel((scope.data.assistKeys || {}).repair);
-      return 'Lets drivers fix a damaged car during the race, where it stands. They hold '
-        + (key || 'the game\'s "Repair / Rewind" key') + ' to do it.';
+      return 'Lets drivers fix a damaged car during the race, where it stands: stop, then hold '
+        + (key || 'the game\'s "Repair / Rewind" key')
+        + '. Nothing happens while the car is still rolling.';
     },
     repairSecs: function (scope) {
       var key = keyLabel((scope.data.assistKeys || {}).repair);
@@ -206,26 +240,61 @@ angular.module('beamng.apps')
     },
 
     // --- Start ---
-    f1Start: 'Start the race on five red lights instead of a plain countdown. They go out after a short '
-      + 'random wait, and moving before they do costs the penalty below.',
+    // The surprising half of this mode is not the lights, it is that the car is NOT held while they are
+    // lit (ADR-0043 decision 2: the position freeze lifts at countdown entry instead of at GO). Under the
+    // plain countdown the car is frozen until GO, so nobody can jump. The checkbox label carries the
+    // "you launch yourself" half; this carries what that costs. The lights themselves stay
+    // server-synchronized -- this is a start you drive, not a start the mod stops running.
+    f1Start: 'Five red lights fill, hold for a random moment, then go out -- that is GO. Your car is '
+      + 'never held, so going too early costs the penalty below. The plain countdown holds it for you '
+      + 'until GO instead.',
     jumpPenalty: 'Seconds added to the final time of anyone who moves before the lights go out.',
 
     // --- AI ---
-    aiEnabled: 'Add computer drivers to the race. They line up with everyone else and drive against you.',
+    aiEnabled: 'Add computer drivers to the field. They take grid slots like anyone else, so the field '
+      + 'gets bigger.',
     aiCount: 'How many computer drivers race, 1 to 16. Lowering it drops the last ones and leaves the rest '
       + 'alone.',
-    aiPreset: 'How good the computer drivers are. It fills in the values under Advanced.',
-    aiCar: 'What the computer drivers drive. "default" gives each of them the car that suits them. '
+    // The one new state-dependent entry of this pass (ADR-0049 amendment). It names the two numbers the
+    // preset fills in, which are otherwise only visible after opening Advanced -- and they come off the
+    // SAME scope.data.aiDefaults payload scope.aiParamHint reads (race/ai.lua preset_defaults), so the
+    // tooltip and the field placeholders can never disagree.
+    //
+    // Three branches, in the ADR-0049 discipline of reporting state but never guessing it:
+    //   * no payload yet (or an unknown preset name) -- say what the control does and no numbers;
+    //   * the empty "default" option -- GE resolves the fallback preset, but that is also the ONE branch
+    //     where an aiRace track's own authored values may override aggression and skill
+    //     (ai.resolve_params), so the numbers are named as the usual case, not asserted;
+    //   * a picked preset -- the numbers are exact.
+    aiPreset: function (scope) {
+      var defaults = scope.data.aiDefaults || {};
+      var presets = defaults.presets || {};
+      var chosen = scope.form.aiPreset;
+      var preset = presets[chosen || defaults.fallback];
+      var text = 'How good the computer drivers are. It fills in the values under Advanced';
+      if (!preset || typeof preset.aggr !== 'number' || typeof preset.skill !== 'number') {
+        return text + '.';
+      }
+      text += ': aggression ' + preset.aggr + ', skill ' + preset.skill + '.';
+      if (!chosen) {
+        text += ' Some tracks bring AI values of their own, and those win on this setting.';
+      }
+      return text;
+    },
+    aiCar: 'What the computer drivers drive. "default" gives each driver the car that belongs to his name. '
       + 'Changing this gives the whole field new cars but keeps their names and colours.',
     aiRandomTrim: 'Give each AI car a random factory version instead of the standard one.',
-    aiNoBigCars: 'Leave buses, trucks and vans out of the AI draw, going by weight.',
+    aiNoBigCars: 'Leave buses, trucks and vans out of the AI draw. It goes by weight, so a very heavy '
+      + 'pickup can still slip through.',
     rosterToggle: 'Show the drivers, so you can change them one by one.',
     rollAll: 'Draw a whole new set of drivers -- new names, cars and colours. This also changes who starts '
       + 'where.',
     rosterName: 'Pick this driver from the name list. A name brings its own car and colour with it. Names '
       + 'already taken are not offered.',
     rosterNameRoll: 'Draw another free name, with the car and colour that belong to it.',
-    rosterCarShown: 'The car this driver spawns in. Use Change to pick another.',
+    // Kept rather than dropped as a label repeat: the row also shows the colour swatch, which the label
+    // "Car" does not account for, and the adjacent Change button has its own text.
+    rosterCarShown: 'The car this driver starts in, with his paint beside it.',
     rosterChange: 'Open this driver\'s car, version and colour. What you set here counts for this race '
       + 'only.',
     rosterTypeShown: 'The factory version this car spawns as.',
@@ -238,8 +307,10 @@ angular.module('beamng.apps')
     rosterColorRoll: 'Draw another colour.',
     rosterDone: 'Fold this driver away again. Nothing is thrown away.',
     aiAdvanced: 'Show the driving values behind the difficulty setting.',
-    aiRoute: 'How the computer drivers find their way. "snap" keeps them on the road network, "direct" '
-      + 'follows the race line exactly -- useful where a track has no roads to follow.',
+    // Names the two options the way the dropdown shows them, and says WHEN to pick the second one --
+    // the internal words ("the road network") are the engine's, not the player's.
+    aiRoute: 'How the computer drivers find their way. "snap (road)" keeps them on the roads. "direct '
+      + '(exact)" follows the race line instead -- for routes that leave the road.',
     aiAggr: 'How hard they fight for position, 0 to 1. Empty uses the value from the difficulty setting, '
       + 'shown greyed out in the field.',
     aiSkill: 'How cleanly and quickly they drive, 0 to 1. Empty uses the value from the difficulty '
@@ -249,13 +320,15 @@ angular.module('beamng.apps')
     aiAvoid: 'Let them steer around other cars instead of driving through them.',
 
     // --- Tournament ---
-    tourMode: 'Run several races as one contest. Only one format at a time -- and picking off really ENDS '
-      + 'the one that is running, it does not just hide it.',
+    tourMode: 'Run several races as one contest. Only one format at a time -- and switching to off ends '
+      + 'the contest that is running, it does not just hide it.',
     champStatus: 'The championship running on the server right now.',
     champPreset: 'How finishing places turn into points.',
     champOrder: 'How the next grid is built from the points table. It takes effect at once and overrides '
       + 'Start order.',
-    champQualiMinutes: 'How long qualifying runs before each championship race.',
+    // Same clamp as qualiMinutes -- the panel command is rebuilt into a /championship quali=<n> and lands
+    // on quali.clamp too (server champ.handle_cmd -> champ.parse_args).
+    champQualiMinutes: 'How long qualifying runs before each championship race, from 1 to 30 minutes.',
     champReset: 'Set every score back to zero. The championship keeps running -- to stop it, set Mode to '
       + 'off.',
     tourStatus: 'The class-drop tournament running on the server right now.',
@@ -274,9 +347,9 @@ angular.module('beamng.apps')
       + 'running -- to stop it, set Mode to off.',
 
     // --- Players ---
-    players: 'Everyone on the server right now. "temporary name" means BeamMP handed that name out and '
-      + 'the player has not picked his own yet -- he can, by typing "/name <his name>" in chat, and it '
-      + 'then sticks across restarts.',
+    players: 'Everyone on the server right now. "temporary name" means the player still carries the name '
+      + 'BeamMP gave him -- he can set his own with "/name <name>" in chat, and it then sticks across '
+      + 'restarts.',
     remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick '
       + 'their own. Nobody else is written to.',
 
