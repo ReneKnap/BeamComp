@@ -1,6 +1,8 @@
 {
-    "_comment": "racePassword is the way to lock this server down: any player who types /raceui and enters it is a race admin until he leaves. Leave it empty and EVERY player may start and abort races, overwrite grids and presets, and run the championship. raceAdmins matches the BeamMP name, which rotates on every game start while BeamMP login is broken -- an entry there will not match the same person tomorrow. The plugin reads this file at server start only.",
+    "_note": "JSON has no comments -- the _ keys are the notes. The plugin ignores them. Read at server start only.",
     "raceAdmins": [],
+    "_raceAdmins": "Race admins by BeamMP name. Unusable while BeamMP login is broken.",
     "racePassword": "",
+    "_racePassword": "Anyone who types /raceui and enters this is a race admin until he disconnects. EMPTY = EVERY player may start races, overwrite grids and run the championship.",
     "useClientName": true
 }
