@@ -554,8 +554,20 @@ local function load_config()
     local config, path, err = read_config()
     if not config then
         if err == "parse" then
+            -- Name the CAUSE, not just the symptom. Every operator's first instinct on a settings file
+            -- is to comment a line out, and JSON has no comment syntax at all: //, /* */, #, -- and a
+            -- trailing comma are ALL rejected. Measured against this server's own Lua 5.3.5 with a
+            -- plain-JSON control arm, not assumed (ADR-0056).
+            --
+            -- The second added line is the one that matters. A parse error invalidates the file as a
+            -- WHOLE, so an operator who set a password and then typo'd the file is running completely
+            -- unprotected -- and the boxed no-protection warning that follows at startup would
+            -- otherwise read as if he had simply never configured anything.
             log_info("beamcomp.cfg", "config at " .. tostring(path)
                 .. " is not valid JSON; race-admin gate inactive")
+            log_info("beamcomp.cfg", "  likely cause: JSON has no comments -- //, /* */, # and -- are"
+                .. " all rejected, and so is a trailing comma. Use the \"_\" note keys instead.")
+            log_info("beamcomp.cfg", "  CONSEQUENCE: any racePassword in this file is NOT in effect.")
         else
             log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
         end

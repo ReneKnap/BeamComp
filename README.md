@@ -66,8 +66,14 @@ admin, and they work side by side:
 **With neither set, every connected player may do all of the above** — the deliberate, non-breaking
 default. The server logs a boxed warning at startup when that is the case.
 
-Two things to know about the file itself:
+Three things to know about the file itself:
 
+- **You cannot comment in it.** JSON has no comment syntax, and `Util.JsonDecode` rejects every form of
+  it — `//`, `/* */`, `#`, `--` and a trailing comma all make the file invalid. It is invalid as a
+  *whole*, so one commented-out line silently disables **every** setting in it, including a password you
+  thought was protecting the server. The `"_"`-prefixed keys (`_note`, `_raceAdmins`, `_racePassword`)
+  are the notes instead; the plugin ignores them. If you do break the file, the server says so at
+  startup, names this as the likely cause, and warns that no password is in effect.
 - It is read **at server start only**. Change the password, restart the server.
 - It is **tracked in git and not preserved by the deploy**: `scripts/deploy.ps1` wipes and recopies
   `Resources/Server/BeamComp/` from the repo (only `beamcomp.grids.json`, `beamcomp.runs.jsonl` and
