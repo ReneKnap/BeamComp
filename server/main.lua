@@ -271,36 +271,78 @@ local session = {
     race_event = nil,         -- id shared by every logged run of THIS race instance (ADR-0050), so field size, start slot and finishing position can be related across rows; assigned in start_race
 }
 
--- Race-command permissions / plugin config (ADR-0016). The race-admin allowlist gates /race, /raceend and
--- /raceclear; it is loaded on init from the plugin config file. Candidate paths tolerate the unverified
--- runtime working directory (recon TODO #4) -- server root first, then the plugin folder. An empty,
--- missing, or unparseable config leaves the gate inactive (opt-in: everyone may start/end races).
+-- Race-command permissions / plugin settings (ADR-0016, format superseded by ADR-0056). The race-admin
+-- allowlist gates /race, /raceend and /raceclear; it is loaded on init from the plugin settings file.
+-- Candidate paths tolerate the unverified runtime working directory (recon TODO #4) -- server root
+-- first, then the plugin folder. A missing file, or one that sets nothing, leaves the gate inactive
+-- (opt-in: everyone may start/end races).
 local CONFIG_CANDIDATE_PATHS = {
-    "Resources/Server/BeamComp/beamcomp.config.json",
-    "beamcomp.config.json",
+    "Resources/Server/BeamComp/beamcomp.config.ini",
+    "beamcomp.config.ini",
 }
 
--- The plugin config, as read from beamcomp.config.json (ADR-0016). One namespace table rather than a
--- local per setting: main.lua lives at LuaJIT's 200-local ceiling (see grid_store / f1), and a table
--- costs one local no matter how many settings it grows.
+-- The plugin settings, as read from beamcomp.config.ini (ADR-0016; the format is ADR-0056 round 3).
+-- One namespace table rather than a local per setting: main.lua lives at LuaJIT's 200-local ceiling
+-- (see grid_store / f1), and a table costs one local no matter how many settings -- or, since round 3,
+-- how many parser helpers -- it grows.
 --   * `admins` / `admin_gate_active` -- normalized (trimmed, lowercased) admin names -> true, and
 --     whether the race-admin gate is on at all (no admins configured = everyone may start races).
 --   * `use_client_name` -- whether player identity resolves to the client-reported player-set name
---     instead of the BeamMP name (ADR-0054). Default on -- a missing/unparseable config keeps it on, so the
---     guest-name fix applies out of the box. Set false in beamcomp.config.json to fall back everywhere.
+--     instead of the BeamMP name (ADR-0054). Default on -- a missing file or an unreadable line keeps it on, so the
+--     guest-name fix applies out of the box. Set false in beamcomp.config.ini to fall back everywhere.
 --   * `stats_enabled` -- whether the per-run statistics subsystem exists at all (ADR-0053): the run log,
 --     best times, track records, the bestNotice toast, the raceRecords push, the analysis overlay and
---     /analysis. JSON key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
---     use_client_name above: only an explicit `true` enables it, so a missing key, a missing file, a
---     malformed file or a non-boolean value all leave the feature dead. A suppression switch has to fail
---     closed. The key is DELIBERATELY ABSENT from the shipped beamcomp.config.json -- it is documented
---     here and in ADR-0053, not in the file users read, so the feature does not exist to anyone who was
---     not told about it. Do not "helpfully" add it to the shipped config.
+--     /analysis. Settings key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
+--     use_client_name above: only an explicit `true` enables it, so a missing key, an empty value, a
+--     missing file or a typo all leave the feature dead. A suppression switch has to fail closed. The
+--     key is DELIBERATELY ABSENT from the shipped beamcomp.config.ini -- it is documented here and in
+--     ADR-0053, not in the file users read, so the feature does not exist to anyone who was not told
+--     about it. Do not "helpfully" add it to the shipped settings file, not even with a nice comment:
+--     now that the format HAS comments, that is exactly the tempting mistake. Its absence is the feature.
+--   * `password` -- the server password that turns any player into a race admin for the duration of his
+--     connection (ADR-0056). Settings key `racePassword`, nil when unset. Trimmed on read: a trailing
+--     space is invisible in every editor and would lock the operator out of his own server with no
+--     symptom to see. The format has no quoting, so a value simply cannot start or end with one. Lives on cfg (it is config, like `admins` above); the GRANTS it hands out
+--     live on `access` below, because those are what the session accumulates. That split is what makes
+--     "a Lua-state reload drops every grant" true by construction -- the reload rebuilds both literals,
+--     load_config refills this one and access comes back empty.
 local cfg = {
     admins = {},
     admin_gate_active = false,
     use_client_name = true,
     stats_enabled = false,
+    password = nil,
+}
+
+-- Password-based race-admin access (ADR-0056, superseding ADR-0016 in part). The name allowlist above
+-- authorizes by BeamMP display name -- and that name ROTATES on every game start while BeamMP login is
+-- broken (measured: four consecutive sessions of the same user gave four different guest names), so it
+-- cannot identify anybody. A password does not depend on identity at all, which is why it works here.
+--
+-- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
+-- (see the cfg / identity / f1 / grid_store namespaces around it), and a table costs ONE local no matter
+-- how much it carries. Declared HERE, above is_race_admin, because the gate reads `granted`; the
+-- functions are assigned further down, next to the locals they close over (send_event, player_name_of,
+-- champ/tour/identity). A table field needs no forward declaration.
+--
+-- `granted` is written in exactly ONE place, access.handle_unlock, after a successful comparison.
+-- Nothing else in this plugin assigns into it -- keep it that way.
+local access = {
+    -- player_id -> true for a connection that entered the server password. Keyed to the ID and not to a
+    -- name on purpose: ADR-0054 forbids authorizing on anything the player can set with /name, and a
+    -- player_id is issued by BeamMP. Cleared in on_player_disconnect -- NOT optional bookkeeping, since
+    -- BeamMP reuses player ids and a grant left behind is inherited by whoever takes the slot next.
+    granted = {},
+    -- player_id -> {n = <consecutive failures>, locked_until = <now() deadline or nil>}. Cleared on
+    -- disconnect with the grant, so a fresh joiner never inherits somebody else's lockout.
+    attempts = {},
+    MSG_LOCKED = "setupLocked",    -- server -> client: open the race-setup panel in its LOCKED state
+    MSG_UNLOCK = "raceUnlock",     -- client -> server: a password attempt {password = "..."}
+    MSG_RESULT = "unlockResult",   -- server -> client: the verdict {ok, reason, triesLeft, wait}
+    -- Wrong attempts before a cooldown, and the cooldown in seconds. High enough that a fat-fingered
+    -- admin never notices the limit, low enough that one guess per 12 s is not a way in.
+    MAX_TRIES = 5,
+    LOCKOUT_SECONDS = 60,
 }
 
 -- Connection-scoped player-set name per player id (ADR-0054), reported once on connect via
@@ -475,23 +517,129 @@ local function normalize_name(name)
     return (name:gsub("^%s*(.-)%s*$", "%1")):lower()
 end
 
--- Read and JSON-decode the plugin config from the first candidate path that opens. Returns the decoded
--- table plus the resolved path, or nil plus the resolved path and an error label ("parse"/"missing").
--- The decode is pcall-guarded so a malformed file can never crash the plugin load.
+-- Trim surrounding whitespace, case INTACT -- the password counterpart of normalize_name above, which
+-- lowercases and is therefore unusable for a case-sensitive secret (ADR-0056). The extra parentheses
+-- drop gsub's second return value, so this yields exactly one string.
+function access.trim(text)
+    return (text:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+-- Parse the settings file into a key -> trimmed-string map (ADR-0056 round 3). BeamComp parses this
+-- itself because the server exposes no reader that could: measured at runtime, `Util` offers JSON
+-- helpers and nothing else, and `MP.Settings` is a fixed enum for the server's own TOML. So the choice
+-- was JSON-with-no-comments or a format we read ourselves.
+--
+-- The format is deliberately LINE-ORIENTED, and that is the whole point of the change. JSON is
+-- all-or-nothing: one stray character invalidates the entire document, which is why this used to need a
+-- shouted "your password is NOT in effect" line. Here a bad line is one bad line -- it is skipped with
+-- its line NUMBER, and every other setting, including a password below it, still applies.
+--
+-- Rules, each with a reason:
+--   * `key = value`, split on the FIRST `=` only. A password may contain `=`, and everything after the
+--     first one belongs to the value.
+--   * `#` and `;` start a comment ONLY at the start of a line (after optional whitespace). NOT
+--     mid-line: a password may contain `#`, and stripping a "trailing comment" would silently truncate
+--     it -- the operator would be locked out by a password he can see in the file.
+--   * Key and value are trimmed at both ends. There is no quoting, so a value cannot begin or end with
+--     a space. Same rule and same reason as the old JSON read: an invisible trailing space would lock
+--     the owner out of his own server with no symptom to see.
+--   * An empty value means "not set" (see cfg.value).
+--   * `[section]` headers are ignored, not rejected -- this format is flat, but somebody will write one.
+--   * A duplicate key warns and the LAST one wins, which is what a reader expects of a file read
+--     top to bottom.
+--
+-- Split on "\n" alone and let the trim eat a "\r": that handles CRLF without a second pattern.
+function cfg.parse_ini(contents, path)
+    local settings = {}
+    local number = 0
+    for raw_line in (contents .. "\n"):gmatch("(.-)\n") do
+        number = number + 1
+        local line = access.trim(raw_line)
+        local first = line:sub(1, 1)
+        if line == "" or first == "#" or first == ";" or first == "[" then
+            -- blank, comment, or a section header we do not need
+        else
+            local key, value = line:match("^([^=]*)=(.*)$")
+            key = key and access.trim(key)
+            if not key or key == "" then
+                -- Never fatal, and never silent: name the file and the line so it can be found.
+                log_info("beamcomp.cfg", "  " .. path .. " line " .. number
+                    .. ": cannot read this line, skipping it (expected 'key = value' or a '#' comment)")
+            else
+                if settings[key] ~= nil then
+                    log_info("beamcomp.cfg", "  " .. path .. " line " .. number
+                        .. ": '" .. key .. "' is set more than once; the last one wins")
+                end
+                settings[key] = access.trim(value)
+            end
+        end
+    end
+    return settings
+end
+
+-- The value for a key, or nil when the key is absent or its value is empty -- "empty = not set", so
+-- `racePassword =` in the shipped file means exactly what a missing key means.
+function cfg.value(settings, key)
+    local value = settings[key]
+    if value == nil or value == "" then
+        return nil
+    end
+    return value
+end
+
+-- A boolean setting: `true`/`false`, case-insensitive. Anything else keeps the documented default and
+-- says so -- a typo must not silently flip a setting, and it must not take the file down with it either.
+function cfg.boolean(settings, key, default)
+    local value = cfg.value(settings, key)
+    if value == nil then
+        return default
+    end
+    local lowered = value:lower()
+    if lowered == "true" then
+        return true
+    end
+    if lowered == "false" then
+        return false
+    end
+    log_info("beamcomp.cfg", "  " .. key .. " is '" .. value .. "', which is not true or false; using "
+        .. tostring(default))
+    return default
+end
+
+-- The settings file BeamComp replaced. Nothing reads it any more, and a SILENT fallback would hide that
+-- from whoever is still editing it -- so its presence is called out loudly when no .ini was found.
+cfg.LEGACY_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.config.json",
+    "beamcomp.config.json",
+}
+
+function cfg.warn_legacy_json()
+    for _, path in ipairs(cfg.LEGACY_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            file:close()
+            log_info("beamcomp.cfg", "!! " .. path .. " is still here and is NOT read any more."
+                .. " BeamComp now reads beamcomp.config.ini -- nothing in the old file is in effect.")
+            return
+        end
+    end
+end
+
+-- Read the plugin settings from the first candidate path that opens. Returns the parsed key -> value
+-- map plus the resolved path, or nil twice when no settings file exists at all.
+--
+-- io.open(path, "r"), never "a". An append-mode probe CREATES the file as a side effect -- the trap
+-- ADR-0053 layer 0 is built around.
 local function read_config()
     for _, path in ipairs(CONFIG_CANDIDATE_PATHS) do
         local file = io.open(path, "r")
         if file then
             local contents = file:read("*a")
             file:close()
-            local ok, decoded = pcall(Util.JsonDecode, contents)
-            if not ok or type(decoded) ~= "table" then
-                return nil, path, "parse"
-            end
-            return decoded, path, nil
+            return cfg.parse_ini(contents, path), path
         end
     end
-    return nil, nil, "missing"
+    return nil, nil
 end
 
 -- Populate the race-admin allowlist from the plugin config (ADR-0016). An empty list, a missing file,
@@ -503,46 +651,50 @@ local function load_config()
     cfg.admin_gate_active = false
     cfg.use_client_name = true
     cfg.stats_enabled = false
+    cfg.password = nil
 
-    local config, path, err = read_config()
-    if not config then
-        if err == "parse" then
-            log_info("beamcomp.cfg", "config at " .. tostring(path)
-                .. " is not valid JSON; race-admin gate inactive")
-        else
-            log_info("beamcomp.cfg", "no config file found; race-admin gate inactive")
-        end
-        log_info("beamcomp.cfg", "useClientName=on (default; no config)")
-        log_info("beamcomp.cfg", "enableStatistics=off (default; no config)")
+    local settings, path = read_config()
+    if not settings then
+        -- Only when NO settings file was found: if an .ini is in place it is the file the operator is
+        -- being told about, and a note about a leftover .json would be noise.
+        cfg.warn_legacy_json()
+        log_info("beamcomp.cfg", "no settings file found; race-admin gate inactive")
+        log_info("beamcomp.cfg", "useClientName=on (default; no settings file)")
+        log_info("beamcomp.cfg", "enableStatistics=off (default; no settings file)")
         return
     end
+
+    -- The server password (ADR-0056). Read HERE, above the raceAdmins handling, for the same reason
+    -- enableStatistics is: the next block returns early when no admins are listed -- and none listed is
+    -- exactly the config of a server that relies on the password, so a read placed below that return
+    -- would be dead code on every server that needs it.
+    --
+    -- Already trimmed at both ends by the parser, and so is every attempt (access.trim). normalize_name
+    -- is unusable here: it lowercases, and a password is case-sensitive. An empty value and a missing
+    -- key both mean "no password configured". The VALUE is never logged, here or anywhere else.
+    cfg.password = cfg.value(settings, "racePassword")
 
     -- Default on (ADR-0054): only an explicit false turns it off; a missing key stays on.
-    cfg.use_client_name = config.useClientName ~= false
+    cfg.use_client_name = cfg.boolean(settings, "useClientName", true)
     log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
 
-    -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: ONLY an explicit true
-    -- enables the statistics subsystem. A missing key, a truthy non-boolean, the string "true" -- all
-    -- stay off. Read here rather than below because the raceAdmins early return is next, so a config
-    -- carrying enableStatistics but no raceAdmins array must still be honoured. This log line is the
-    -- one place the switch is observable; it is the acceptance check after a deploy.
-    cfg.stats_enabled = config.enableStatistics == true
+    -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: only an explicit true
+    -- enables the statistics subsystem. A missing key, an empty value, a typo -- all stay off, because
+    -- cfg.boolean falls back to the default it is given and this one is false. A suppression switch has
+    -- to fail closed. Read here rather than below because the raceAdmins return is next, so a file
+    -- carrying enableStatistics but no admins must still be honoured. This log line is the one place
+    -- the switch is observable; it is the acceptance check after a deploy.
+    cfg.stats_enabled = cfg.boolean(settings, "enableStatistics", false)
     log_info("beamcomp.cfg", "enableStatistics=" .. (cfg.stats_enabled and "on" or "off"))
 
-    if type(config.raceAdmins) ~= "table" then
-        log_info("beamcomp.cfg", "config at " .. path
-            .. " has no raceAdmins array; race-admin gate inactive")
-        return
-    end
-
     local count = 0
-    for _, name in ipairs(config.raceAdmins) do
-        if type(name) == "string" then
-            local normalized = normalize_name(name)
-            if normalized ~= "" and not cfg.admins[normalized] then
-                cfg.admins[normalized] = true
-                count = count + 1
-            end
+    for entry in (cfg.value(settings, "raceAdmins") or ""):gmatch("[^,]+") do
+        -- normalize_name trims and lowercases, so a spaced-out list reads the same as a tight one and a
+        -- stray comma contributes nothing.
+        local normalized = normalize_name(entry)
+        if normalized ~= "" and not cfg.admins[normalized] then
+            cfg.admins[normalized] = true
+            count = count + 1
         end
     end
 
@@ -557,13 +709,88 @@ local function load_config()
         .. count .. " race admin(s), gate active")
 end
 
--- Whether `player_name` may issue the gated race commands. With the gate inactive (no admins
--- configured) everyone is allowed -- the opt-in default (ADR-0016).
-local function is_race_admin(player_name)
-    if not cfg.admin_gate_active then
+-- Whether the issuing player may run the gated race commands. Two independent ways in (ADR-0056,
+-- amending ADR-0016): the SESSION GRANT -- this connection entered the server password in the
+-- race-setup panel -- or the NAME ALLOWLIST, the original ADR-0016 gate. With neither a password nor a
+-- populated allowlist the gate is inactive and everyone is allowed: ADR-0016's opt-in default,
+-- deliberately unchanged so an upgrade breaks no existing server.
+--
+-- Three things here are load-bearing:
+--
+--   * A CONFIGURED PASSWORD ACTIVATES THE GATE. cfg.admin_gate_active is false whenever raceAdmins is
+--     empty -- which is every server that relies on the password. Reading only that flag would leave
+--     "empty list = everyone may do everything" in force and the password would gate nothing at all.
+--     This is the line the whole feature turns on.
+--   * `player_id` is a plain second argument and Lua does not enforce it -- which FAILS CLOSED. A call
+--     site that forgets it can never see a grant, so the worst a missed site can do is refuse an
+--     unlocked admin; it can never admit a stranger. That is the safe direction for an omitted argument.
+--   * This stays the SINGLE chokepoint. All 14 call sites call exactly this function; there is no
+--     second predicate anywhere in the plugin, and adding one is how a refusal path silently goes open.
+--
+-- The name check reads the RAW BeamMP name at every site (ADR-0054): a name the player can set with
+-- /name must never be an authorization key. A player_id is not settable by the player, so keying the
+-- grant to it does not violate that rule.
+local function is_race_admin(player_name, player_id)
+    if not cfg.admin_gate_active and not cfg.password then
         return true
     end
-    return cfg.admins[normalize_name(player_name)] == true
+    if player_id ~= nil and access.granted[player_id] then
+        return true
+    end
+    return cfg.admin_gate_active and player_name ~= nil
+        and cfg.admins[normalize_name(player_name)] == true
+end
+
+-- The one place a race-admin refusal is worded. `what` is the action in the caller's own words
+-- ("start races", "edit grids", ...), so every site keeps the line it has always sent.
+--
+-- With a server password configured the refusal also says HOW to get in (ADR-0056): /raceui is the only
+-- place the password can be entered, and a player who does not know that is simply stuck. Without a
+-- password the line is byte-identical to before, because there would be nothing to point at.
+--
+-- One helper rather than 14 edited string literals: the hint has to reach every refusal or it is a
+-- coin flip whether a locked-out player ever learns the password exists -- and a list of 14 literals is
+-- exactly the kind of list that goes stale at the 15th site.
+function access.refuse(player_id, what)
+    local line = "BeamComp: you are not allowed to " .. what
+    if cfg.password then
+        line = line .. " -- type " .. CHAT_COMMAND_RACEUI .. " and enter the server password"
+    end
+    MP.SendChatMessage(player_id, line)
+end
+
+-- Log what actually protects this server, once, at startup (ADR-0056). Called from on_init right after
+-- load_config -- deliberately NOT from inside it: load_config has four returns, and the two that skip
+-- its tail (no config file, no raceAdmins array) are exactly the paths where "nothing protects this
+-- server" is most likely true. A warning written at the end of load_config would be missing precisely
+-- when it matters. One call site every path converges on is a property; four branches that each
+-- remember to warn is a claim. (Same reasoning as ADR-0053's layer 0.)
+--
+-- The password itself is never logged -- only whether one is set.
+function access.log_startup_state()
+    log_info("beamcomp.cfg", "racePassword=" .. (cfg.password and "set" or "not set"))
+
+    if not cfg.admin_gate_active and not cfg.password then
+        -- Boxed because it has to survive a scrolling BeamMP console. This is the release-visible half
+        -- of the "unconfigured stays open" decision: the behaviour is unchanged, the silence is not.
+        log_info("beamcomp.cfg", "#############################################################")
+        log_info("beamcomp.cfg", "#  NO ADMIN PROTECTION IS ACTIVE                            #")
+        log_info("beamcomp.cfg", "#  EVERY player on this server may start and abort races,   #")
+        log_info("beamcomp.cfg", "#  overwrite and delete saved grids and presets, and run    #")
+        log_info("beamcomp.cfg", "#  the championship and tournament.                         #")
+        log_info("beamcomp.cfg", "#  Set \"racePassword\" in beamcomp.config.ini and restart.   #")
+        log_info("beamcomp.cfg", "#############################################################")
+        return
+    end
+
+    if cfg.admin_gate_active then
+        -- The reason this item exists, told to the one operator who can still act on it: whoever just
+        -- filled in raceAdmins. Measured 2026-09-09 -- four consecutive sessions of the same user
+        -- produced four different guest names.
+        log_info("beamcomp.cfg", "NOTE: raceAdmins matches the BeamMP name, and while BeamMP login is"
+            .. " broken every player connects as a guest whose name CHANGES on every game start."
+            .. " An entry here will not match the same person tomorrow -- use racePassword instead.")
+    end
 end
 
 -- Read and JSON-decode the grids file from the first candidate path that opens (ADR-0023). Returns
@@ -6015,8 +6242,8 @@ end
 -- verbatim to clients (race-blind, ADR-0005/0013/0018) for the client to validate against geometry. The
 -- caller supplies an already-resolved race_name + overrides; this owns everything from the admin check on.
 local function begin_race_request(player_id, player_name, race_name, overrides)
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "start races")
         log_info("beamcomp.race", "denied race request from " .. tostring(player_name) .. " (not a race admin)")
         return
     end
@@ -6358,7 +6585,7 @@ function identity.apply(player_id, requested)
 end
 
 -- Whether player-set names do anything on this server (ADR-0054). `useClientName` is an operator-editable
--- key in the shipped beamcomp.config.json (ADR-0031 §4): with it off, resolve_identity ignores
+-- key in the shipped beamcomp.config.ini (ADR-0031 §4): with it off, resolve_identity ignores
 -- client_names entirely, so a name set here would change nothing anywhere. Everything the feature shows
 -- the player -- the command, the join hint, the admin's list -- goes through this, so an operator who
 -- turns identity off gets a server that says so rather than one that quietly ignores /name.
@@ -6426,8 +6653,8 @@ function identity.handle_remind(player_id)
     if not player_name then
         return
     end
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to remind players")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "remind players")
         log_info("beamcomp.identity", "denied " .. identity.MSG_REMIND .. " from " .. player_name
             .. " (not a race admin)")
         return
@@ -6567,8 +6794,8 @@ end
 -- /raceclear: force the machine back to lobby + cleanup/despawn from any active phase (safety hatch). This
 -- is the former /raceend behavior; /raceend now force-finishes into the results screen instead (ADR-0038).
 local function handle_raceclear_command(player_id, player_name)
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to end races")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "end races")
         log_info("beamcomp.race", "denied /raceclear from " .. player_name .. " (not a race admin)")
         return
     end
@@ -6586,8 +6813,8 @@ end
 -- same finalize as a grace expiry (classify everyone, capture records) from any active pre-finished phase;
 -- the cars/props stay up until /raceclear or the finished window expires.
 local function handle_raceend_command(player_id, player_name)
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to end races")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "end races")
         log_info("beamcomp.race", "denied /raceend from " .. player_name .. " (not a race admin)")
         return
     end
@@ -6656,8 +6883,8 @@ function champ.handle_command(player_id, player_name, argument)
         return
     end
 
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to manage the championship")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "manage the championship")
         log_info("beamcomp.champ", "denied /championship from " .. player_name .. " (not a race admin)")
         return
     end
@@ -6707,8 +6934,8 @@ end
 -- is the ONLY way a staged race moves forward -- staging no longer times out -- and the panel's raceGo
 -- routes through here too (handle_race_go), so both host routes share one admin gate and one end state.
 local function handle_start_command(player_id, player_name)
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "start races")
         log_info("beamcomp.race", "denied /go from " .. player_name .. " (not a race admin)")
         return
     end
@@ -6786,15 +7013,13 @@ local function handle_analysis_command(player_id, player_name)
     log_info("beamcomp.race", CHAT_COMMAND_ANALYSIS .. " toggle by " .. player_name)
 end
 
--- /raceui: open the asking admin's race-setup panel (ADR-0037). Admin-gated like /race, since the panel
--- starts races; the client assembles the option lists + opens the app on this relay. Race-blind: the
--- server only relays the open signal, it builds no race data.
-local function handle_raceui_command(player_id, player_name)
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to start races")
-        log_info("beamcomp.race", "denied " .. CHAT_COMMAND_RACEUI .. " from " .. player_name .. " (not a race admin)")
-        return
-    end
+-- Open one player's race-setup panel and seed it. Shared by /raceui and by a successful password unlock
+-- (ADR-0056), so an unlocked panel fills EXACTLY as a normal open does -- a property of there being one
+-- function, not of two send lists being kept equal. Race-blind: the server only relays the open signal,
+-- it builds no race data.
+--
+-- Every caller is downstream of the admin check. Do not call this from anywhere that has not passed it.
+function access.open_setup(player_id)
     send_event(player_id, MSG_SETUP_OPEN, {})
     -- Seed the panel with the current championship + tournament state (ADR-0040/0042) so its tournament
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.
@@ -6803,6 +7028,104 @@ local function handle_raceui_command(player_id, player_name)
     -- Same deal for the connected players (ADR-0054): seed the freshly opened panel, then let
     -- identity.broadcast_players keep it current.
     send_event(player_id, identity.MSG_PLAYERS, {players = identity.player_list()})
+end
+
+-- A password attempt from the locked race-setup panel (ADR-0056). Verifies, grants or refuses, and
+-- answers the panel in every branch so it can never sit waiting.
+--
+-- THE ONLY WRITER of access.granted. The attempt string is never logged -- the log records WHO tried and
+-- THAT it failed, which is what an operator needs, and nothing an onlooker could use.
+--
+-- Reads the name straight off MP.GetPlayers rather than through player_name_of, exactly as
+-- identity.handle_remind does and for the same reason: that local is declared further down the chunk,
+-- so a closure created here could not see it. It is the same raw BeamMP name either way, and it is used
+-- for the LOG LINE only -- the authorization decision keys on player_id.
+function access.handle_unlock(player_id, payload)
+    local player_name = MP.GetPlayers()[player_id] or ("id " .. tostring(player_id))
+
+    if not cfg.password then
+        -- Not reachable through the UI (a panel only opens locked when a password is set), but a client
+        -- may send anything; answer rather than drop, so a stale panel does not hang.
+        send_event(player_id, access.MSG_RESULT, {ok = false, reason = "unavailable"})
+        return
+    end
+
+    if access.granted[player_id] then
+        access.open_setup(player_id)
+        send_event(player_id, access.MSG_RESULT, {ok = true})
+        return
+    end
+
+    local state = access.attempts[player_id]
+    if state and state.locked_until and now() < state.locked_until then
+        send_event(player_id, access.MSG_RESULT, {
+            ok = false,
+            reason = "lockout",
+            wait = math.ceil(state.locked_until - now()),
+        })
+        log_info("beamcomp.access", "password attempt from " .. player_name .. " ignored: locked out")
+        return
+    end
+
+    local attempt = type(payload) == "table" and payload.password or nil
+    if type(attempt) ~= "string" or access.trim(attempt) ~= cfg.password then
+        state = state or {n = 0}
+        state.n = state.n + 1
+        state.locked_until = nil
+        access.attempts[player_id] = state
+        if state.n >= access.MAX_TRIES then
+            -- Counter reset with the lockout, so the cooldown is the punishment rather than a permanent
+            -- one-try-per-minute state the player can never climb out of.
+            state.n = 0
+            state.locked_until = now() + access.LOCKOUT_SECONDS
+            send_event(player_id, access.MSG_RESULT, {
+                ok = false,
+                reason = "lockout",
+                wait = access.LOCKOUT_SECONDS,
+            })
+            log_info("beamcomp.access", "wrong password from " .. player_name
+                .. "; locked out for " .. access.LOCKOUT_SECONDS .. "s")
+            return
+        end
+        send_event(player_id, access.MSG_RESULT, {
+            ok = false,
+            reason = "wrong",
+            triesLeft = access.MAX_TRIES - state.n,
+        })
+        log_info("beamcomp.access", "wrong password from " .. player_name
+            .. " (" .. (access.MAX_TRIES - state.n) .. " tries left)")
+        return
+    end
+
+    access.granted[player_id] = true
+    access.attempts[player_id] = nil
+    access.open_setup(player_id)
+    send_event(player_id, access.MSG_RESULT, {ok = true})
+    log_info("beamcomp.access", player_name .. " unlocked race admin with the server password")
+end
+
+-- /raceui: open the asking admin's race-setup panel (ADR-0037). Admin-gated like /race, since the panel
+-- starts races; the client assembles the option lists + opens the app on this relay.
+local function handle_raceui_command(player_id, player_name)
+    if not is_race_admin(player_name, player_id) then
+        -- With a server password configured /raceui is the way IN rather than a wall (ADR-0056): open
+        -- the panel in its LOCKED state, where the only control is the password box. Without a password
+        -- there is nothing to type, so the original refusal stands.
+        --
+        -- This is an operating gate, not a data boundary. The panel's link-time pulls read client state
+        -- the server broadcasts to everyone anyway, and the real boundary is unchanged: all 14
+        -- server-side checks re-verify every single action, so a tampered client that forces its own
+        -- panel open gains nothing.
+        if cfg.password then
+            send_event(player_id, access.MSG_LOCKED, {})
+            log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " opened locked for " .. tostring(player_name))
+            return
+        end
+        access.refuse(player_id, "start races")
+        log_info("beamcomp.race", "denied " .. CHAT_COMMAND_RACEUI .. " from " .. player_name .. " (not a race admin)")
+        return
+    end
+    access.open_setup(player_id)
     log_info("beamcomp.race", CHAT_COMMAND_RACEUI .. " open by " .. player_name)
 end
 
@@ -6810,8 +7133,8 @@ end
 -- /raceui, the server only relays the open signal; the client assembles the race list + opens the app.
 -- The grid edit/save/assign messages this panel drives are already admin-gated server-side (ADR-0023).
 local function handle_gridui_command(player_id, player_name)
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to edit grids")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "edit grids")
         log_info("beamcomp.grid", "denied " .. CHAT_COMMAND_GRIDUI .. " from " .. player_name .. " (not a race admin)")
         return
     end
@@ -6837,6 +7160,11 @@ local function on_player_disconnect(player_id)
     -- and with it any join hint still waiting out its grace.
     client_names[player_id] = nil
     identity.pending[player_id] = nil
+    -- Drop the password grant and the failed-attempt counter with it (ADR-0056). NOT optional
+    -- bookkeeping: BeamMP reuses player ids, so a grant left behind is inherited by whoever takes the
+    -- slot next -- and a stale counter would have a fresh joiner start out half-locked-out.
+    access.granted[player_id] = nil
+    access.attempts[player_id] = nil
     -- Unconditional: the panel lists EVERY connected player, so any leave changes it -- including a
     -- leaver who had a set name. The id is passed because onPlayerDisconnect may or may not still list
     -- him (see is_server_empty_without); without it he could linger in the admin's list.
@@ -7287,8 +7615,8 @@ end
 -- numbers (race-blind, ADR-0005). Payload: {map, race, name, forward = <params>, reverse = <params>?}.
 local function handle_grid_save(player_id, payload)
     local player_name = player_name_of(player_id)
-    if not player_name or not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to save grids")
+    if not player_name or not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "save grids")
         return
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
@@ -7331,8 +7659,8 @@ end
 -- that race. Payload: {map, race, name}.
 local function handle_grid_assign(player_id, payload)
     local player_name = player_name_of(player_id)
-    if not player_name or not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to assign grids")
+    if not player_name or not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "assign grids")
         return
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
@@ -7366,8 +7694,8 @@ end
 -- second round-trip. Payload: {map, race, name}.
 local function handle_grid_delete(player_id, payload)
     local player_name = player_name_of(player_id)
-    if not player_name or not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to delete grids")
+    if not player_name or not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "delete grids")
         return
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
@@ -7457,8 +7785,8 @@ end
 -- {map, name, form}.
 function grid_store.handle_preset_save(player_id, payload)
     local player_name = player_name_of(player_id)
-    if not player_name or not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to save presets")
+    if not player_name or not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "save presets")
         return
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
@@ -7491,8 +7819,8 @@ end
 -- dropdown refreshes. Payload: {map, name}.
 function grid_store.handle_preset_delete(player_id, payload)
     local player_name = player_name_of(player_id)
-    if not player_name or not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to delete presets")
+    if not player_name or not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "delete presets")
         return
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
@@ -7749,8 +8077,8 @@ function tour.handle_cmd(player_id, payload)
     if not player_name then
         return
     end
-    if not is_race_admin(player_name) then
-        MP.SendChatMessage(player_id, "BeamComp: you are not allowed to manage tournaments")
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "manage tournaments")
         log_info("beamcomp.tour", "denied tournamentCmd from " .. player_name .. " (not a race admin)")
         return
     end
@@ -7836,6 +8164,11 @@ local function handle_client_event(player_id, data)
         handle_client_identity(player_id, decoded.payload)
     elseif decoded.type == identity.MSG_REMIND then
         identity.handle_remind(player_id)
+    elseif decoded.type == access.MSG_UNLOCK then
+        -- A password attempt from the locked race-setup panel (ADR-0056). Deliberately NOT gated on
+        -- is_race_admin: this is the one message whose whole job is to be sent by somebody who is not
+        -- an admin yet.
+        access.handle_unlock(player_id, decoded.payload)
     elseif decoded.type == grid_fit.MSG_SIZE then
         grid_fit.handle_size(player_id, decoded.payload)
     elseif decoded.type == MSG_GRID_SAVE then
@@ -7899,6 +8232,9 @@ local function on_init()
     -- Seed the RNG for the random / no-source-fallback start orders (ADR-0033).
     math.randomseed(os.time())
     load_config()
+    -- Every load_config return path converges here, which is what makes the "nothing protects this
+    -- server" warning complete rather than merely intended (ADR-0056).
+    access.log_startup_state()
     ensure_grids_loaded()
     grid_store.ensure_presets_loaded()
     -- Replay the run log into the derived aggregate. A no-op while statistics are switched off
