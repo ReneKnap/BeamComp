@@ -43,16 +43,30 @@ angular.module('beamng.apps')
   // here rather than in the ng-repeat markup for the same reason `label` and `min` do: a knob and its
   // explanation belong together, and the repeat then renders ONE text instead of one per row.
   var LAYOUT_KNOBS = [
-    { key: 'offsetForward', label: 'Offset forward (m)',
-      tip: 'How far behind the start line the whole field sits. Higher moves everyone further back.' },
-    { key: 'offsetLateral', label: 'Offset lateral (m)',
-      tip: 'Moves the whole field sideways, plus to the right. Use it to centre the cars on a wide road '
-        + 'or get them clear of a wall.' },
-    { key: 'headingDeg', label: 'Heading (deg)',
-      tip: 'Turns the whole grid, cars and all. Use it when the cars do not point along the road.' },
+    // `label` is display text and may be reworded -- but only within the label column's fixed width:
+    // `.bc-row.bc-knob > span` in app.html pins it to min(30%, 126px), which is about 21 characters at
+    // the panel's 13px, and a longer label wraps the row to two lines. 22 is the longest that ships.
+    //
+    // `key` is the PERSISTENCE CONTRACT and may not be reworded.
+    // race/grid.lua resolved_params reads params.offsetForward / offsetLateral / headingDeg / rowGap /
+    // colGap / rows / columns off every stored grid, and server/main.lua's grid_fit mirrors some again --
+    // rename one and every saved grid silently loads with default values instead.
+    //
+    // 'Offset forward' was renamed because it said the opposite of what it does: a HIGHER value moves the
+    // field further BACK (DEFAULT_OFFSET_FORWARD is "metres the whole grid trails behind the line").
+    { key: 'offsetForward', label: 'Behind start line (m)',
+      tip: 'How far behind the start line the field sits. On a later part of the grid it is the gap to '
+        + 'the part in front instead.' },
+    { key: 'offsetLateral', label: 'Shift sideways (m)',
+      tip: 'Plus moves the field to the right, minus to the left. Use it to centre the cars on a wide '
+        + 'road or get them clear of a wall.' },
+    // 'Heading' read as a compass bearing; the value is a rotation ADDED to the start line's own heading.
+    { key: 'headingDeg', label: 'Rotate grid (deg)',
+      tip: 'Turns the grid, and the cars turn with it. Use it when the cars do not point along the '
+        + 'road.' },
     { key: 'rowGap', label: 'Row gap (m)', min: 0,
       tip: 'Distance from one row of cars to the next. It also sets how far the columns are staggered.' },
-    { key: 'colGap', label: 'Col gap (m)', min: 0,
+    { key: 'colGap', label: 'Column gap (m)', min: 0,
       tip: 'Distance between two cars standing side by side.' },
     { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
       tip: 'Fix how many rows there are and let the width follow the number of cars. Setting this clears '
@@ -69,14 +83,18 @@ angular.module('beamng.apps')
   // starts, offsetHeight where the car ends up, and the two switches turn the drop and the tilt off.
   // All four are per segment, like every other knob. The internal split height anchor is gone (the
   // chain does its job now) and was never a knob.
+  // Both labels are worded in the section's OWN vocabulary -- the hint above these rows already says
+  // "every car is dropped onto the ground starting from the height the car in front of it landed on", so
+  // "the drop" is a word the panel has taught before either knob is read. 'Height before drop' read as
+  // the height a car has before it falls (an absolute); the value raises where the drop BEGINS.
+  // `key` unchanged, as above: race/grid.lua reads params.castHeight / params.offsetHeight.
   var HEIGHT_KNOBS = [
-    { key: 'castHeight', label: 'Height before drop (m)',
-      tip: 'Starts the search for the ground this much higher up. Use it when a part of the grid sits on '
-        + 'a bank the cars cannot see from below. It only moves the search -- the cars still land on '
-        + 'whatever ground it finds.' },
-    { key: 'offsetHeight', label: 'Height lift (m)',
-      tip: 'Lifts the cars off the ground after they are dropped onto it, so +1 leaves them hovering a '
-        + 'metre up. Only this part of the grid. Use a little where cars sink into the terrain.' },
+    { key: 'castHeight', label: 'Drop starts higher (m)',
+      tip: 'Begins the drop this much higher up. Raise it where the cars sit far below their real ground '
+        + '-- a bank or a ramp the drop cannot reach. They still land on the ground, not above it.' },
+    { key: 'offsetHeight', label: 'Lift above ground (m)',
+      tip: 'Applied after the drop, so +1 leaves the cars hovering a metre up. Use a little where cars '
+        + 'sink into the terrain.' },
   ];
 
   // Every numeric knob, for the helpers that do not care which section a knob renders in (the edit-field
@@ -90,9 +108,11 @@ angular.module('beamng.apps')
     { key: 'mirror', label: 'Mirror', section: 'layout',
       tip: 'Flip the grid to the other side of the road, so the front car swaps between left and '
         + 'right.' },
+    // The label may not be reworded (it is named after what it switches ON, see above), so this tip is
+    // the only place "downcast" can be put into the player's words -- hence a translation, not a repeat.
     { key: 'noDowncast', label: 'Disable downcast', section: 'height',
-      tip: 'Stops the cars in this part of the grid being dropped onto the ground. They stay at the '
-        + 'height carried over from the car in front, plus the lift below.' },
+      tip: 'Switched on, the cars here are not dropped onto the ground at all: they keep the height of '
+        + 'the car in front, plus the lift. Use it where the ground beneath them is wrong.' },
     { key: 'noSlope', label: 'Disable slope', section: 'height',
       tip: 'Keeps the cars in this part of the grid level instead of leaning them with the ground. Use '
         + 'it where a kerb or a step tips a car over.' },
@@ -128,8 +148,7 @@ angular.module('beamng.apps')
   // race/grid.lua). An entry may be a FUNCTION of the scope where the useful answer depends on live
   // state (see scope.tip).
   var TIPS = {
-    race: 'The race this grid is for. A grid belongs to its race, so this also decides which saved grids '
-      + 'count as "this race" below.',
+    race: 'The race this grid is for. It also decides which saved grids the list below shows first.',
     newGrid: 'Start a fresh grid from the track default. Needs a race picked, and it throws away whatever '
       + 'you are editing.',
     load: 'Show the grids saved on this map.',
@@ -145,7 +164,7 @@ angular.module('beamng.apps')
       + 'own layout.',
     removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
-      + 'one to edit it with the knobs below.',
+      + 'one to edit it with the settings below.',
 
     previewCount: 'How many cars the preview draws. It is also the field size above which starting a race '
       + 'warns you, and it never changes the layout itself.',
@@ -154,8 +173,7 @@ angular.module('beamng.apps')
       + 'ground is awkward -- under a bridge, on a bank, on a kerb.',
 
     saveGrid: 'Show the name field, to store this grid for the race you are editing.',
-    saveName: 'What to call this grid. No spaces -- a grid name has to work as an argument, so a spaced '
-      + 'name cannot be saved or used.',
+    saveName: 'What to call this grid. A name with a space in it cannot be saved.',
     saveConfirm: 'Save the grid under this name, replacing any grid of that name on this race.',
     // Says which grid this race starts on TODAY, which is the one thing the button's own label cannot.
     // All three answers come off the saved-grid list the panel already holds.
@@ -166,7 +184,9 @@ angular.module('beamng.apps')
     // dropdown here would name the wrong race's grid in exactly that case.
     makeDefault: function (scope) {
       if (!scope.savedName || !scope.state.race) {
-        return 'Makes this race start on the grid you are editing. Save or load a grid first.';
+        // The hint under this button already says to save or load first, so this branch does not repeat
+        // it -- it says what the button will do once there is something to point at.
+        return 'Makes this race start on the grid you are editing.';
       }
       var current = defaultGridName(scope.data.grids, scope.state.race);
       if (current === scope.savedName) {

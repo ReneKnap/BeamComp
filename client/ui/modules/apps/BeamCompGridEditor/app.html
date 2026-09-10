@@ -215,9 +215,11 @@
          -- state.activeSegment has always been 1-based. -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Segment</div>
+      <!-- This hint names a Layout label by its display text, so it has to be kept in step with
+           LAYOUT_KNOBS in app.js -- it is the only place outside that table where one appears. -->
       <div class="bc-hint">Editing segment {{state.activeSegment}} of {{state.segments.length}} (from
-        {{slotLabel(state.activeStartSlot)}}). The Layout knobs below apply to this segment; it stacks
-        behind the previous one, with its Offset forward as the gap.</div>
+        {{slotLabel(state.activeStartSlot)}}). The Layout settings below apply to this segment; it stacks
+        behind the previous one, with its Behind start line value as the gap.</div>
       <div class="bc-row" bc-grid-tip="tip('breakpoint')">
         <span>Breakpoint at P</span>
         <div class="bc-step">
