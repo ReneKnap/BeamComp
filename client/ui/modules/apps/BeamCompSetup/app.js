@@ -156,8 +156,8 @@ angular.module('beamng.apps')
       + 'starts it anyway, but then the cars line up facing the wrong way.',
 
     // --- Vehicles ---
-    carModel: 'The car everyone drives. "keep own" leaves each player in the car he is already in. Pick '
-      + 'one car and the limits below disappear.',
+    carModel: 'The car everyone drives. "keep own" leaves each player in the car they are already in. '
+      + 'Pick one car and the limits below disappear.',
     carConfig: 'Which factory version of that car to spawn.',
     carRandomTrim: 'Give each drawn car a random factory version instead of the standard one.',
     // The filter is a curb-weight ceiling (vehiclespecs.BIG_CAR_MAX_WEIGHT), not a vehicle class, so a
@@ -281,8 +281,8 @@ angular.module('beamng.apps')
       }
       return text;
     },
-    aiCar: 'What the computer drivers drive. "default" gives each driver the car that belongs to his name. '
-      + 'Changing this gives the whole field new cars but keeps their names and colours.',
+    aiCar: 'What the computer drivers drive. "default" gives each driver the car that belongs to their '
+      + 'name. Changing this gives the whole field new cars but keeps their names and colours.',
     aiRandomTrim: 'Give each AI car a random factory version instead of the standard one.',
     aiNoBigCars: 'Leave buses, trucks and vans out of the AI draw. It goes by weight, so a very heavy '
       + 'pickup can still slip through.',
@@ -294,7 +294,7 @@ angular.module('beamng.apps')
     rosterNameRoll: 'Draw another free name, with the car and colour that belong to it.',
     // Kept rather than dropped as a label repeat: the row also shows the colour swatch, which the label
     // "Car" does not account for, and the adjacent Change button has its own text.
-    rosterCarShown: 'The car this driver starts in, with his paint beside it.',
+    rosterCarShown: 'The car this driver starts in, with their paint beside it.',
     rosterChange: 'Open this driver\'s car, version and colour. What you set here counts for this race '
       + 'only.',
     rosterTypeShown: 'The factory version this car spawns as.',
@@ -348,8 +348,8 @@ angular.module('beamng.apps')
 
     // --- Players ---
     players: 'Everyone on the server right now. "temporary name" means the player still carries the name '
-      + 'BeamMP gave him -- he can set his own with "/name <name>" in chat, and it then sticks across '
-      + 'restarts.',
+      + 'BeamMP gave them -- they can set their own with "/name <name>" in chat, and it then sticks '
+      + 'across restarts.',
     remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick '
       + 'their own. Nobody else is written to.',
 
