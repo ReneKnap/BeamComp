@@ -3,8 +3,8 @@
   "directive": "beamCompSetup",
   "name": "BeamComp Setup",
   "description": "BeamComp race-setup panel -- set all /race options via dropdowns and start the race (admin only). Opened with /raceui.",
-  "author": "BeamComp",
-  "version": "0.0.1",
+  "author": "Rene Knap",
+  "version": "0.9.0",
   "category": "Gameplay",
   "types": [
     "ui.apps.categories.racing"

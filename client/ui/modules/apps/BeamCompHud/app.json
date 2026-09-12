@@ -2,9 +2,9 @@
   "domElement": "<beam-comp-hud></beam-comp-hud>",
   "directive": "beamCompHud",
   "name": "BeamComp HUD",
-  "description": "BeamComp race HUD -- next checkpoint, position, and live time. Placeholder; populated in Phase 4.",
-  "author": "BeamComp",
-  "version": "0.0.1",
+  "description": "BeamComp race HUD -- your next checkpoint, your position, and live times while you race. Appears on its own when a race starts.",
+  "author": "Rene Knap",
+  "version": "0.9.0",
   "category": "Gameplay",
   "interactive": "no",
   "types": [
