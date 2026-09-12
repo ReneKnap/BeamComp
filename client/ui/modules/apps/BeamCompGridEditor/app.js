@@ -45,7 +45,12 @@ angular.module('beamng.apps')
   var LAYOUT_KNOBS = [
     // `label` is display text and may be reworded -- but only within the label column's fixed width:
     // `.bc-row.bc-knob > span` in app.html pins it to min(30%, 126px), which is about 21 characters at
-    // the panel's 13px, and a longer label wraps the row to two lines. 22 is the longest that ships.
+    // the panel's 13px, and a longer label wraps the row to two lines. 18 is the longest that ships.
+    //
+    // The UNIT is deliberately not in the label. Spelling it out ("Behind start line in meters") ran
+    // 27 characters and wrapped every row; the cryptic "(m)" was what prompted the rewording in the
+    // first place. So each tip names its unit instead, and the label stays a plain name. Putting a
+    // unit back in a label means checking it against the width above.
     //
     // `key` is the PERSISTENCE CONTRACT and may not be reworded.
     // race/grid.lua resolved_params reads params.offsetForward / offsetLateral / headingDeg / rowGap /
@@ -54,26 +59,22 @@ angular.module('beamng.apps')
     //
     // 'Offset forward' was renamed because it said the opposite of what it does: a HIGHER value moves the
     // field further BACK (DEFAULT_OFFSET_FORWARD is "metres the whole grid trails behind the line").
-    { key: 'offsetForward', label: 'Behind start line (m)',
-      tip: 'How far behind the start line the field sits. On a later part of the grid it is the gap to '
-        + 'the part in front instead.' },
-    { key: 'offsetLateral', label: 'Shift sideways (m)',
-      tip: 'Plus moves the field to the right, minus to the left. Use it to centre the cars on a wide '
-        + 'road or get them clear of a wall.' },
+    { key: 'offsetForward', label: 'Behind start line',
+      tip: 'How far behind the start line the field sits, in meters.' },
+    { key: 'offsetLateral', label: 'Shift sideways',
+      tip: 'Plus moves the field to the right, minus to the left, in meters.' },
     // 'Heading' read as a compass bearing; the value is a rotation ADDED to the start line's own heading.
-    { key: 'headingDeg', label: 'Rotate grid (deg)',
-      tip: 'Turns the grid, and the cars turn with it. Use it when the cars do not point along the '
-        + 'road.' },
-    { key: 'rowGap', label: 'Row gap (m)', min: 0,
-      tip: 'Distance from one row of cars to the next. It also sets how far the columns are staggered.' },
-    { key: 'colGap', label: 'Column gap (m)', min: 0,
-      tip: 'Distance between two cars standing side by side.' },
-    { key: 'rows', label: 'Rows', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
-      tip: 'Fix how many rows there are and let the width follow the number of cars. Setting this clears '
-        + 'Columns -- only one of the two can be fixed.' },
-    { key: 'columns', label: 'Columns', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
-      tip: 'Fix how many cars stand side by side and let the rows follow the number of cars. Setting this '
-        + 'clears Rows -- only one of the two can be fixed.' },
+    { key: 'headingDeg', label: 'Rotate grid',
+      tip: 'Turns the grid, and the cars turn with it, in degrees. Use it when the cars do not point along '
+        + 'the road.' },
+    { key: 'rowGap', label: 'Row gap', min: 0,
+      tip: 'Distance from one row of cars to the next, in meters.' },
+    { key: 'colGap', label: 'Column gap', min: 0,
+      tip: 'Distance between two cars standing side by side, in meters.' },
+    { key: 'rows', label: 'Number of rows', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
+      tip: 'Fix how many rows there are and let the width follow the number of cars.' },
+    { key: 'columns', label: 'Number of columns', integer: true, auto: true, min: 1, max: AXIS_PIN_MAX,
+      tip: 'Fix how many cars stand side by side and let the rows follow the number of cars.' },
   ];
 
   // The height section (ADR-0023 amendment 2026-09-01), revealed on demand and collapsed by default --
@@ -89,12 +90,12 @@ angular.module('beamng.apps')
   // the height a car has before it falls (an absolute); the value raises where the drop BEGINS.
   // `key` unchanged, as above: race/grid.lua reads params.castHeight / params.offsetHeight.
   var HEIGHT_KNOBS = [
-    { key: 'castHeight', label: 'Drop starts higher (m)',
-      tip: 'Begins the drop this much higher up. Raise it where the cars sit far below their real ground '
-        + '-- a bank or a ramp the drop cannot reach. They still land on the ground, not above it.' },
-    { key: 'offsetHeight', label: 'Lift above ground (m)',
-      tip: 'Applied after the drop, so +1 leaves the cars hovering a metre up. Use a little where cars '
-        + 'sink into the terrain.' },
+    { key: 'castHeight', label: 'Drop starts higher',
+      tip: 'Begins the drop this much higher up, in meters. Raise it where the cars sit far below their real '
+        + 'ground, a bank or a ramp the drop cannot reach.' },
+    { key: 'offsetHeight', label: 'Lift above ground',
+      tip: 'Applied after the drop, in meters, so +1 leaves the cars hovering a meter up. Use a little where '
+        + 'cars sink into the terrain.' },
   ];
 
   // Every numeric knob, for the helpers that do not care which section a knob renders in (the edit-field
@@ -111,11 +112,10 @@ angular.module('beamng.apps')
     // The label may not be reworded (it is named after what it switches ON, see above), so this tip is
     // the only place "downcast" can be put into the player's words -- hence a translation, not a repeat.
     { key: 'noDowncast', label: 'Disable downcast', section: 'height',
-      tip: 'Switched on, the cars here are not dropped onto the ground at all: they keep the height of '
-        + 'the car in front, plus the lift. Use it where the ground beneath them is wrong.' },
+      tip: 'Switched on, the cars here are not dropped onto the ground at all: they keep the height of the '
+        + 'car in front, plus the lift.' },
     { key: 'noSlope', label: 'Disable slope', section: 'height',
-      tip: 'Keeps the cars in this part of the grid level instead of leaning them with the ground. Use '
-        + 'it where a kerb or a step tips a car over.' },
+      tip: 'Keeps the cars in this part level instead of leaning them with the ground.' },
   ];
 
   // The switch rows of one section, in declaration order.
@@ -148,30 +148,24 @@ angular.module('beamng.apps')
   // race/grid.lua). An entry may be a FUNCTION of the scope where the useful answer depends on live
   // state (see scope.tip).
   var TIPS = {
-    race: 'The race this grid is for. It also decides which saved grids the list below shows first.',
-    newGrid: 'Start a fresh grid from the track default. Needs a race picked, and it throws away whatever '
-      + 'you are editing.',
+    race: 'The race this grid is for.',
+    newGrid: 'Start a fresh grid from the track default. Needs a race picked.',
     load: 'Show the grids saved on this map.',
-    gridRow: 'Load this grid for editing. While you are editing it asks twice, because loading throws '
-      + 'away unsaved changes.',
-    gridDelete: 'Delete this saved grid. Click twice -- there is no undo.',
-
+    gridRow: 'Load this grid for editing.',
+    gridDelete: 'Delete this saved grid.',
     direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
 
-    breakpoint: 'The starting position where a new part of the grid begins. Type a number, then press Add '
-      + 'breakpoint -- typing alone does nothing.',
+    breakpoint: 'The starting position where a new part of the grid begins.',
     addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
       + 'own layout.',
     removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
       + 'one to edit it with the settings below.',
 
-    previewCount: 'How many cars the preview draws. It is also the field size above which starting a race '
-      + 'warns you, and it never changes the layout itself.',
-
-    heightOptions: 'Show the settings for how the cars meet the ground. You only need them where the '
-      + 'ground is awkward -- under a bridge, on a bank, on a kerb.',
-
+    previewCount: 'Sets the recommended number of participants and determines how many cars the preview '
+      + 'draws.',
+    heightOptions: 'Show the settings for how the cars meet the ground. You only need them where the ground '
+      + 'is unusual: under a bridge, on a bank.',
     saveGrid: 'Show the name field, to store this grid for the race you are editing.',
     saveName: 'What to call this grid. A name with a space in it cannot be saved.',
     saveConfirm: 'Save the grid under this name, replacing any grid of that name on this race.',
