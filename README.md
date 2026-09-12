@@ -119,7 +119,7 @@ follows here is the same thing in short.
 ```ini
 # Lines starting with # are comments.
 raceAdmins = Alice, Bob
-racePassword = choose-something-here
+racePassword = something-only-we-know
 useClientName = true
 ```
 
