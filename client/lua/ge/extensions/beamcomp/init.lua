@@ -1,5 +1,9 @@
 -- BeamComp -- client GE (Game-Engine) extension.
 --
+-- Copyright 2026 Rene Knap. Licensed under the PolyForm Strict License 1.0.0 plus an additional
+-- permission; the full terms are in the LICENSE file at the root of this mod zip. Run it, do not
+-- redistribute it.
+--
 -- Lives at lua/ge/extensions/beamcomp/init.lua inside the client mod zip and loads under
 -- the name `beamcomp_init` (brought up by scripts/beamcomp/modScript.lua). The GE VM owns
 -- the scene, level, UI, camera, and vehicle spawning, and is where the BeamMP client<->
