@@ -9,6 +9,9 @@
   are replaced on each run. The committed client/ and server/ trees are never
   modified -- all duplication happens in a staging directory and the target.
 
+  LICENSE rides along in both halves, and README.md in the server half, so a
+  download carries its own terms and setup instructions.
+
   Runtime data the plugin writes into the server folder (named grids, saved
   presets, the per-run records log) is copied out before the folder is wiped and
   put back afterwards, so a redeploy never resets it to the empty repo seed.
@@ -78,8 +81,14 @@ $repoRoot  = Split-Path -Parent $PSScriptRoot
 $clientDir = Join-Path $repoRoot 'client'
 $serverDir = Join-Path $repoRoot 'server'
 $envelope  = Join-Path $repoRoot 'shared\envelope.lua'
+# The license has to travel with the payload. BeamComp is handed out as a download and the repository
+# is not public, so a LICENSE that never leaves the source tree reaches nobody who installs it -- and
+# the license is the only enforcement basis there is (the mod ships as readable source by necessity).
+# Both halves get a copy, and a missing file throws below rather than shipping an unlicensed build.
+$license   = Join-Path $repoRoot 'LICENSE'
+$readme    = Join-Path $repoRoot 'README.md'
 
-foreach ($p in @($clientDir, $serverDir, $envelope)) {
+foreach ($p in @($clientDir, $serverDir, $envelope, $license, $readme)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "Missing repo path: $p" }
 }
 
@@ -114,6 +123,9 @@ try {
     $geBeamcomp = Join-Path $stageClient 'lua\ge\extensions\beamcomp'
     New-Dir $geBeamcomp
     Copy-Item -LiteralPath $envelope -Destination (Join-Path $geBeamcomp 'envelope.lua') -Force
+
+    # At the zip root, so every player who receives the mod receives the terms it comes under.
+    Copy-Item -LiteralPath $license -Destination (Join-Path $stageClient 'LICENSE') -Force
 
     New-Dir $clientOutDir
     # Zip the staged contents so the archive root is the mod tree (lua/, ui/).
@@ -182,6 +194,10 @@ try {
     New-Dir $serverOut
     Copy-Item -Path (Join-Path $serverDir '*') -Destination $serverOut -Recurse -Force
     Copy-Item -LiteralPath $envelope -Destination (Join-Path $serverOut 'envelope.lua') -Force
+
+    # The operator is the one who has to read both: the terms, and how to set the thing up.
+    Copy-Item -LiteralPath $license -Destination (Join-Path $serverOut 'LICENSE') -Force
+    Copy-Item -LiteralPath $readme -Destination (Join-Path $serverOut 'README.md') -Force
 
     if ($null -ne $gridsBackup) {
         Copy-Item -LiteralPath $gridsBackup -Destination $gridsTarget -Force
