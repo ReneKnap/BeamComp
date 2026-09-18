@@ -1896,22 +1896,26 @@ grid_fit.SAFETY_MARGIN = 0.5
 -- drift is not slight. A server clamping tighter than the client reserves its holes in a grid of a
 -- different width than the one the client lays out, which is a wrong reservation for every pin between
 -- the two bounds. It moved from 8 to 32 with the client's pin cap (bug
--- grideditor-knobs-missing-upper-clamp). MAX_PASSES below is unaffected by that: a columns-pinned
--- segment's geometry does not depend on the extent at all, and a rows-pinned one still maps the extent
--- through ceil(count / rows) -- a wider range of pins, not a new way for the fixpoint to oscillate.
+-- grideditor-knobs-missing-upper-clamp). MAX_ROUNDS below is unaffected by that: a columns-pinned
+-- segment's geometry does not depend on the layout size at all, and a rows-pinned one still maps it
+-- through ceil(count / rows) -- a wider range of pins, not a longer walk.
 grid_fit.DEFAULT_COLUMNS = 2
 grid_fit.DEFAULT_ROW_GAP = 8.0
 grid_fit.DEFAULT_COL_GAP = 4.0
 grid_fit.AXIS_CAPACITY = 32
 
 -- Safety rails.
---   MAX_PASSES -- the allocation is a fixpoint: a ROWS-pinned segment derives its column count from how
---     many poses are laid out (race/grid.lua), which is what the allocation itself decides. It settles on
---     the first comparison for the columns-pinned default; give the rows-pinned case a few tries and then
---     give up rather than guess, because server and client must agree on the column count exactly.
+--   MAX_ROUNDS -- the allocation WALKS candidate layout sizes (grid_fit.assign) and the walk has to end
+--     somewhere. Measured (.claude/tools/grid_fit_probe.py) over 9240 parameter sets -- 15 width pins x
+--     4 gap sets x 77 fields of cars, buses and semis from 2 to 32 vehicles, each with and without the
+--     ADR-0044 start ramp: every one of them resolves, the worst needing 184 rounds (32 semis on a
+--     rows=4 grid with a 3 m column gap), a field of 12 or fewer 1 to 3. So 192, the worst case plus
+--     headroom. Cost at that worst case, on an INTERPRETED Lua to be safe: 34 ms, once, in the staging
+--     window -- against a 0.02 ms median for a normal field. Running out is the fallback ADR-0051 §5
+--     asks for, not a failure to plan for.
 --   MAX_SCAN_PER_CAR -- hard bound on the search for a free slot, so a degenerate grid (or a logic slip)
 --     can never spin the BeamMP server's single Lua thread.
-grid_fit.MAX_PASSES = 6
+grid_fit.MAX_ROUNDS = 192
 grid_fit.MAX_SCAN_PER_CAR = 64
 
 -- The per-direction param block a client will feed to its grid math, out of a stored grid record.
@@ -2035,6 +2039,25 @@ function grid_fit.clears(one, two)
     return longitudinal >= grid_fit.SAFETY_MARGIN
 end
 
+-- The rectangle a car of `size` occupies on layout index `index`: its front on the pose with the body
+-- extending BACKWARD by its length (front-anchored, ADR-0034), centred laterally. nil means there is
+-- nothing to reason about -- an unreported footprint, or a hand-edited gap of 0 that switches an axis
+-- off. Both the allocation pass and the stretch build their boxes here, so the two can never disagree
+-- about where a slot puts a car.
+function grid_fit.box(geometry, index, size)
+    if not size or geometry.row_gap <= 0 or geometry.col_gap <= 0 then
+        return nil
+    end
+    local setback, lateral = grid_fit.slot_offsets(geometry, index)
+    return {
+        setback = setback,
+        lateral = lateral,
+        length = size.length,
+        width = size.width,
+        segment = geometry.start,
+    }
+end
+
 -- One allocation pass over `ordered` (participant ids in START ORDER -- never re-sorted), assuming the
 -- client lays `total` poses out. `offset` shifts a participant slot onto its layout index: 1 for the
 -- staged-quali start ramp the client splits off the front (ADR-0044), else 0.
@@ -2052,25 +2075,16 @@ function grid_fit.assign_pass(ordered, sizes, segments, offset, total)
     local slots = {}
     local cursor = 0
     for position, id in ipairs(ordered) do
-        local size = sizes[id]
         local slot
         for candidate = cursor, cursor + grid_fit.MAX_SCAN_PER_CAR do
             local index = candidate + offset
-            local geometry = grid_fit.geometry(segments, index, total)
+            local box = grid_fit.box(grid_fit.geometry(segments, index, total), index, sizes[id])
             -- No footprint, or a grid whose gaps cannot be reasoned about (a hand-edited 0): take the
             -- slot as it comes, exactly as before this feature existed.
-            if not size or geometry.row_gap <= 0 or geometry.col_gap <= 0 then
+            if not box then
                 slot = candidate
                 break
             end
-            local setback, lateral = grid_fit.slot_offsets(geometry, index)
-            local box = {
-                setback = setback,
-                lateral = lateral,
-                length = size.length,
-                width = size.width,
-                segment = geometry.start,
-            }
             local free = true
             for _, other in ipairs(placed) do
                 if other.segment == box.segment and not grid_fit.clears(box, other) then
@@ -2093,6 +2107,29 @@ function grid_fit.assign_pass(ordered, sizes, segments, offset, total)
     return slots, cursor
 end
 
+-- Move the LAST car onto the final slot of a `total`-pose layout and report whether it still clears
+-- everyone; on success `slots` carries the new number. This is what lets the server CHOOSE a layout
+-- size: the client lays out `highest slot + 1` poses (race/start.lua layout_extent), so the last car's
+-- slot is the only thing that decides how wide a rows-pinned grid ends up. Nobody else moves -- the
+-- others were already placed under this same geometry.
+function grid_fit.stretch(ordered, sizes, segments, offset, slots, total)
+    local last = #ordered
+    local index = total - 1
+    local moved = grid_fit.box(grid_fit.geometry(segments, index, total), index, sizes[ordered[last]])
+    if moved then
+        for position = 1, last - 1 do
+            local other_index = slots[position] + offset
+            local other = grid_fit.box(grid_fit.geometry(segments, other_index, total), other_index,
+                sizes[ordered[position]])
+            if other and other.segment == moved.segment and not grid_fit.clears(moved, other) then
+                return false
+            end
+        end
+    end
+    slots[last] = index - offset
+    return true
+end
+
 -- The reported footprints keyed by participant id (ADR-0051 §3). Only a complete, positive pair counts:
 -- a car whose box could not be read reserves nothing, the same way an unreported pwr just sorts to the
 -- back instead of failing the grid.
@@ -2108,14 +2145,60 @@ function grid_fit.sizes()
     return sizes
 end
 
+-- The one line an admin gets when the reservation gives up. A WARNING, and it names what to change: the
+-- grid's width pin and the car the field could not be laid out around. The plugin's only sink is print,
+-- so the level is textual here -- same as access.log_startup_state. As a bare info line between
+-- everything else nobody connected it to the too-tight starting grid they were looking at.
+function grid_fit.log_fallback(ordered, sizes, segments)
+    local params = segments[1].params
+    -- Same precedence grid_fit.geometry applies, so the line never names a pin that is not in force:
+    -- an explicit `columns` wins over an explicit `rows`, and neither means the two-column default.
+    local shape = "the default 2-column"
+    if type(params.columns) == "number" and params.columns >= 1 then
+        shape = string.format("columns=%d", math.floor(params.columns))
+    elseif type(params.rows) == "number" and params.rows >= 1 then
+        shape = string.format("rows=%d", math.floor(params.rows))
+    end
+    local worst, worst_id
+    for _, id in ipairs(ordered) do
+        local size = sizes[id]
+        if size and (not worst or size.length > worst.length) then
+            worst, worst_id = size, id
+        end
+    end
+    if not worst then
+        return
+    end
+    log_info("beamcomp.grid", string.format(
+        "WARNING: %s grid too tight for this field -- longest car %.1f x %.1f m (%s); "
+        .. "using a plain grid, cars will stand too close",
+        shape, worst.length, worst.width, resolve_identity(worst_id) or tostring(worst_id)))
+end
+
 -- Assign every participant in `ordered` a 0-based slot, leaving the slots an oversized car covers empty.
--- Returns the slot list (1:1 with `ordered`), or nil when there is nothing to reserve or the fit could
--- not be resolved -- the caller then falls back to today's contiguous slots.
+-- Returns the slot list (1:1 with `ordered`), or nil when there is nothing to reserve or no layout could
+-- be made to hold the field -- the caller then falls back to today's contiguous slots (ADR-0051 §5).
 --
--- The loop is the fixpoint from ADR-0051 §5: a rows-pinned segment's column count depends on how many
--- poses are laid out, which is what this decides, so a pass is re-run until the extent it produces is
--- the one it assumed. Bailing out on no-settle is deliberate -- a server that assumed a different column
--- count than the client uses would place cars into the wrong holes.
+-- The LAYOUT SIZE is a parameter here, not a result. A rows-pinned segment derives its column count from
+-- how many poses the client lays out, and the client lays out `highest slot + 1` of them -- so the server
+-- picks a size, fits the field under the geometry that size implies, and makes the highest slot come out
+-- as exactly one less. Both sides then compute the same columns by construction, which is the agreement
+-- ADR-0051 §5 protects: a server that assumed a different column count than the client uses would place
+-- cars into the wrong holes.
+--
+-- Round 1 read that agreement as a FIXPOINT and re-ran a pass until the extent it produced equalled the
+-- one it assumed. Measured (bug grid-fit-fixpoint-exhausts-on-rows-pinned-grids): on a rows-pinned grid
+-- with oversized cars that equation usually has NO solution at all. More poses means more columns, and
+-- once the columns reach the field size every car fits in row 0 and the extent collapses back onto the
+-- field size, taking the columns with it. So the iteration cycled -- 4 -> 8 -> 4 for four semis on
+-- rows = 2, period 4 for eight buses on rows = 4 -- and no pass budget could ever have helped.
+--
+-- The walk below still FOLLOWS that iteration, because where a self-consistent layout exists the
+-- iteration lands on it and lands tight: all 4183 fields round 1 could solve come out slot for slot the
+-- same. What it adds is `tried` -- a size is only ever assumed once, so a cycle runs out of new sizes
+-- instead of repeating -- and, at the point where round 1 would have started over, the stretch: it moves
+-- the LAST car onto the final slot of the current size. A monotone walk terminates too and was measured
+-- against this one, but it made 394 of 4620 already-working grids looser, so it is not what ships.
 function grid_fit.assign(ordered)
     if #ordered == 0 then
         return nil
@@ -2128,19 +2211,34 @@ function grid_fit.assign(ordered)
         session.grid_direction))
     local offset = session.grid_ramp and 1 or 0
     local extent = #ordered
-    for _ = 1, grid_fit.MAX_PASSES do
-        local slots, next_extent =
-            grid_fit.assign_pass(ordered, sizes, segments, offset, extent + offset)
+    local tried = {}
+    for _ = 1, grid_fit.MAX_ROUNDS do
+        tried[extent] = true
+        local slots, needed = grid_fit.assign_pass(ordered, sizes, segments, offset, extent + offset)
         if not slots then
-            log_info("beamcomp.grid", "slot reservation ran out of candidate slots; using a plain grid")
-            return nil
-        end
-        if next_extent == extent then
+            -- Every slot within MAX_SCAN_PER_CAR of the one before it was taken under this geometry. A
+            -- wider layout spreads the columns, so keep walking instead of giving up here.
+            extent = extent + 1
+        elseif needed == extent then
             return slots
+        elseif not tried[needed] then
+            -- Follow the size the pass asks for, larger or smaller. Where a self-consistent layout
+            -- exists this walks straight onto it -- it is the round-1 iteration, and it keeps that
+            -- iteration's tight answers exactly. `tried` is what makes it safe: a size is only ever
+            -- assumed once, so the sequence that used to cycle runs out of new sizes instead.
+            extent = needed
+        else
+            -- Back on a size already assumed: from here the sequence could only repeat itself. Put the
+            -- last car on the final slot instead, which makes the client lay out exactly the `extent`
+            -- poses this fit was checked against. If it cannot stand there, one slot more is next.
+            if needed < extent
+                and grid_fit.stretch(ordered, sizes, segments, offset, slots, extent + offset) then
+                return slots
+            end
+            extent = extent + 1
         end
-        extent = next_extent
     end
-    log_info("beamcomp.grid", "slot reservation did not settle on a grid size; using a plain grid")
+    grid_fit.log_fallback(ordered, sizes, segments)
     return nil
 end
 
