@@ -14,6 +14,9 @@ Built for small groups on private servers who would rather race than free-roam.
 This is an Early Access release: complete and playable, with a few known rough edges listed in
 [CHANGELOG.md](CHANGELOG.md).
 
+BeamComp lives at **<https://www.patreon.com/c/ReneKnap>**. New versions appear there, and that is
+where to ask anything about it.
+
 ## What you get
 
 - **Real starting grids.** Cars line up in rows and columns, not in a heap on the spawn point. Grids
@@ -238,6 +241,13 @@ field can be diagnosed. That is not an invitation to redistribute it.
 
 **Why it is worth respecting.** BeamComp is free to play with -- the supporters who pay for it are
 buying *early* access to new versions, nothing else. One re-upload and that is gone, and with it the
-reason there are new versions. If someone asks you for it, send them to the original download.
+reason there are new versions. If someone asks you for it, send them to
+<https://www.patreon.com/c/ReneKnap>.
 
 If you want to do something the license does not allow, ask -- permission can be granted.
+
+## Credits
+
+BeamComp is by Rene Knap.
+
+Team Principal supporters are named here, once there are any.
