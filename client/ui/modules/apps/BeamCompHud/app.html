@@ -121,7 +121,10 @@
       line-height: 1.2;
       text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
     }
-    /* The toastr kind carried through as colour; "info" keeps the white default above. */
+    /* The toastr kind carried through as colour, so a message keeps the same severity whichever surface
+       it lands on -- the routing must not change what it looks like it means. "info" keeps the white
+       default above, so it needs no rule. These two class names are BUILT BY CONCATENATION in the markup
+       ("bc-notice-" + kind), so grepping for the literal finds nothing -- check the ng-class expression. */
     .beamcomp-root .bc-notice-warning {
       color: #f2c744;
     }
