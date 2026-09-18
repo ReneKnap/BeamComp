@@ -514,6 +514,47 @@ function notice.say(msg, kind, title)
     notice.paint()
 end
 
+-- Show one checkpoint passage on the centred readout: "CP 3/8" plus the total time, ~2 s, then gone.
+-- Replaces the per-crossing toast -- the one message in the race that fired unasked and repeatedly
+-- (8 checkpoints over 3 laps = 24 toasts in a single race).
+--
+-- Two passages are deliberately silent:
+--   * the one that ENDS the race (the last plan entry, seq + 1 == count): the green finish banner and the
+--     results card own that moment. That is the last CROSSING, not every crossing of the start/finish
+--     line -- a circuit closes a lap on that line every lap, and those do show.
+--   * every passage in qualifying: the sector readout already sits on this exact spot with a richer line
+--     (split + delta), and qualifying stays untouched. Hence the `racing`-only gate rather than
+--     notice.in_race().
+--
+-- Everything it needs is already at the client (ADR-0011): no new traffic.
+function notice.checkpoint(event, count)
+    if M.state.phase ~= "racing" then
+        return
+    end
+    if count and event.seq + 1 >= count then
+        return
+    end
+    local race = M.state.race
+    local per_lap = ((race and race.checkpoints) and #race.checkpoints) or count or 0
+    local done = event.seq + 1
+    local in_lap = done
+    if race and race.mode == "circuit" and per_lap > 0 then
+        in_lap = done % per_lap
+        -- A lap-closing crossing lands on 0 here; it is that lap's Nth checkpoint, not its zeroth. The
+        -- HUD's own counter reads 0/N in the same second because it describes the NEW lap's progress --
+        -- this line describes the crossing that just happened, so the two differ on purpose.
+        if in_lap == 0 then
+            in_lap = per_lap
+        end
+    end
+    M.state.cp_readout = {
+        label = string.format("CP %d/%d", in_lap, per_lap),
+        time = event.time,
+        remaining = notice.READOUT_LIFETIME,
+    }
+    notice.paint()
+end
+
 -- Drop both surfaces and tell the app. Called from teardown_race_world, which also runs on
 -- onExtensionUnloaded -- see the ADR-0052 note on the M.state fields.
 function notice.clear()
@@ -4876,8 +4917,8 @@ function hold.circuit_run()
     notice.say("Qualifying run complete -- your car stays parked until the session ends", "info")
 end
 
--- Surface one detected checkpoint passage: log + toast + report to the server. This is the single
--- emission seam for a passage -- keep it the one place a passage is reported. The report carries
+-- Surface one detected checkpoint passage: log + centred readout + report to the server. This is the
+-- single emission seam for a passage -- keep it the one place a passage is reported. The report carries
 -- `seq` (the plan ordinal, the server's ordering key), `lap`, the display `index`/`name`, the time,
 -- and `count` (total scored crossings) so the race-blind server (ADR-0005) tracks progress and the
 -- The session sector reference (the field's best time per sector) AND its companion crossing
@@ -4905,11 +4946,7 @@ end
 local function on_checkpoint_reached(event, count)
     log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) lap %d reached @ %.2fs (seq %d)",
         event.index, tostring(event.name), event.lap, event.time, event.seq))
-    guihooks.trigger("toastrMsg", {
-        type = "success",
-        title = "BeamComp",
-        msg = string.format("Checkpoint %d reached @ %.1fs", event.index, event.time),
-    })
+    notice.checkpoint(event, count)
     -- A scored crossing of the start/finish line closes a lap on the display clock (ADR-0022). The
     -- start node is the only plan entry at that stable index, so this fires once per lap, never on the
     -- body checkpoints. Done before the report so the report carries the just-completed lap's best.
