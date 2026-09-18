@@ -339,6 +339,7 @@ angular.module('beamng.apps')
     link: function (scope, element, attrs) {
       scope.hud = {active: false, entries: []};
       scope.countdown = {active: false};
+      scope.notice = {};
       scope.finishBanner = {active: false, position: null};
       scope.jumpBanner = {active: false, penalty: null};
       scope.winnerBanner = {active: false, local: false, name: null};
@@ -706,6 +707,22 @@ angular.module('beamng.apps')
           scope.hud.provisionalRows = scope.hud.provisionalEntries || scope.hud.entries;
           var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
+        });
+      });
+
+      // Centered race messages (feature race-toast-cleanup-and-checkpoint-readout): the message line
+      // under the countdown block and the checkpoint readout above it, pushed by race/countdown.lua on
+      // its second hook. Deliberately NOT another kind on BeamCompCountdown below: that assigns
+      // scope.countdown = data, so every push replaces the whole payload, and the staging wait re-pushes
+      // it once a second -- a message parked there would be gone within a second and would blank the
+      // "waiting for the host" line until then.
+      //
+      // Every push carries the complete state of both surfaces ({line, readout}, either absent), and GE
+      // owns both lifetimes and re-pushes while either stands. So this handler is a plain assignment: no
+      // timer, and no way for one surface to lose the other.
+      scope.$on('BeamCompNotice', function (event, data) {
+        scope.$evalAsync(function () {
+          scope.notice = data || {};
         });
       });
 

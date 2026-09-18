@@ -90,6 +90,72 @@
       background: #ff2222;
       box-shadow: 0 0 28px 6px rgba(255, 40, 40, 0.85), inset 0 0 12px rgba(255, 170, 170, 0.6);
     }
+    /* Centered race-message line (feature race-toast-cleanup-and-checkpoint-readout): every message this
+       mod raises while the race HUD stands lands here instead of the top-left toast -- at the wheel the
+       player is looking at the road, and a corner toast is a distraction he has to fetch with his eyes.
+       Its own hook and its own GE-side lifetime, NOT another kind on .bc-countdown: that one is a single
+       slot the staging repaint rewrites every second (see app.js).
+
+       Sits BELOW the countdown block and is anchored by its TOP edge (translateX only), so a two-line
+       message grows downward and can never creep up into the count. .bc-countdown centers its own box on
+       25%, so its lower edge moves with its content: the 170px start count reaches ~33% at 1080p, the
+       105px assist count ~30%, the light tower ~31%, the staging line ~29%. */
+    .beamcomp-root .bc-notice {
+      /* Vertical position from the top of the viewport -- the single knob to re-tune in-game (the
+         --bc-quali-sector-top pattern). */
+      --bc-notice-top: 34%;
+      position: fixed;
+      top: var(--bc-notice-top);
+      left: 50%;
+      transform: translateX(-50%);
+      /* Long messages wrap instead of running off the screen; the widest shipped one is ~66 characters
+         ("AFK in 20 s -- move now, or you stop holding the finish timer open"). */
+      max-width: 46vw;
+      text-align: center;
+      pointer-events: none;
+      z-index: 1000;
+      color: #fff;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-weight: bold;
+      font-size: 30px;
+      line-height: 1.2;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+    }
+    /* The toastr kind carried through as colour; "info" keeps the white default above. */
+    .beamcomp-root .bc-notice-warning {
+      color: #f2c744;
+    }
+    .beamcomp-root .bc-notice-success {
+      color: #3fd96b;
+    }
+    /* Checkpoint passage readout (feature race-toast-cleanup-and-checkpoint-readout): "CP 3/8" plus the
+       total time, ~2 s per passage, replacing the per-crossing toast -- the one race message that fired
+       unasked and repeatedly (24 of them in a three-lap race with eight checkpoints). Same arrangement as
+       .bc-quali-sector, deliberately: that is the spot the driver already reads split times at. The two
+       never share the screen -- hud.sector is only built in the qualifying phase (init.lua), and the
+       readout only fires while racing. */
+    .beamcomp-root .bc-cp-readout {
+      /* Vertical position from the top of the viewport -- the single knob to re-tune in-game. */
+      --bc-cp-readout-top: 20%;
+      position: fixed;
+      top: var(--bc-cp-readout-top);
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 900;
+      color: #fff;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-weight: bold;
+      font-size: 26px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+    }
+    .beamcomp-root .bc-cp-readout .bc-cpr-label {
+      opacity: 0.85;
+      margin-right: 10px;
+    }
     /* Quali->race settle timer (ADR-0041): a small centered cue shown after the grid re-spawn and before the
        start countdown, so the count does not begin unexpectedly. Smaller than the start countdown. */
     .beamcomp-root .bc-quali-settle {
@@ -1241,6 +1307,12 @@
       </div>
     </div>
   </div>
+  <!-- The two centred surfaces of the BeamCompNotice hook (feature
+       race-toast-cleanup-and-checkpoint-readout): the checkpoint readout above the countdown block and the
+       race-message line below it. Both are pure render -- GE owns when they appear and when they go, and
+       re-pushes while either stands (init.lua `notice`), so there is no timer on this side. -->
+  <div class="bc-cp-readout" ng-if="notice.readout"><span class="bc-cpr-label">{{notice.readout.label}}</span>{{formatTime(notice.readout.time)}}</div>
+  <div class="bc-notice" ng-if="notice.line" ng-class="'bc-notice-' + notice.line.kind">{{notice.line.text}}</div>
   <!-- Quali->race settle window (ADR-0041): after the cars re-spawn on the earned grid, the big results card
        steps back for this small timer so the start countdown does not begin abruptly. Reuses the
        quali-results remaining seconds, which read ~the settle lead at the re-grid and count down to 0. -->
