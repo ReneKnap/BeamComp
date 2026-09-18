@@ -597,16 +597,16 @@ function notice.step(dt)
 end
 -- ===== end centred race messages ==========================================================
 
+-- The server's heartbeat. Nothing to tell the player -- it used to echo "Server event: ping" as a toast,
+-- which is a developer's confirmation that the channel is alive, not a race message. The log line is that
+-- confirmation now.
 local function handle_ping(_payload)
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = "Server event: ping",
-    })
+    log("I", LOG_TAG, "server ping")
 end
 
--- Resolve + lay out the race for this client, store the state, and surface the slot. On any
--- failure (the server cannot validate the name, ADR-0005) warn and toast the reason.
+-- Resolve + lay out the race for this client and store the state. On any failure (the server cannot
+-- validate the name, ADR-0005) warn and toast the reason -- the only message here that still belongs
+-- top-left, because a race we could not resolve leaves this client with no HUD to speak on.
 local function handle_race_start(payload)
     -- Adopt the server's statistics setting (ADR-0053) before anything else in this handler. Position is
     -- deliberate: BOTH per-race clear blocks below -- the resolve-failure path and the accept path -- run
@@ -938,12 +938,6 @@ local function handle_race_start(payload)
 
     log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d, mode=%s laps=%d",
         race.name, race.mySlot, tostring(race.mode), race.laps or 1))
-    guihooks.trigger("toastrMsg", {
-        type = "success",
-        title = "BeamComp -- " .. race.name,
-        msg = string.format("Slot %d -- start (%.0f, %.0f, %.0f)",
-            race.mySlot, race.myPose.pos.x, race.myPose.pos.y, race.myPose.pos.z),
-    })
 
     -- Tell the server this client is spawned + seated so it can leave the spawning phase once everyone
     -- is ready instead of waiting a fixed delay (ADR-0006 amendment). Sent unconditionally -- even if
@@ -1559,7 +1553,7 @@ function hold.sync()
 end
 -- ===== end the qualifying hold ===========================================================
 
--- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
+-- Record the server-authoritative race phase and drive the start lock off it. The
 -- server broadcasts a racePhase on every transition (ADR-0006/0041). The car is spawned frozen in
 -- handle_race_start and held through the countdown; here we release it on racing/qualifying, and release
 -- defensively on lobby (the car is preserved in place, only unlocked). The countdown UI is driven
@@ -1848,16 +1842,6 @@ local function handle_race_phase(payload)
     -- blocks the recover keys for a staged driver holding in the queue, and every phase after qualifying
     -- releases them again. Placed after the branch so it reads the phase's freshly-set quali state.
     hold.sync()
-
-    -- Surface the phase as a toast, except staging/countdown/racing/qualifying -- the centered overlay
-    -- covers those (the staging indicator, the count, GO!, and the quali drive).
-    if phase ~= "staging" and phase ~= "countdown" and phase ~= "racing" and phase ~= "qualifying" then
-        guihooks.trigger("toastrMsg", {
-            type = "info",
-            title = "BeamComp",
-            msg = "Race phase: " .. phase,
-        })
-    end
 end
 
 -- Store the latest server-broadcast standings for the HUD to render (item 5). Receive and store
