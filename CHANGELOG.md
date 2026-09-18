@@ -46,8 +46,6 @@ below rather than hidden.
 
 ### Known issues
 
-- A grid with a pinned row count and oversized vehicles (bus, semi truck) can fall back to a plain
-  grid, placing cars closer together than they should be.
 - Changing your car's configuration during the pause after qualifying leaves it loose going into the
   race countdown.
 - If the race host disconnects during staged qualifying while AI are in the field, those AI are left
