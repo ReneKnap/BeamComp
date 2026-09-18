@@ -536,9 +536,14 @@ function notice.checkpoint(event, count)
     end
     local race = M.state.race
     local per_lap = ((race and race.checkpoints) and #race.checkpoints) or count or 0
+    if per_lap <= 0 then
+        -- Unreachable with a live detector (it needs race.checkpoints to step at all), but a readout
+        -- reading "CP 5/0" is worse than no readout, so it never gets the chance.
+        return
+    end
     local done = event.seq + 1
     local in_lap = done
-    if race and race.mode == "circuit" and per_lap > 0 then
+    if race and race.mode == "circuit" then
         in_lap = done % per_lap
         -- A lap-closing crossing lands on 0 here; it is that lap's Nth checkpoint, not its zeroth. The
         -- HUD's own counter reads 0/N in the same second because it describes the NEW lap's progress --
@@ -4509,6 +4514,11 @@ function M.onExtensionLoaded()
     -- default is the old top-left toast, so a load path that missed this line degrades to the previous
     -- surface rather than to silence. Re-installed here because a GE Lua reload re-requires the module.
     lock.notify = notice.say
+    -- Blank the centred surfaces from the freshly rebuilt (empty) state. onExtensionUnloaded runs WITHOUT
+    -- a pcall, so a teardown that threw part way is no guarantee its clearing push went out (ADR-0052) --
+    -- and after the reload M.state carries no message left to expire, so nothing else would ever take a
+    -- stranded line back down.
+    notice.paint()
     -- Report the name the player set with /name, so the server keys every identity on it (ADR-0054).
     -- Read from the settings file, so it needs no vehicle and no later refresh. Fires on a Lua reload /
     -- reconnect too, so a reconnecting client re-reports.
