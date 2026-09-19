@@ -55,6 +55,9 @@ That is the name everyone sees in the standings and the results. Without it you 
 BeamMP name -- and while BeamMP login is broken, that is a guest number that changes every time you
 start the game, so nobody will recognise you twice. Two to twenty characters, spaces allowed.
 
+When you join, BeamComp tells you in chat which keys your game has for repairing your car and for
+getting back to the last checkpoint -- hold one while standing still. `/keys` says it again.
+
 During a race, `/dnf` gives up and `/results` hides or shows your own results card.
 
 ## If you run the server
@@ -195,6 +198,7 @@ Anything else that goes wrong has a way out: `/raceend` jumps straight to the re
 | `/races [all]` | everyone | List the races on your current map. |
 | `/cars [model]` | everyone | List installed vehicles, or one model's configurations. |
 | `/name <your name>` | everyone | Set the name everyone sees. |
+| `/keys` | everyone | Name the keys your game has for repairing and recovering your car. |
 | `/dnf` | everyone | Give up the race you are in. |
 | `/results` | everyone | Hide or show your own results card. |
 | `/beamcomp` | everyone | Diagnostic ping -- answers in chat if the mod is alive. |
