@@ -7187,6 +7187,14 @@ end
 --
 -- THE ONE text builder. The join hint, /keys and the panel's button all print exactly this, so the three
 -- can never drift into three different answers to the same question.
+-- Where the player changes this assist's key himself (user request 2026-09-19, after the in-game round).
+-- Every state names it, because knowing which key you have is only half of what a player wants to do with
+-- that knowledge -- and `command` is the ONLY string with which he can find the binding in BeamNG's own
+-- settings, so it is worth repeating per assist rather than naming one of the two for both.
+function keys.rebind(assist)
+    return "change the key in Options > Controls under \"" .. assist.command .. "\""
+end
+
 function keys.lines(player_id)
     local report = keys.reported[player_id]
     local lines = {}
@@ -7197,14 +7205,15 @@ function keys.lines(player_id)
         local entry = report[assist.field]
         local state = type(entry) == "table" and entry.state or nil
         if state == "key" then
-            lines[#lines + 1] = "BeamComp: hold " .. entry.key .. " while standing still to " .. assist.does
+            lines[#lines + 1] = "BeamComp: hold " .. entry.key .. " while standing still to "
+                .. assist.does .. " -- " .. keys.rebind(assist)
         elseif state == "device" then
             -- The device is not named. The engine reports a raw devicetype ("xinput", "joystick",
             -- "wheel") and notes itself that some force-feedback wheels identify as joysticks, so
             -- "your wheel" would be a guess -- while the one thing worth saying, that the key is not on
             -- his keyboard, is certain.
             lines[#lines + 1] = "BeamComp: " .. assist.doing
-                .. " is bound on another device, not on the keyboard"
+                .. " is bound on another device, not on the keyboard -- " .. keys.rebind(assist)
         elseif state == "none" then
             lines[#lines + 1] = "BeamComp: no key is bound for " .. assist.doing .. ". Bind \""
                 .. assist.command .. "\" in Options > Controls -- you will need it during a race."
