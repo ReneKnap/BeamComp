@@ -110,11 +110,18 @@ M.uilayout = require("beamcomp/race/uilayout")
 --          the server at connect, and the admin panel's "who has no name" list. It carries NO cached
 --          copy of the name -- the file is the truth and is re-read on load, which is what makes a GE
 --          Lua reload a non-event here (ADR-0052).
+-- notice -- where a player-facing message goes (feature race-toast-cleanup-and-checkpoint-readout):
+--          the ONE phase predicate, the centred message line, the checkpoint readout, and the tick that
+--          ages both. Every message in this file and in race/lock.lua goes through notice.say, so a call
+--          site states WHAT it reports and never WHERE -- the chokepoint reasoning of is_race_admin and
+--          resolve_identity (CLAUDE.md), which is also what makes the next message land right without
+--          anyone remembering the rule.
 local quali = {}
 local hold = {}
 local setup = {}
 local stall = {}
 local identity = {}
+local notice = {}
 -- ===== end namespace tables =============================================================
 
 -- How long to mute BeamMP's vehicle-spawn notifications from a race start, covering the host's
@@ -229,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "tooltip-copy/2026-09-12"
+local BUILD_MARKER = "race-notice/2026-09-18"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -375,6 +382,16 @@ M.state = {
     -- stall.step drops the whole table whenever the finish timer is not running, which is also what makes
     -- every car start its 15 s from zero the instant the timer arms. nil the rest of the time
     stall_track = nil,
+    -- The two centred message surfaces (feature race-toast-cleanup-and-checkpoint-readout), owned by the
+    -- `notice` namespace: the message line {text, kind, remaining} and the checkpoint readout
+    -- {label, time, remaining}, plus the shared seconds-to-next-repaint clock. nil when nothing stands.
+    --
+    -- ADR-0052 contract: pure transients whose teardown value IS their literal value here, and
+    -- teardown_race_world calls notice.clear(), which also pushes the CLEARING frame to the app -- so a GE
+    -- Lua reload can never leave a message stranded on a surface whose GE-side owner has forgotten it.
+    notice = nil,
+    cp_readout = nil,
+    notice_repaint = 0,
 }
 
 -- Queue a one-shot stock dashboard/tacho rebind (bug default-dashboard-ui-missing-at-race-start): armed
@@ -416,16 +433,185 @@ local disarm_assist_ve
 -- used earlier in handle_race_phase / handle_race_start, so forward-declared here (ADR-0017 amendment).
 local disarm_freeze_hold_ve
 
-local function handle_ping(_payload)
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = "Server event: ping",
-    })
+-- ===== centred race messages (feature race-toast-cleanup-and-checkpoint-readout) ==========
+-- Every player-facing message this mod raises goes through notice.say. While the race HUD stands it
+-- lands in the screen centre, under the countdown block; anywhere else it stays the top-left toast it
+-- always was. The cut runs along the PHASE, not along the text: at a panel or in the grid editor the
+-- player is already looking at the screen edge, at the wheel he is looking at the road.
+
+-- How long a centred message stands before it clears itself, and how long the checkpoint readout does.
+-- Both are in-game tuning knobs -- neither can be judged outside the game -- as are the two CSS tops in
+-- BeamCompHud/app.html (--bc-notice-top, --bc-cp-readout-top).
+notice.LIFETIME = 4.0
+notice.READOUT_LIFETIME = 2.0
+
+-- Seconds between re-pushes while either surface stands. Same recovery, same reason, same number as
+-- countdown.STAGING_REPAINT_INTERVAL: the HUD app mounts best-effort (ADR-0012 section 3) and can be
+-- added or UI-reloaded at any moment, and the EARLIEST messages here fire during the raceStart spawn
+-- burst -- before the staging phase has ever called hud.show(). A one-shot push in that window would be
+-- sent at an app that is not listening yet and lost with no symptom, which is the exact failure this
+-- feature exists to end.
+notice.REPAINT_INTERVAL = 1.0
+
+-- The phases in which this client's race HUD stands. `spawning` is in the list, and the lobby/nil
+-- reading during the raceStart window resolves to it -- see notice.in_race.
+notice.RACE_PHASES = {
+    spawning = true,
+    staging = true,
+    countdown = true,
+    racing = true,
+    qualifying = true,
+    qualiResults = true,
+    finished = true,
+}
+
+-- Whether a message raised right now belongs in the screen centre. THE single phase boundary -- no call
+-- site decides this for itself.
+--
+-- Two readings, and both are load-bearing:
+--   * M.state.race -- a race THIS client resolved. A raceStart we could not resolve (handle_race_start's
+--     failure path) leaves it nil while the SERVER still walks spawning..finished; there is no HUD on
+--     this client then, so a centred push would land on a surface nobody can see. The phase alone would
+--     send it there anyway.
+--   * M.state.phase -- the server-authoritative phase. `lobby`/nil WITH a resolved race is the raceStart
+--     window: the server sends raceStart before it broadcasts the spawning phase (server/main.lua
+--     start_race), so the phase still reads lobby while this client is already spawning its car. Two race
+--     messages fire in that window (no suitable car, AI load). It can mean nothing else -- the lobby
+--     transition nils M.state.race in the same handler (teardown_race_world).
+function notice.in_race()
+    if not M.state.race then
+        return false
+    end
+    local phase = M.state.phase
+    return phase == nil or phase == "lobby" or notice.RACE_PHASES[phase] == true
 end
 
--- Resolve + lay out the race for this client, store the state, and surface the slot. On any
--- failure (the server cannot validate the name, ADR-0005) warn and toast the reason.
+-- Push the current truth of BOTH centred surfaces, and restart the repaint clock. Always the whole
+-- state, never a delta: one owner writing everything is what keeps this clear of the countdown channel's
+-- one-slot failure (see NOTICE_HOOK in race/countdown.lua).
+function notice.paint()
+    M.state.notice_repaint = notice.REPAINT_INTERVAL
+    countdown.show_notice(
+        M.state.notice and {text = M.state.notice.text, kind = M.state.notice.kind} or nil,
+        M.state.cp_readout and {label = M.state.cp_readout.label, time = M.state.cp_readout.time} or nil)
+end
+
+-- Say one thing to the player. `kind` is the toastr type ("info" / "warning" / "success") and doubles as
+-- the centred line's colour; `title` is used only on the toast path, so the two richer toast titles
+-- survive verbatim where they are still shown (no text is rewritten by this feature).
+function notice.say(msg, kind, title)
+    if not notice.in_race() then
+        if guihooks then
+            guihooks.trigger("toastrMsg", {type = kind or "info", title = title or "BeamComp", msg = msg})
+        end
+        return
+    end
+    M.state.notice = {text = msg, kind = kind or "info", remaining = notice.LIFETIME}
+    -- The surface lives in the race HUD app, and the staging phase would otherwise be the first thing to
+    -- put that app on the layout -- too late for the spawn-time messages. ensure_visible dedups, so this
+    -- never disturbs an existing placement (ADR-0012).
+    hud.show()
+    notice.paint()
+end
+
+-- Show one checkpoint passage on the centred readout: "CP 3/8" plus the total time, ~2 s, then gone.
+-- Replaces the per-crossing toast -- the one message in the race that fired unasked and repeatedly
+-- (8 checkpoints over 3 laps = 24 toasts in a single race).
+--
+-- Two passages are deliberately silent:
+--   * the one that ENDS the race (the last plan entry, seq + 1 == count): the green finish banner and the
+--     results card own that moment. That is the last CROSSING, not every crossing of the start/finish
+--     line -- a circuit closes a lap on that line every lap, and those do show.
+--   * every passage in qualifying: the sector readout already sits on this exact spot with a richer line
+--     (split + delta), and qualifying stays untouched. Hence the `racing`-only gate rather than
+--     notice.in_race().
+--
+-- Everything it needs is already at the client (ADR-0011): no new traffic.
+function notice.checkpoint(event, count)
+    if M.state.phase ~= "racing" then
+        return
+    end
+    if count and event.seq + 1 >= count then
+        return
+    end
+    local race = M.state.race
+    local per_lap = ((race and race.checkpoints) and #race.checkpoints) or count or 0
+    if per_lap <= 0 then
+        -- Unreachable with a live detector (it needs race.checkpoints to step at all), but a readout
+        -- reading "CP 5/0" is worse than no readout, so it never gets the chance.
+        return
+    end
+    local done = event.seq + 1
+    local in_lap = done
+    if race and race.mode == "circuit" then
+        in_lap = done % per_lap
+        -- A lap-closing crossing lands on 0 here; it is that lap's Nth checkpoint, not its zeroth. The
+        -- HUD's own counter reads 0/N in the same second because it describes the NEW lap's progress --
+        -- this line describes the crossing that just happened, so the two differ on purpose.
+        if in_lap == 0 then
+            in_lap = per_lap
+        end
+    end
+    M.state.cp_readout = {
+        label = string.format("CP %d/%d", in_lap, per_lap),
+        time = event.time,
+        remaining = notice.READOUT_LIFETIME,
+    }
+    notice.paint()
+end
+
+-- Drop both surfaces and tell the app. Called from teardown_race_world, which also runs on
+-- onExtensionUnloaded -- see the ADR-0052 note on the M.state fields.
+function notice.clear()
+    if not M.state.notice and not M.state.cp_readout then
+        return
+    end
+    M.state.notice = nil
+    M.state.cp_readout = nil
+    notice.paint()
+end
+
+-- Age both surfaces one frame, expire what is due, and keep what stands painted. Called unconditionally
+-- from onUpdate: a message raised in the last racing frame still has to expire, and by then the race
+-- phase may already be gone. Two nil checks when nothing stands.
+function notice.step(dt)
+    local line = M.state.notice
+    local readout = M.state.cp_readout
+    if not line and not readout then
+        return
+    end
+    local expired = false
+    if line then
+        line.remaining = line.remaining - (dt or 0)
+        if line.remaining <= 0 then
+            M.state.notice = nil
+            expired = true
+        end
+    end
+    if readout then
+        readout.remaining = readout.remaining - (dt or 0)
+        if readout.remaining <= 0 then
+            M.state.cp_readout = nil
+            expired = true
+        end
+    end
+    M.state.notice_repaint = (M.state.notice_repaint or 0) - (dt or 0)
+    if expired or M.state.notice_repaint <= 0 then
+        notice.paint()
+    end
+end
+-- ===== end centred race messages ==========================================================
+
+-- The server's heartbeat. Nothing to tell the player -- it used to echo "Server event: ping" as a toast,
+-- which is a developer's confirmation that the channel is alive, not a race message. The log line is that
+-- confirmation now.
+local function handle_ping(_payload)
+    log("I", LOG_TAG, "server ping")
+end
+
+-- Resolve + lay out the race for this client and store the state. On any failure (the server cannot
+-- validate the name, ADR-0005) warn and toast the reason -- the only message here that still belongs
+-- top-left, because a race we could not resolve leaves this client with no HUD to speak on.
 local function handle_race_start(payload)
     -- Adopt the server's statistics setting (ADR-0053) before anything else in this handler. Position is
     -- deliberate: BOTH per-race clear blocks below -- the resolve-failure path and the accept path -- run
@@ -712,11 +898,8 @@ local function handle_race_start(payload)
         -- best-effort now, never a non-participation outcome. The ordinary Mode-1 on-foot fresh-spawn does
         -- NOT set this flag, so a plain foot-start stays silent (it is not a no-suitable-car case).
         log("W", RACE_LOG_TAG, "no suitable car -- spawned default; warning and racing")
-        guihooks.trigger("toastrMsg", {
-            type = "warning",
-            title = "BeamComp -- " .. race.name,
-            msg = "No suitable car available -- spawning default car",
-        })
+        notice.say("No suitable car available -- spawning default car", "warning",
+            "BeamComp -- " .. race.name)
     end
     if race_car then
         -- Remember the race car as the bounce target for the in-race switch lock (onVehicleSwitched):
@@ -760,12 +943,6 @@ local function handle_race_start(payload)
 
     log("I", RACE_LOG_TAG, string.format("race '%s': you are slot %d, mode=%s laps=%d",
         race.name, race.mySlot, tostring(race.mode), race.laps or 1))
-    guihooks.trigger("toastrMsg", {
-        type = "success",
-        title = "BeamComp -- " .. race.name,
-        msg = string.format("Slot %d -- start (%.0f, %.0f, %.0f)",
-            race.mySlot, race.myPose.pos.x, race.myPose.pos.y, race.myPose.pos.z),
-    })
 
     -- Tell the server this client is spawned + seated so it can leave the spawning phase once everyone
     -- is ready instead of waiting a fixed delay (ADR-0006 amendment). Sent unconditionally -- even if
@@ -860,11 +1037,8 @@ local function handle_race_start(payload)
             -- Performance hint (ADR-0036 Etappe B): all AI physics run on this host, so warn once past a
             -- handful. Owner-local + non-blocking -- it never gates the spawn.
             if #cars >= AI_PERF_HINT_THRESHOLD then
-                guihooks.trigger("toastrMsg", {
-                    type = "warning",
-                    title = "BeamComp -- AI",
-                    msg = string.format("%d AI cars run on your machine -- expect higher load.", #cars),
-                })
+                notice.say(string.format("%d AI cars run on your machine -- expect higher load.", #cars),
+                    "warning", "BeamComp -- AI")
             end
         end
     end
@@ -893,6 +1067,11 @@ end
 -- handler, or editor/spawn-mute state -- each caller owns those.
 local function teardown_race_world()
     countdown.clear()
+    -- Take any standing centred message + checkpoint readout down with the race, and push the clearing
+    -- frame while the app is still there to hear it (feature race-toast-cleanup-and-checkpoint-readout).
+    -- This also runs from onExtensionUnloaded, which is what keeps a GE Lua reload from stranding a
+    -- message on a surface whose GE-side owner has just been rebuilt empty (ADR-0052).
+    notice.clear()
     hud.clear()
     hud.hide()
     -- Lift the in-race vehicle-action lock and restore the seated car's vanilla recovery (ADR-0017).
@@ -1379,7 +1558,7 @@ function hold.sync()
 end
 -- ===== end the qualifying hold ===========================================================
 
--- Record the server-authoritative race phase, drive the start lock off it, and surface it. The
+-- Record the server-authoritative race phase and drive the start lock off it. The
 -- server broadcasts a racePhase on every transition (ADR-0006/0041). The car is spawned frozen in
 -- handle_race_start and held through the countdown; here we release it on racing/qualifying, and release
 -- defensively on lobby (the car is preserved in place, only unlocked). The countdown UI is driven
@@ -1668,16 +1847,6 @@ local function handle_race_phase(payload)
     -- blocks the recover keys for a staged driver holding in the queue, and every phase after qualifying
     -- releases them again. Placed after the branch so it reads the phase's freshly-set quali state.
     hold.sync()
-
-    -- Surface the phase as a toast, except staging/countdown/racing/qualifying -- the centered overlay
-    -- covers those (the staging indicator, the count, GO!, and the quali drive).
-    if phase ~= "staging" and phase ~= "countdown" and phase ~= "racing" and phase ~= "qualifying" then
-        guihooks.trigger("toastrMsg", {
-            type = "info",
-            title = "BeamComp",
-            msg = "Race phase: " .. phase,
-        })
-    end
 end
 
 -- Store the latest server-broadcast standings for the HUD to render (item 5). Receive and store
@@ -2292,11 +2461,7 @@ function quali.request_requeue()
         vehicles.set_vehicle_frozen(own, true)
     end
     countdown.clear()
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = "Recover -- new attempt, back of the queue",
-    })
+    notice.say("Recover -- new attempt, back of the queue", "info")
     log("I", RACE_LOG_TAG, "staged quali: requeued self on recover")
 end
 
@@ -2462,16 +2627,10 @@ function stall.who(car)
 end
 
 -- Warn the LOCAL player, once per standstill episode, WINDOW - WARN_AT seconds before they are reported.
--- Same toast seam and shape as the recover/repair feedback (notify_assist_blocked, ADR-0017 amendment),
--- inlined rather than calling it because that helper is a local defined much further down this file.
 -- Never for an AI: there is nobody to warn.
 function stall.warn_local()
-    guihooks.trigger("toastrMsg", {
-        type = "warning",
-        title = "BeamComp",
-        msg = string.format("AFK in %.0f s -- move now, or you stop holding the finish timer open",
-            stall.WINDOW - stall.WARN_AT),
-    })
+    notice.say(string.format("AFK in %.0f s -- move now, or you stop holding the finish timer open",
+        stall.WINDOW - stall.WARN_AT), "warning")
 end
 
 -- Run one owned car's standstill clock and report the AFK / MOVING-AGAIN edges, once each.
@@ -4350,6 +4509,16 @@ function M.onExtensionLoaded()
     if own then
         M.state.current_vehicle_id = own:getId()
     end
+    -- Hand race/lock.lua the message chokepoint (feature race-toast-cleanup-and-checkpoint-readout).
+    -- It cannot reach `notice` itself -- we require it, not the other way round -- and its own built-in
+    -- default is the old top-left toast, so a load path that missed this line degrades to the previous
+    -- surface rather than to silence. Re-installed here because a GE Lua reload re-requires the module.
+    lock.notify = notice.say
+    -- Blank the centred surfaces from the freshly rebuilt (empty) state. onExtensionUnloaded runs WITHOUT
+    -- a pcall, so a teardown that threw part way is no guarantee its clearing push went out (ADR-0052) --
+    -- and after the reload M.state carries no message left to expire, so nothing else would ever take a
+    -- stranded line back down.
+    notice.paint()
     -- Report the name the player set with /name, so the server keys every identity on it (ADR-0054).
     -- Read from the settings file, so it needs no vehicle and no later refresh. Fires on a Lua reload /
     -- reconnect too, so a reconnecting client re-reports.
@@ -4385,11 +4554,7 @@ local function bounce_to_race_car(silent)
     local now = os.clock()
     if not silent and now - last_block_toast_at >= SWITCH_BLOCK_TOAST_THROTTLE then
         last_block_toast_at = now
-        guihooks.trigger("toastrMsg", {
-            type = "warning",
-            title = "BeamComp",
-            msg = "Vehicle switching is locked during the race",
-        })
+        notice.say("Vehicle switching is locked during the race", "warning")
     end
     log("I", RACE_LOG_TAG, "blocked vehicle switch -- bounced player back to race car")
     return true
@@ -4743,15 +4908,11 @@ function hold.circuit_run()
     -- vehicle-config respawn, so the freeze cannot be thrown off again.
     hold.sync()
     log("I", RACE_LOG_TAG, "quali hold: lap closed in the grace window; car parked for the session")
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = "Qualifying run complete -- your car stays parked until the session ends",
-    })
+    notice.say("Qualifying run complete -- your car stays parked until the session ends", "info")
 end
 
--- Surface one detected checkpoint passage: log + toast + report to the server. This is the single
--- emission seam for a passage -- keep it the one place a passage is reported. The report carries
+-- Surface one detected checkpoint passage: log + centred readout + report to the server. This is the
+-- single emission seam for a passage -- keep it the one place a passage is reported. The report carries
 -- `seq` (the plan ordinal, the server's ordering key), `lap`, the display `index`/`name`, the time,
 -- and `count` (total scored crossings) so the race-blind server (ADR-0005) tracks progress and the
 -- The session sector reference (the field's best time per sector) AND its companion crossing
@@ -4779,11 +4940,7 @@ end
 local function on_checkpoint_reached(event, count)
     log("I", RACE_LOG_TAG, string.format("checkpoint %d (%s) lap %d reached @ %.2fs (seq %d)",
         event.index, tostring(event.name), event.lap, event.time, event.seq))
-    guihooks.trigger("toastrMsg", {
-        type = "success",
-        title = "BeamComp",
-        msg = string.format("Checkpoint %d reached @ %.1fs", event.index, event.time),
-    })
+    notice.checkpoint(event, count)
     -- A scored crossing of the start/finish line closes a lap on the display clock (ADR-0022). The
     -- start node is the only plan entry at that stable index, so this fires once per lap, never on the
     -- body checkpoints. Done before the report so the report carries the just-completed lap's best.
@@ -6067,11 +6224,7 @@ local function perform_assist(kind)
     end
 
     log("I", RACE_LOG_TAG, "assist performed: " .. tostring(kind))
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = (kind == "repair") and "Repaired in place" or "Recovered to last checkpoint",
-    })
+    notice.say((kind == "repair") and "Repaired in place" or "Recovered to last checkpoint", "info")
 end
 
 -- Clear any in-progress assist countdown and its centered overlay (ADR-0017). Idempotent.
@@ -6113,14 +6266,11 @@ local function assist_verb(kind)
     return (kind == "repair") and "repair" or "recover"
 end
 
--- Warning toast telling the player WHY a recover/repair did not fire (ADR-0017 amendment): disabled,
--- not stationary, or released too early. Mirrors the lock's notify_spawn_blocked toast style.
+-- Tell the player WHY a recover/repair did not fire (ADR-0017 amendment): disabled, not stationary, or
+-- released too early. Seven callers, one seam -- and since it only ever speaks during a race, every one
+-- of them lands on the centred line.
 local function notify_assist_blocked(msg)
-    guihooks.trigger("toastrMsg", {
-        type = "warning",
-        title = "BeamComp",
-        msg = msg,
-    })
+    notice.say(msg, "warning")
 end
 
 -- Tell a held qualifying driver why their recover key did nothing (bug quali-hold-reset-and-repaint-leak).
@@ -6167,11 +6317,7 @@ local function perform_staging_repair()
     -- as the restage does (init.lua restage_swapped_car).
     vehicles.set_vehicle_frozen(own_car, true)
     log("I", RACE_LOG_TAG, "staging repair: re-placed own car on its grid slot")
-    guihooks.trigger("toastrMsg", {
-        type = "info",
-        title = "BeamComp",
-        msg = "Car repaired",
-    })
+    notice.say("Car repaired", "info")
 end
 
 -- A recover/repair key went down (forwarded from the VE, ADR-0017): record which assist is held so
@@ -6373,11 +6519,7 @@ local function warn_over_cap(veh, power, weight, caps)
     else
         detail = name .. " exceeds the vehicle limit"
     end
-    guihooks.trigger("toastrMsg", {
-        type = "warning",
-        title = "BeamComp",
-        msg = "Can't stage that car -- " .. detail,
-    })
+    notice.say("Can't stage that car -- " .. detail, "warning")
     log("I", RACE_LOG_TAG, "rejected over-cap staging swap: " .. detail)
 end
 
@@ -6755,6 +6897,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if M.state.setup_open then
         setup.step(dtReal)
     end
+    -- Phase-independent: age the centred message line + checkpoint readout, and keep whatever still
+    -- stands painted (feature race-toast-cleanup-and-checkpoint-readout). NOT phase-gated: a message
+    -- raised in the last racing frame still has to expire, and by then the phase may be gone. Two nil
+    -- checks when nothing stands.
+    notice.step(dtReal)
     -- Phase-independent: retry whatever BeamNG's HUD-apps layout UI swallowed while it owned the
     -- layout document (bug ui-glitches-after-ingame-menu-resize). Every panel show/close in this file
     -- is a one-shot, so a call that lands in that window used to be lost for good -- the seam now

@@ -135,15 +135,27 @@ local ORIG_REPLACE_KEY = "beamcomp_orig_replaceVehicle"
 local SPAWN_BLOCK_TOAST_THROTTLE = 2.0
 local last_spawn_block_toast_at = 0
 
+-- Where a player-facing refusal from this module goes. init.lua installs its phase-routing chokepoint
+-- here (notice.say) in onExtensionLoaded: during a race the message belongs in the screen centre, outside
+-- it in the top-left toast (feature race-toast-cleanup-and-checkpoint-readout). This module cannot reach
+-- that chokepoint itself -- init.lua requires it, not the other way round -- so it is handed in, the same
+-- shape as on_before_replace above.
+--
+-- The built-in default is the OLD toast on purpose: a seam nobody installed then degrades to the surface
+-- this message had before, never to silence. Re-installed after a GE Lua reload with everything else in
+-- onExtensionLoaded (ADR-0052).
+function M.notify(msg, kind)
+    if not guihooks then
+        return
+    end
+    guihooks.trigger("toastrMsg", {type = kind or "warning", title = "BeamComp", msg = msg})
+end
+
 local function notify_spawn_blocked()
     local now = os.clock()
     if now - last_spawn_block_toast_at >= SPAWN_BLOCK_TOAST_THROTTLE then
         last_spawn_block_toast_at = now
-        guihooks.trigger("toastrMsg", {
-            type = "warning",
-            title = "BeamComp",
-            msg = "Switching or spawning vehicles is locked during the race",
-        })
+        M.notify("Switching or spawning vehicles is locked during the race", "warning")
     end
     log("I", LOG_TAG, "blocked a vehicle spawn/replace during the race")
 end
