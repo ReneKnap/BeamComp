@@ -344,6 +344,7 @@ M.state = {
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
+    server_defaults = nil,    -- the defaults the SERVER owns, as it sent them on setupOpen ({jumpPenalty = 15}, ADR-0043), or nil. Relayed verbatim to the setup panel with EVERY push_setup_data -- not just the opening one -- because the panel also pulls its dataset itself on link (request_setup_data), and a value hanging off setupOpen alone would be gone after a UI reload. GE reads no key of it: the next server-owned default is a key on the server plus a placeholder in the markup. Safe at nil across a GE reload (ADR-0052): it mirrors a server constant and needs no previous value of its own, and nil means "not heard yet", which the panel shows as the neutral "default" rather than a number nothing stands behind. Cleared by setup.clear, which onClientEndMission runs when the player leaves the session -- so one server's numbers can never be shown as the next server's
     setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
@@ -3152,6 +3153,11 @@ function setup.clear()
     -- The next open re-asserts this from the server, so forgetting it here is the safe direction
     -- (ADR-0056): a closed panel cannot be locked, and a reopen decides afresh.
     M.state.setup_locked = false
+    -- Same direction, and here it is the point: onClientEndMission calls this when the player LEAVES the
+    -- BeamMP session, so dropping the numbers here is what keeps one server's defaults from being shown
+    -- as the next server's. Costs nothing -- handle_setup_open re-asserts them before the push that
+    -- carries them, so a reopen never flashes the unknown state.
+    M.state.server_defaults = nil
 end
 
 -- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
@@ -3397,6 +3403,12 @@ local function push_setup_data(include_deprecated)
         -- panel's hover help can name the real key instead of a hardcoded guess. Either field is absent
         -- when the action has no keyboard binding; the panel then names the command and no key.
         assistKeys = lock.assist_controls(),
+        -- The defaults the SERVER owns, relayed verbatim from its setupOpen (M.state.server_defaults).
+        -- Unlike the three above it is NOT a GE constant, so it can genuinely be missing -- an older
+        -- server, or this GE state rebuilt by a Lua reload (ADR-0052). It is sent on every push, absent
+        -- included: the panel must read an absent table as "unknown" and fall back to a neutral
+        -- "default", never keep showing a number GE can no longer vouch for.
+        serverDefaults = M.state.server_defaults,
     })
     -- The driver NAME list for the panel's roster name picker (ADR-0048): sourced from the mod-bundled
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
@@ -3411,7 +3423,13 @@ end
 -- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
 -- already-open panel) and make the app visible. A freshly-added app links *after* this push, so the panel
 -- also pulls the dataset itself on link via request_setup_data -- the two together cover every timing.
-local function handle_setup_open(_payload)
+local function handle_setup_open(payload)
+    -- Remember the server's own defaults BEFORE the push that carries them on (see push_setup_data).
+    -- Taken as one opaque table: GE relays it and reads no key, so a server that adds one needs nothing
+    -- here. A payload without it clears the field on purpose -- the message carries the whole truth, and
+    -- a server that names no defaults must not leave the previous server's numbers standing.
+    local defaults = type(payload) == "table" and payload.serverDefaults or nil
+    M.state.server_defaults = type(defaults) == "table" and defaults or nil
     push_setup_data(false)
     -- Ensure the panel app is on the current layout (ADR-0012 best-effort auto-add); dedups by appName.
     M.uilayout.ensure_visible("beamCompSetup")

@@ -428,7 +428,7 @@
       <label class="bc-row bc-check" bc-setup-tip="tip('f1Start')"><input type="checkbox" ng-model="form.f1Start"><span>F1 start (launch yourself)</span></label>
       <label class="bc-row" ng-if="form.f1Start" bc-setup-tip="tip('jumpPenalty')">
         <span>Jump-start penalty (sec)</span>
-        <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="15">
+        <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="{{serverHint('jumpPenalty')}}">
       </label>
     </div>
 

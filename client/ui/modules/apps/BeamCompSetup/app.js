@@ -381,7 +381,11 @@ angular.module('beamng.apps')
       // booleans so a saved preset round-trips the admin's choice.
       carRandomTrim: true, carNoBigCars: true,
       orderMode: 'random', orderRev: false, qualiStart: 'random', qualiMinutes: 5, grid: '',
-      f1Start: false, jumpPenalty: 15,
+      // The jump-start penalty opens EMPTY, not at 15. A prefilled 15 was sent as an explicit
+      // jumpPenaltySeconds on every panel start, so the server's own f1.DEFAULT_PENALTY never applied to
+      // a panel race at all -- change that constant and /race would follow while this panel silently
+      // stayed at 15. Empty means "the server decides", and the grey placeholder names what it decided.
+      f1Start: false, jumpPenalty: '',
       recover: true, recoverSecs: '', repair: true, repairSecs: '',
       aiEnabled: false, aiCount: 4, aiPreset: 'hard', aiCar: '', aiRoute: '', aiAdvanced: false,
       aiAggr: '', aiSkill: '', aiRubber: '', aiAvoid: true,
@@ -664,8 +668,10 @@ angular.module('beamng.apps')
       // assistKeys = {repair, recover} -- the KEYBOARD keys BeamNG's two recovery actions are bound to on
       // this machine (race/lock.lua assist_controls). Either field may be missing, in which case the help
       // names the command and no key: a guessed key would be worse than none.
+      // serverDefaults = the defaults the SERVER owns, keyed by field ({jumpPenalty: 15}), relayed by GE
+      // from the server's setupOpen. The one bag for all of them -- see scope.serverHint.
       scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [],
-        aiDefaults: null, assistHoldDefault: null, assistKeys: {} };
+        aiDefaults: null, assistHoldDefault: null, assistKeys: {}, serverDefaults: null };
       // raceId -> {closed, defaultLaps} for races GE has described, filled lazily as races are selected
       // (see raceMeta below). A race that is absent here has NOT been reported as open -- it has not been
       // asked about yet, or GE could not parse it -- and the panel must not act as if it knew.
@@ -908,6 +914,13 @@ angular.module('beamng.apps')
           // Kept on a miss like the palette above: an older GE that does not send the keys must leave the
           // ones we already have alone rather than blanking them back to "no key known".
           scope.data.assistKeys = (payload && payload.assistKeys) || scope.data.assistKeys || {};
+          // The server's own defaults -- deliberately NOT kept on a miss, the one exception on this push
+          // and the opposite of the three lines above. Those carry GE constants, which cannot go missing;
+          // this one crosses two process boundaries and GE forgets it on a Lua reload (ADR-0052). A push
+          // without the table therefore means "GE no longer knows", and the placeholder has to fall back
+          // to the neutral "default". Keeping the last number would hide exactly that and show a figure
+          // nothing stands behind any more.
+          scope.data.serverDefaults = (payload && payload.serverDefaults) || null;
           rebuildRaceCarOpts();
           // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
           // harmless (labelFor falls back) and re-fetched on the next model change.
@@ -1105,6 +1118,18 @@ angular.module('beamng.apps')
       scope.lapsHint = function () {
         var meta = scope.raceMetaById[scope.form.race];
         return defaultHint(meta && meta.defaultLaps, 'auto');
+      };
+
+      // The defaults the SERVER owns, by key (currently 'jumpPenalty' = f1.DEFAULT_PENALTY). One lookup
+      // for all of them, so the next server-owned default is one key in the server's setupOpen payload
+      // plus one placeholder attribute in the markup -- no new message, no new GE field, no new function.
+      //
+      // The fallback is the neutral 'default' rather than any number: GE forgets the table on a Lua reload
+      // (ADR-0052) and an older server never sends one, and in both cases this panel has no business
+      // naming a figure. Copying the server's constant into the client is exactly the hand-mirror this
+      // channel exists to retire.
+      scope.serverHint = function (key) {
+        return defaultHint((scope.data.serverDefaults || {})[key], 'default');
       };
 
       // Aggression / skill / rubberband: race/ai.lua's PRESETS, so the hint FOLLOWS the Preset dropdown --
