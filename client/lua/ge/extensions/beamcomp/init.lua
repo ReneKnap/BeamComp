@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "race-notice/2026-09-18"
+local BUILD_MARKER = "key-hint/2026-09-19"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -4483,6 +4483,25 @@ function identity.report()
     send_to_server("clientIdentity", {name = name})
 end
 
+-- Report which keys the two in-race assists sit on here, so the server can name them in this player's
+-- chat (ADR-0058). Only the client knows its own bindings and only the server can write a chat line, so
+-- the knowledge has to travel.
+--
+-- An M field rather than a top-level local: init.lua sits at LuaJIT's 200-local ceiling (CLAUDE.md), and
+-- an M field costs none. Not a `local function` called once either -- being reachable as
+-- beamcomp_init.report_assist_keys() is what lets the binding be re-checked from the console in-game.
+--
+-- Sends NOTHING when the bindings cannot be read (see lock.assist_key_report). The server stays silent in
+-- that case, which is the whole point: it never guesses a key, not even BeamNG's defaults.
+function M.report_assist_keys()
+    local report = lock.assist_key_report()
+    if not report then
+        log("I", LOG_TAG, "no assist key bindings to report; the server will say nothing about them")
+        return
+    end
+    send_to_server("clientKeys", {assists = report})
+end
+
 function M.onExtensionLoaded()
     -- Keep the extension across level/scenario switches (a race spans a level).
     setExtensionUnloadMode(M, "manual")
@@ -4523,6 +4542,12 @@ function M.onExtensionLoaded()
     -- Read from the settings file, so it needs no vehicle and no later refresh. Fires on a Lua reload /
     -- reconnect too, so a reconnecting client re-reports.
     identity.report()
+    -- Report which keys this machine has the two in-race assists on, so the server can tell the player
+    -- how to repair his car and how to get back on track (ADR-0058). Beside identity.report() and for
+    -- the same reason: a key binding belongs to this CONNECTION, not to a race,
+    -- and there is nothing later to re-read it from. A Lua reload or a level change re-reports (the
+    -- binding may have changed since) -- the server stores the fresh answer and does NOT hint twice.
+    M.report_assist_keys()
     -- Include a distinctive build marker so a redeploy can be confirmed live in beamng.log before trusting
     -- an in-game result -- the BeamMP client mod cache can serve a stale zip (memory
     -- beammp-client-mod-cache-stale).
