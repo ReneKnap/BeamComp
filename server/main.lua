@@ -7536,7 +7536,18 @@ end
 --
 -- Every caller is downstream of the admin check. Do not call this from anywhere that has not passed it.
 function access.open_setup(player_id)
-    send_event(player_id, MSG_SETUP_OPEN, {})
+    -- Every default the SERVER owns and the panel shows as a grey "15 (default)" placeholder rides in
+    -- this one table (ADR-0049 hint style). The panel had the jump-start penalty as a literal in two
+    -- places -- a hand-mirrored constant across the process boundary that nothing checked, the same
+    -- shape as the grid constants. One table rather than one field per value so the next server-owned
+    -- default costs a key here and a placeholder attribute in the markup, and nothing in between: the
+    -- client relays this verbatim and reads no key of it.
+    --
+    -- Only values that hold for the whole connection belong here. This is sent on /raceui and on a
+    -- successful unlock, so anything that changes between two opens would sit stale in the panel.
+    send_event(player_id, MSG_SETUP_OPEN, {
+        serverDefaults = {jumpPenalty = f1.DEFAULT_PENALTY},
+    })
     -- Seed the panel with the current championship + tournament state (ADR-0040/0042) so its tournament
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.
     send_event(player_id, champ.MSG, champ.snapshot())

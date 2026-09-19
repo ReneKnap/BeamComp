@@ -289,7 +289,7 @@
            child scope would swallow. -->
       <label class="bc-row" ng-if="form.mode === 'circuit'" bc-setup-tip="tip('laps')">
         <span>Laps</span>
-        <input type="number" min="1" ng-model="form.laps" placeholder="auto">
+        <input type="number" min="1" ng-model="form.laps" placeholder="{{lapsHint()}}">
       </label>
       <label class="bc-row bc-check" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
     </div>
@@ -428,7 +428,7 @@
       <label class="bc-row bc-check" bc-setup-tip="tip('f1Start')"><input type="checkbox" ng-model="form.f1Start"><span>F1 start (launch yourself)</span></label>
       <label class="bc-row" ng-if="form.f1Start" bc-setup-tip="tip('jumpPenalty')">
         <span>Jump-start penalty (sec)</span>
-        <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="15">
+        <input type="number" min="0" ng-model="form.jumpPenalty" placeholder="{{serverHint('jumpPenalty')}}">
       </label>
     </div>
 

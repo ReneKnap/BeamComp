@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "connect-reports/2026-09-19"
+local BUILD_MARKER = "field-defaults/2026-09-19"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -344,6 +344,7 @@ M.state = {
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
+    server_defaults = nil,    -- the defaults the SERVER owns, as it sent them on setupOpen ({jumpPenalty = 15}, ADR-0043), or nil. Relayed verbatim to the setup panel with EVERY push_setup_data -- not just the opening one -- because the panel also pulls its dataset itself on link (request_setup_data), and a value hanging off setupOpen alone would be gone after a UI reload. GE reads no key of it: the next server-owned default is a key on the server plus a placeholder in the markup. Safe at nil across a GE reload (ADR-0052): it mirrors a server constant and needs no previous value of its own, and nil means "not heard yet", which the panel shows as the neutral "default" rather than a number nothing stands behind. Cleared by setup.clear, which onClientEndMission runs when the player leaves the session -- so one server's numbers can never be shown as the next server's
     setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
@@ -3091,18 +3092,27 @@ end
 
 -- Push ONE race's track metadata to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this
 -- when the selected race changes; it needs `closed` to preselect sprint vs circuit and to decide whether a
--- lap count means anything (ADR-0013 amendment).
+-- lap count means anything (ADR-0013 amendment), and `defaultLaps` to show the lap count that applies when
+-- the Laps field is left empty, as its grey "3 (default)" placeholder (ADR-0049).
 --
 -- Lazy per race for the same reason configs are lazy per model: racelist.options deliberately parses no
--- geometry, and a map can carry well over a hundred races. `closed` is nil when the race cannot be resolved
--- or parsed -- the panel then keeps its "track type unknown" fallback instead of being told something
--- false. Public so the app can reach it as beamcomp_init.request_race_meta.
+-- geometry, and a map can carry well over a hundred races. Both fields are nil when the race cannot be
+-- resolved or parsed -- the panel then keeps its "track type unknown" fallback and its "auto" placeholder
+-- instead of being told something false. Public so the app can reach it as beamcomp_init.request_race_meta.
+--
+-- defaultLaps is put through race_start.resolve_laps with no request, which is literally the panel's
+-- question: "what does this race run if I type nothing?". That covers the track that names no lap count
+-- at all -- the answer is one lap, and it is race/start.lua's answer, not a second one invented here.
 function M.request_race_meta(race_id)
     if type(race_id) ~= "string" then
         return
     end
     local meta = racelist.meta_for(maps.current(), race_id)
-    guihooks.trigger("BeamCompRaceMeta", {id = race_id, closed = meta and meta.closed})
+    guihooks.trigger("BeamCompRaceMeta", {
+        id = race_id,
+        closed = meta and meta.closed,
+        defaultLaps = meta and race_start.resolve_laps(nil, meta.defaultLaps) or nil,
+    })
 end
 
 -- ===== race-setup panel presence (bug setup-panel-settings-survive-ui-reload) =====================
@@ -3143,6 +3153,11 @@ function setup.clear()
     -- The next open re-asserts this from the server, so forgetting it here is the safe direction
     -- (ADR-0056): a closed panel cannot be locked, and a reopen decides afresh.
     M.state.setup_locked = false
+    -- Same direction, and here it is the point: onClientEndMission calls this when the player LEAVES the
+    -- BeamMP session, so dropping the numbers here is what keeps one server's defaults from being shown
+    -- as the next server's. Costs nothing -- handle_setup_open re-asserts them before the push that
+    -- carries them, so a reopen never flashes the unknown state.
+    M.state.server_defaults = nil
 end
 
 -- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
@@ -3388,6 +3403,12 @@ local function push_setup_data(include_deprecated)
         -- panel's hover help can name the real key instead of a hardcoded guess. Either field is absent
         -- when the action has no keyboard binding; the panel then names the command and no key.
         assistKeys = lock.assist_controls(),
+        -- The defaults the SERVER owns, relayed verbatim from its setupOpen (M.state.server_defaults).
+        -- Unlike the three above it is NOT a GE constant, so it can genuinely be missing -- an older
+        -- server, or this GE state rebuilt by a Lua reload (ADR-0052). It is sent on every push, absent
+        -- included: the panel must read an absent table as "unknown" and fall back to a neutral
+        -- "default", never keep showing a number GE can no longer vouch for.
+        serverDefaults = M.state.server_defaults,
     })
     -- The driver NAME list for the panel's roster name picker (ADR-0048): sourced from the mod-bundled
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
@@ -3402,7 +3423,13 @@ end
 -- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
 -- already-open panel) and make the app visible. A freshly-added app links *after* this push, so the panel
 -- also pulls the dataset itself on link via request_setup_data -- the two together cover every timing.
-local function handle_setup_open(_payload)
+local function handle_setup_open(payload)
+    -- Remember the server's own defaults BEFORE the push that carries them on (see push_setup_data).
+    -- Taken as one opaque table: GE relays it and reads no key, so a server that adds one needs nothing
+    -- here. A payload without it clears the field on purpose -- the message carries the whole truth, and
+    -- a server that names no defaults must not leave the previous server's numbers standing.
+    local defaults = type(payload) == "table" and payload.serverDefaults or nil
+    M.state.server_defaults = type(defaults) == "table" and defaults or nil
     push_setup_data(false)
     -- Ensure the panel app is on the current layout (ADR-0012 best-effort auto-add); dedups by appName.
     M.uilayout.ensure_visible("beamCompSetup")
@@ -6824,11 +6851,19 @@ local function step_staging(dt_real)
     staging.repaint_in = countdown.STAGING_REPAINT_INTERVAL
     -- F1 light start (ADR-0043): a short pre-procedure heads-up during the staging wait, before the
     -- lights begin. Reads the relayed start mode + penalty (the only consumer of those race fields).
+    --
+    -- The penalty rides in with raceStart and the server always fills it for an F1 start, so the number
+    -- is there in every real case. Should it ever not be, the sentence LOSES the figure rather than
+    -- naming a guessed one: a driver reads this as what will happen to him, and there is no channel here
+    -- to check a guess against -- an ordinary player never sees a setupOpen.
     local race = M.state.race
     local hint = nil
     if race and race.startMode == "f1" then
-        hint = "F1 light start -- hold until lights out (jump = +"
-            .. tostring(race.jumpPenaltySeconds or 15) .. "s)"
+        hint = "F1 light start -- hold until lights out"
+        local penalty = tonumber(race.jumpPenaltySeconds)
+        if penalty then
+            hint = hint .. " (jump = +" .. tostring(penalty) .. "s)"
+        end
     end
     countdown.show_staging(hint)
 end

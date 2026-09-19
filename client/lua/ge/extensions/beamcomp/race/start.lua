@@ -87,9 +87,23 @@ local function resolve_direction(payload)
     return payload.direction == "reverse" and "reverse" or "forward"
 end
 
+-- The lap count a CIRCUIT actually runs: the requested number when one was asked for, else the track's
+-- own default, else a single lap -- clamped to [1, MAX_LAPS] (ADR-0013). Both arguments are raw and may
+-- be nil or garbage; tonumber decides.
+--
+-- Public because the race-setup panel asks the same question with `requested = nil` -- "what does this
+-- race run if I leave Laps empty?" -- to fill its grey "3 (default)" placeholder (init.lua
+-- request_race_meta, ADR-0037/0049). Exposed rather than reimplemented there, exactly like
+-- M.assist_hold_default below: the single-lap fallback and the clamp live here once, so a number the
+-- panel shows can never differ from the number this start would use.
+function M.resolve_laps(requested, track_default)
+    local laps = tonumber(requested) or tonumber(track_default) or 1
+    return math.max(1, math.min(MAX_LAPS, math.floor(laps)))
+end
+
 -- Resolve the effective race mode + lap count for this start (ADR-0013/0018/0019):
 --   mode -- the payload override ("sprint"/"circuit") if given, else auto from meta.closed.
---   laps -- circuit only: the payload override else meta.defaultLaps, clamped >= 1; sprint is always
+--   laps -- circuit only: M.resolve_laps of the payload override and meta.defaultLaps; sprint is always
 --           a single pass (laps = 1).
 -- The pre-flight check (ADR-0019) refuses a circuit on an open race unless forced, so circuit here is
 -- either valid or a deliberate force -- kept as-is. The sprint fallback is defensive only. Returns
@@ -113,8 +127,7 @@ local function resolve_mode(race, payload)
 
     local laps = 1
     if mode == "circuit" then
-        local requested_laps = tonumber(payload.laps) or (race.meta and race.meta.defaultLaps) or 1
-        laps = math.max(1, math.min(MAX_LAPS, math.floor(requested_laps)))
+        laps = M.resolve_laps(payload.laps, race.meta and race.meta.defaultLaps)
     end
 
     return mode, laps
@@ -145,12 +158,20 @@ local function resolve_assists(payload)
     }
 end
 
--- The F1 jump-start penalty (seconds) for the offender's HUD banner (ADR-0043). The server owns the
--- authoritative penalty folded into the standings; this copy is display-only, so it is defaulted +
--- floored defensively (trust boundary, ADR-0005). nil startMode races never read it.
-local JUMP_PENALTY_DEFAULT_SECONDS = 15
+-- The F1 jump-start penalty (seconds) as relayed by the server (ADR-0043), floored defensively at the
+-- trust boundary (ADR-0005). Its one reader is the staging heads-up in init.lua step_staging; the
+-- authoritative penalty is the server's, folded into the standings, and never this copy.
+--
+-- Returns nil when the server named no number, rather than a default: the client has no second source
+-- for this figure, and a guessed one reads to a driver as the penalty he is about to take. The server
+-- fills it on every F1 start (it sets jump_penalty_seconds alongside start_mode), so nil is the
+-- impossible case, and the reader drops the number from its sentence instead of inventing one.
 local function resolve_jump_penalty(seconds)
-    return math.max(0, tonumber(seconds) or JUMP_PENALTY_DEFAULT_SECONDS)
+    local value = tonumber(seconds)
+    if not value then
+        return nil
+    end
+    return math.max(0, value)
 end
 
 -- The grid param block to apply for `direction`, picked from a relayed raceStart.gridParams (ADR-0023).
@@ -623,7 +644,7 @@ function M.prepare(payload)
         direction = direction,
         plan = plan,
         -- F1 light start (ADR-0043): "f1" = lights + free car + jump-start penalty; nil = lock countdown.
-        -- jumpPenaltySeconds labels the offender's local banner; the server applies the real penalty.
+        -- jumpPenaltySeconds names the penalty in the staging heads-up; the server applies the real one.
         startMode = payload.startMode == "f1" and "f1" or nil,
         jumpPenaltySeconds = resolve_jump_penalty(payload.jumpPenaltySeconds),
         -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.

@@ -185,10 +185,21 @@ function M.options(loaded_map, include_deprecated)
     return optsort.by_display(options, "label", "id")
 end
 
--- The track metadata the race-setup panel needs for ONE race (ADR-0037/0013): currently just `closed`,
--- the flag that decides whether a race is a lap race or a point-to-point run. Returns nil when the race
--- cannot be resolved or cannot be parsed (a branching track, a missing file) -- the panel then keeps its
--- "track type unknown" state rather than being told something false.
+-- The track metadata the race-setup panel needs for ONE race (ADR-0037/0013): `closed`, the flag that
+-- decides whether a race is a lap race or a point-to-point run, and `defaultLaps`, the lap count THIS
+-- TRACK itself brings (nil when it names none). Returns nil when the race cannot be resolved or cannot
+-- be parsed (a branching track, a missing file) -- the panel then keeps its "track type unknown" state
+-- rather than being told something false.
+--
+-- defaultLaps is read off the PARSED race (parser.build_meta), never off the race.race.json: that file's
+-- own defaultLaps is an editor value the mission's info.json contradicts, and the info field is named
+-- per mission type ("defaultLaps" for timeTrial/rallyStage, "lapCount" for aiRace -- ADR-0024/0035).
+-- parser.parse resolves both; 72 of the 213 stock missions with a lap field disagree between the two,
+-- so a number taken from the wrong one would be wrong on a third of the game's races.
+--
+-- The number is the track's own, NOT the one a start would end up using: the single-lap fallback and
+-- the upper clamp belong to race/start.lua and are applied by the caller (init.lua request_race_meta)
+-- through race_start.resolve_laps, so nothing here re-invents them.
 --
 -- Deliberately NOT folded into M.options, which parses no geometry on purpose: that list is rebuilt on
 -- every panel open, refresh and form restore, and a map can carry well over a hundred races, so parsing
@@ -209,7 +220,10 @@ function M.meta_for(loaded_map, race_id)
     if not race or not race.meta then
         return nil
     end
-    return {closed = race.meta.closed and true or false}
+    return {
+        closed = race.meta.closed and true or false,
+        defaultLaps = tonumber(race.meta.defaultLaps),
+    }
 end
 
 return M
