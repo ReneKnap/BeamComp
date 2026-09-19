@@ -74,6 +74,13 @@
 --                 all players; affects only that player's view (a "resultsToggle" event).
 --   /analysis     toggle the asking player's own post-race analysis overlay on/off (ADR-0028). Open to
 --                 all players; affects only that player's view (an "analysisToggle" event).
+--   /keys         repeat the chat lines naming the keys this player's repair and recover assists sit on
+--                 (ADR-0058). Open to all players; answers the asker only. The keys are whatever HIS
+--                 client reported at connect ("clientKeys") -- the server never guesses one, so a player
+--                 whose client said nothing is told that instead of being given a key that may be wrong.
+--                 The same lines are sent unasked once per connection, when that report arrives, and the
+--                 race-setup panel's "Send keys" button ("remindKeys", admin-gated) re-sends them to
+--                 everyone.
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
 -- All commands suppress their own chat echo. Anything else relays as normal chat.
@@ -396,6 +403,73 @@ identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHA
     .. " <your name>\" to pick the name everyone sees"
 identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
     .. identity.MIN_BYTES .. "-" .. identity.MAX_BYTES .. " characters, spaces allowed)"
+
+-- Everything the assist-key hint needs (ADR-0058): what each connection reported about its own key
+-- bindings, whether it has been hinted yet, the /keys command and the copy. The two in-race assists
+-- (ADR-0017) are on by default and their keys are bound by default, but nothing in the game ever told a
+-- player which key that is -- the only place the keys appear is the admin-only setup panel.
+--
+-- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
+-- (see identity above, plus grid_store / runlog / f1), and a table costs ONE local no matter how much it
+-- carries. Chat texts written as `local MSG_...` would each cost one as well, so they ride here too.
+--
+-- Constants and state live here; the functions are assigned in a later block beside identity's, after the
+-- locals they close over (is_race_admin, access.refuse, log_info). A table field needs no forward
+-- declaration and every cross-call is a runtime lookup, so the order is free.
+local keys = {
+    CHAT_COMMAND = "/keys",
+    MSG_REPORT = "clientKeys",   -- client -> server: how THIS machine binds the two in-race assists
+    MSG_REMIND = "remindKeys",   -- client -> server: admin asks us to re-send everyone his own key lines
+    -- Key labels arrive from a client and go into a chat line, so they are bounded and screened like
+    -- every other client-reported string (identity.validate, same reasoning). 32 bytes is far above the
+    -- longest real label ("Ctrl+Insert" is 11) and far below a line that would flood somebody's chat.
+    MAX_KEY_BYTES = 32,
+    -- player_id -> {repair = <entry>?, recover = <entry>?}, where an entry is one of
+    --   {state = "key", key = "Insert"} | {state = "device"} | {state = "none"}
+    -- and an ABSENT field means "this client said nothing usable about that assist" -- which is not the
+    -- same as "none" and deliberately produces no line at all.
+    -- Connection-scoped, cleared on disconnect: BeamMP reuses player ids, so a report left behind would
+    -- be read out to whoever takes the slot next.
+    reported = {},
+    -- player_id -> true once the join hint has gone out on this connection. Set when it is sent and
+    -- cleared ONLY on disconnect: a GE Lua reload and a level change make the client report again (its
+    -- bindings may have changed) and must refresh the stored answer without hinting a second time, while
+    -- a rejoin is a new connection and is hinted again.
+    hinted = {},
+}
+
+-- The two assists, in the order their lines are written.
+--
+-- THE FIELD NAMES ARE THE BEAMCOMP ASSISTS, NOT THE ENGINE ACTIONS, AND THE TWO ARE CROSSED: BeamComp's
+-- REPAIR sits on BeamNG's plain `recover_vehicle` (default Insert), BeamComp's RECOVER on
+-- `recover_vehicle_alt` (default Ctrl+Insert) -- ADR-0017 decision 3, implemented in the client's VE
+-- forwarder (lua/vehicle/extensions/beamcomp/init.lua on_recover_down) and crossed once more on the way
+-- out in race/lock.lua assist_key_report. The client reports under the BeamComp names, so nothing here
+-- has to know the engine actions at all -- and nothing here may "straighten" the pairing, which would
+-- send every player on the server the wrong key.
+--
+-- `command` is what the player sees the binding called in BeamNG's own Options > Controls (verbatim from
+-- the game's en-US translation, ui.inputActions.gameplay.recover_vehicle[_alt].title). It stays exactly
+-- as clumsy as it reads: it is the only string with which he can find the binding again.
+keys.ASSISTS = {
+    {
+        field = "repair",
+        does = "repair your car",
+        doing = "repairing your car",
+        command = "Repair / Rewind",
+    },
+    {
+        field = "recover",
+        does = "get back to the last checkpoint",
+        doing = "getting back to the last checkpoint",
+        command = "Repair / Rewind (alternate version)",
+    },
+}
+
+-- The answer to /keys when this connection has reported nothing usable. The JOIN hint stays silent in
+-- that case -- an unasked-for "I know nothing about you" is noise -- but a player who typed the command
+-- asked, and silence would read as a broken command.
+keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
 
 -- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
 -- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
@@ -6896,6 +6970,180 @@ local function handle_client_identity(player_id, payload)
     end
 end
 
+-- One reported assist, screened (ADR-0058). Returns the entry to store, or nil -- and nil means that
+-- assist counts as UNKNOWN, which produces no chat line at all. Never a guessed key, and never a
+-- "nothing is bound" claim this server did not actually hear.
+--
+-- The label is assembled on a machine its owner controls and goes verbatim into a hand-assembled chat
+-- line, so the rule from /name applies: validate at the boundary, never at the sender.
+--
+-- A byte scan rather than a pattern, for the same reason identity.validate uses one: the obvious "%z"
+-- class was REMOVED in Lua 5.2, and on a stricter build an unknown class letter matches that literal
+-- character instead. Printable ASCII only -- BeamNG control names are ASCII scancode names ("insert",
+-- "ctrl insert"), so nothing legitimate is refused.
+function keys.validate_entry(entry)
+    if type(entry) ~= "table" then
+        return nil
+    end
+    if entry.state == "device" or entry.state == "none" then
+        return {state = entry.state}
+    end
+    if entry.state ~= "key" or type(entry.key) ~= "string" then
+        return nil
+    end
+    local label = entry.key
+    if #label == 0 or #label > keys.MAX_KEY_BYTES then
+        return nil
+    end
+    for i = 1, #label do
+        local byte = label:byte(i)
+        if byte < 0x20 or byte > 0x7E then
+            return nil
+        end
+    end
+    return {state = "key", key = label}
+end
+
+-- A whole clientKeys payload, screened down to the fields this server will speak (ADR-0058). Returns the
+-- table to store, or nil when not one usable field survived.
+--
+-- Per assist, not per message: a client may know its repair key and not its recover key, so one bad field
+-- must not cost the other its line. Unknown fields in the payload are ignored -- only the two assists this
+-- server has copy for are ever read.
+function keys.validate(payload)
+    if type(payload) ~= "table" or type(payload.assists) ~= "table" then
+        return nil
+    end
+    local entries = {}
+    local usable = false
+    for _, assist in ipairs(keys.ASSISTS) do
+        local entry = keys.validate_entry(payload.assists[assist.field])
+        if entry then
+            entries[assist.field] = entry
+            usable = true
+        end
+    end
+    if not usable then
+        return nil
+    end
+    return entries
+end
+
+-- The chat lines for one player, in the order the assists are listed (ADR-0058). Empty when nothing
+-- usable was ever reported -- the server NEVER guesses a key here, not even BeamNG's defaults, because a
+-- wrong key is worse than no key: the player believes it. Same rule the panel's assist tooltips follow
+-- (ADR-0049).
+--
+-- THE ONE text builder. The join hint, /keys and the panel's button all print exactly this, so the three
+-- can never drift into three different answers to the same question.
+function keys.lines(player_id)
+    local report = keys.reported[player_id]
+    local lines = {}
+    if type(report) ~= "table" then
+        return lines
+    end
+    for _, assist in ipairs(keys.ASSISTS) do
+        local entry = report[assist.field]
+        local state = type(entry) == "table" and entry.state or nil
+        if state == "key" then
+            lines[#lines + 1] = "BeamComp: hold " .. entry.key .. " while standing still to " .. assist.does
+        elseif state == "device" then
+            -- The device is not named. The engine reports a raw devicetype ("xinput", "joystick",
+            -- "wheel") and notes itself that some force-feedback wheels identify as joysticks, so
+            -- "your wheel" would be a guess -- while the one thing worth saying, that the key is not on
+            -- his keyboard, is certain.
+            lines[#lines + 1] = "BeamComp: " .. assist.doing
+                .. " is bound on another device, not on the keyboard"
+        elseif state == "none" then
+            lines[#lines + 1] = "BeamComp: no key is bound for " .. assist.doing .. ". Bind \""
+                .. assist.command .. "\" in Options > Controls -- you will need it during a race."
+        end
+    end
+    return lines
+end
+
+-- Write one player his own key lines. Returns how many went out, which is 0 for a connection that never
+-- reported anything usable -- the callers decide what that silence means.
+function keys.send(player_id)
+    local lines = keys.lines(player_id)
+    for _, line in ipairs(lines) do
+        MP.SendChatMessage(player_id, line)
+    end
+    return #lines
+end
+
+-- A client reported how it binds the two assists (ADR-0058). Store it, and hint once per connection.
+--
+-- THE REPORT IS THE TRIGGER, NOT THE JOIN, and that is not a detail. identity's join hint waits out an
+-- 8-second grace because it fires on ABSENCE: it has to give the client time to report a name, or it
+-- hints at exactly the people who are about to be named. This one fires on PRESENCE -- before the report
+-- there is nothing it could say -- so a grace could only lose it: a client whose GE extension comes up
+-- with the level reports after any grace has expired, and the hint would fall out with no symptom.
+--
+-- The flag is set BEFORE the send, so a send that throws part way still leaves this a one-shot. It is
+-- cleared only on disconnect, so a Lua reload or a level change refreshes the stored bindings (they may
+-- have changed) without hinting again, while a rejoin is hinted anew.
+function keys.handle_report(player_id, payload)
+    local entries = keys.validate(payload)
+    if not entries then
+        log_info("beamcomp.keys", "dropped an unusable key report from id " .. tostring(player_id))
+        return
+    end
+    keys.reported[player_id] = entries
+    if keys.hinted[player_id] then
+        return
+    end
+    keys.hinted[player_id] = true
+    -- The send is its own statement, not an argument to the log call: a log line that later grows a level
+    -- check would take the hint down with it.
+    local sent = keys.send(player_id)
+    log_info("beamcomp.keys", string.format("hinted id=%s with %d line(s)", tostring(player_id), sent))
+end
+
+-- /keys: repeat the asking player's own lines. Open to EVERY player -- it writes only to the asker and
+-- says only what his own client reported, so there is nothing here to gate.
+function keys.handle_command(player_id)
+    if keys.send(player_id) == 0 then
+        MP.SendChatMessage(player_id, keys.UNKNOWN)
+    end
+end
+
+-- The Send-keys button in the race-setup panel (ADR-0058): re-send everyone the lines naming HIS own
+-- assist keys. The counterpart to identity's Remind, and admin-gated for the same reason -- it writes into
+-- every player's chat. This is the 15th is_race_admin call site; there is no second predicate anywhere in
+-- this plugin and adding one is how a refusal path silently goes open (ADR-0056).
+--
+-- Walks the connected players rather than keys.reported: the two agree (the disconnect clears the report),
+-- but a report that somehow outlived its connection would be written to whoever holds the id now, and the
+-- player list cannot be wrong about who is here. Players who reported nothing are skipped in keys.send,
+-- so nobody is told "no idea" without having asked.
+--
+-- Reads the caller's name straight off MP.GetPlayers rather than through player_name_of, exactly like
+-- identity.handle_remind: that local is declared further down the chunk, so a closure created here could
+-- not see it.
+function keys.handle_remind(player_id)
+    local player_name = MP.GetPlayers()[player_id]
+    if not player_name then
+        return
+    end
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "send the key hint")
+        log_info("beamcomp.keys", "denied " .. keys.MSG_REMIND .. " from " .. player_name
+            .. " (not a race admin)")
+        return
+    end
+
+    local reached = 0
+    for id in pairs(MP.GetPlayers()) do
+        if keys.send(id) > 0 then
+            reached = reached + 1
+        end
+    end
+    MP.SendChatMessage(player_id, string.format("BeamComp: sent the key hint to %d player(s)", reached))
+    log_info("beamcomp.keys", string.format("%s by %s reached %d player(s)", keys.MSG_REMIND,
+        player_name, reached))
+end
+
 -- /raceclear: force the machine back to lobby + cleanup/despawn from any active phase (safety hatch). This
 -- is the former /raceend behavior; /raceend now force-finishes into the results screen instead (ADR-0038).
 local function handle_raceclear_command(player_id, player_name)
@@ -7270,6 +7518,11 @@ local function on_player_disconnect(player_id)
     -- slot next -- and a stale counter would have a fresh joiner start out half-locked-out.
     access.granted[player_id] = nil
     access.attempts[player_id] = nil
+    -- Drop the reported assist-key bindings and the one-shot hint flag with them (ADR-0058). Same reason
+    -- as the grant right above: BeamMP reuses player ids, so a report left behind would be read out to
+    -- whoever takes the slot next -- and a flag left behind would swallow that player's own hint.
+    keys.reported[player_id] = nil
+    keys.hinted[player_id] = nil
     -- Unconditional: the panel lists EVERY connected player, so any leave changes it -- including a
     -- leaver who had a set name. The id is passed because onPlayerDisconnect may or may not still list
     -- him (see is_server_empty_without); without it he could linger in the admin's list.
@@ -7388,6 +7641,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == identity.CHAT_COMMAND then
         identity.handle_command(player_id, player_name, argument)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == keys.CHAT_COMMAND then
+        keys.handle_command(player_id)
         return 1  -- suppress the command's own chat echo
     end
 
@@ -8269,6 +8527,10 @@ local function handle_client_event(player_id, data)
         handle_client_identity(player_id, decoded.payload)
     elseif decoded.type == identity.MSG_REMIND then
         identity.handle_remind(player_id)
+    elseif decoded.type == keys.MSG_REPORT then
+        keys.handle_report(player_id, decoded.payload)
+    elseif decoded.type == keys.MSG_REMIND then
+        keys.handle_remind(player_id)
     elseif decoded.type == access.MSG_UNLOCK then
         -- A password attempt from the locked race-setup panel (ADR-0056). Deliberately NOT gated on
         -- is_race_admin: this is the one message whose whole job is to be sent by somebody who is not

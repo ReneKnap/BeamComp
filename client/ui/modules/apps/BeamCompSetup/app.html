@@ -86,6 +86,9 @@
     .bc-refresh { background: #355; color: #cde; padding: 3px 10px; border: none; border-radius: 3px;
       font-weight: 700; cursor: pointer; }
     .bc-refresh[disabled] { background: #2a2e35; color: #777; cursor: default; }
+    /* The Players section's two buttons share their row evenly, like the preset row below -- a plain
+       .bc-row would space-between them into opposite corners. */
+    .bc-player-actions button { flex: 1 1 auto; }
     /* Presets (ADR-0037 amendment 2026-07-30): collapsed, the section is nothing but this two-button row,
        sharing the refresh look -- Save reveals the name row below it, Load opens the saved list. */
     .bc-preset-actions { gap: 8px; }
@@ -625,9 +628,13 @@
       <!-- The count and the disabled state hang on the TEMPORARY players, not on the list length: the
            list is non-empty as soon as anyone is on the server, but Remind has nobody to write to unless
            somebody is still on a name BeamMP gave him. -->
-      <div class="bc-row">
+      <div class="bc-row bc-player-actions">
         <button class="bc-refresh" ng-disabled="!temporaryCount" ng-click="remindUnnamed()"
           bc-setup-tip="tip('remindUnnamed')">Remind ({{temporaryCount}})</button>
+        <!-- No count and never disabled: the panel is not told who reported his key bindings, and the
+             server skips the players who did not. -->
+        <button class="bc-refresh" ng-click="remindKeys()"
+          bc-setup-tip="tip('remindKeys')">Send keys</button>
       </div>
     </div>
 

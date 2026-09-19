@@ -3071,6 +3071,14 @@ function M.remind_unnamed()
     send_to_server("remindUnnamed", {})
 end
 
+-- The panel's Send-keys button (ADR-0058): ask the server to re-send every player the chat lines naming
+-- HIS own assist keys -- the same lines he got on joining, built by the same
+-- builder. The counterpart to Remind, and admin-gated server-side exactly like it, so a non-admin panel
+-- simply gets a refusal in chat. Public as beamcomp_init.remind_keys.
+function M.remind_keys()
+    send_to_server("remindKeys", {})
+end
+
 -- Push one model's configs to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this when
 -- the car model changes; configs are probed lazily per model since an all-models probe is heavy. Public
 -- so the app can reach it as beamcomp_init.request_car_configs.
