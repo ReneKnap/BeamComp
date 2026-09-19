@@ -6851,11 +6851,19 @@ local function step_staging(dt_real)
     staging.repaint_in = countdown.STAGING_REPAINT_INTERVAL
     -- F1 light start (ADR-0043): a short pre-procedure heads-up during the staging wait, before the
     -- lights begin. Reads the relayed start mode + penalty (the only consumer of those race fields).
+    --
+    -- The penalty rides in with raceStart and the server always fills it for an F1 start, so the number
+    -- is there in every real case. Should it ever not be, the sentence LOSES the figure rather than
+    -- naming a guessed one: a driver reads this as what will happen to him, and there is no channel here
+    -- to check a guess against -- an ordinary player never sees a setupOpen.
     local race = M.state.race
     local hint = nil
     if race and race.startMode == "f1" then
-        hint = "F1 light start -- hold until lights out (jump = +"
-            .. tostring(race.jumpPenaltySeconds or 15) .. "s)"
+        hint = "F1 light start -- hold until lights out"
+        local penalty = tonumber(race.jumpPenaltySeconds)
+        if penalty then
+            hint = hint .. " (jump = +" .. tostring(penalty) .. "s)"
+        end
     end
     countdown.show_staging(hint)
 end

@@ -158,12 +158,20 @@ local function resolve_assists(payload)
     }
 end
 
--- The F1 jump-start penalty (seconds) for the offender's HUD banner (ADR-0043). The server owns the
--- authoritative penalty folded into the standings; this copy is display-only, so it is defaulted +
--- floored defensively (trust boundary, ADR-0005). nil startMode races never read it.
-local JUMP_PENALTY_DEFAULT_SECONDS = 15
+-- The F1 jump-start penalty (seconds) as relayed by the server (ADR-0043), floored defensively at the
+-- trust boundary (ADR-0005). Its one reader is the staging heads-up in init.lua step_staging; the
+-- authoritative penalty is the server's, folded into the standings, and never this copy.
+--
+-- Returns nil when the server named no number, rather than a default: the client has no second source
+-- for this figure, and a guessed one reads to a driver as the penalty he is about to take. The server
+-- fills it on every F1 start (it sets jump_penalty_seconds alongside start_mode), so nil is the
+-- impossible case, and the reader drops the number from its sentence instead of inventing one.
 local function resolve_jump_penalty(seconds)
-    return math.max(0, tonumber(seconds) or JUMP_PENALTY_DEFAULT_SECONDS)
+    local value = tonumber(seconds)
+    if not value then
+        return nil
+    end
+    return math.max(0, value)
 end
 
 -- The grid param block to apply for `direction`, picked from a relayed raceStart.gridParams (ADR-0023).
@@ -636,7 +644,7 @@ function M.prepare(payload)
         direction = direction,
         plan = plan,
         -- F1 light start (ADR-0043): "f1" = lights + free car + jump-start penalty; nil = lock countdown.
-        -- jumpPenaltySeconds labels the offender's local banner; the server applies the real penalty.
+        -- jumpPenaltySeconds names the penalty in the staging heads-up; the server applies the real one.
         startMode = payload.startMode == "f1" and "f1" or nil,
         jumpPenaltySeconds = resolve_jump_penalty(payload.jumpPenaltySeconds),
         -- Opt-in recover/repair assists relayed from /race (ADR-0017); enforced VE-side.
