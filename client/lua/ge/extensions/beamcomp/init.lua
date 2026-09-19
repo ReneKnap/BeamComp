@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "key-hint/2026-09-19"
+local BUILD_MARKER = "connect-reports/2026-09-19"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -4049,6 +4049,24 @@ local HANDLERS = {
             end
         end
     end,
+    -- The server can reach us now, so send everything we report at connect (ADR-0058): the player-set
+    -- name and the keys the two in-race assists sit on.
+    --
+    -- THIS is the path that lands on a fresh join, not the pair of calls in onExtensionLoaded. That runs
+    -- inside BeamMP's resource handshake, ~27 s before the server counts this player as joined, and
+    -- BeamMP drops every client -> server event until then -- silently on this side, which is why two
+    -- reports were being lost with nothing in this log to show for it (measured 2026-09-19). The load-time
+    -- calls stay because they are the path for a GE Lua reload in a session that is already up, where the
+    -- server has long stopped asking.
+    --
+    -- Both reports are safe to repeat: the server re-reads the name idempotently and hints about the keys
+    -- once per connection. Defined inline -- a table field costs no top-level local, and both callees are
+    -- table fields resolved at call time, so their definitions further down this chunk are no problem.
+    needReports = function()
+        log("I", LOG_TAG, "server asked for the connect reports; sending name + assist keys")
+        identity.report()
+        M.report_assist_keys()
+    end,
     -- The server accepted a /name (ADR-0054): persist what the player TYPED, so the next session reports
     -- it without him typing anything. The command is entered into chat, which this Lua never sees, so the
     -- server telling us is the only way we can learn it. Defined inline -- a table field costs no
@@ -4478,9 +4496,16 @@ end
 -- Report the stored name to the server so it keys every identity -- live standings, results, the grid
 -- roster -- on the name the player picked instead of his rotating BeamMP guest name (ADR-0054).
 --
--- Once, at connect. There is nothing to re-read later: the name is a file, not a property of a car, so
--- the ADR-0031 spawn report, staging poll and GO lock-in are all gone. No stored name means we send
--- nothing and the server shows the BeamMP name -- and hints the player about /name.
+-- There is nothing to re-read later: the name is a file, not a property of a car, so the ADR-0031 spawn
+-- report, staging poll and GO lock-in are all gone. No stored name means we send nothing and the server
+-- shows the BeamMP name -- and hints the player about /name.
+--
+-- Called from TWO places, and the one at load is the weaker of them (ADR-0058). onExtensionLoaded runs
+-- inside BeamMP's resource handshake, and until the server counts this player as joined BeamMP drops
+-- every client -> server event without telling this side -- so on a fresh join that call is best-effort
+-- and normally lands nowhere. The reliable path is the server asking (needReports), which it does as soon
+-- as it can reach us. The load-time call still earns its place: after a GE Lua reload the session is long
+-- up, the server is no longer asking, and it is the only path left.
 function identity.report()
     local name = identity.load()
     if not name then
@@ -4501,6 +4526,11 @@ end
 --
 -- Sends NOTHING when the bindings cannot be read (see lock.assist_key_report). The server stays silent in
 -- that case, which is the whole point: it never guesses a key, not even BeamNG's defaults.
+--
+-- Called from onExtensionLoaded AND from the needReports handler, exactly like identity.report and for
+-- the same reason -- see the note there. The needReports call is also the better READ of the two: it
+-- happens well after the engine has filled its binding table, where the load-time call can still find it
+-- empty.
 function M.report_assist_keys()
     local report = lock.assist_key_report()
     if not report then
@@ -4546,15 +4576,16 @@ function M.onExtensionLoaded()
     -- and after the reload M.state carries no message left to expire, so nothing else would ever take a
     -- stranded line back down.
     notice.paint()
-    -- Report the name the player set with /name, so the server keys every identity on it (ADR-0054).
-    -- Read from the settings file, so it needs no vehicle and no later refresh. Fires on a Lua reload /
-    -- reconnect too, so a reconnecting client re-reports.
+    -- Report the name the player set with /name, so the server keys every identity on it (ADR-0054), and
+    -- which keys this machine has the two in-race assists on, so the server can tell the player how to
+    -- repair his car and how to get back on track (ADR-0058). Neither needs a vehicle or a later refresh.
+    --
+    -- BEST-EFFORT HERE, and that is not a caveat but the design (ADR-0058). On a fresh join this runs
+    -- inside BeamMP's resource handshake, ~27 s before the server counts this player as joined, and
+    -- BeamMP drops both events without a word to this side. The server asks again the moment it can
+    -- reach us (the needReports handler above), which is what lands on a join. These two calls are what
+    -- covers a GE Lua reload in a session that is already up, where nobody is going to ask.
     identity.report()
-    -- Report which keys this machine has the two in-race assists on, so the server can tell the player
-    -- how to repair his car and how to get back on track (ADR-0058). Beside identity.report() and for
-    -- the same reason: a key binding belongs to this CONNECTION, not to a race,
-    -- and there is nothing later to re-read it from. A Lua reload or a level change re-reports (the
-    -- binding may have changed since) -- the server stores the fresh answer and does NOT hint twice.
     M.report_assist_keys()
     -- Include a distinctive build marker so a redeploy can be confirmed live in beamng.log before trusting
     -- an in-game result -- the BeamMP client mod cache can serve a stale zip (memory

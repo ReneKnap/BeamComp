@@ -404,6 +404,45 @@ identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHA
 identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
     .. identity.MIN_BYTES .. "-" .. identity.MAX_BYTES .. " characters, spaces allowed)"
 
+-- THE CONNECT-REPORT PULL (ADR-0058). A client cannot simply report at load: its GE extension comes up
+-- inside BeamMP's resource handshake, and BeamMP accepts nothing for that player until it counts him as
+-- joined -- 27 seconds later on the measured join (2026-09-19), with every event in between refused as
+-- "Player hasn't joined yet". Both connect reports were being dropped in exactly that window: the assist
+-- keys, and -- shipped and unnoticed since ADR-0054 -- the player-set name. The name failure hid itself,
+-- because the "you have no race name set" hint fires precisely when the report is missing, so a named
+-- player being told to pick a name looked like the feature working.
+--
+-- So the SERVER asks, once it can reach the player at all. send_event reports whether BeamMP took the
+-- event, which makes "the channel is open" something this plugin can observe instead of guess, and the
+-- retry makes the whole thing self-correcting: no BeamMP internal, no engine signal, no timing constant
+-- tuned against one machine. The client answers with whatever reports it has.
+--
+-- These ride on `identity` rather than on a namespace of their own because identity.handle_join and
+-- identity.step already own "what happens when a player joins" and main.lua's main chunk has no local to
+-- spare (200-local ceiling). The message is deliberately NOT identity-specific: it asks for every report
+-- a client makes at connect, so the next one needs no second channel.
+-- server -> client: "you can reach me now, send your connect reports"
+identity.MSG_NEED_REPORTS = "needReports"
+identity.PULL_INTERVAL = 1.0   -- seconds between attempts while BeamMP is still refusing
+-- A DELIVERED request is not an answered one. The client's extension is up well before the player is
+-- synced on every join measured so far, but "well before" is a timing claim, and a request aimed at a
+-- client that is not listening yet would be lost in silence -- the exact failure this whole pull exists to
+-- end. So a delivered request is repeated until the client answers, a small bounded number of times: two
+-- more chances for a listener that was a moment late, and a stop for a client that is never going to
+-- answer (an older one, or one that simply has nothing to report).
+identity.PULL_REASK = 3.0      -- seconds between delivered requests that have not been answered
+identity.PULL_MAX_REQUESTS = 3
+-- Give up after this long. Generous on purpose: the window we are waiting out contains the download of
+-- every server mod, which is minutes rather than seconds on a slow line. It exists so a player who never
+-- arrives cannot leave an attempt running for the lifetime of the server, not to bound a normal join.
+identity.PULL_TIMEOUT = 300
+-- player_id -> {armed_at, next_at, give_up_at, attempts, requests, answered, done}. `done` is kept rather
+-- than the record deleted, so the SECOND join event (BeamMP fires both onPlayerJoining and onPlayerJoin)
+-- re-arms nothing.
+-- Cleared on disconnect -- BeamMP reuses player ids, and a `done` left behind would mean the next holder
+-- of the slot is never asked.
+identity.pull = {}
+
 -- Everything the assist-key hint needs (ADR-0058): what each connection reported about its own key
 -- bindings, whether it has been hinted yet, the /keys command and the copy. The two in-race assists
 -- (ADR-0017) are on by default and their keys are bound by default, but nothing in the game ever told a
@@ -1555,17 +1594,31 @@ end
 
 -- Send a typed event to one client as a { type, payload } envelope. BeamMP
 -- JSON-encodes the table; the client decodes it with the shared envelope module.
-local function send_event(player_id, message_type, payload)
+--
+-- RETURNS whether BeamMP accepted the event, which is a real question and not a formality: between a
+-- player's arrival and the moment the server logs "is now synced!" BeamMP refuses every event for him
+-- with "Player hasn't joined yet" -- 27 seconds on the measured join (2026-09-19), and the client's Lua
+-- is already running for most of it. This return is the ONLY reading of that window available in Lua, and
+-- identity's connect-report pull is built on it.
+--
+-- `quiet` suppresses the failure log line for a caller that EXPECTS to fail and retries (that pull): one
+-- refusal per second for half a minute would bury the log lines that matter. A caller that passes nothing
+-- keeps the old behaviour exactly.
+local function send_event(player_id, message_type, payload, quiet)
     local envelope = {
         type = message_type,
         payload = payload,
     }
     net.note_size(message_type, envelope)
     local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, envelope)
-    if not ok then
+    if ok then
+        return true
+    end
+    if not quiet then
         log_info("beamcomp.net", "client event '" .. message_type .. "' to id "
             .. player_id .. " failed: " .. tostring(err))
     end
+    return false
 end
 
 -- Send a typed event to every connected player. BeamMP has no broadcast for
@@ -6851,34 +6904,130 @@ function identity.handle_remind(player_id)
         player_name, reminded))
 end
 
--- A player joined (ADR-0054): put him on the panel's list and arm his one-time hint.
+-- A player joined (ADR-0054): put him on the panel's list and start asking him for his connect reports.
 --
--- The two halves have DIFFERENT timing on purpose. The list is pushed NOW, because the panel shows every
--- connected player and a join changes it immediately -- he appears at once marked `temporary name`, and
--- loses the marker seconds later when his stored name arrives. The HINT waits out a grace instead: a
--- client that HAS a stored name reports it a moment after joining, so hinting at the join instant would
--- write to exactly the people who are about to be named. identity.step emits it once the grace has
--- passed and the player is still without an entry.
+-- The list is pushed NOW because the panel shows every connected player and a join changes it
+-- immediately -- he appears at once marked `temporary name`, and loses the marker once his stored name
+-- arrives. (This first push is one of the events BeamMP refuses during the handshake; the second join
+-- event and every later change re-push it, and a panel opened afterwards is seeded on open.)
 --
--- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
--- events safe (see the MP.RegisterEvent block at the end of the file). The second call re-pushes the list
--- as well, which also covers an earlier event that fired before MP.GetPlayers knew the id.
+-- The HINT is NOT armed here any more (ADR-0058). Its grace exists to give the client time to report a
+-- name, and at this instant the client cannot report at all -- so it used to expire long before the
+-- earliest possible answer and hint at exactly the people it was written to leave alone. It is armed in
+-- identity.pull_step instead, the moment the client has actually been reached.
+--
+-- Idempotent, which is what makes registering both join events safe (see the MP.RegisterEvent block at
+-- the end of the file): the second call re-pushes the list and finds the pull already armed.
 function identity.handle_join(player_id)
     identity.broadcast_players()
+    identity.request_reports(player_id)
+end
+
+-- Arm the "you have no race name set" hint for one player. Called the moment the client has been ASKED
+-- for its reports -- not at the join.
+--
+-- That is the whole point of the grace, and it was aimed at the wrong instant: it exists to give the
+-- client time to report a name, and at the join the client cannot report at all (see identity.pull), so
+-- it expired 19 seconds before the earliest possible answer and hinted at exactly the people it was
+-- written to leave alone. Started here, the eight seconds are eight seconds of a channel that is open.
+function identity.arm_hint(player_id)
     if client_names[player_id] or not identity.is_enabled() then
         return
     end
     identity.pending[player_id] = now() + identity.HINT_DELAY
 end
 
--- Emit any join hint whose grace has run out. Called from the top of tick(), ABOVE its lobby early
--- return: the lobby is exactly where a joining player is.
+-- Arm the connect-report pull for a player who just joined (ADR-0058). Idempotent: BeamMP fires two join
+-- events and both land here, and a player who has already been asked must not be asked again.
+function identity.request_reports(player_id)
+    if identity.pull[player_id] then
+        return
+    end
+    local at = now()
+    identity.pull[player_id] = {
+        armed_at = at,
+        next_at = at,          -- try straight away; on a Lua reload mid-session this already succeeds
+        give_up_at = at + identity.PULL_TIMEOUT,
+        attempts = 0,        -- sends tried, including the ones BeamMP refused
+        requests = 0,        -- sends BeamMP actually took
+        answered = false,
+        done = false,
+    }
+end
+
+-- A client answered the pull (ADR-0058). Called by BOTH connect-report handlers the moment their message
+-- arrives -- before any validation, because a report this server then rejects is still an answer and
+-- re-asking would only fetch the same rejected thing again.
+--
+-- This, not the delivery of the request, is what ends the pull: a delivered request only proves BeamMP
+-- took it, never that the client's extension was listening.
+function identity.note_report(player_id)
+    local pull = identity.pull[player_id]
+    if pull then
+        pull.answered = true
+    end
+end
+
+-- Drive the pull: ask every armed player again until BeamMP takes the event (ADR-0058). Called from
+-- identity.step, i.e. from the top of tick() above its lobby early return -- a joining player is in the
+-- lobby by definition.
+--
+-- Ends in one of four ways and never otherwise: the client ANSWERS (the normal case, a moment after
+-- BeamMP starts accepting events for him -- ~27 s after arrival on the measured join), three delivered
+-- requests go unanswered, the timeout expires, or the player disconnects and on_player_disconnect drops
+-- the record. The first delivered request is logged with the elapsed time and the attempt count, because
+-- that number is the only in-game reading of how long this server's handshake window actually is.
+function identity.pull_step()
+    if next(identity.pull) == nil then
+        return
+    end
+    local at = now()
+    for player_id, pull in pairs(identity.pull) do
+        if not pull.done then
+            if pull.answered then
+                pull.done = true          -- the report handlers log the arrival itself
+            elseif at >= pull.give_up_at then
+                pull.done = true
+                log_info("beamcomp.identity", string.format(
+                    "gave up asking id %s for its connect reports (%d attempt(s) over %.0f s)",
+                    tostring(player_id), pull.attempts, at - pull.armed_at))
+            elseif pull.requests >= identity.PULL_MAX_REQUESTS then
+                pull.done = true
+                log_info("beamcomp.identity", string.format(
+                    "asked id %s for its connect reports %d times with no answer; it reports nothing",
+                    tostring(player_id), pull.requests))
+            elseif at >= pull.next_at then
+                pull.attempts = pull.attempts + 1
+                pull.next_at = at + identity.PULL_INTERVAL
+                -- Quiet: every attempt before the player is synced is refused by design, and absorbing
+                -- those refusals is what this loop is for -- reporting them is not.
+                if send_event(player_id, identity.MSG_NEED_REPORTS, {}, true) then
+                    pull.requests = pull.requests + 1
+                    pull.next_at = at + identity.PULL_REASK
+                    if pull.requests == 1 then
+                        log_info("beamcomp.identity", string.format(
+                            "asked id %s for its connect reports after %.1f s (%d attempt(s))",
+                            tostring(player_id), at - pull.armed_at, pull.attempts))
+                        identity.arm_hint(player_id)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Drive the connect-report pull, then emit any join hint whose grace has run out. Called from the top of
+-- tick(), ABOVE its lobby early return: the lobby is exactly where a joining player is.
+--
+-- The pull runs first and unconditionally -- its own early return is on its own table, so the hint's
+-- "nothing pending" guard below can never switch it off.
 --
 -- The `client_names[id] == nil` test here is the ONE place that decides whether a hint is still
 -- warranted -- neither /name nor the connect report clears the pending entry, so there is no list of
 -- accept paths that has to stay complete for the rule to hold. Clearing the entry before the send makes
 -- it a one-shot even if the send throws; a player who is named by now, or gone, gets nothing.
 function identity.step()
+    identity.pull_step()
     if next(identity.pending) == nil then
         return
     end
@@ -6947,6 +7096,8 @@ end
 -- The client sends this once at connect from its settings file, so a rejection here is a tampered or
 -- stale file rather than a player action: log it and drop it, no chat line.
 local function handle_client_identity(player_id, payload)
+    -- The client answered the connect-report pull, whatever the payload turns out to be (ADR-0058).
+    identity.note_report(player_id)
     if type(payload) ~= "table" or type(payload.name) ~= "string" then
         return
     end
@@ -7084,6 +7235,9 @@ end
 -- cleared only on disconnect, so a Lua reload or a level change refreshes the stored bindings (they may
 -- have changed) without hinting again, while a rejoin is hinted anew.
 function keys.handle_report(player_id, payload)
+    -- The client answered the connect-report pull, even if what it sent is unusable (ADR-0058): re-asking
+    -- would only fetch the same unusable thing again.
+    identity.note_report(player_id)
     local entries = keys.validate(payload)
     if not entries then
         log_info("beamcomp.keys", "dropped an unusable key report from id " .. tostring(player_id))
@@ -7513,6 +7667,10 @@ local function on_player_disconnect(player_id)
     -- and with it any join hint still waiting out its grace.
     client_names[player_id] = nil
     identity.pending[player_id] = nil
+    -- And the connect-report pull (ADR-0058), whether it is still trying or already done: BeamMP reuses
+    -- player ids, so a `done` record left behind would mean the next holder of this slot is never asked
+    -- and reports nothing at all.
+    identity.pull[player_id] = nil
     -- Drop the password grant and the failed-attempt counter with it (ADR-0056). NOT optional
     -- bookkeeping: BeamMP reuses player ids, so a grant left behind is inherited by whoever takes the
     -- slot next -- and a stale counter would have a fresh joiner start out half-locked-out.
