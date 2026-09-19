@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "field-defaults/2026-09-19"
+local BUILD_MARKER = "own-row/2026-09-19"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -345,6 +345,7 @@ M.state = {
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
     server_defaults = nil,    -- the defaults the SERVER owns, as it sent them on setupOpen ({jumpPenalty = 15}, ADR-0043), or nil. Relayed verbatim to the setup panel with EVERY push_setup_data -- not just the opening one -- because the panel also pulls its dataset itself on link (request_setup_data), and a value hanging off setupOpen alone would be gone after a UI reload. GE reads no key of it: the next server-owned default is a key on the server plus a placeholder in the markup. Safe at nil across a GE reload (ADR-0052): it mirrors a server constant and needs no previous value of its own, and nil means "not heard yet", which the panel shows as the neutral "default" rather than a number nothing stands behind. Cleared by setup.clear, which onClientEndMission runs when the player leaves the session -- so one server's numbers can never be shown as the next server's
+    own_player_id = nil,      -- the id this connection has on the server, as it named it on setupOpen (yourPlayerId), or nil. Lets the setup panel mark this player's own row in its player list -- the list is a broadcast and cannot say who the reader is. Nil after a GE Lua reload like every other M.state field (ADR-0052), which is why identity.own_id falls back to BeamMP's own copy of the same id -- MPConfig DOES survive a reload. Cleared by setup.clear on leaving the session, so the next server's list is never matched against the previous server's id
     setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
@@ -3059,9 +3060,7 @@ end
 -- so a freshly linked or reopened panel fills without waiting for the next server broadcast. Public as
 -- beamcomp_init.request_players.
 function M.request_players()
-    if guihooks then
-        guihooks.trigger("BeamCompPlayers", {players = M.state.player_list or {}})
-    end
+    identity.push_players()
 end
 
 -- The panel's Remind button (ADR-0054): ask the server to chat-hint every player still on a temporary
@@ -3158,6 +3157,9 @@ function setup.clear()
     -- as the next server's. Costs nothing -- handle_setup_open re-asserts them before the push that
     -- carries them, so a reopen never flashes the unknown state.
     M.state.server_defaults = nil
+    -- Same reason, and here it matters more than for the numbers: BeamMP hands out player ids per
+    -- server, so an id kept from the last one would match a stranger's row on the next.
+    M.state.own_player_id = nil
 end
 
 -- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
@@ -3430,6 +3432,14 @@ local function handle_setup_open(payload)
     -- a server that names no defaults must not leave the previous server's numbers standing.
     local defaults = type(payload) == "table" and payload.serverDefaults or nil
     M.state.server_defaults = type(defaults) == "table" and defaults or nil
+    -- Which row of the player list is this client (identity.own_id). The server names it here because
+    -- the list itself goes out as one broadcast to everybody; a payload without it leaves the field nil
+    -- and the fallback answers instead.
+    M.state.own_player_id = type(payload) == "table" and tonumber(payload.yourPlayerId) or nil
+    -- Re-stamp the list we already hold: on a FRESH open the panel pulls it itself on link, but a
+    -- /raceui into an ALREADY open panel links nothing, and the list cached before this message knows
+    -- nothing about the id that just arrived.
+    identity.push_players()
     push_setup_data(false)
     -- Ensure the panel app is on the current layout (ADR-0012 best-effort auto-add); dedups by appName.
     M.uilayout.ensure_visible("beamCompSetup")
@@ -4110,9 +4120,7 @@ local HANDLERS = {
     playerList = function(payload)
         M.state.player_list = (type(payload) == "table" and type(payload.players) == "table")
             and payload.players or {}
-        if guihooks then
-            guihooks.trigger("BeamCompPlayers", {players = M.state.player_list})
-        end
+        identity.push_players()
     end,
     championship = handle_championship,
     tournament = handle_tournament,
@@ -4541,6 +4549,78 @@ function identity.report()
     end
     log("I", LOG_TAG, "reporting race name: " .. name)
     send_to_server("clientIdentity", {name = name})
+end
+
+-- Which player id this connection has on the server, or nil when neither source answers. The setup
+-- panel's player list is the same list for everybody, so this is what tells the panel which of its rows
+-- belongs to the player reading it.
+--
+-- TWO sources, the server first:
+--
+--   1. The server names it on setupOpen (`yourPlayerId`). Authoritative, and free of any BeamMP
+--      internal -- but it does not survive a GE Lua reload (M.state is rebuilt from its literal,
+--      ADR-0052), and the panel's link-time pull goes to GE rather than to the server, so nothing
+--      re-sends it until the next /raceui.
+--   2. BeamMP's own MPConfig carries the very same id -- the server assigns it at connect and the
+--      client stores it from the 'P' packet (MPGameNetwork.lua:469). It DOES survive a GE Lua reload:
+--      MPConfig defines onSerialize/onDeserialized and takes PlayerServerID with it (MPConfig.lua:314),
+--      which is exactly the gate our own M.state does not pass. Being a BeamMP internal it is guarded
+--      like every other one here (race/cones.lua) and stays the fallback, never the source of truth.
+--
+-- The stored race name is NOT a third source. identity.load() holds what the player TYPED, not the
+-- collision-suffixed name the server actually gave him, so matching a row by it would mark the OTHER
+-- player's row in precisely the case where the two differ.
+--
+-- Logs which of the two answered, and only when the answer changes -- the house rule for every engine /
+-- BeamMP signal in this codebase (input action names, the uilayout route prefix). A marker that is
+-- missing and a marker nobody asked for look identical on screen; the log line is what tells them apart.
+function identity.own_id()
+    local id = tonumber(M.state.own_player_id)
+    local source = "server"
+    if id == nil then
+        source = "beammp"
+        if type(MPConfig) == "table" and type(MPConfig.getPlayerServerID) == "function" then
+            local ok, value = pcall(MPConfig.getPlayerServerID)
+            if ok then
+                id = tonumber(value)
+            end
+        end
+    end
+    if id == nil then
+        source = "none"
+    end
+    -- Keyed on the source AND the id, not the source alone: hopping from one server to the next keeps
+    -- the source at "server" while the id changes, and that is exactly the case where the log is worth
+    -- having.
+    local answer = source .. ":" .. tostring(id)
+    if identity.id_source ~= answer then
+        identity.id_source = answer
+        if id == nil then
+            log("I", LOG_TAG, "own player id unknown; the panel marks nobody as (you)")
+        else
+            log("I", LOG_TAG, "own player id " .. tostring(id) .. " (source: " .. source .. ")")
+        end
+    end
+    return id
+end
+
+-- Push the connected-player list to the setup panel, marking this client's own row (ADR-0054 display).
+-- The ONE push point for BeamCompPlayers: both the server broadcast and the panel's link-time pull come
+-- through here, so the marker cannot be on one path and missing on the other.
+--
+-- `isYou` is re-stamped on every row on every push rather than set once. The id can arrive after a list
+-- has already been cached -- setupOpen and a join broadcast land in either order -- and a flag that is
+-- only ever set would leave a stale mark behind on the row of whoever held that id before.
+function identity.push_players()
+    local rows = M.state.player_list or {}
+    local own = identity.own_id()
+    for i = 1, #rows do
+        local row = rows[i]
+        row.isYou = (own ~= nil and tonumber(row.id) == own) or nil
+    end
+    if guihooks then
+        guihooks.trigger("BeamCompPlayers", {players = rows})
+    end
 end
 
 -- Report which keys the two in-race assists sit on here, so the server can name them in this player's

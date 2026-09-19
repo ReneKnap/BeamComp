@@ -7547,6 +7547,13 @@ function access.open_setup(player_id)
     -- successful unlock, so anything that changes between two opens would sit stale in the panel.
     send_event(player_id, MSG_SETUP_OPEN, {
         serverDefaults = {jumpPenalty = f1.DEFAULT_PENALTY},
+        -- Which of the player-list rows is THIS player, so the panel can mark his own name "(you)".
+        -- The list itself is a broadcast -- one payload for everybody -- so it cannot carry the answer;
+        -- this per-player message is where the server can say it without a second send per client.
+        --
+        -- Deliberately not a key of serverDefaults: that table is the panel's grey "N (default)" hints
+        -- and is relayed verbatim, while this is an identity fact the client resolves against.
+        yourPlayerId = player_id,
     })
     -- Seed the panel with the current championship + tournament state (ADR-0040/0042) so its tournament
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.

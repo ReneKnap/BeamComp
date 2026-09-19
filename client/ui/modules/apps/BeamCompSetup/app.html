@@ -172,6 +172,14 @@
     .bc-player-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; line-height: 16px; }
     .bc-player-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden;
       text-overflow: ellipsis; }
+    /* The reader's own row. Same green as the HUD's own-row tint and the same bold, so the panel and the
+       standings read as one convention rather than two inventions. Height-neutral by construction: the
+       row pins its own 16px line-height, so bold cannot move the 18px arithmetic above, and the negative
+       margin with matching padding only pulls the tint across the list's 6px gutter. The tint is also
+       the half of the marking that cannot be clipped -- a 20-character name in a hand-narrowed panel can
+       ellipsis away the "(you)", and the row still reads as the reader's own. */
+    .bc-player-row.bc-player-you { background: rgba(63, 217, 107, 0.18); font-weight: bold;
+      margin: 0 -6px; padding-left: 6px; padding-right: 6px; }
     .bc-player-temp { flex: 0 0 auto; opacity: 0.65; font-style: italic; font-size: 11px;
       white-space: nowrap; }
     .bc-players-empty { padding: 1px 0; line-height: 16px; opacity: 0.7; font-style: italic; }
@@ -617,10 +625,14 @@
       <!-- track by p.id: two guests can carry the same BeamMP name, which a bare ng-repeat rejects
            outright ("Duplicates in a repeater"), and it also keeps Angular from stamping $$hashKey onto
            rows that came straight off the wire. The server owns the order (temporary first, then
-           alphabetical), so there is no orderBy here to fight it. -->
+           alphabetical), so there is no orderBy here to fight it.
+
+           isYou is stamped by GE, not by the server: this list goes out as ONE broadcast to everybody,
+           so which row is "yours" can only be decided on the receiving side. It is deliberately not
+           matched on the name -- the comment above says why two rows can carry the same one. -->
       <div class="bc-players-list" bc-setup-tip="tip('players')">
-        <div class="bc-player-row" ng-repeat="p in players track by p.id">
-          <span class="bc-player-name">{{p.name}}</span>
+        <div class="bc-player-row" ng-class="{'bc-player-you': p.isYou}" ng-repeat="p in players track by p.id">
+          <span class="bc-player-name">{{p.name}}<span ng-if="p.isYou"> (you)</span></span>
           <span class="bc-player-temp" ng-if="p.temporary">temporary name</span>
         </div>
         <div class="bc-players-empty" ng-if="!players.length">nobody connected</div>
