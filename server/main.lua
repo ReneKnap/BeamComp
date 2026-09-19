@@ -74,6 +74,13 @@
 --                 all players; affects only that player's view (a "resultsToggle" event).
 --   /analysis     toggle the asking player's own post-race analysis overlay on/off (ADR-0028). Open to
 --                 all players; affects only that player's view (an "analysisToggle" event).
+--   /keys         repeat the chat lines naming the keys this player's repair and recover assists sit on
+--                 (ADR-0058). Open to all players; answers the asker only. The keys are whatever HIS
+--                 client reported at connect ("clientKeys") -- the server never guesses one, so a player
+--                 whose client said nothing is told that instead of being given a key that may be wrong.
+--                 The same lines are sent unasked once per connection, when that report arrives, and the
+--                 race-setup panel's "Send keys" button ("remindKeys", admin-gated) re-sends them to
+--                 everyone.
 --   /beamcomp     diagnostic ping -- replies in chat AND sends a "ping" event the client
 --                 mod surfaces.
 -- All commands suppress their own chat echo. Anything else relays as normal chat.
@@ -396,6 +403,112 @@ identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHA
     .. " <your name>\" to pick the name everyone sees"
 identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
     .. identity.MIN_BYTES .. "-" .. identity.MAX_BYTES .. " characters, spaces allowed)"
+
+-- THE CONNECT-REPORT PULL (ADR-0058). A client cannot simply report at load: its GE extension comes up
+-- inside BeamMP's resource handshake, and BeamMP accepts nothing for that player until it counts him as
+-- joined -- 27 seconds later on the measured join (2026-09-19), with every event in between refused as
+-- "Player hasn't joined yet". Both connect reports were being dropped in exactly that window: the assist
+-- keys, and -- shipped and unnoticed since ADR-0054 -- the player-set name. The name failure hid itself,
+-- because the "you have no race name set" hint fires precisely when the report is missing, so a named
+-- player being told to pick a name looked like the feature working.
+--
+-- So the SERVER asks, once it can reach the player at all. send_event reports whether BeamMP took the
+-- event, which makes "the channel is open" something this plugin can observe instead of guess, and the
+-- retry makes the whole thing self-correcting: no BeamMP internal, no engine signal, no timing constant
+-- tuned against one machine. The client answers with whatever reports it has.
+--
+-- These ride on `identity` rather than on a namespace of their own because identity.handle_join and
+-- identity.step already own "what happens when a player joins" and main.lua's main chunk has no local to
+-- spare (200-local ceiling). The message is deliberately NOT identity-specific: it asks for every report
+-- a client makes at connect, so the next one needs no second channel.
+-- server -> client: "you can reach me now, send your connect reports"
+identity.MSG_NEED_REPORTS = "needReports"
+identity.PULL_INTERVAL = 1.0   -- seconds between attempts while BeamMP is still refusing
+-- A DELIVERED request is not an answered one. The client's extension is up well before the player is
+-- synced on every join measured so far, but "well before" is a timing claim, and a request aimed at a
+-- client that is not listening yet would be lost in silence -- the exact failure this whole pull exists to
+-- end. So a delivered request is repeated until the client answers, a small bounded number of times: two
+-- more chances for a listener that was a moment late, and a stop for a client that is never going to
+-- answer (an older one, or one that simply has nothing to report).
+identity.PULL_REASK = 3.0      -- seconds between delivered requests that have not been answered
+identity.PULL_MAX_REQUESTS = 3
+-- Give up after this long. Generous on purpose: the window we are waiting out contains the download of
+-- every server mod, which is minutes rather than seconds on a slow line. It exists so a player who never
+-- arrives cannot leave an attempt running for the lifetime of the server, not to bound a normal join.
+identity.PULL_TIMEOUT = 300
+-- player_id -> {armed_at, next_at, give_up_at, attempts, requests, answered, done}. `done` is kept rather
+-- than the record deleted, so the SECOND join event (BeamMP fires both onPlayerJoining and onPlayerJoin)
+-- re-arms nothing.
+-- Cleared on disconnect -- BeamMP reuses player ids, and a `done` left behind would mean the next holder
+-- of the slot is never asked.
+identity.pull = {}
+
+-- Everything the assist-key hint needs (ADR-0058): what each connection reported about its own key
+-- bindings, whether it has been hinted yet, the /keys command and the copy. The two in-race assists
+-- (ADR-0017) are on by default and their keys are bound by default, but nothing in the game ever told a
+-- player which key that is -- the only place the keys appear is the admin-only setup panel.
+--
+-- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
+-- (see identity above, plus grid_store / runlog / f1), and a table costs ONE local no matter how much it
+-- carries. Chat texts written as `local MSG_...` would each cost one as well, so they ride here too.
+--
+-- Constants and state live here; the functions are assigned in a later block beside identity's, after the
+-- locals they close over (is_race_admin, access.refuse, log_info). A table field needs no forward
+-- declaration and every cross-call is a runtime lookup, so the order is free.
+local keys = {
+    CHAT_COMMAND = "/keys",
+    MSG_REPORT = "clientKeys",   -- client -> server: how THIS machine binds the two in-race assists
+    MSG_REMIND = "remindKeys",   -- client -> server: admin asks us to re-send everyone his own key lines
+    -- Key labels arrive from a client and go into a chat line, so they are bounded and screened like
+    -- every other client-reported string (identity.validate, same reasoning). 32 bytes is far above the
+    -- longest real label ("Ctrl+Insert" is 11) and far below a line that would flood somebody's chat.
+    MAX_KEY_BYTES = 32,
+    -- player_id -> {repair = <entry>?, recover = <entry>?}, where an entry is one of
+    --   {state = "key", key = "Insert"} | {state = "device"} | {state = "none"}
+    -- and an ABSENT field means "this client said nothing usable about that assist" -- which is not the
+    -- same as "none" and deliberately produces no line at all.
+    -- Connection-scoped, cleared on disconnect: BeamMP reuses player ids, so a report left behind would
+    -- be read out to whoever takes the slot next.
+    reported = {},
+    -- player_id -> true once the join hint has gone out on this connection. Set when it is sent and
+    -- cleared ONLY on disconnect: a GE Lua reload and a level change make the client report again (its
+    -- bindings may have changed) and must refresh the stored answer without hinting a second time, while
+    -- a rejoin is a new connection and is hinted again.
+    hinted = {},
+}
+
+-- The two assists, in the order their lines are written.
+--
+-- THE FIELD NAMES ARE THE BEAMCOMP ASSISTS, NOT THE ENGINE ACTIONS, AND THE TWO ARE CROSSED: BeamComp's
+-- REPAIR sits on BeamNG's plain `recover_vehicle` (default Insert), BeamComp's RECOVER on
+-- `recover_vehicle_alt` (default Ctrl+Insert) -- ADR-0017 decision 3, implemented in the client's VE
+-- forwarder (lua/vehicle/extensions/beamcomp/init.lua on_recover_down) and crossed once more on the way
+-- out in race/lock.lua assist_key_report. The client reports under the BeamComp names, so nothing here
+-- has to know the engine actions at all -- and nothing here may "straighten" the pairing, which would
+-- send every player on the server the wrong key.
+--
+-- `command` is what the player sees the binding called in BeamNG's own Options > Controls (verbatim from
+-- the game's en-US translation, ui.inputActions.gameplay.recover_vehicle[_alt].title). It stays exactly
+-- as clumsy as it reads: it is the only string with which he can find the binding again.
+keys.ASSISTS = {
+    {
+        field = "repair",
+        does = "repair your car",
+        doing = "repairing your car",
+        command = "Repair / Rewind",
+    },
+    {
+        field = "recover",
+        does = "get back to the last checkpoint",
+        doing = "getting back to the last checkpoint",
+        command = "Repair / Rewind (alternate version)",
+    },
+}
+
+-- The answer to /keys when this connection has reported nothing usable. The JOIN hint stays silent in
+-- that case -- an unasked-for "I know nothing about you" is noise -- but a player who typed the command
+-- asked, and silence would read as a broken command.
+keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
 
 -- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
 -- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
@@ -1481,17 +1594,31 @@ end
 
 -- Send a typed event to one client as a { type, payload } envelope. BeamMP
 -- JSON-encodes the table; the client decodes it with the shared envelope module.
-local function send_event(player_id, message_type, payload)
+--
+-- RETURNS whether BeamMP accepted the event, which is a real question and not a formality: between a
+-- player's arrival and the moment the server logs "is now synced!" BeamMP refuses every event for him
+-- with "Player hasn't joined yet" -- 27 seconds on the measured join (2026-09-19), and the client's Lua
+-- is already running for most of it. This return is the ONLY reading of that window available in Lua, and
+-- identity's connect-report pull is built on it.
+--
+-- `quiet` suppresses the failure log line for a caller that EXPECTS to fail and retries (that pull): one
+-- refusal per second for half a minute would bury the log lines that matter. A caller that passes nothing
+-- keeps the old behaviour exactly.
+local function send_event(player_id, message_type, payload, quiet)
     local envelope = {
         type = message_type,
         payload = payload,
     }
     net.note_size(message_type, envelope)
     local ok, err = MP.TriggerClientEventJson(player_id, EVENT_CHANNEL, envelope)
-    if not ok then
+    if ok then
+        return true
+    end
+    if not quiet then
         log_info("beamcomp.net", "client event '" .. message_type .. "' to id "
             .. player_id .. " failed: " .. tostring(err))
     end
+    return false
 end
 
 -- Send a typed event to every connected player. BeamMP has no broadcast for
@@ -6777,34 +6904,130 @@ function identity.handle_remind(player_id)
         player_name, reminded))
 end
 
--- A player joined (ADR-0054): put him on the panel's list and arm his one-time hint.
+-- A player joined (ADR-0054): put him on the panel's list and start asking him for his connect reports.
 --
--- The two halves have DIFFERENT timing on purpose. The list is pushed NOW, because the panel shows every
--- connected player and a join changes it immediately -- he appears at once marked `temporary name`, and
--- loses the marker seconds later when his stored name arrives. The HINT waits out a grace instead: a
--- client that HAS a stored name reports it a moment after joining, so hinting at the join instant would
--- write to exactly the people who are about to be named. identity.step emits it once the grace has
--- passed and the player is still without an entry.
+-- The list is pushed NOW because the panel shows every connected player and a join changes it
+-- immediately -- he appears at once marked `temporary name`, and loses the marker once his stored name
+-- arrives. (This first push is one of the events BeamMP refuses during the handshake; the second join
+-- event and every later change re-push it, and a panel opened afterwards is seeded on open.)
 --
--- Idempotent, and a re-arm only pushes the deadline later -- which is what makes registering both join
--- events safe (see the MP.RegisterEvent block at the end of the file). The second call re-pushes the list
--- as well, which also covers an earlier event that fired before MP.GetPlayers knew the id.
+-- The HINT is NOT armed here any more (ADR-0058). Its grace exists to give the client time to report a
+-- name, and at this instant the client cannot report at all -- so it used to expire long before the
+-- earliest possible answer and hint at exactly the people it was written to leave alone. It is armed in
+-- identity.pull_step instead, the moment the client has actually been reached.
+--
+-- Idempotent, which is what makes registering both join events safe (see the MP.RegisterEvent block at
+-- the end of the file): the second call re-pushes the list and finds the pull already armed.
 function identity.handle_join(player_id)
     identity.broadcast_players()
+    identity.request_reports(player_id)
+end
+
+-- Arm the "you have no race name set" hint for one player. Called the moment the client has been ASKED
+-- for its reports -- not at the join.
+--
+-- That is the whole point of the grace, and it was aimed at the wrong instant: it exists to give the
+-- client time to report a name, and at the join the client cannot report at all (see identity.pull), so
+-- it expired 19 seconds before the earliest possible answer and hinted at exactly the people it was
+-- written to leave alone. Started here, the eight seconds are eight seconds of a channel that is open.
+function identity.arm_hint(player_id)
     if client_names[player_id] or not identity.is_enabled() then
         return
     end
     identity.pending[player_id] = now() + identity.HINT_DELAY
 end
 
--- Emit any join hint whose grace has run out. Called from the top of tick(), ABOVE its lobby early
--- return: the lobby is exactly where a joining player is.
+-- Arm the connect-report pull for a player who just joined (ADR-0058). Idempotent: BeamMP fires two join
+-- events and both land here, and a player who has already been asked must not be asked again.
+function identity.request_reports(player_id)
+    if identity.pull[player_id] then
+        return
+    end
+    local at = now()
+    identity.pull[player_id] = {
+        armed_at = at,
+        next_at = at,          -- try straight away; on a Lua reload mid-session this already succeeds
+        give_up_at = at + identity.PULL_TIMEOUT,
+        attempts = 0,        -- sends tried, including the ones BeamMP refused
+        requests = 0,        -- sends BeamMP actually took
+        answered = false,
+        done = false,
+    }
+end
+
+-- A client answered the pull (ADR-0058). Called by BOTH connect-report handlers the moment their message
+-- arrives -- before any validation, because a report this server then rejects is still an answer and
+-- re-asking would only fetch the same rejected thing again.
+--
+-- This, not the delivery of the request, is what ends the pull: a delivered request only proves BeamMP
+-- took it, never that the client's extension was listening.
+function identity.note_report(player_id)
+    local pull = identity.pull[player_id]
+    if pull then
+        pull.answered = true
+    end
+end
+
+-- Drive the pull: ask every armed player again until BeamMP takes the event (ADR-0058). Called from
+-- identity.step, i.e. from the top of tick() above its lobby early return -- a joining player is in the
+-- lobby by definition.
+--
+-- Ends in one of four ways and never otherwise: the client ANSWERS (the normal case, a moment after
+-- BeamMP starts accepting events for him -- ~27 s after arrival on the measured join), three delivered
+-- requests go unanswered, the timeout expires, or the player disconnects and on_player_disconnect drops
+-- the record. The first delivered request is logged with the elapsed time and the attempt count, because
+-- that number is the only in-game reading of how long this server's handshake window actually is.
+function identity.pull_step()
+    if next(identity.pull) == nil then
+        return
+    end
+    local at = now()
+    for player_id, pull in pairs(identity.pull) do
+        if not pull.done then
+            if pull.answered then
+                pull.done = true          -- the report handlers log the arrival itself
+            elseif at >= pull.give_up_at then
+                pull.done = true
+                log_info("beamcomp.identity", string.format(
+                    "gave up asking id %s for its connect reports (%d attempt(s) over %.0f s)",
+                    tostring(player_id), pull.attempts, at - pull.armed_at))
+            elseif pull.requests >= identity.PULL_MAX_REQUESTS then
+                pull.done = true
+                log_info("beamcomp.identity", string.format(
+                    "asked id %s for its connect reports %d times with no answer; it reports nothing",
+                    tostring(player_id), pull.requests))
+            elseif at >= pull.next_at then
+                pull.attempts = pull.attempts + 1
+                pull.next_at = at + identity.PULL_INTERVAL
+                -- Quiet: every attempt before the player is synced is refused by design, and absorbing
+                -- those refusals is what this loop is for -- reporting them is not.
+                if send_event(player_id, identity.MSG_NEED_REPORTS, {}, true) then
+                    pull.requests = pull.requests + 1
+                    pull.next_at = at + identity.PULL_REASK
+                    if pull.requests == 1 then
+                        log_info("beamcomp.identity", string.format(
+                            "asked id %s for its connect reports after %.1f s (%d attempt(s))",
+                            tostring(player_id), at - pull.armed_at, pull.attempts))
+                        identity.arm_hint(player_id)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Drive the connect-report pull, then emit any join hint whose grace has run out. Called from the top of
+-- tick(), ABOVE its lobby early return: the lobby is exactly where a joining player is.
+--
+-- The pull runs first and unconditionally -- its own early return is on its own table, so the hint's
+-- "nothing pending" guard below can never switch it off.
 --
 -- The `client_names[id] == nil` test here is the ONE place that decides whether a hint is still
 -- warranted -- neither /name nor the connect report clears the pending entry, so there is no list of
 -- accept paths that has to stay complete for the rule to hold. Clearing the entry before the send makes
 -- it a one-shot even if the send throws; a player who is named by now, or gone, gets nothing.
 function identity.step()
+    identity.pull_step()
     if next(identity.pending) == nil then
         return
     end
@@ -6873,6 +7096,8 @@ end
 -- The client sends this once at connect from its settings file, so a rejection here is a tampered or
 -- stale file rather than a player action: log it and drop it, no chat line.
 local function handle_client_identity(player_id, payload)
+    -- The client answered the connect-report pull, whatever the payload turns out to be (ADR-0058).
+    identity.note_report(player_id)
     if type(payload) ~= "table" or type(payload.name) ~= "string" then
         return
     end
@@ -6894,6 +7119,192 @@ local function handle_client_identity(player_id, payload)
     if changed and unique ~= requested then
         MP.SendChatMessage(player_id, "BeamComp: name taken, using " .. unique)
     end
+end
+
+-- One reported assist, screened (ADR-0058). Returns the entry to store, or nil -- and nil means that
+-- assist counts as UNKNOWN, which produces no chat line at all. Never a guessed key, and never a
+-- "nothing is bound" claim this server did not actually hear.
+--
+-- The label is assembled on a machine its owner controls and goes verbatim into a hand-assembled chat
+-- line, so the rule from /name applies: validate at the boundary, never at the sender.
+--
+-- A byte scan rather than a pattern, for the same reason identity.validate uses one: the obvious "%z"
+-- class was REMOVED in Lua 5.2, and on a stricter build an unknown class letter matches that literal
+-- character instead. Printable ASCII only -- BeamNG control names are ASCII scancode names ("insert",
+-- "ctrl insert"), so nothing legitimate is refused.
+function keys.validate_entry(entry)
+    if type(entry) ~= "table" then
+        return nil
+    end
+    if entry.state == "device" or entry.state == "none" then
+        return {state = entry.state}
+    end
+    if entry.state ~= "key" or type(entry.key) ~= "string" then
+        return nil
+    end
+    local label = entry.key
+    if #label == 0 or #label > keys.MAX_KEY_BYTES then
+        return nil
+    end
+    for i = 1, #label do
+        local byte = label:byte(i)
+        if byte < 0x20 or byte > 0x7E then
+            return nil
+        end
+    end
+    return {state = "key", key = label}
+end
+
+-- A whole clientKeys payload, screened down to the fields this server will speak (ADR-0058). Returns the
+-- table to store, or nil when not one usable field survived.
+--
+-- Per assist, not per message: a client may know its repair key and not its recover key, so one bad field
+-- must not cost the other its line. Unknown fields in the payload are ignored -- only the two assists this
+-- server has copy for are ever read.
+function keys.validate(payload)
+    if type(payload) ~= "table" or type(payload.assists) ~= "table" then
+        return nil
+    end
+    local entries = {}
+    local usable = false
+    for _, assist in ipairs(keys.ASSISTS) do
+        local entry = keys.validate_entry(payload.assists[assist.field])
+        if entry then
+            entries[assist.field] = entry
+            usable = true
+        end
+    end
+    if not usable then
+        return nil
+    end
+    return entries
+end
+
+-- The chat lines for one player, in the order the assists are listed (ADR-0058). Empty when nothing
+-- usable was ever reported -- the server NEVER guesses a key here, not even BeamNG's defaults, because a
+-- wrong key is worse than no key: the player believes it. Same rule the panel's assist tooltips follow
+-- (ADR-0049).
+--
+-- THE ONE text builder. The join hint, /keys and the panel's button all print exactly this, so the three
+-- can never drift into three different answers to the same question.
+-- Where the player changes this assist's key himself (user request 2026-09-19, after the in-game round).
+-- Every state names it, because knowing which key you have is only half of what a player wants to do with
+-- that knowledge -- and `command` is the ONLY string with which he can find the binding in BeamNG's own
+-- settings, so it is worth repeating per assist rather than naming one of the two for both.
+function keys.rebind(assist)
+    return "change the key in Options > Controls under \"" .. assist.command .. "\""
+end
+
+function keys.lines(player_id)
+    local report = keys.reported[player_id]
+    local lines = {}
+    if type(report) ~= "table" then
+        return lines
+    end
+    for _, assist in ipairs(keys.ASSISTS) do
+        local entry = report[assist.field]
+        local state = type(entry) == "table" and entry.state or nil
+        if state == "key" then
+            lines[#lines + 1] = "BeamComp: hold " .. entry.key .. " while standing still to "
+                .. assist.does .. " -- " .. keys.rebind(assist)
+        elseif state == "device" then
+            -- The device is not named. The engine reports a raw devicetype ("xinput", "joystick",
+            -- "wheel") and notes itself that some force-feedback wheels identify as joysticks, so
+            -- "your wheel" would be a guess -- while the one thing worth saying, that the key is not on
+            -- his keyboard, is certain.
+            lines[#lines + 1] = "BeamComp: " .. assist.doing
+                .. " is bound on another device, not on the keyboard -- " .. keys.rebind(assist)
+        elseif state == "none" then
+            lines[#lines + 1] = "BeamComp: no key is bound for " .. assist.doing .. ". Bind \""
+                .. assist.command .. "\" in Options > Controls -- you will need it during a race."
+        end
+    end
+    return lines
+end
+
+-- Write one player his own key lines. Returns how many went out, which is 0 for a connection that never
+-- reported anything usable -- the callers decide what that silence means.
+function keys.send(player_id)
+    local lines = keys.lines(player_id)
+    for _, line in ipairs(lines) do
+        MP.SendChatMessage(player_id, line)
+    end
+    return #lines
+end
+
+-- A client reported how it binds the two assists (ADR-0058). Store it, and hint once per connection.
+--
+-- THE REPORT IS THE TRIGGER, NOT THE JOIN, and that is not a detail. identity's join hint waits out an
+-- 8-second grace because it fires on ABSENCE: it has to give the client time to report a name, or it
+-- hints at exactly the people who are about to be named. This one fires on PRESENCE -- before the report
+-- there is nothing it could say -- so a grace could only lose it: a client whose GE extension comes up
+-- with the level reports after any grace has expired, and the hint would fall out with no symptom.
+--
+-- The flag is set BEFORE the send, so a send that throws part way still leaves this a one-shot. It is
+-- cleared only on disconnect, so a Lua reload or a level change refreshes the stored bindings (they may
+-- have changed) without hinting again, while a rejoin is hinted anew.
+function keys.handle_report(player_id, payload)
+    -- The client answered the connect-report pull, even if what it sent is unusable (ADR-0058): re-asking
+    -- would only fetch the same unusable thing again.
+    identity.note_report(player_id)
+    local entries = keys.validate(payload)
+    if not entries then
+        log_info("beamcomp.keys", "dropped an unusable key report from id " .. tostring(player_id))
+        return
+    end
+    keys.reported[player_id] = entries
+    if keys.hinted[player_id] then
+        return
+    end
+    keys.hinted[player_id] = true
+    -- The send is its own statement, not an argument to the log call: a log line that later grows a level
+    -- check would take the hint down with it.
+    local sent = keys.send(player_id)
+    log_info("beamcomp.keys", string.format("hinted id=%s with %d line(s)", tostring(player_id), sent))
+end
+
+-- /keys: repeat the asking player's own lines. Open to EVERY player -- it writes only to the asker and
+-- says only what his own client reported, so there is nothing here to gate.
+function keys.handle_command(player_id)
+    if keys.send(player_id) == 0 then
+        MP.SendChatMessage(player_id, keys.UNKNOWN)
+    end
+end
+
+-- The Send-keys button in the race-setup panel (ADR-0058): re-send everyone the lines naming HIS own
+-- assist keys. The counterpart to identity's Remind, and admin-gated for the same reason -- it writes into
+-- every player's chat. This is the 15th is_race_admin call site; there is no second predicate anywhere in
+-- this plugin and adding one is how a refusal path silently goes open (ADR-0056).
+--
+-- Walks the connected players rather than keys.reported: the two agree (the disconnect clears the report),
+-- but a report that somehow outlived its connection would be written to whoever holds the id now, and the
+-- player list cannot be wrong about who is here. Players who reported nothing are skipped in keys.send,
+-- so nobody is told "no idea" without having asked.
+--
+-- Reads the caller's name straight off MP.GetPlayers rather than through player_name_of, exactly like
+-- identity.handle_remind: that local is declared further down the chunk, so a closure created here could
+-- not see it.
+function keys.handle_remind(player_id)
+    local player_name = MP.GetPlayers()[player_id]
+    if not player_name then
+        return
+    end
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "send the key hint")
+        log_info("beamcomp.keys", "denied " .. keys.MSG_REMIND .. " from " .. player_name
+            .. " (not a race admin)")
+        return
+    end
+
+    local reached = 0
+    for id in pairs(MP.GetPlayers()) do
+        if keys.send(id) > 0 then
+            reached = reached + 1
+        end
+    end
+    MP.SendChatMessage(player_id, string.format("BeamComp: sent the key hint to %d player(s)", reached))
+    log_info("beamcomp.keys", string.format("%s by %s reached %d player(s)", keys.MSG_REMIND,
+        player_name, reached))
 end
 
 -- /raceclear: force the machine back to lobby + cleanup/despawn from any active phase (safety hatch). This
@@ -7265,11 +7676,20 @@ local function on_player_disconnect(player_id)
     -- and with it any join hint still waiting out its grace.
     client_names[player_id] = nil
     identity.pending[player_id] = nil
+    -- And the connect-report pull (ADR-0058), whether it is still trying or already done: BeamMP reuses
+    -- player ids, so a `done` record left behind would mean the next holder of this slot is never asked
+    -- and reports nothing at all.
+    identity.pull[player_id] = nil
     -- Drop the password grant and the failed-attempt counter with it (ADR-0056). NOT optional
     -- bookkeeping: BeamMP reuses player ids, so a grant left behind is inherited by whoever takes the
     -- slot next -- and a stale counter would have a fresh joiner start out half-locked-out.
     access.granted[player_id] = nil
     access.attempts[player_id] = nil
+    -- Drop the reported assist-key bindings and the one-shot hint flag with them (ADR-0058). Same reason
+    -- as the grant right above: BeamMP reuses player ids, so a report left behind would be read out to
+    -- whoever takes the slot next -- and a flag left behind would swallow that player's own hint.
+    keys.reported[player_id] = nil
+    keys.hinted[player_id] = nil
     -- Unconditional: the panel lists EVERY connected player, so any leave changes it -- including a
     -- leaver who had a set name. The id is passed because onPlayerDisconnect may or may not still list
     -- him (see is_server_empty_without); without it he could linger in the admin's list.
@@ -7388,6 +7808,11 @@ local function on_chat_message(player_id, player_name, message)
 
     if command == identity.CHAT_COMMAND then
         identity.handle_command(player_id, player_name, argument)
+        return 1  -- suppress the command's own chat echo
+    end
+
+    if command == keys.CHAT_COMMAND then
+        keys.handle_command(player_id)
         return 1  -- suppress the command's own chat echo
     end
 
@@ -8269,6 +8694,10 @@ local function handle_client_event(player_id, data)
         handle_client_identity(player_id, decoded.payload)
     elseif decoded.type == identity.MSG_REMIND then
         identity.handle_remind(player_id)
+    elseif decoded.type == keys.MSG_REPORT then
+        keys.handle_report(player_id, decoded.payload)
+    elseif decoded.type == keys.MSG_REMIND then
+        keys.handle_remind(player_id)
     elseif decoded.type == access.MSG_UNLOCK then
         -- A password attempt from the locked race-setup panel (ADR-0056). Deliberately NOT gated on
         -- is_race_admin: this is the one message whose whole job is to be sent by somebody who is not

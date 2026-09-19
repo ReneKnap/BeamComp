@@ -325,6 +325,8 @@ angular.module('beamng.apps')
       + 'BeamMP gave them as guest, they can set their own with "/name <name>" in chat.',
     remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick their '
       + 'own.',
+    remindKeys: 'Send every player the keys his own game has for repairing his car and getting back to the '
+      + 'last checkpoint.',
     // --- Presets ---
     presetSave: 'Save every race setting under a name you can load again later.',
     presetLoad: 'Show the setups saved for this map.',
@@ -1465,6 +1467,14 @@ angular.module('beamng.apps')
       // non-admin panel simply gets a refusal in chat.
       scope.remindUnnamed = function () {
         geCall('remind_unnamed');
+      };
+
+      // Send keys: the server re-sends every player the same lines he got on joining -- the keys HIS game
+      // has the repair and recover assists on, as his client reported them. Nobody who reported nothing is
+      // written to, and the server never guesses a key. Admin-gated server-side like Remind, so a
+      // non-admin panel simply gets a refusal in chat.
+      scope.remindKeys = function () {
+        geCall('remind_keys');
       };
 
       // Class-drop tournament state (ADR-0042): GE pushes the table + classes on open and on every change.

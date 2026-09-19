@@ -455,36 +455,110 @@ function M.remove()
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
 end
 
--- The KEYBOARD control currently bound to `action`, or nil. Reads BeamNG's own binding table
+-- Whether BeamNG's binding table can be read at all right now. core_input_bindings.bindings starts life
+-- as an EMPTY list and is filled in that module's onFirstUpdate, so "not a single device" means "not
+-- populated yet", never "this machine has no keyboard". The difference is load-bearing for the join hint:
+-- reading the empty table as an answer would conclude that nothing is bound and say so out loud.
+local function bindings_readable()
+    local bindings = core_input_bindings and core_input_bindings.bindings
+    return type(bindings) == "table" and #bindings > 0
+end
+
+-- Where `action` is bound. Returns TWO values: the control of its KEYBOARD binding (or nil), and the
+-- devicetype of the first non-keyboard device carrying it (or nil). Reads BeamNG's own binding table
 -- (core_input_bindings.bindings: one entry per device, each with contents.devicetype and
 -- contents.bindings = {{action, control}, ...}; controls are normalized to lower case by the engine).
 --
--- Keyboard only, on purpose. The engine's own core_input_bindings.getControlForAction returns whichever
--- device it happens to reach first, so with a gamepad attached it answers things like "button31" -- true,
--- but useless to read in a tooltip and worse than showing no key at all. `unused` marks a binding the
--- engine has disabled for the seated vehicle, so those are skipped too.
+-- The split into two return values is what lets the panel's tooltips and the join hint share ONE reader
+-- while the tooltips never see a foreign device: keyboard_control_for takes the first value only, so "the
+-- panel sees keyboard bindings and nothing else" is a property of the code instead of a claim about its
+-- callers. The engine's own core_input_bindings.getControlForAction serves neither -- it returns whichever
+-- device it reaches first, so with a wheel attached it answers things like "button31": true, and
+-- unreadable. `unused` marks a binding the engine has disabled for the seated vehicle, skipped on every
+-- device.
 --
 -- Guarded like every other engine-version-coupled touchpoint in this file (ADR-0017): a renamed or
 -- restructured binding table degrades to "no key known", never to an error.
-local function keyboard_control_for(action)
+local function binding_for(action)
     local bindings = core_input_bindings and core_input_bindings.bindings
     if type(bindings) ~= "table" then
-        return nil
+        return nil, nil
     end
+    local other_device = nil
     for _, device in ipairs(bindings) do
         local contents = type(device) == "table" and device.contents or nil
-        if type(contents) == "table" and contents.devicetype == "keyboard"
-            and type(contents.bindings) == "table" then
+        if type(contents) == "table" and type(contents.bindings) == "table" then
+            local is_keyboard = contents.devicetype == "keyboard"
             for _, binding in ipairs(contents.bindings) do
                 if type(binding) == "table" and binding.action == action
                     and not binding.unused and binding.active ~= false
                     and type(binding.control) == "string" and binding.control ~= "" then
-                    return binding.control
+                    if is_keyboard then
+                        return binding.control, nil
+                    end
+                    other_device = other_device or contents.devicetype or "unknown"
+                    break
                 end
             end
         end
     end
-    return nil
+    return nil, other_device
+end
+
+-- The KEYBOARD control currently bound to `action`, or nil. Deliberately drops binding_for's second
+-- return value: every caller of this one puts its answer in front of a player as a key he can press, and
+-- a wheel's "button31" is worse there than naming no key at all (ADR-0049).
+local function keyboard_control_for(action)
+    local control = binding_for(action)
+    return control
+end
+
+-- A BeamNG control as a person would write it: the engine stores bindings lower-cased and
+-- space-separated ("insert", "ctrl insert"), which reads as a key on a keyboard once capitalised and
+-- joined with "+". nil for anything unusable, and every caller must treat that as "name no key at all".
+--
+-- The Lua half of a pair -- BeamCompSetup/app.js keyLabel() is the JS half and has to stay in step with
+-- this one. Two halves because the two surfaces are fed from different sides: the panel formats a control
+-- the GE push handed it, this formats one before it leaves the client, so that the server never handles a
+-- raw BeamNG control string and needs no formatting rule of its own.
+local function key_label(control)
+    if type(control) ~= "string" then
+        return nil
+    end
+    local parts = {}
+    for part in control:gmatch("%S+") do
+        parts[#parts + 1] = part:sub(1, 1):upper() .. part:sub(2)
+    end
+    if #parts == 0 then
+        return nil
+    end
+    return table.concat(parts, "+")
+end
+
+-- How ONE assist is bound, as the join hint needs it: {state = "key", key = "Insert"} for a keyboard
+-- binding, {state = "device"} for one that sits on a wheel/gamepad/mouse, {state = "none"} for an action
+-- with no binding anywhere. nil when the control cannot be turned into a label -- the server then says
+-- nothing at all about that assist, which is the safe direction.
+--
+-- Three states rather than two, and each assist is asked on its own: a driver can have Repair on the
+-- keyboard and Recover on his wheel, and a single "everything is bound" branch would be wrong for him.
+-- The device is never NAMED, only its absence from the keyboard: the engine's devicetype is a raw
+-- "xinput"/"joystick"/"wheel" (bindings.lua getBindings), and it notes itself that some force-feedback
+-- wheels report as "joystick" -- so a friendly device name would be a guess, while "another device" cannot
+-- be wrong.
+local function assist_state(action)
+    local control, other_device = binding_for(action)
+    if control then
+        local label = key_label(control)
+        if not label then
+            return nil
+        end
+        return {state = "key", key = label}
+    end
+    if other_device then
+        return {state = "device"}
+    end
+    return {state = "none"}
 end
 
 -- The keys the two in-race assists actually sit on, for the race-setup panel's hover help (ADR-0049
@@ -505,6 +579,37 @@ function M.assist_controls()
         return {}
     end
     return controls
+end
+
+-- How this machine binds the two in-race assists, for the chat lines the server writes when a player joins
+-- (ADR-0058). Returns {repair = <state>, recover = <state>} in the shape assist_state describes, or nil
+-- when nothing can be said at all.
+--
+-- The mapping is INVERTED here exactly as it is in M.assist_controls, and for the same reason: BeamComp's
+-- REPAIR sits on the game's plain `recover_vehicle`, BeamComp's RECOVER on `recover_vehicle_alt` (ADR-0017
+-- decision 3; the crossing is implemented in the VE forwarder, lua/vehicle/extensions/beamcomp/init.lua
+-- on_recover_down). Pairing `recover` with `recover_vehicle` because it reads more sensibly sends every
+-- player on the server the WRONG key.
+--
+-- nil rather than two "nothing is bound" states while the binding table is unpopulated: this runs at
+-- extension load, and reporting an unread table would tell a correctly bound player to go and bind his
+-- keys. A wrong key is worse than no key, and so is a wrong "you have none".
+function M.assist_key_report()
+    if not bindings_readable() then
+        log("W", LOG_TAG, "input bindings not readable yet; reporting no assist keys")
+        return nil
+    end
+    local ok, report = pcall(function()
+        return {
+            repair = assist_state("recover_vehicle"),
+            recover = assist_state("recover_vehicle_alt"),
+        }
+    end)
+    if not ok then
+        log("W", LOG_TAG, "could not read input bindings: " .. tostring(report))
+        return nil
+    end
+    return report
 end
 
 -- True (once) if the player replaced their car since the last call: the swap-allowed pass-through sets
