@@ -3091,18 +3091,27 @@ end
 
 -- Push ONE race's track metadata to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this
 -- when the selected race changes; it needs `closed` to preselect sprint vs circuit and to decide whether a
--- lap count means anything (ADR-0013 amendment).
+-- lap count means anything (ADR-0013 amendment), and `defaultLaps` to show the lap count that applies when
+-- the Laps field is left empty, as its grey "3 (default)" placeholder (ADR-0049).
 --
 -- Lazy per race for the same reason configs are lazy per model: racelist.options deliberately parses no
--- geometry, and a map can carry well over a hundred races. `closed` is nil when the race cannot be resolved
--- or parsed -- the panel then keeps its "track type unknown" fallback instead of being told something
--- false. Public so the app can reach it as beamcomp_init.request_race_meta.
+-- geometry, and a map can carry well over a hundred races. Both fields are nil when the race cannot be
+-- resolved or parsed -- the panel then keeps its "track type unknown" fallback and its "auto" placeholder
+-- instead of being told something false. Public so the app can reach it as beamcomp_init.request_race_meta.
+--
+-- defaultLaps is put through race_start.resolve_laps with no request, which is literally the panel's
+-- question: "what does this race run if I type nothing?". That covers the track that names no lap count
+-- at all -- the answer is one lap, and it is race/start.lua's answer, not a second one invented here.
 function M.request_race_meta(race_id)
     if type(race_id) ~= "string" then
         return
     end
     local meta = racelist.meta_for(maps.current(), race_id)
-    guihooks.trigger("BeamCompRaceMeta", {id = race_id, closed = meta and meta.closed})
+    guihooks.trigger("BeamCompRaceMeta", {
+        id = race_id,
+        closed = meta and meta.closed,
+        defaultLaps = meta and race_start.resolve_laps(nil, meta.defaultLaps) or nil,
+    })
 end
 
 -- ===== race-setup panel presence (bug setup-panel-settings-survive-ui-reload) =====================

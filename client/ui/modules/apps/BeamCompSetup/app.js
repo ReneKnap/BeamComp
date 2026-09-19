@@ -142,9 +142,10 @@ angular.module('beamng.apps')
       return base + 'This track is built as a ' + recommended + ', so that is preselected. You can still '
         + 'pick the other one.';
     },
-    // The label already says "Laps", so the text is only the part it cannot say. The track's own count is
-    // NOT named: it never reaches this panel (BeamCompRaceMeta carries `closed` and nothing else), and a
-    // guessed number would be worse than none.
+    // The label already says "Laps", so the text is only the part it cannot say. It deliberately does not
+    // name the number even now that BeamCompRaceMeta carries it: the grey placeholder shows the figure
+    // ("3 (default)", scope.lapsHint), and this sentence says where it comes from. Two texts for one fact
+    // is how they drift apart.
     laps: 'Leave it empty and the track\'s own lap count applies.',
     // Forced reverse keeps the FORWARD grid anchor (ADR-0019: the default start selector is used when the
     // track has no reverse one), so the cars line up facing the wrong way. That is what Force costs here.
@@ -665,9 +666,9 @@ angular.module('beamng.apps')
       // names the command and no key: a guessed key would be worse than none.
       scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [],
         aiDefaults: null, assistHoldDefault: null, assistKeys: {} };
-      // raceId -> {closed} for races GE has described, filled lazily as races are selected (see raceMeta
-      // below). A race that is absent here has NOT been reported as open -- it has not been asked about
-      // yet, or GE could not parse it -- and the panel must not act as if it knew.
+      // raceId -> {closed, defaultLaps} for races GE has described, filled lazily as races are selected
+      // (see raceMeta below). A race that is absent here has NOT been reported as open -- it has not been
+      // asked about yet, or GE could not parse it -- and the panel must not act as if it knew.
       scope.raceMetaById = {};
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
@@ -976,13 +977,15 @@ angular.module('beamng.apps')
 
       // One race's track metadata, answering a requestRaceMeta (ADR-0013 amendment). `closed` decides
       // sprint vs circuit, so it is only cached when GE actually reported a boolean -- a race GE could not
-      // parse leaves the entry absent, and "absent" means unknown, never "open".
+      // parse leaves the entry absent, and "absent" means unknown, never "open". `defaultLaps` rides the
+      // same gate for free: GE sends both or neither, so an unparsable race keeps the Laps placeholder on
+      // its "auto" fallback instead of naming a number nobody resolved.
       scope.$on('BeamCompRaceMeta', function (event, payload) {
         scope.$evalAsync(function () {
           if (!payload || !payload.id || typeof payload.closed !== 'boolean') {
             return;
           }
-          scope.raceMetaById[payload.id] = { closed: payload.closed };
+          scope.raceMetaById[payload.id] = { closed: payload.closed, defaultLaps: payload.defaultLaps };
           if (payload.id === scope.form.race) {
             applyRecommendedMode();
           }
@@ -1089,6 +1092,19 @@ angular.module('beamng.apps')
       // Recover / repair hold: race/start.lua's ASSIST_DEFAULT_HOLD_SECONDS. One constant for both fields.
       scope.holdHint = function () {
         return defaultHint(scope.data.assistHoldDefault, 'default');
+      };
+
+      // Laps: the lap count the SELECTED TRACK runs when the field is left empty, resolved GE-side
+      // (race/start.lua resolve_laps) off the track's own default and pushed with the rest of its
+      // description. Per race, so it follows the race dropdown the way aiParamHint follows the preset one.
+      //
+      // The fallback stays the old 'auto' for every state in which GE has not described this race: nothing
+      // picked, the description still in flight, or a race GE could not parse. A track whose lap count the
+      // panel cannot know must say so -- a number the admin believes and that then does not happen is worse
+      // than no number at all.
+      scope.lapsHint = function () {
+        var meta = scope.raceMetaById[scope.form.race];
+        return defaultHint(meta && meta.defaultLaps, 'auto');
       };
 
       // Aggression / skill / rubberband: race/ai.lua's PRESETS, so the hint FOLLOWS the Preset dropdown --
