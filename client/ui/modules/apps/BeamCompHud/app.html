@@ -108,8 +108,8 @@
       top: var(--bc-notice-top);
       left: 50%;
       transform: translateX(-50%);
-      /* Long messages wrap instead of running off the screen; the widest shipped one is ~66 characters
-         ("AFK in 20 s -- move now, or you stop holding the finish timer open"). */
+      /* Long messages wrap instead of running off the screen; the widest shipped one is 71 characters
+         ("Qualifying run complete -- your car stays parked until the session ends"). */
       max-width: 46vw;
       text-align: center;
       pointer-events: none;
@@ -130,6 +130,24 @@
     }
     .beamcomp-root .bc-notice-success {
       color: #3fd96b;
+    }
+    /* The standing driver's own AFK count (feature standings-afk-cutoff-counter) -- the third sub-surface
+       of the BeamCompNotice hook, and the running replacement for the one-shot "AFK in 5 s" message.
+
+       It lives INSIDE the .bc-notice block rather than anchoring itself, deliberately: a second
+       position:fixed element on the same top would land on top of any message that stands at the same
+       moment. The block is anchored by its top edge and grows downward, so the two simply stack. */
+    .beamcomp-root .bc-notice .bc-notice-afk {
+      color: #f2c744;
+      /* The number changes every second; fixed-width digits keep the line from jiggling. */
+      font-variant-numeric: tabular-nums;
+    }
+    /* The sentence under the count: the same words the one-shot message carried, at a size that lets the
+       count itself be the thing the driver reads first. */
+    .beamcomp-root .bc-notice .bc-afk-hint {
+      font-size: 0.55em;
+      font-weight: normal;
+      opacity: 0.85;
     }
     /* Checkpoint passage readout (feature race-toast-cleanup-and-checkpoint-readout): "CP 3/8" plus the
        total time, ~2 s per passage, replacing the per-crossing toast -- the one race message that fired
@@ -497,6 +515,18 @@
     .beamcomp-hud .bc-fin-mark {
       color: #3fd96b;
       font-weight: bold;
+    }
+    /* The AFK cutoff addendum (feature standings-afk-cutoff-counter): " . AFK in 7" behind the finish
+       timer on the provisional results card and on the three qualifying lines, shown only while EVERY
+       remaining driver is being counted out. Red rather than the amber of the counters it sits behind --
+       it is the reason that counter is about to jump, and it must not read as part of it. Four call
+       sites, all with this class: grep for it to find them all.
+
+       No opacity of its own: .bc-provisional-badge sets 0.85 on the parent, and a child cannot be more
+       opaque than the element it sits in -- an opacity here would look like it did something. */
+    .beamcomp-hud .bc-afk-cutoff {
+      color: #ff5b5b;
+      font-variant-numeric: tabular-nums;
     }
     /* "still running" sub-label under the provisional-standings title. */
     .beamcomp-hud .bc-provisional-badge {
@@ -930,8 +960,8 @@
       <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
       <!-- Clock expired: the finish-your-lap timeout (time left to be at the finish), or -- once this driver
            has completed their lap -- that they are waiting for the others to finish (ADR-0041). -->
-      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null && !hud.qualiDone">FINISH LAP <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
-      <div class="bc-quali-grace" ng-if="hud.qualiDone">Waiting <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null && !hud.qualiDone">FINISH LAP <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span><span class="bc-afk-cutoff" ng-if="hud.afkCutoff != null"> &middot; AFK in {{formatAfk(hud.afkCutoff)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiDone">Waiting <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span><span class="bc-afk-cutoff" ng-if="hud.afkCutoff != null"> &middot; AFK in {{formatAfk(hud.afkCutoff)}}</span></div>
       <div class="bc-panel bc-standings-panel">
         <div class="bc-scroll">
           <table class="bc-standings">
@@ -1003,7 +1033,7 @@
     <div class="bc-tl">
       <div class="bc-quali-head">QUALIFYING</div>
       <div class="bc-quali-clock" ng-if="hud.qualiGrace == null">{{formatStaging(hud.qualiRemaining)}}</div>
-      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null">FINISH RUN <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span></div>
+      <div class="bc-quali-grace" ng-if="hud.qualiGrace != null">FINISH RUN <span class="bc-quali-grace-t">{{formatStaging(hud.qualiGrace)}}</span><span class="bc-afk-cutoff" ng-if="hud.afkCutoff != null"> &middot; AFK in {{formatAfk(hud.afkCutoff)}}</span></div>
       <div class="bc-quali-grace" ng-if="hud.qualiWaiting">Waiting for driver to start</div>
       <div class="bc-panel bc-standings-panel">
         <div class="bc-scroll">
@@ -1105,7 +1135,7 @@
        live corner board next to it keeps the on-track order with the penalty still pending. -->
   <div class="bc-results-card" ng-if="hud.provisionalShown">
     <div class="bc-results-title">Provisional Standings</div>
-    <div class="bc-provisional-badge">{{hud.grace != null ? 'Race ends in ' + formatTime(hud.grace) : 'Race in progress'}}</div>
+    <div class="bc-provisional-badge">{{hud.grace != null ? 'Race ends in ' + formatTime(hud.grace) : 'Race in progress'}}<span class="bc-afk-cutoff" ng-if="hud.afkCutoff != null"> &middot; AFK in {{formatAfk(hud.afkCutoff)}}</span></div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
         <tr class="bc-results-head">
@@ -1310,12 +1340,17 @@
       </div>
     </div>
   </div>
-  <!-- The two centred surfaces of the BeamCompNotice hook (feature
-       race-toast-cleanup-and-checkpoint-readout): the checkpoint readout above the countdown block and the
-       race-message line below it. Both are pure render -- GE owns when they appear and when they go, and
-       re-pushes while either stands (init.lua `notice`), so there is no timer on this side. -->
+  <!-- The three centred surfaces of the BeamCompNotice hook (feature
+       race-toast-cleanup-and-checkpoint-readout, extended by standings-afk-cutoff-counter): the checkpoint
+       readout above the countdown block, and below it the race-message line plus the standing driver's AFK
+       count. All three are pure render -- GE owns when they appear and when they go, and re-pushes while
+       any of them stands (init.lua `notice`), so there is no timer on this side.
+       The message and the count share one anchored block so they stack instead of overlapping. -->
   <div class="bc-cp-readout" ng-if="notice.readout"><span class="bc-cpr-label">{{notice.readout.label}}</span>{{formatTime(notice.readout.time)}}</div>
-  <div class="bc-notice" ng-if="notice.line" ng-class="'bc-notice-' + notice.line.kind">{{notice.line.text}}</div>
+  <div class="bc-notice" ng-if="notice.line || notice.afk">
+    <div ng-if="notice.line" ng-class="'bc-notice-' + notice.line.kind">{{notice.line.text}}</div>
+    <div class="bc-notice-afk" ng-if="notice.afk">AFK in {{notice.afk.seconds}}<div class="bc-afk-hint">{{notice.afk.hint}}</div></div>
+  </div>
   <!-- Quali->race settle window (ADR-0041): after the cars re-spawn on the earned grid, the big results card
        steps back for this small timer so the start countdown does not begin abruptly. Reuses the
        quali-results remaining seconds, which read ~the settle lead at the re-grid and count down to 0. -->

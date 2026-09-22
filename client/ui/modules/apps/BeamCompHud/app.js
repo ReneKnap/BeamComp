@@ -133,6 +133,18 @@ angular.module('beamng.apps')
     return m + ':' + (s < 10 ? '0' : '') + s;
   }
 
+  // Bare seconds for the AFK cutoff addendum (feature standings-afk-cutoff-counter): "AFK in 7"
+  // behind the finish-timer counter. Ceil, not round -- 7 means "within the next 7 seconds", and
+  // rounding would print a 0 a full half-second before the cutoff. Floors at 0 and never goes
+  // negative: the number is ticked down locally between two server edges, so it can reach the end of
+  // its count before the server takes it back, and a count of -1 would be a promise about the past.
+  function formatAfk(t) {
+    if (typeof t !== 'number') {
+      return '';
+    }
+    return Math.max(0, Math.ceil(t));
+  }
+
   // Content-density bucket for the rows actually on screen. The app frame is owned by the BeamNG
   // layout system and does not grow with content, so the template shrinks font and padding as the
   // shown field, lap count, or checkpoint count climbs. A tier is chosen only when every dimension
@@ -352,6 +364,7 @@ angular.module('beamng.apps')
       scope.formatReaction = formatReaction;
       scope.formatInterval = formatInterval;
       scope.formatStaging = formatStaging;
+      scope.formatAfk = formatAfk;
       scope.formatSeconds = formatSeconds;
       scope.formatDuration = formatDuration;
       // Staged sprint quali status line (ADR-0044) + board row time (ADR-0044/Round6) + the circuit
@@ -717,9 +730,9 @@ angular.module('beamng.apps')
       // it once a second -- a message parked there would be gone within a second and would blank the
       // "waiting for the host" line until then.
       //
-      // Every push carries the complete state of both surfaces ({line, readout}, either absent), and GE
-      // owns both lifetimes and re-pushes while either stands. So this handler is a plain assignment: no
-      // timer, and no way for one surface to lose the other.
+      // Every push carries the complete state of all three surfaces ({line, readout, afk}, any absent),
+      // and GE owns their lifetimes and re-pushes while any of them stands. So this handler is a plain
+      // assignment: no timer, and no way for one surface to lose another.
       scope.$on('BeamCompNotice', function (event, data) {
         scope.$evalAsync(function () {
           scope.notice = data || {};
