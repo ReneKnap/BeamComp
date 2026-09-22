@@ -120,15 +120,16 @@ function M.clear()
 end
 
 -- Paint the centred notice surfaces: `line` is the race-message line ({text, kind}) shown under the
--- countdown block, `readout` the checkpoint readout ({label, time}) above it. Either may be nil, and nil
--- for both is the clear -- the caller always hands over the complete current state, never a delta.
+-- countdown block, `readout` the checkpoint readout ({label, time}) above it, and `afk` the standing
+-- driver's AFK count ({seconds, hint}) under the line. Any may be nil, and nil for all three is the
+-- clear -- the caller always hands over the complete current state, never a delta.
 --
 -- Lifetimes live GE-side (init.lua's notice.step), not in an app-side timer, for the same reason
 -- STAGING_REPAINT_INTERVAL exists: the HUD app mounts best-effort (ADR-0012 section 3) and the earliest
 -- messages fire during the raceStart spawn burst, before staging has ever shown the app. A one-shot push
 -- there would be sent at an app that is not listening yet and lost with no symptom.
-function M.show_notice(line, readout)
-    trigger_ui(NOTICE_HOOK, {line = line, readout = readout})
+function M.show_notice(line, readout, afk)
+    trigger_ui(NOTICE_HOOK, {line = line, readout = readout, afk = afk})
 end
 
 -- Play the per-number beep for the final 3-2-1 beats (no-op for the silent 8..4 beats).

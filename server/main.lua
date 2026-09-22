@@ -3069,7 +3069,9 @@ end
 -- The flags live on session.stall_reported -- deliberately a sibling of session.progress, not a field on
 -- the progress records. build_standings and the run log both read those records, and a new record field
 -- is the shape that leaks into a broadcast or persisted blob; a sibling table cannot, which is what
--- keeps the wire format byte-identical here.
+-- keeps the wire format byte-identical here. session.stall_due (when each standing driver is counted out)
+-- and session.stall_cutoff (the value the clients were last told) are siblings for the same reason -- no
+-- AFK information belongs in a standings row.
 --
 -- Declared ahead of the `quali` namespace on purpose: quali.advance_staged closes over `stall`, and Lua
 -- binds upvalues when the closure is created, so a local declared after that function would silently
@@ -3079,7 +3081,34 @@ local stall = {}
 -- client->server: {stalled = bool} for the sender's own car, {aiId = ..., stalled = bool} for one of the
 -- owner's AI. THE input to the predicate below -- the only one there is. Kept on the table, not as a
 -- top-level local (200-local ceiling), like quali.MSG_* and track.MSG_*.
+--
+-- It carries a THIRD shape since the AFK cutoff counter (feature standings-afk-cutoff-counter):
+-- {standing = true, dueIn = <seconds>} -- "this car is standing and my own clock counts it out in dueIn
+-- seconds". That one is a PREDICTION and never a verdict; see stall.set_standing.
 stall.MSG = "stallReport"
+
+-- server->client: the AFK cutoff counter shown behind the finish-timer counter on the provisional results
+-- card and the three qualifying lines. {active = true, dueIn = <seconds>} arms it, {active = false} takes
+-- it back; clients count down locally, exactly as they do for the finish grace itself. Edge-driven -- see
+-- stall.cutoff_step, far below (it needs the `quali` namespace, which is declared after this block).
+stall.MSG_CUTOFF = "afkCutoff"
+
+-- Upper bound on a client-supplied due time, in seconds. NOT a mirror of the client's standstill window --
+-- the whole point of taking the deadline from the client is that this side has no opinion about its length
+-- (feature standings-afk-cutoff-counter). It is a sanity ceiling: the value only ever becomes a number on
+-- a card, so a client sending nonsense can at worst print a silly one, never shorten anybody's grace.
+stall.MAX_DUE_IN = 60.0
+
+-- THE definition of "still out there", for every reader of that set. maybe_end_race (the racing grace),
+-- quali.anyone_lapping (the circuit quali lap grace) and stall.waiting_ids (the cutoff counter) must see
+-- the SAME field or they drift: the counter would announce an end for a set the early end does not act on.
+-- One predicate is a property of the code; three loops that happen to read alike are a claim about it.
+--
+-- The staged sprint quali waits on a different set (its own `running` status plus the two bounded ramp
+-- roles) and deliberately does NOT use this -- see stall.waiting_ids.
+function stall.remaining(record)
+    return record ~= nil and not record.finished and not record.dnf
+end
 
 -- THE liveness predicate, and now a pure lookup: all three finish graces ask this one question --
 -- maybe_end_race for the racing grace (ADR-0014), quali.advance_staged for the staged sprint's
@@ -3100,10 +3129,16 @@ function stall.verdict(id)
     return nil
 end
 
--- Drop every reported flag. Per-race, like session.progress: called at race start and from
--- reset_to_lobby, so one race's staleness can never be read as the next race's liveness.
+-- Drop every reported flag AND every pending due time. Per-race, like session.progress: called at race
+-- start and from reset_to_lobby, so one race's staleness can never be read as the next race's liveness.
+--
+-- session.stall_due is cleared HERE, beside the flags, and for the same reason: it describes the grace
+-- that is currently armed and nothing else. A due time left over from an earlier grace would put a
+-- countdown on everybody's card for a cutoff that is not coming -- the display-side twin of the leftover
+-- verdict that once discounted four AI in the second the next grace armed (see stall.begin_grace).
 function stall.clear()
     session.stall_reported = nil
+    session.stall_due = nil
 end
 
 -- A grace is arming: drop every verdict from before it.
@@ -3139,6 +3174,11 @@ end
 -- touches a progress record, or moves a car. The DNF still comes from finalize_race when the grace expires.
 function stall.set_reported(id, stalled)
     local flags = session.stall_reported
+    -- Either edge ends the prediction: the verdict has arrived, or the driver is moving again. Left
+    -- standing, a due time in the past would peg the cutoff counter at 0 while the others still count.
+    if session.stall_due then
+        session.stall_due[id] = nil
+    end
     if stalled then
         if flags and flags[id] then
             return
@@ -3156,6 +3196,33 @@ function stall.set_reported(id, stalled)
     flags[id] = nil
     log_info("beamcomp.race", "driver " .. tostring(id)
         .. " reported moving again by its client -- counts as able to finish once more")
+end
+
+-- Record a CLIENT-MEASURED due time for one driver: "this car is standing, and my clock counts it out in
+-- dueIn seconds" (feature standings-afk-cutoff-counter). The client sends this the moment its own count
+-- starts -- so the "last N seconds" threshold lives once, on the side that owns the standstill window,
+-- and this side mirrors no constant of it.
+--
+-- THIS IS NOT A VERDICT, and that is the whole safety property of the feature. It writes
+-- session.stall_due, which stall.verdict does not read; the only writer of session.stall_reported is
+-- set_reported above, and the only thing that reaches it is payload.stalled == true. A driver who has
+-- just gone quiet therefore still holds his grace open for the full window (ADR-0014), and shortening it
+-- early is not something a caller could get wrong -- there is no path from here to the flags.
+--
+-- A due time is silently dropped rather than clamped when it is out of range: the counter needs EVERY
+-- remaining driver accounted for, so a rejected one simply means no counter -- the safe direction.
+function stall.set_standing(id, due_in)
+    if type(due_in) ~= "number" or due_in ~= due_in or due_in < 0 or due_in > stall.MAX_DUE_IN then
+        log_info("beamcomp.race", "stall standing report for driver " .. tostring(id)
+            .. " ignored: bad dueIn " .. tostring(due_in))
+        return
+    end
+    local due = session.stall_due
+    if not due then
+        due = {}
+        session.stall_due = due
+    end
+    due[id] = now() + due_in
 end
 
 -- Client->server stall verdict (stall.MSG). A player reports its own car; the race owner proxies each of
@@ -3179,6 +3246,13 @@ function stall.handle_report(player_id, payload)
         subject_id = payload.aiId
     end
     if not (session.progress and session.progress[subject_id]) then
+        return
+    end
+    -- The third shape (standings-afk-cutoff-counter), behind the same validation as the other two. It is
+    -- a separate branch rather than an extra field on the verdict call, so no reading of `standing` can
+    -- ever end up in stall.set_reported.
+    if payload.standing == true then
+        stall.set_standing(subject_id, tonumber(payload.dueIn))
         return
     end
     stall.set_reported(subject_id, payload.stalled == true)
@@ -3588,7 +3662,8 @@ end
 -- Is anyone still circulating in the circuit quali? The ADR-0041 half of the one liveness predicate --
 -- maybe_end_race and quali.advance_staged ask stall.verdict the same question for their own graces.
 --
--- The set is session.progress minus the DNF'd and the finished, the same shape maybe_end_race uses.
+-- The set is session.progress minus the DNF'd and the finished -- stall.remaining, the same one predicate
+-- maybe_end_race and the AFK cutoff counter read.
 -- Excluding `finished` is safe here and was verified rather than assumed: the circuit quali plan is sized
 -- so the field CANNOT run it out (race/start.lua builds it with max(10, ceil(duration / 8)) laps, an
 -- ~8 s/lap floor), so record.finished stays false for everyone for the whole session -- and a driver who
@@ -3605,7 +3680,7 @@ end
 function quali.anyone_lapping()
     local anyone = false
     for id, record in pairs(session.progress or {}) do
-        if not record.dnf and not record.finished then
+        if stall.remaining(record) then
             local reason = stall.verdict(id)
             if reason then
                 quali.note_lap_stall(id, reason)
@@ -4874,6 +4949,120 @@ local function reset_to_lobby()
     end
 end
 
+-- ===== the AFK cutoff counter (feature standings-afk-cutoff-counter) =======================
+-- The four functions below belong to the `stall` namespace above but live HERE, behind `quali`, because
+-- stall.waiting_ids reads quali.is_staged(): Lua binds upvalues when a closure is created, so a function
+-- written up there would resolve `quali` to a nil global. Same reason `stall` itself is declared ahead of
+-- `quali` -- the two namespaces reach into each other and the file order decides which way works.
+--
+-- What they add: ADR-0014's early end is invisible. When every remaining driver has been reported AFK the
+-- grace is cut to the results window, and a player watching from the finish line sees "Race ends in 1:40"
+-- turn into "0:05" with nothing saying why. These broadcast the LATEST due time of the field so the card
+-- can print "AFK in 7" behind the counter it is about to change.
+
+-- The drivers the staged sprint's finish-your-run grace is waiting on (ADR-0044), or nil when there are
+-- none to announce. Its own `running` status, not stall.remaining: a staged driver who has done his run
+-- is finished for the session while his progress record says nothing of the kind.
+--
+-- The two ramp roles are BOUNDED waits (STAGE_COUNTDOWN / STAGE_CLEAR_TIMEOUT) that no AFK count can
+-- shorten, so while either is filled there is nothing to announce at all.
+function stall.staged_waiting_ids()
+    local q = session.quali
+    if not q or not q.lap_grace_deadline or q.staging_id ~= nil or q.clearing_id ~= nil then
+        return nil
+    end
+    local ids = nil
+    for id in pairs(session.progress or {}) do
+        if q.status and q.status[id] == "running" then
+            ids = ids or {}
+            ids[#ids + 1] = id
+        end
+    end
+    return ids
+end
+
+-- The drivers the CURRENTLY armed grace is still waiting on, or nil when no grace is armed (and therefore
+-- no cutoff can be running). The racing grace and the circuit quali's lap grace both wait on
+-- stall.remaining over session.progress -- literally the set maybe_end_race and quali.anyone_lapping
+-- walk. The staged sprint is the one that differs, and it says so in its own function above.
+function stall.waiting_ids()
+    local phase = session.phase
+    if phase == PHASE.qualifying and quali.is_staged() then
+        return stall.staged_waiting_ids()
+    end
+    local armed = (phase == PHASE.racing and session.grace_deadline ~= nil)
+        or (phase == PHASE.qualifying and session.quali ~= nil
+            and session.quali.lap_grace_deadline ~= nil)
+    if not armed then
+        return nil
+    end
+    local ids = nil
+    for id, record in pairs(session.progress or {}) do
+        if stall.remaining(record) then
+            ids = ids or {}
+            ids[#ids + 1] = id
+        end
+    end
+    return ids
+end
+
+-- When the LAST of the waiting drivers is counted out, as an absolute time -- or nil when there is no
+-- cutoff to announce. The last one decides when the race ends, so the field's latest due time is the
+-- number the counter shows.
+--
+-- The all-or-nothing rule of maybe_end_race, restated as a display condition: one driver who is neither
+-- counting down nor already counted out and there is nothing to say, because nothing is going to happen.
+-- A field in which EVERY driver is already counted out returns nil too -- that is the instant the grace
+-- shortens, and the counter has served its purpose.
+function stall.cutoff_due()
+    local ids = stall.waiting_ids()
+    if not ids then
+        return nil
+    end
+    local latest = nil
+    for _, id in ipairs(ids) do
+        local due = session.stall_due and session.stall_due[id]
+        if due then
+            if not latest or due > latest then
+                latest = due
+            end
+        elseif not stall.verdict(id) then
+            return nil
+        end
+    end
+    return latest
+end
+
+-- Broadcast the cutoff counter when the condition becomes true, take it back when it becomes false, and
+-- re-send when the latest due time moves (which only happens when the field shrinks -- a finish or a DNF
+-- can remove the driver the counter was naming). Driven from the tick: a driver going quiet is the
+-- ABSENCE of an event, and so is the moment a countdown crosses into view.
+--
+-- Nothing here is per-second. session.stall_cutoff holds the value the clients were last told, so the
+-- comparison is against what they believe, not against what they should believe.
+function stall.cutoff_step()
+    local due = stall.cutoff_due()
+    if due == nil then
+        if session.stall_cutoff ~= nil then
+            session.stall_cutoff = nil
+            broadcast_event(stall.MSG_CUTOFF, {active = false})
+            -- No reason in the line: it is withdrawn both when somebody drives again and when the
+            -- count runs out, and the report line that caused it sits directly above either way.
+            log_info("beamcomp.race", "AFK cutoff counter withdrawn")
+        end
+        return
+    end
+    if session.stall_cutoff == due then
+        return
+    end
+    session.stall_cutoff = due
+    local remaining = math.max(0, due - now())
+    broadcast_event(stall.MSG_CUTOFF, {active = true, dueIn = remaining})
+    log_info("beamcomp.race", string.format(
+        "every remaining driver is standing still; AFK cutoff in %.1fs", remaining))
+end
+-- ===== end the AFK cutoff counter ==========================================================
+
 -- Early-end check (ADR-0014): once no player can still finish, don't wait out the full grace. With at
 -- least one finisher, cut the grace to a short results window (never extend, and re-broadcast so the
 -- client countdown resyncs); with everyone DNF and no finisher there is nothing to show, so return to
@@ -4902,7 +5091,9 @@ local function maybe_end_race()
     local active = 0
     local stalled
     for id, record in pairs(session.progress) do
-        if not record.finished and not record.dnf then
+        -- stall.remaining, not an open-coded test: the cutoff counter announces the end of exactly this
+        -- set, so the two must never disagree about who is still out there.
+        if stall.remaining(record) then
             local reason = grace_armed and stall.verdict(id)
             if reason then
                 stalled = stalled or {}
@@ -6006,6 +6197,10 @@ local function tick()
     -- Ahead of the lobby early return below: a player who just joined and has no name is sitting in the
     -- lobby, which is precisely where his hint has to reach him (ADR-0054).
     identity.step()
+    -- Ahead of the phase branching below, because both branches that could host it return early and the
+    -- counter has to be taken back on the way out of either (feature standings-afk-cutoff-counter). It
+    -- reads the phase itself and costs one nil compare when nothing is armed.
+    stall.cutoff_step()
 
     local phase = session.phase
     if phase == PHASE.lobby then

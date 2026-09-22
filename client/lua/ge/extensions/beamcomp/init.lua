@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "own-row/2026-09-19"
+local BUILD_MARKER = "afk-cutoff/2026-09-22"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -296,6 +296,7 @@ M.state = {
     standings = nil,     -- latest server-broadcast ranked standings entries, or nil
     car_info = nil,      -- one-shot per-driver car descriptors, cached from the carInfo channel keyed by the standings row (slot, else name); the standings entries no longer carry `car` (ADR-0029 amendment, bug partconfig-blob-bloats-standings), or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
+    stall_cutoff = nil,  -- server-broadcast AFK cutoff {remaining = seconds}: how long until the LAST still-standing driver is counted out and the finish grace shortens (feature standings-afk-cutoff-counter). Ticked locally beside `grace` in stall.step_clocks, which also drops it whenever `grace` is gone -- the addendum may never outlive the counter it stands behind. nil = nothing to announce, which is also what an older server, a dropped message and a GE Lua reload leave behind (ADR-0052): absence means unknown, never "what I saw last"
     staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
     countdown = nil,     -- start-countdown {remaining = seconds}, ticked locally to drive the 8s count (ADR-0021), or nil
     f1 = nil,            -- F1 light start (ADR-0043): grid baselines, first-movement times and report latches for the own car and (host) each AI, plus lights_out_at; nil outside an F1 start
@@ -377,22 +378,29 @@ M.state = {
     quali_hold_locked = false, -- the held-ness last pushed to lock.set_recover_blocked, so the sync only calls the engine on a real edge. A cache of an engine state that DOES outlive a GE Lua reload (core/input/actionFilter.lua serializes its action groups) while this flag does not, so it is re-asserted in onExtensionLoaded rather than trusted -- the first sync after a load must never compare against a guessed value
     -- Per-owned-car standstill clock for the client-measured AFK verdict (feature
     -- stall-detection-client-measured-movement), keyed "self" for the local car and by AI id for each
-    -- host-driven AI: {since, warned, reported} -- when this car last started standing still, and the two
-    -- one-shot latches. A number and two booleans on purpose, so no engine handle can go stale in it
+    -- host-driven AI: {since, announced, reported} -- when this car last started standing still, and the
+    -- two one-shot latches (its due time was sent / its AFK verdict was sent). A number and two booleans
+    -- on purpose, so no engine handle can go stale in it
     -- (like size_track); a GE Lua reload drops it with the rest of M.state, which costs nothing here --
     -- it is re-seeded from zero the next time the finish timer arms. Exists ONLY while M.state.grace is armed:
     -- stall.step drops the whole table whenever the finish timer is not running, which is also what makes
     -- every car start its 15 s from zero the instant the timer arms. nil the rest of the time
     stall_track = nil,
-    -- The two centred message surfaces (feature race-toast-cleanup-and-checkpoint-readout), owned by the
-    -- `notice` namespace: the message line {text, kind, remaining} and the checkpoint readout
-    -- {label, time, remaining}, plus the shared seconds-to-next-repaint clock. nil when nothing stands.
+    -- The three centred message surfaces (feature race-toast-cleanup-and-checkpoint-readout, extended by
+    -- standings-afk-cutoff-counter), owned by the `notice` namespace: the message line
+    -- {text, kind, remaining}, the checkpoint readout {label, time, remaining} and the standing driver's
+    -- AFK count {seconds, hint}, plus the shared seconds-to-next-repaint clock. nil when nothing stands.
+    --
+    -- afk_notice is the odd one out and deliberately so: it carries no `remaining`, because it is a
+    -- MEASUREMENT and not a message. stall.check raises it, moves it and drops it; notice.step only keeps
+    -- it painted and enforces that it never stands without M.state.grace.
     --
     -- ADR-0052 contract: pure transients whose teardown value IS their literal value here, and
     -- teardown_race_world calls notice.clear(), which also pushes the CLEARING frame to the app -- so a GE
     -- Lua reload can never leave a message stranded on a surface whose GE-side owner has forgotten it.
     notice = nil,
     cp_readout = nil,
+    afk_notice = nil,
     notice_repaint = 0,
 }
 
@@ -488,14 +496,17 @@ function notice.in_race()
     return phase == nil or phase == "lobby" or notice.RACE_PHASES[phase] == true
 end
 
--- Push the current truth of BOTH centred surfaces, and restart the repaint clock. Always the whole
+-- Push the current truth of ALL THREE centred surfaces, and restart the repaint clock. Always the whole
 -- state, never a delta: one owner writing everything is what keeps this clear of the countdown channel's
--- one-slot failure (see NOTICE_HOOK in race/countdown.lua).
+-- one-slot failure (see NOTICE_HOOK in race/countdown.lua). The rule scales with the number of surfaces --
+-- the AFK count is the third, and it is written here for the same reason the other two are.
 function notice.paint()
     M.state.notice_repaint = notice.REPAINT_INTERVAL
     countdown.show_notice(
         M.state.notice and {text = M.state.notice.text, kind = M.state.notice.kind} or nil,
-        M.state.cp_readout and {label = M.state.cp_readout.label, time = M.state.cp_readout.time} or nil)
+        M.state.cp_readout and {label = M.state.cp_readout.label, time = M.state.cp_readout.time} or nil,
+        M.state.afk_notice
+            and {seconds = M.state.afk_notice.seconds, hint = M.state.afk_notice.hint} or nil)
 end
 
 -- Say one thing to the player. `kind` is the toastr type ("info" / "warning" / "success") and doubles as
@@ -562,27 +573,36 @@ function notice.checkpoint(event, count)
     notice.paint()
 end
 
--- Drop both surfaces and tell the app. Called from teardown_race_world, which also runs on
+-- Drop all three surfaces and tell the app. Called from teardown_race_world, which also runs on
 -- onExtensionUnloaded -- see the ADR-0052 note on the M.state fields.
 function notice.clear()
-    if not M.state.notice and not M.state.cp_readout then
+    if not M.state.notice and not M.state.cp_readout and not M.state.afk_notice then
         return
     end
     M.state.notice = nil
     M.state.cp_readout = nil
+    M.state.afk_notice = nil
     notice.paint()
 end
 
--- Age both surfaces one frame, expire what is due, and keep what stands painted. Called unconditionally
--- from onUpdate: a message raised in the last racing frame still has to expire, and by then the race
--- phase may already be gone. Two nil checks when nothing stands.
+-- Age the two timed surfaces one frame, expire what is due, and keep what stands painted. Called
+-- unconditionally from onUpdate: a message raised in the last racing frame still has to expire, and by
+-- then the race phase may already be gone. Three nil checks when nothing stands.
+--
+-- The AFK count is NOT aged here -- it has no lifetime, stall.check owns it. What it does get here is its
+-- one unconditional guard: it belongs to the finish timer, so no timer means no count. This runs in every
+-- phase where stall.step does not, which is what makes it a property rather than a list of clear sites.
 function notice.step(dt)
     local line = M.state.notice
     local readout = M.state.cp_readout
-    if not line and not readout then
+    if not line and not readout and not M.state.afk_notice then
         return
     end
     local expired = false
+    if M.state.afk_notice and not M.state.grace then
+        M.state.afk_notice = nil
+        expired = true
+    end
     if line then
         line.remaining = line.remaining - (dt or 0)
         if line.remaining <= 0 then
@@ -664,6 +684,7 @@ local function handle_race_start(payload)
         M.state.provisional_open = true
         M.state.grace = nil
         M.state.stall_track = nil
+        M.state.stall_cutoff = nil
         M.state.assist_armed = false
         M.state.assist_held = nil
         M.state.assist_arming = nil
@@ -728,6 +749,7 @@ local function handle_race_start(payload)
     M.state.provisional_open = true
     M.state.grace = nil
     M.state.stall_track = nil
+    M.state.stall_cutoff = nil
     M.state.staging = nil
     M.state.countdown = nil
     -- Drop any F1 light-start state (ADR-0043) so a prior race's latched jump can never leak into this one.
@@ -1145,6 +1167,7 @@ local function teardown_race_world()
     M.state.provisional_open = true
     M.state.grace = nil
     M.state.stall_track = nil
+    M.state.stall_cutoff = nil
     M.state.staging = nil
     M.state.countdown = nil
     -- Drop any F1 light-start state (ADR-0043) so a prior race's latched jump can never leak into this one.
@@ -1783,6 +1806,7 @@ local function handle_race_phase(payload)
         M.state.qualifying = nil
         M.state.grace = nil
         M.state.stall_track = nil
+        M.state.stall_cutoff = nil
         M.state.detection = nil
         M.state.laptimer = nil
         M.state.quali_settle = false
@@ -2598,13 +2622,30 @@ end
 -- resolve rather than being reported at once.
 stall.WINDOW = 15.0
 
--- Seconds of standstill at which the LOCAL player is warned, 5 s before WINDOW. AI get no warning -- there
--- is nobody to warn.
-stall.WARN_AT = 10.0
+-- Seconds of standstill at which the count starts: the local player sees a running "AFK in n" from here
+-- to WINDOW, and the server is told at the same instant when this car is due to be counted out. THE one
+-- place the "last 10 seconds" threshold exists -- the server mirrors no constant of it and has no opinion
+-- about the length of a standstill window (feature standings-afk-cutoff-counter). Was 10.0, which showed
+-- the driver only the last 5 s. AI raise no count -- there is nobody to show it to -- but their due time
+-- is reported all the same, because the cutoff is decided by the LAST driver of the field.
+stall.WARN_AT = 5.0
 
 -- Client->server verdict, matching the server's stall.MSG: {stalled = bool} for our own car,
--- {aiId = ..., stalled = bool} for one of the host's AI (the qualiCleared split).
+-- {aiId = ..., stalled = bool} for one of the host's AI (the qualiCleared split). The third shape,
+-- {standing = true, dueIn = <seconds>}, is the early edge the cutoff counter runs on -- a prediction, and
+-- explicitly NOT a verdict: the server keeps it in its own table and its liveness predicate never reads
+-- it, so a driver who has just gone quiet still holds the grace open for the full WINDOW (ADR-0014).
 stall.MSG = "stallReport"
+
+-- server->client: the field's AFK cutoff, shown behind the finish-timer counter on the provisional
+-- results card and the three qualifying lines. {active = true, dueIn = <seconds>} arms it,
+-- {active = false} takes it back; the seconds are ticked down locally, like the finish grace itself.
+stall.MSG_CUTOFF = "afkCutoff"
+
+-- The sentence under the driver's own count. Kept beside the count rather than in the app, so the whole
+-- message has one owner and every push carries it (ADR-0057). It is the second half of the message this
+-- feature turned from a one-shot into a count -- the words are unchanged.
+stall.HINT = "move now, or you stop holding the finish timer open"
 
 -- Is this car standing still? THE criterion, and deliberately the very same test the recover/repair hold
 -- uses to decide whether it may run (ADR-0017, is_car_stationary): one predicate, one number, applied to
@@ -2628,11 +2669,81 @@ function stall.who(car)
     return "own car"
 end
 
--- Warn the LOCAL player, once per standstill episode, WINDOW - WARN_AT seconds before they are reported.
--- Never for an AI: there is nobody to warn.
-function stall.warn_local()
-    notice.say(string.format("AFK in %.0f s -- move now, or you stop holding the finish timer open",
-        stall.WINDOW - stall.WARN_AT), "warning")
+-- Show the LOCAL player how long they have left, as a count that follows their own standstill clock.
+-- Never for an AI: there is nobody to show it to.
+--
+-- It is a third sub-surface of the centred `notice` payload (ADR-0057), not a message: it has NO lifetime
+-- of its own, because stall.check owns when it appears and when it goes. Stretching notice.LIFETIME over
+-- a ten-second count would be the wrong seam -- the count would outlive the standstill that justifies it.
+--
+-- Repainted only when the displayed second changes, so a 10 s count costs ten pushes, not 600.
+function stall.show_countdown(remaining)
+    local seconds = math.max(0, math.ceil(remaining))
+    local shown = M.state.afk_notice
+    if shown and shown.seconds == seconds then
+        return
+    end
+    M.state.afk_notice = {seconds = seconds, hint = stall.HINT}
+    if not shown then
+        -- Only on the arming push, and for the same reason notice.say does it: the HUD app mounts
+        -- best-effort (ADR-0012 section 3), so the surface has to be on the layout before the first
+        -- frame of the count. ensure_visible dedups, so this never disturbs an existing placement.
+        hud.show()
+    end
+    notice.paint()
+end
+
+-- Drop the count. Called the instant the car moves, when the verdict lands (the prediction has resolved;
+-- "AFK in 0" would be a forecast of something that already happened), and on the way out of every phase
+-- and grace that could have raised it. Idempotent -- two nil checks when nothing stands.
+function stall.clear_countdown()
+    if not M.state.afk_notice then
+        return
+    end
+    M.state.afk_notice = nil
+    notice.paint()
+end
+
+-- Server->client cutoff counter (stall.MSG_CUTOFF): how long until the LAST still-standing driver of the
+-- field is counted out, i.e. until the finish grace shortens. Stored as a local clock and ticked down in
+-- onUpdate, exactly like M.state.grace -- the wire carries one edge, never a second per second.
+--
+-- Anything that is not an explicit arm clears it. A counter announcing a race end that does not come is
+-- worse than no counter, so an absent field, a malformed payload or an older server all mean "no
+-- addendum" rather than "whatever was there last".
+function stall.handle_cutoff(payload)
+    local remaining = (type(payload) == "table" and payload.active == true)
+        and tonumber(payload.dueIn) or nil
+    if not remaining or remaining < 0 then
+        if M.state.stall_cutoff then
+            M.state.stall_cutoff = nil
+            log("I", RACE_LOG_TAG, "AFK cutoff withdrawn")
+        end
+        return
+    end
+    M.state.stall_cutoff = {remaining = remaining}
+    log("I", RACE_LOG_TAG, string.format(
+        "AFK cutoff in %.1fs -- every remaining driver is standing still", remaining))
+end
+
+-- Tick both finish-timer clocks one frame. Display only -- the server stays authoritative on the actual
+-- cutoff (ADR-0014) and on the AFK verdict.
+--
+-- ONE function for both, called from both race phases, because the AFK addendum may never outlive the
+-- counter it stands behind: no grace, no addendum. That is a property of this function rather than a
+-- promise made at each of the places that drop M.state.grace.
+function stall.step_clocks(dt)
+    if not M.state.grace then
+        M.state.stall_cutoff = nil
+        return
+    end
+    M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dt or 0))
+    local cutoff = M.state.stall_cutoff
+    if cutoff then
+        -- Floors at 0 and stays there until the server takes it back, which rides the same tick that
+        -- shortens the grace: the last second must not blink out before the thing it announced happens.
+        cutoff.remaining = math.max(0, cutoff.remaining - (dt or 0))
+    end
 end
 
 -- Run one owned car's standstill clock and report the AFK / MOVING-AGAIN edges, once each.
@@ -2644,8 +2755,13 @@ end
 -- standstill DURING the timer and nothing else -- a driver who was already parked when it started still
 -- gets the full WINDOW.
 --
--- Moving clears the whole episode: the reversal is reported if we had claimed AFK, and the entry is
--- dropped, which also cancels a pending warning so a later standstill warns again from scratch.
+-- Moving clears the whole episode: the reversal is reported if we had said anything about this car at
+-- all, and the entry is dropped, so a later standstill counts again from scratch.
+--
+-- Three edges, not two, since the cutoff counter (feature standings-afk-cutoff-counter): at WARN_AT the
+-- server is told WHEN this car is due to be counted out, at WINDOW that it now is, and on movement that
+-- it is not. The first is a prediction and the server keeps it well away from its liveness predicate --
+-- it exists so the provisional card can print "AFK in 7" behind the counter it is about to change.
 function stall.check(veh, t, car)
     local ai_id = car and car.id
     local key = ai_id or "self"
@@ -2654,18 +2770,23 @@ function stall.check(veh, t, car)
 
     if not stall.is_stopped(veh) then
         if entry then
-            if entry.reported then
+            -- `announced` and not just `reported`: a due time we sent is a claim about this car too, and
+            -- leaving it standing would keep a countdown on everybody's card for a car that is driving.
+            if entry.reported or entry.announced then
                 send_to_server(stall.MSG, {aiId = ai_id, stalled = false})
                 log("I", RACE_LOG_TAG, string.format(
                     "stall: %s is moving again -- reported as still running", stall.who(car)))
             end
             seen[key] = nil
         end
+        if not ai_id then
+            stall.clear_countdown()
+        end
         return
     end
 
     if not entry then
-        seen[key] = {since = t, warned = false, reported = false}
+        seen[key] = {since = t, announced = false, reported = false}
         return
     end
     if entry.reported then
@@ -2679,11 +2800,27 @@ function stall.check(veh, t, car)
         log("I", RACE_LOG_TAG, string.format(
             "stall: %s has been standing still for %.0f s of the finish timer -- reported AFK",
             stall.who(car), stall.WINDOW))
-    elseif not ai_id and not entry.warned and standing >= stall.WARN_AT then
-        entry.warned = true
-        stall.warn_local()
+        if not ai_id then
+            stall.clear_countdown()
+        end
+        return
+    end
+    if standing < stall.WARN_AT then
+        return
+    end
+
+    local due_in = stall.WINDOW - standing
+    if not entry.announced then
+        entry.announced = true
+        -- The measured remainder, not the WINDOW - WARN_AT literal: whatever frame this lands on, the
+        -- server gets the deadline this client is actually counting to.
+        send_to_server(stall.MSG, {aiId = ai_id, standing = true, dueIn = due_in})
         log("I", RACE_LOG_TAG, string.format(
-            "stall: own car standing still for %.0f s -- warned the driver", stall.WARN_AT))
+            "stall: %s standing still for %.0f s -- reported due in %.1f s", stall.who(car),
+            stall.WARN_AT, due_in))
+    end
+    if not ai_id then
+        stall.show_countdown(due_in)
     end
 end
 
@@ -2700,6 +2837,7 @@ end
 function stall.step()
     local phase = M.state.phase
     if not M.state.race or (phase ~= "racing" and phase ~= "qualifying") then
+        stall.clear_countdown()
         return
     end
     -- Nothing counts until the finish timer runs (user decision 2026-09-03). Dropping the table here is
@@ -2707,6 +2845,7 @@ function stall.step()
     -- means 15 s of the timer -- and it keeps a normal race completely free of both work and traffic.
     if not M.state.grace then
         M.state.stall_track = nil
+        stall.clear_countdown()
         return
     end
     local seen = M.state.stall_track
@@ -2716,6 +2855,7 @@ function stall.step()
     end
     local t = os.clockhp()
 
+    local measured_own = false
     local detection = M.state.detection
     if detection and not detection.done and not hold.is_held() then
         -- The car the detector scores checkpoints with, not M.state.race_car_id: if a switch ever gets
@@ -2724,7 +2864,14 @@ function stall.step()
         local own = vehicles.resolve_own_car(M.state.current_vehicle_id)
         if own then
             stall.check(own, t, nil)
+            measured_own = true
         end
+    end
+    if not measured_own then
+        -- The driver's count is the face of a measurement, so a frame that does not measure this car has
+        -- nothing to show: finished, held, or momentarily unresolved, the count goes. Cheaper than
+        -- arguing that every one of those transitions has to pass through a moving frame first.
+        stall.clear_countdown()
     end
 
     local cars = M.state.ai_cars
@@ -4139,6 +4286,10 @@ local HANDLERS = {
     trackFetch = handle_track_fetch,
     trackData = handle_track_data,
     finishGrace = handle_finish_grace,
+    -- The AFK cutoff counter shown behind the finish-timer counter (feature
+    -- standings-afk-cutoff-counter). Keyed off the constant so the wire name lives in exactly one place
+    -- on this side, and handled on the `stall` namespace so it costs no top-level local.
+    [stall.MSG_CUTOFF] = stall.handle_cutoff,
     resultsToggle = handle_results_toggle,
     analysisToggle = handle_analysis_toggle,
     gridData = handle_grid_data,
@@ -6015,6 +6166,12 @@ local function build_hud_snapshot()
     -- local player can still finish (ADR-0014) -- finished/DNF players see how long until the race ends.
     local grace = M.state.grace and M.state.grace.remaining or nil
     local grace_can_finish = not local_finished and not local_dnf
+    -- The AFK cutoff addendum (feature standings-afk-cutoff-counter), read from INSIDE the same condition
+    -- as the counter it stands behind: it explains a jump of that counter, so a screen without the
+    -- counter must never carry it. Reading `grace` rather than M.state.grace a second time is what makes
+    -- that structural instead of a habit.
+    local afk_cutoff = (grace ~= nil and M.state.stall_cutoff)
+        and M.state.stall_cutoff.remaining or nil
 
     -- The post-race analysis block is derived only when the overlay is actually open in the finished
     -- phase -- it runs every frame for the long finished window, so the closed-overlay default (and every
@@ -6149,6 +6306,10 @@ local function build_hud_snapshot()
         intervalMode = M.state.interval_mode or "self",  -- live-standings interval reference for the REL toggle label
         grace = grace,
         graceCanFinish = grace_can_finish,
+        -- Seconds until the LAST still-standing driver is counted out and the finish timer shortens, or
+        -- nil when that is not happening. Rendered as " . AFK in n" behind the provisional card's counter
+        -- and the three qualifying lines (feature standings-afk-cutoff-counter).
+        afkCutoff = afk_cutoff,
         isCircuit = is_circuit,
         -- F1 light start active this race (ADR-0043): gates the standings React column.
         f1Start = (race and race.startMode == "f1") or false,
@@ -7153,10 +7314,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
             M.state.qualifying.remaining = math.max(0, M.state.qualifying.remaining - (dtReal or 0))
         end
         -- Once the quali clock expires the server arms a finish-your-lap window (ADR-0041): tick its local
-        -- copy so the HUD shows the timeout to be at the finish (the server stays authoritative on the cut).
-        if M.state.grace then
-            M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
-        end
+        -- copy so the HUD shows the timeout to be at the finish (the server stays authoritative on the cut),
+        -- and the AFK cutoff addendum with it.
+        stall.step_clocks(dtReal)
     elseif M.state.phase == "qualiResults" and M.state.race then
         -- Update the quali-results card's "race starts in" remaining from the wall-clock anchor (os.clockhp),
         -- so the AI-despawn frame hitch can't drift it behind the server pause (ADR-0041). Display only.
@@ -7183,11 +7343,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         f1_step_reactions()
         -- Drive the held recover/repair countdown (ADR-0017).
         step_assist(dtReal)
-        -- Tick the finish-grace countdown in wall time (the server's cutoff is wall-time; ADR-0014).
-        -- Visual only -- the server stays authoritative on the actual DNF cutoff.
-        if M.state.grace then
-            M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dtReal or 0))
-        end
+        -- Tick the finish-grace countdown, and the AFK cutoff addendum behind it, in wall time (the
+        -- server's cutoff is wall-time; ADR-0014). Visual only -- the server stays authoritative on the
+        -- actual DNF cutoff.
+        stall.step_clocks(dtReal)
     end
     -- Host only: once BeamMP has registered the spawned AI cars, broadcast their server ids so remotes can
     -- label + suppress them (ADR-0036). Registration is async, so this retries while pending until every
