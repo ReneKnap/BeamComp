@@ -1,0 +1,82 @@
+<div class="bc-controls">
+  <style scoped>
+    /* This app IS interactive (app.json deliberately carries no "interactive": "no", unlike
+       BeamCompHud): every chip is a button into BeamNG's binding dialog. So the host frame keeps
+       pointer-events: auto and nothing here has to re-enable them. */
+    .bc-controls { display: flex; flex-direction: column; height: 100%; box-sizing: border-box;
+      font-family: 'Roboto', sans-serif; font-size: 13px; color: #f0f0f0;
+      background: rgba(20, 22, 26, 0.92); border-radius: 4px; overflow: hidden; }
+    .bc-ctl-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+      border-bottom: 1px solid rgba(255,255,255,0.12); }
+    .bc-ctl-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      font-size: 11px; color: #8fd3ff; }
+    .bc-ctl-x { margin-left: auto; background: #2a2e35; color: #f0f0f0;
+      border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 0 7px;
+      font-size: 12px; line-height: 18px; cursor: pointer; }
+    .bc-ctl-x:hover { background: #3a4049; }
+    .bc-ctl-body { flex: 1 1 auto; overflow-y: auto; padding: 6px 8px; }
+    .bc-ctl-wait { color: #9aa3ad; font-size: 12px; }
+    .bc-ctl-row { display: flex; align-items: flex-start; gap: 8px; margin: 5px 0; }
+    /* Capped, not proportional -- same reasoning as the setup panel's label column: every pixel a
+       wider window adds should land on the key chips, not on two captions that never needed it. */
+    .bc-ctl-name { flex: 0 0 min(40%, 132px); }
+    .bc-ctl-label { display: block; font-weight: 700; }
+    .bc-ctl-does { display: block; color: #9aa3ad; font-size: 11px; line-height: 1.25; }
+    .bc-ctl-keys { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap;
+      justify-content: flex-end; gap: 4px; }
+    /* The chip box is OURS, not the engine's: the game's binding directive draws a glyph and a name
+       and no box at all, so without this the two halves of the window would look like two features.
+       The click target is this wrapper, never the <binding> inside it -- that element renders nothing
+       at all when it has nothing to show, so there would be no target left to click. */
+    .bc-ctl-chip { display: inline-flex; align-items: center; padding: 1px 6px;
+      background: #2a2e35; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px;
+      white-space: nowrap; }
+    .bc-ctl-hot { cursor: pointer; }
+    .bc-ctl-hot:hover { background: #3a4049; border-color: rgba(143,211,255,0.55); }
+    /* The fallback chip is deliberately NOT a <kbd>: BeamNG styles kbd and its child spans globally
+       (ui/entrypoints/main/main.css:5-22, including text-transform: uppercase), which would render a
+       device name as KEYBOARD0 and make our half of the window drift with the game's stylesheet. */
+    .bc-ctl-dev { color: #9aa3ad; font-size: 11px; margin-right: 4px; }
+    .bc-ctl-key { font-family: 'Noto Sans Mono', monospace; }
+    .bc-ctl-na { font-weight: 700; }
+  </style>
+
+  <div class="bc-ctl-bar">
+    <span class="bc-ctl-title">BeamComp assist keys</span>
+    <button class="bc-ctl-x" ng-click="close()">&#10005;</button>
+  </div>
+
+  <div class="bc-ctl-body">
+    <!-- Nothing is claimed before the engine has answered: an early "[N/A]" would tell a correctly
+         bound player that he has no key, which is the one thing this window must never do. -->
+    <div class="bc-ctl-wait" ng-if="!rows">Reading your key bindings.</div>
+
+    <div class="bc-ctl-row" ng-repeat="row in rows track by row.action">
+      <span class="bc-ctl-name">
+        <span class="bc-ctl-label">{{row.label}}</span>
+        <span class="bc-ctl-does">{{row.does}}</span>
+      </span>
+      <span class="bc-ctl-keys">
+        <!-- One chip per device carrying this action. `device` and `key` are EXPRESSIONS: the game's
+             binding directive binds them with '=' and only `action`/`showunassigned` with '@'
+             (ui/modules/options/options.js:912-920). Quoting them as strings renders nothing, silently. -->
+        <span class="bc-ctl-chip" ng-class="{'bc-ctl-hot': canEdit}"
+              ng-repeat="c in row.controls track by $index"
+              ng-click="edit(row, c)">
+          <binding ng-if="useDirective" device="c.device" key="c.key"></binding>
+          <span ng-if="!useDirective"><span class="bc-ctl-dev">{{c.device}}</span><span
+            class="bc-ctl-key">{{c.label}}</span></span>
+        </span>
+        <!-- Unassigned: the directive's own [N/A], and the click leads into the same dialog without an
+             oldBinding -- the route the options UI itself takes when adding a binding
+             (controls-bindings.html:44 -> options.js:2189). -->
+        <span class="bc-ctl-chip bc-ctl-na" ng-class="{'bc-ctl-hot': canEdit}"
+              ng-if="row.controls.length === 0"
+              ng-click="edit(row, null)">
+          <binding ng-if="useDirective" showunassigned="true"></binding>
+          <span ng-if="!useDirective">[N/A]</span>
+        </span>
+      </span>
+    </div>
+  </div>
+</div>
