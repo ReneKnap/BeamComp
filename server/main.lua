@@ -459,6 +459,9 @@ local keys = {
     CHAT_COMMAND = "/keys",
     MSG_REPORT = "clientKeys",   -- client -> server: how THIS machine binds the two in-race assists
     MSG_REMIND = "remindKeys",   -- client -> server: admin asks us to re-send everyone his own key lines
+    -- server -> ONE client: open (or close) that player's controls window, the visual answer to /keys
+    -- (ADR-0061). The client owns the on/off state, so this is a plain toggle relay like resultsToggle.
+    MSG_CONTROLS = "controlsOpen",
     -- Key labels arrive from a client and go into a chat line, so they are bounded and screened like
     -- every other client-reported string (identity.validate, same reasoning). 32 bytes is far above the
     -- longest real label ("Ctrl+Insert" is 11) and far below a line that would flood somebody's chat.
@@ -509,6 +512,13 @@ keys.ASSISTS = {
 -- that case -- an unasked-for "I know nothing about you" is noise -- but a player who typed the command
 -- asked, and silence would read as a broken command.
 keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
+
+-- The join hint (ADR-0061). ONE line that points at the command, instead of the up-to-two lines that used
+-- to print the keys themselves: the window says the same thing better, for every device, and a player who
+-- is not interested pays one line instead of two. The trigger and the once-per-connection rule are
+-- unchanged -- see keys.handle_report.
+keys.HINT = "BeamComp: type \"" .. keys.CHAT_COMMAND
+    .. "\" to see and change your repair and recover keys"
 
 -- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
 -- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
@@ -7380,8 +7390,10 @@ end
 -- wrong key is worse than no key: the player believes it. Same rule the panel's assist tooltips follow
 -- (ADR-0049).
 --
--- THE ONE text builder. The join hint, /keys and the panel's button all print exactly this, so the three
--- can never drift into three different answers to the same question.
+-- THE ONE text builder, and STILL the answer for the admin button even though /keys became a window
+-- (ADR-0061). `Send keys` writes into OTHER players' chats and cannot open a window on a machine it does
+-- not run on, so it stays text -- with all three states, unchanged.
+--
 -- Where the player changes this assist's key himself (user request 2026-09-19, after the in-game round).
 -- Every state names it, because knowing which key you have is only half of what a player wants to do with
 -- that knowledge -- and `command` is the ONLY string with which he can find the binding in BeamNG's own
@@ -7418,7 +7430,11 @@ function keys.lines(player_id)
 end
 
 -- Write one player his own key lines. Returns how many went out, which is 0 for a connection that never
--- reported anything usable -- the callers decide what that silence means.
+-- reported anything usable -- the caller decides what that silence means.
+--
+-- Reached only from keys.handle_remind since ADR-0061 moved /keys onto the window and the join hint onto
+-- one pointer line. It is NOT leftovers and must not be folded away: the admin button is the one surface
+-- that writes into a chat the sender does not own.
 function keys.send(player_id)
     local lines = keys.lines(player_id)
     for _, line in ipairs(lines) do
@@ -7438,6 +7454,10 @@ end
 -- The flag is set BEFORE the send, so a send that throws part way still leaves this a one-shot. It is
 -- cleared only on disconnect, so a Lua reload or a level change refreshes the stored bindings (they may
 -- have changed) without hinting again, while a rejoin is hinted anew.
+--
+-- ADR-0061 changed only WHAT is written here -- one line pointing at /keys instead of the key lines
+-- themselves. Trigger, the absence of a grace and the once-per-connection rule are deliberately
+-- untouched.
 function keys.handle_report(player_id, payload)
     -- The client answered the connect-report pull, even if what it sent is unusable (ADR-0058): re-asking
     -- would only fetch the same unusable thing again.
@@ -7452,18 +7472,32 @@ function keys.handle_report(player_id, payload)
         return
     end
     keys.hinted[player_id] = true
-    -- The send is its own statement, not an argument to the log call: a log line that later grows a level
-    -- check would take the hint down with it.
-    local sent = keys.send(player_id)
-    log_info("beamcomp.keys", string.format("hinted id=%s with %d line(s)", tostring(player_id), sent))
+    MP.SendChatMessage(player_id, keys.HINT)
+    log_info("beamcomp.keys", "hinted id=" .. tostring(player_id))
 end
 
--- /keys: repeat the asking player's own lines. Open to EVERY player -- it writes only to the asker and
--- says only what his own client reported, so there is nothing here to gate.
+-- /keys: open the asking player's own controls window (ADR-0061). Open to EVERY player -- it reaches only
+-- the asker and shows only what his own machine binds, so there is nothing here to gate.
+--
+-- The window toggles: this sends the same message every time and the client decides whether that means
+-- open or close, exactly like /results (ADR-0022). The server keeps no window state, which is why a
+-- client that reloads its Lua or leaves cannot leave anything stale here.
+--
+-- A connection that never reported anything usable has no BeamComp client extension listening (ADR-0058
+-- -- the report is what proves one is there), so there is nothing that could open a window; that player
+-- gets the same sentence he got before. This needs no bookkeeping of its own: the reported table already
+-- carries the fact, and the disconnect already clears it.
+--
+-- send_event's return is deliberately NOT read. It reports BeamMP's join window, which matters for a
+-- report the server PULLS at connect; this one is answering a chat line the player just typed on an
+-- established connection, and a caller that ignores the return behaves exactly as before ADR-0058.
 function keys.handle_command(player_id)
-    if keys.send(player_id) == 0 then
+    if not keys.reported[player_id] then
         MP.SendChatMessage(player_id, keys.UNKNOWN)
+        return
     end
+    send_event(player_id, keys.MSG_CONTROLS, {})
+    log_info("beamcomp.keys", keys.CHAT_COMMAND .. " toggle for id " .. tostring(player_id))
 end
 
 -- The Send-keys button in the race-setup panel (ADR-0058): re-send everyone the lines naming HIS own

@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "afk-cutoff/2026-09-22"
+local BUILD_MARKER = "controls-window/2026-09-23"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -345,6 +345,7 @@ M.state = {
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
+    controls_open = false,    -- the controls window (/keys, ADR-0061) is on the layout: set by M.toggle_controls, cleared by M.close_controls (the window's own X and the toggle's close half). Local-only and not admin-gated -- it shows this player his own key bindings and nothing else. Deliberately NOT reload-proof (ADR-0052): a GE Lua reload rebuilds it as false while the window is still on screen, so the next /keys re-adds it (ensure_visible dedups, nothing visible happens) and the one after closes it -- one wasted command against no new serialization contract. Nothing else in the mod reads it, so a stale true can only cost that one command
     server_defaults = nil,    -- the defaults the SERVER owns, as it sent them on setupOpen ({jumpPenalty = 15}, ADR-0043), or nil. Relayed verbatim to the setup panel with EVERY push_setup_data -- not just the opening one -- because the panel also pulls its dataset itself on link (request_setup_data), and a value hanging off setupOpen alone would be gone after a UI reload. GE reads no key of it: the next server-owned default is a key on the server plus a placeholder in the markup. Safe at nil across a GE reload (ADR-0052): it mirrors a server constant and needs no previous value of its own, and nil means "not heard yet", which the panel shows as the neutral "default" rather than a number nothing stands behind. Cleared by setup.clear, which onClientEndMission runs when the player leaves the session -- so one server's numbers can never be shown as the next server's
     own_player_id = nil,      -- the id this connection has on the server, as it named it on setupOpen (yourPlayerId), or nil. Lets the setup panel mark this player's own row in its player list -- the list is a broadcast and cannot say who the reader is. Nil after a GE Lua reload like every other M.state field (ADR-0052), which is why identity.own_id falls back to BeamMP's own copy of the same id -- MPConfig DOES survive a reload. Cleared by setup.clear on leaving the session, so the next server's list is never matched against the previous server's id
     setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
@@ -4132,6 +4133,54 @@ function M.clear_grid_editor()
     push_grid_state()
 end
 
+-- ===== the controls window (ADR-0061) =============================================================
+-- /keys opens (and a second /keys closes) a window that draws where BeamComp's two in-race assists are
+-- bound, on every device, with the game's own binding glyphs -- and jumps into BeamNG's binding dialog on
+-- a click. GE owns nothing but the on/off state: the app reads the bindings from BeamNG's own
+-- InputBindingsChanged broadcast and never asks GE for data.
+--
+-- Everything here is a field on M, not a top-level local: init.lua sits at LuaJIT's 200-local ceiling
+-- (182/200 measured 2026-09-23) and a plain `local function` here would spend one of the eighteen left.
+
+-- Open or close the window. Called by the server's controlsOpen relay (/keys) and by nothing else --
+-- the X inside the window goes to M.close_controls, so both paths flip the same flag and can never
+-- disagree about what a second /keys means.
+--
+-- M.state.controls_open does NOT survive a GE Lua reload (ADR-0052) and is not made to: after one it
+-- reads false while the window is still on the layout, so the next /keys re-adds it (ensure_visible
+-- dedups by appName, so nothing visible happens) and the one after that closes it. One wasted command
+-- after a reload, against no new serialization contract -- deliberately the cheaper side.
+function M.toggle_controls()
+    if M.state.controls_open then
+        M.close_controls()
+        return
+    end
+    M.state.controls_open = true
+    -- Through the seam, never at the layout file: a call the player's HUD-apps menu would swallow is
+    -- recorded and replayed by M.uilayout.step, not dropped (bug ui-glitches-after-ingame-menu-resize).
+    M.uilayout.ensure_visible("beamCompControls")
+    log("I", "beamcomp.ui", "controls window shown")
+end
+
+-- Close the window. Public so its own X can reach it as beamcomp_init.close_controls (UI -> GE,
+-- ADR-0012), and the toggle's close half.
+function M.close_controls()
+    M.state.controls_open = false
+    M.uilayout.remove("beamCompControls")
+    log("I", "beamcomp.ui", "controls window hidden")
+end
+
+-- One log line from the controls window (UI -> GE). The window's two engine touchpoints -- the game's own
+-- <binding> directive and its binding-edit route -- both fail SILENTLY when a BeamNG version moves them,
+-- so the app probes each and reports which case it landed in. This is the only place that report becomes
+-- visible; the tag matches race/uilayout.lua's, since both are about the app surface.
+--
+-- The app reaches this by name through bngApi, which is why it is a plain M field and why the tag lives
+-- here instead of in the app: an app that could pass its own log tag could pass anything.
+function M.note_controls(msg)
+    log("I", "beamcomp.ui", "controls window: " .. tostring(msg))
+end
+
 -- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
 -- Surface it as a toast; the track record wins the message when both are set.
 local function handle_best_notice(payload)
@@ -4292,6 +4341,12 @@ local HANDLERS = {
     [stall.MSG_CUTOFF] = stall.handle_cutoff,
     resultsToggle = handle_results_toggle,
     analysisToggle = handle_analysis_toggle,
+    -- /keys (ADR-0061): open or close this client's controls window. An inline function rather than a
+    -- named handler on purpose -- a `local function handle_controls_open` would spend one of init.lua's
+    -- remaining top-level locals for a one-line relay, and the real work is a public M function anyway.
+    controlsOpen = function()
+        M.toggle_controls()
+    end,
     gridData = handle_grid_data,
     gridList = handle_grid_list,
     presetData = handle_preset_data,
