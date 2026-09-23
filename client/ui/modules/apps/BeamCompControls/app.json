@@ -13,8 +13,8 @@
     "top": "90px",
     "right": "50px",
     "width": "360px",
-    "height": "200px",
+    "height": "230px",
     "min-width": "260px",
-    "min-height": "120px"
+    "min-height": "150px"
   }
 }

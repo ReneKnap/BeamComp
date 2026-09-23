@@ -16,6 +16,8 @@
     .bc-ctl-x:hover { background: #3a4049; }
     .bc-ctl-body { flex: 1 1 auto; overflow-y: auto; padding: 6px 8px; }
     .bc-ctl-wait { color: #9aa3ad; font-size: 12px; }
+    .bc-ctl-hint { color: #9aa3ad; font-size: 11px; margin-top: 8px;
+      border-top: 1px solid rgba(255,255,255,0.12); padding-top: 5px; }
     .bc-ctl-row { display: flex; align-items: flex-start; gap: 8px; margin: 5px 0; }
     /* Capped, not proportional -- same reasoning as the setup panel's label column: every pixel a
        wider window adds should land on the key chips, not on two captions that never needed it. */
@@ -78,5 +80,11 @@
         </span>
       </span>
     </div>
+
+    <!-- Says where a click LANDS, not what it lands on. The new options UI has no deep link onto a
+         single binding, so the player arrives at the controls page and finds the row himself; a text
+         promising his key would be a promise the window cannot keep. Only shown when a click leads
+         anywhere at all. -->
+    <div class="bc-ctl-hint" ng-if="canEdit">Click a key to open BeamNG's controls settings.</div>
   </div>
 </div>

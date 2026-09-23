@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "controls-window/2026-09-23"
+local BUILD_MARKER = "controls-window-r2/2026-09-24"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -4179,6 +4179,115 @@ end
 -- here instead of in the app: an app that could pass its own log tag could pass anything.
 function M.note_controls(msg)
     log("I", "beamcomp.ui", "controls window: " .. tostring(msg))
+end
+
+-- ----- the jump into the key bindings (round 2, 2026-09-24) ---------------------------------------
+-- WHERE THE CLICK ON A KEY LEADS, AND WHY IT IS NOT THE ROUTE IT USED TO BE.
+--
+-- Round 1 jumped to `menu.options.controls.bindings.edit`, copied from BeamNG's own Keys app
+-- (ui/modules/apps/Keys/app.js:43). Measured in-game: that lands in the OLD Angular dialog, while a
+-- player who walks there himself sees the NEW options UI. The route is one of the legacy Angular
+-- router's (ui/entrypoints/main/main.js:393); that the game's own app still uses it says when that app
+-- was written, not where the game goes today.
+--
+-- The new UI is driven by the LUA router: ui/router/routes/options.lua declares the options branch
+-- uiTypes = {"vue"} / uiTypesFilter = only, and a route name the Lua router does not know falls through
+-- to the legacy host -- exactly what was seen. There is NO deep link onto a single action in the new UI:
+-- its edit dialog is a popup opened from the bindings list's own click handlers
+-- (ui-vue/.../options/controls/Bindings.vue runEditBindingPopup), and the store's `selectedBinding` is
+-- set, never watched. The reachable target is therefore the CATEGORY, and the controls category has
+-- exactly one subpage -- the bindings list (ui-vue/src/modules/options/runtime/layout.json, items[8]:
+-- categoryId "controls", subpage "ControlsBindings"). Owner's decision 2026-09-24: the new UI, even
+-- though the action has to be found by hand there.
+--
+-- WHY THIS SITS IN GE AND NOT IN THE APP. window.bngVue.gotoGameState(name, {params}) ends in the very
+-- same call (ui-vue/src/App.vue:212 -> lua.extensions.ui_router.navigate), and the app could reach it --
+-- but it offers no way to ASK whether a route exists; it hands the name over and the answer comes back
+-- only as a resolved promise inside the Vue bridge. Here the existence question is answerable with the
+-- exact predicate navigate itself resolves with, and navigate's own return value is readable. That is
+-- the difference between a probe and a hope, and it is the whole point of this feature. bngApi is also
+-- the channel every other UI -> GE call in this mod already uses, while window.bngVue is an internal
+-- Vue global -- one version-coupled surface fewer.
+
+-- The route that opens the new options UI on the key bindings, or nil when this build has none.
+--
+-- The candidate list is a PREFERENCE ORDER, never a claim: every name is checked against
+-- ui_router_routeManager.getRoute, which is what ui_router.navigate resolves with (ui/router.lua:258).
+-- An invented route name is a silent no-op there -- navigate logs "Route not found" and returns a
+-- failure table nobody reads -- the same trap as an invented input-action name (ADR-0017 / CLAUDE.md).
+-- The pause family comes first because a player clicking a key in this window is driving, not sitting
+-- in the main menu. Nothing is cached: the table cannot change within a session, and resolving again
+-- costs a table lookup while a cache would have to survive a GE Lua reload (ADR-0052).
+--
+-- The candidates live inside the function on purpose -- a top-level local would spend one of the
+-- eighteen this file has left.
+function M.controls_route()
+    local ok, resolved = pcall(function()
+        local manager = extensions.ui_router_routeManager
+        if type(manager) ~= "table" or type(manager.getRoute) ~= "function" then
+            return nil
+        end
+        local candidates = {"pause.options.category", "options.category", "pause.options", "options"}
+        for _, candidate in ipairs(candidates) do
+            if manager.getRoute(candidate) then
+                return candidate
+            end
+        end
+        return nil
+    end)
+    if not ok then
+        log("W", "beamcomp.ui", "controls window: could not read the router's route table: "
+            .. tostring(resolved))
+        return nil
+    end
+    return resolved
+end
+
+-- Tell the window which of its jump targets exists (GE -> UI). The app asks for this once on link and
+-- picks its rung from the answer; it keeps its own legacy rung for the empty answer, so a build without
+-- the new router behaves exactly as round 1 did rather than losing the button.
+--
+-- Pushed as a guihook like every other GE -> UI payload in this mod, not answered through bngApi's
+-- callback channel: that channel works, but nothing else here uses it, and one messaging pattern is
+-- worth more than one saved round-trip.
+function M.request_controls_route()
+    local route = M.controls_route()
+    guihooks.trigger("BeamCompControlsRoute", {route = route or ""})
+end
+
+-- Take the player to the key bindings in the new options UI. Returns whether the router accepted it.
+--
+-- `category` is the id the new UI keys its pages by, and "controls" resolves to the bindings list with
+-- no tab to pick afterwards. It rides even on the two category-less candidates: the Vue side declares
+-- the parameter optional on the same component (/pause/options/:category?), so it is either used or
+-- ignored, never wrong.
+--
+-- navigate does NOT throw on an unknown route or a blocked guard -- it returns a failure table. Reading
+-- it is the only way this can be anything but silent, so the reason goes into the log beside the route.
+function M.open_controls_bindings()
+    local route = M.controls_route()
+    if not route then
+        log("W", "beamcomp.ui", "controls window: no options route in this build; not navigating")
+        return false
+    end
+    local ok, result = pcall(function()
+        return extensions.ui_router.navigate(route, {category = "controls"}, nil)
+    end)
+    if not ok then
+        log("W", "beamcomp.ui", "controls window: navigate to '" .. route .. "' threw: "
+            .. tostring(result))
+        return false
+    end
+    -- Both outcomes come back as a table -- {success = true, ...} or {success = false, reason = ...}
+    -- (ui/router.lua:233 and :523). Only an explicit false counts as a refusal, so a build that answers
+    -- nothing, or answers in a shape we do not know, is taken at its word instead of reported as broken.
+    if type(result) == "table" and result.success == false then
+        log("W", "beamcomp.ui", "controls window: router refused '" .. route .. "': "
+            .. tostring(result.reason or "unknown"))
+        return false
+    end
+    log("I", "beamcomp.ui", "controls window: opened the key bindings via '" .. route .. "'")
+    return true
 end
 
 -- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
