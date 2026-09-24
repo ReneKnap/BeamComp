@@ -392,13 +392,16 @@ local identity = {
     -- "fix" this to a utf8.len.
     MIN_BYTES = 2,
     MAX_BYTES = 20,
-    -- Seconds between a player joining and the hint being emitted. A client that HAS a stored name
-    -- reports it a moment after the join, so an immediate check would hint at exactly the people who are
-    -- about to be named; the grace lets that report land first.
+    -- Seconds between the moment this server can first reach a joining client (identity.arm_hint, at the
+    -- first DELIVERED pull request) and its join block going out. A client that HAS a stored name reports
+    -- it a moment after being asked, so an immediate block would tell exactly the people who are about to
+    -- be named that they have none; the grace lets that report land first.
     HINT_DELAY = 8,
-    -- player_id -> deadline (now()) for a hint that is armed but not yet due.
+    -- player_id -> deadline (now()) for a join block that is armed but not yet due.
     pending = {},
 }
+-- The Remind button's line (ADR-0054), and only that since the join block took the join over: an admin
+-- pressing Remind is pointing at this one thing, so the block's whole list would be beside the point.
 identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHAT_COMMAND
     .. " <your name>\" to pick the name everyone sees"
 identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
@@ -519,6 +522,37 @@ keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
 -- unchanged -- see keys.handle_report.
 keys.HINT = "BeamComp: type \"" .. keys.CHAT_COMMAND
     .. "\" to see and change your repair and recover keys"
+
+-- THE JOIN BLOCK (user request 2026-09-24): the three commands a joiner needs, in one block, at one
+-- moment -- the moment identity's grace expires. It replaces the two separate join lines this plugin used
+-- to write, the name hint here and the assist-key hint on the connect report, and it is the only place a
+-- player ever reads that the race panel exists.
+--
+-- The copy lives HERE, behind the keys namespace, rather than in identity's literal above: the /keys line
+-- names keys.CHAT_COMMAND, and `keys` is declared after `identity`, so in that literal it would index a
+-- nil upvalue at load time. All six lines are in this one place, grep-able as JOIN_.
+--
+-- Every command name comes from its own constant rather than a literal, so a renamed command renames
+-- itself in the block too.
+--
+-- The header deliberately names no count: the /raceui line is absent for a non-admin on an
+-- allowlist-only server (see identity.join_block), and a header promising three commands would then be
+-- wrong.
+identity.JOIN_HEADER = "BeamComp: commands worth knowing"
+identity.JOIN_RACEUI = "  " .. CHAT_COMMAND_RACEUI .. " -- open the race panel"
+-- The same fact access.refuse states at a refusal -- the panel is the only place the password can be
+-- entered -- written for a player who has not been refused anything yet.
+identity.JOIN_RACEUI_PASSWORD = "  " .. CHAT_COMMAND_RACEUI
+    .. " -- open the race panel and enter the server password"
+-- Two /name lines, one condition: whether this player has a name by the time the block goes out. The
+-- first carries the urgency of identity.HINT, which no longer reaches a joiner any other way; the second
+-- is for everyone who has one already and only needs to know the command exists.
+identity.JOIN_NAME_PROMPT = "  " .. identity.CHAT_COMMAND
+    .. " <your name> -- you have no race name set; this is the name everyone sees"
+identity.JOIN_NAME = "  " .. identity.CHAT_COMMAND .. " <your name> -- change the name everyone sees"
+-- Unconditional, even for a connection that reported no keys at all (user decision): a player who types
+-- it then gets keys.UNKNOWN, an honest answer, where a silent command would read as a broken one.
+identity.JOIN_KEYS = "  " .. keys.CHAT_COMMAND .. " -- see and change your repair and recover keys"
 
 -- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
 -- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
@@ -7116,7 +7150,7 @@ end
 -- arrives. (This first push is one of the events BeamMP refuses during the handshake; the second join
 -- event and every later change re-push it, and a panel opened afterwards is seeded on open.)
 --
--- The HINT is NOT armed here any more (ADR-0058). Its grace exists to give the client time to report a
+-- The join block is NOT armed here (ADR-0058). Its grace exists to give the client time to report a
 -- name, and at this instant the client cannot report at all -- so it used to expire long before the
 -- earliest possible answer and hint at exactly the people it was written to leave alone. It is armed in
 -- identity.pull_step instead, the moment the client has actually been reached.
@@ -7128,13 +7162,18 @@ function identity.handle_join(player_id)
     identity.request_reports(player_id)
 end
 
--- Arm the "you have no race name set" hint for one player. Called the moment the client has been ASKED
--- for its reports -- not at the join.
+-- Arm the join block for one player. Called the moment the client has been ASKED for its reports -- not
+-- at the join.
 --
 -- That is the whole point of the grace, and it was aimed at the wrong instant: it exists to give the
 -- client time to report a name, and at the join the client cannot report at all (see identity.pull), so
 -- it expired 19 seconds before the earliest possible answer and hinted at exactly the people it was
 -- written to leave alone. Started here, the eight seconds are eight seconds of a channel that is open.
+-- Do not move this arming: the block reads the name it decides its /name wording by at the END of these
+-- eight seconds, so an earlier moment would put every player on the "you have no name" wording.
+--
+-- The block inherits both guards this arming has always had. A player who is somehow named already needs
+-- none of it, and with useClientName off nothing arms at all -- that server sends no join block.
 function identity.arm_hint(player_id)
     if client_names[player_id] or not identity.is_enabled() then
         return
@@ -7221,16 +7260,75 @@ function identity.pull_step()
     end
 end
 
--- Drive the connect-report pull, then emit any join hint whose grace has run out. Called from the top of
--- tick(), ABOVE its lobby early return: the lobby is exactly where a joining player is.
+-- The join block's lines for one player, in the order he reads them (user request 2026-09-24). Pure: it
+-- decides the wording and hands back the lines plus the two labels the log names -- the sending is
+-- identity.send_join_block's half.
 --
--- The pull runs first and unconditionally -- its own early return is on its own table, so the hint's
+-- THE /raceui LINE IS A GATE READING, and it goes through is_race_admin like every other one: that
+-- predicate is the single chokepoint (ADR-0056), and a second way of answering "does this player count
+-- as an admin" is exactly how the answer starts to drift apart between two places. This is a READING and
+-- not a gate -- it refuses nothing, so the count of gated actions is still what it was -- but it asks the
+-- same question, so it asks the same function. `cfg.password` below is no second predicate either: it
+-- decides nothing anybody may do, only which of two wordings a non-admin reads.
+--
+-- `player_name` is the RAW BeamMP name (ADR-0054) -- /name can set the other one, so it must never decide
+-- an authorization question, and resolve_identity has no business in this function.
+--
+-- Three wordings for the three gate layers, and asking the admin question FIRST is what produces them:
+--   * an admin reads the plain line -- an open server makes everyone one, an allowlist the listed names,
+--     a password whoever has already entered it;
+--   * a non-admin on a server WITH a password reads how to get in, the same fact access.refuse states;
+--   * a non-admin on an allowlist-only server reads nothing about /raceui at all -- there is no way in
+--     for him, and a command that refuses him is worse than one he never heard of. His block is three
+--     lines, which is why the header names no count.
+-- That order is also the fail-closed direction: a call that lost its player_id can only send an admin to
+-- the password wording, never a stranger to the plain one.
+--
+-- The /name wording is where the old `client_names[id] == nil` test lives on. The block itself is
+-- unconditional at this moment -- only its second line knows whether this player got named in the grace.
+function identity.join_block(player_id, player_name)
+    local lines = {identity.JOIN_HEADER}
+    local raceui = "omitted"
+    if is_race_admin(player_name, player_id) then
+        raceui = "plain"
+        lines[#lines + 1] = identity.JOIN_RACEUI
+    elseif cfg.password then
+        raceui = "password"
+        lines[#lines + 1] = identity.JOIN_RACEUI_PASSWORD
+    end
+    local named = client_names[player_id] ~= nil
+    lines[#lines + 1] = named and identity.JOIN_NAME or identity.JOIN_NAME_PROMPT
+    lines[#lines + 1] = identity.JOIN_KEYS
+    return lines, raceui, named and "neutral" or "prompt"
+end
+
+-- Write one player his join block and record which wordings he got.
+--
+-- THE LOG LINE IS THE ONLY READING OF THE /raceui DECISION ANYONE GETS: a running server has exactly one
+-- of the three gate layers, so two of the three wordings cannot be observed in game -- not on this
+-- server, not on any. It names both variants and the line count, because the failure to expect here is
+-- one line too many or one too few, not an empty message.
+function identity.send_join_block(player_id, player_name)
+    local lines, raceui, name_variant = identity.join_block(player_id, player_name)
+    for _, line in ipairs(lines) do
+        MP.SendChatMessage(player_id, line)
+    end
+    log_info("beamcomp.identity", string.format(
+        "sent the join block to id %s (raceui=%s, name=%s, %d lines)",
+        tostring(player_id), raceui, name_variant, #lines))
+end
+
+-- Drive the connect-report pull, then send the join block to every player whose grace has run out. Called
+-- from the top of tick(), ABOVE its lobby early return: the lobby is exactly where a joining player is.
+--
+-- The pull runs first and unconditionally -- its own early return is on its own table, so the block's
 -- "nothing pending" guard below can never switch it off.
 --
--- The `client_names[id] == nil` test here is the ONE place that decides whether a hint is still
--- warranted -- neither /name nor the connect report clears the pending entry, so there is no list of
--- accept paths that has to stay complete for the rule to hold. Clearing the entry before the send makes
--- it a one-shot even if the send throws; a player who is named by now, or gone, gets nothing.
+-- The block is UNCONDITIONAL at this moment (user request 2026-09-24): whoever is still here gets it, and
+-- whether he has a name by now decides only the wording of its /name line. Two properties of this loop
+-- carry the rest and are unchanged: the pending entry is cleared BEFORE the send, so the block stays a
+-- one-shot even if a send throws, and MP.GetPlayers decides whether the player is still here -- the same
+-- read supplies the raw BeamMP name the gate reading needs, so there is one source for both.
 function identity.step()
     identity.pull_step()
     if next(identity.pending) == nil then
@@ -7241,13 +7339,13 @@ function identity.step()
     for player_id, deadline in pairs(identity.pending) do
         if due >= deadline then
             identity.pending[player_id] = nil
-            if client_names[player_id] == nil and players[player_id] then
-                MP.SendChatMessage(player_id, identity.HINT)
-                log_info("beamcomp.identity", "hinted id " .. tostring(player_id) .. " to set a name")
+            local player_name = players[player_id]
+            if player_name then
+                identity.send_join_block(player_id, player_name)
             end
         end
     end
-    -- No list push here. The grace belongs to the HINT, not to the display: the player has been on the
+    -- No list push here. The grace belongs to the BLOCK, not to the display: the player has been on the
     -- panel's list since he joined, marked `temporary name`, and a chat line changes nothing about the row.
 end
 
@@ -7920,7 +8018,7 @@ end
 -- there is no one to race, so fall back to lobby instead (ADR-0014).
 local function on_player_disconnect(player_id)
     -- Drop the connection-scoped name regardless of phase (ADR-0054) -- a player may leave in lobby too,
-    -- and with it any join hint still waiting out its grace.
+    -- and with it any join block still waiting out its grace.
     client_names[player_id] = nil
     identity.pending[player_id] = nil
     -- And the connect-report pull (ADR-0058), whether it is still trying or already done: BeamMP reuses
