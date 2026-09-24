@@ -446,10 +446,10 @@ identity.PULL_TIMEOUT = 300
 -- of the slot is never asked.
 identity.pull = {}
 
--- Everything the assist-key hint needs (ADR-0058): what each connection reported about its own key
--- bindings, whether it has been hinted yet, the /keys command and the copy. The two in-race assists
--- (ADR-0017) are on by default and their keys are bound by default, but nothing in the game ever told a
--- player which key that is -- the only place the keys appear is the admin-only setup panel.
+-- Everything the assist keys need (ADR-0058): what each connection reported about its own key bindings,
+-- the /keys command and the copy. The two in-race assists (ADR-0017) are on by default and their keys are
+-- bound by default, but nothing in the game ever told a player which key that is -- the only place the
+-- keys appear is the admin-only setup panel.
 --
 -- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
 -- (see identity above, plus grid_store / runlog / f1), and a table costs ONE local no matter how much it
@@ -476,11 +476,6 @@ local keys = {
     -- Connection-scoped, cleared on disconnect: BeamMP reuses player ids, so a report left behind would
     -- be read out to whoever takes the slot next.
     reported = {},
-    -- player_id -> true once the join hint has gone out on this connection. Set when it is sent and
-    -- cleared ONLY on disconnect: a GE Lua reload and a level change make the client report again (its
-    -- bindings may have changed) and must refresh the stored answer without hinting a second time, while
-    -- a rejoin is a new connection and is hinted again.
-    hinted = {},
 }
 
 -- The two assists, in the order their lines are written.
@@ -516,10 +511,9 @@ keys.ASSISTS = {
 -- asked, and silence would read as a broken command.
 keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
 
--- The join hint (ADR-0061). ONE line that points at the command, instead of the up-to-two lines that used
--- to print the keys themselves: the window says the same thing better, for every device, and a player who
--- is not interested pays one line instead of two. The trigger and the once-per-connection rule are
--- unchanged -- see keys.handle_report.
+-- The one-line pointer at /keys (ADR-0061). It is no longer sent anywhere: the join block below names
+-- /keys itself, in a player's one moment of reading commands, so the connect report writes no chat line
+-- any more (user request 2026-09-24). Kept as the wording a single-line pointer would use.
 keys.HINT = "BeamComp: type \"" .. keys.CHAT_COMMAND
     .. "\" to see and change your repair and recover keys"
 
@@ -7541,21 +7535,17 @@ function keys.send(player_id)
     return #lines
 end
 
--- A client reported how it binds the two assists (ADR-0058). Store it, and hint once per connection.
+-- A client reported how it binds the two assists (ADR-0058). Store it -- that is now the whole job.
 --
--- THE REPORT IS THE TRIGGER, NOT THE JOIN, and that is not a detail. identity's join hint waits out an
--- 8-second grace because it fires on ABSENCE: it has to give the client time to report a name, or it
--- hints at exactly the people who are about to be named. This one fires on PRESENCE -- before the report
--- there is nothing it could say -- so a grace could only lose it: a client whose GE extension comes up
--- with the level reports after any grace has expired, and the hint would fall out with no symptom.
+-- IT WRITES NO CHAT LINE ANY MORE (user request 2026-09-24). The assist keys are one of the three
+-- commands the join block names, and the block is a joiner's one moment of reading commands; a second
+-- line arriving on its own, at whatever second this client happened to report, was the thing that moment
+-- replaced. What the report still does is answer the pull and refresh the stored bindings, which is why
+-- the once-per-connection flag went with the line: nothing read it any more.
 --
--- The flag is set BEFORE the send, so a send that throws part way still leaves this a one-shot. It is
--- cleared only on disconnect, so a Lua reload or a level change refreshes the stored bindings (they may
--- have changed) without hinting again, while a rejoin is hinted anew.
---
--- ADR-0061 changed only WHAT is written here -- one line pointing at /keys instead of the key lines
--- themselves. Trigger, the absence of a grace and the once-per-connection rule are deliberately
--- untouched.
+-- The stored report has one reader left besides /keys: keys.lines, for the admin's Send-keys button. A
+-- Lua reload or a level change makes the client report again with possibly different bindings, and
+-- overwriting the stored answer every time is exactly right for that reader.
 function keys.handle_report(player_id, payload)
     -- The client answered the connect-report pull, even if what it sent is unusable (ADR-0058): re-asking
     -- would only fetch the same unusable thing again.
@@ -7566,12 +7556,7 @@ function keys.handle_report(player_id, payload)
         return
     end
     keys.reported[player_id] = entries
-    if keys.hinted[player_id] then
-        return
-    end
-    keys.hinted[player_id] = true
-    MP.SendChatMessage(player_id, keys.HINT)
-    log_info("beamcomp.keys", "hinted id=" .. tostring(player_id))
+    log_info("beamcomp.keys", "stored the key report from id=" .. tostring(player_id))
 end
 
 -- /keys: open the asking player's own controls window (ADR-0061). Open to EVERY player -- it reaches only
@@ -8030,11 +8015,9 @@ local function on_player_disconnect(player_id)
     -- slot next -- and a stale counter would have a fresh joiner start out half-locked-out.
     access.granted[player_id] = nil
     access.attempts[player_id] = nil
-    -- Drop the reported assist-key bindings and the one-shot hint flag with them (ADR-0058). Same reason
-    -- as the grant right above: BeamMP reuses player ids, so a report left behind would be read out to
-    -- whoever takes the slot next -- and a flag left behind would swallow that player's own hint.
+    -- Drop the reported assist-key bindings (ADR-0058). Same reason as the grant right above: BeamMP
+    -- reuses player ids, so a report left behind would be read out to whoever takes the slot next.
     keys.reported[player_id] = nil
-    keys.hinted[player_id] = nil
     -- Unconditional: the panel lists EVERY connected player, so any leave changes it -- including a
     -- leaver who had a set name. The id is passed because onPlayerDisconnect may or may not still list
     -- him (see is_server_empty_without); without it he could linger in the admin's list.
