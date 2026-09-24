@@ -1,0 +1,20 @@
+{
+  "domElement": "<beam-comp-controls></beam-comp-controls>",
+  "directive": "beamCompControls",
+  "name": "BeamComp Controls",
+  "description": "BeamComp assist keys -- where repair and recover are bound on each of your devices, and a click to change them. Opened with /keys.",
+  "author": "Rene Knap",
+  "version": "0.9.0",
+  "category": "Gameplay",
+  "types": [
+    "ui.apps.categories.racing"
+  ],
+  "css": {
+    "top": "90px",
+    "right": "50px",
+    "width": "360px",
+    "height": "250px",
+    "min-width": "260px",
+    "min-height": "160px"
+  }
+}
