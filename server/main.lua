@@ -877,8 +877,11 @@ end
 --   * `player_id` is a plain second argument and Lua does not enforce it -- which FAILS CLOSED. A call
 --     site that forgets it can never see a grant, so the worst a missed site can do is refuse an
 --     unlocked admin; it can never admit a stranger. That is the safe direction for an omitted argument.
---   * This stays the SINGLE chokepoint. All 14 call sites call exactly this function; there is no
+--   * This stays the SINGLE chokepoint. All 16 call sites call exactly this function; there is no
 --     second predicate anywhere in the plugin, and adding one is how a refusal path silently goes open.
+--     Fifteen of them are gates. The sixteenth, identity.join_block, is a READING: it refuses nothing,
+--     it only picks which of three /raceui wordings a joiner reads -- but it asks the same question, so
+--     it asks it here.
 --
 -- The name check reads the RAW BeamMP name at every site (ADR-0054): a name the player can set with
 -- /name must never be an authorization key. A player_id is not settable by the player, so keying the
