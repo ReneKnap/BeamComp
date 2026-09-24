@@ -43,8 +43,9 @@ below rather than hidden.
 - Admin access by password or by BeamMP name -- see `beamcomp.config.ini`.
 - Players pick the name everyone sees with `/name`.
 - Recover and repair as a held key during the race, on by default and switchable per race.
-- Every player is told in chat, on joining, which keys his own game has those two on -- `/keys`
-  repeats it, and the setup panel can send it to everyone.
+- On joining, every player is pointed at `/keys`: a window showing which keys his own game has those
+  two on, for every connected device, where he can also rebind or remove them. The setup panel can
+  still send the key lines to everyone in chat.
 
 ### Known issues
 
