@@ -506,16 +506,11 @@ keys.ASSISTS = {
     },
 }
 
--- The answer to /keys when this connection has reported nothing usable. The JOIN hint stays silent in
--- that case -- an unasked-for "I know nothing about you" is noise -- but a player who typed the command
--- asked, and silence would read as a broken command.
+-- The answer to /keys when this connection has reported nothing usable. The join block names /keys to
+-- everyone, reported keys or not (user decision 2026-09-24), so this is what that player meets when he
+-- takes it up -- an honest answer, where a command that did nothing at all would read as a broken one.
 keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
 
--- The one-line pointer at /keys (ADR-0061). It is no longer sent anywhere: the join block below names
--- /keys itself, in a player's one moment of reading commands, so the connect report writes no chat line
--- any more (user request 2026-09-24). Kept as the wording a single-line pointer would use.
-keys.HINT = "BeamComp: type \"" .. keys.CHAT_COMMAND
-    .. "\" to see and change your repair and recover keys"
 
 -- THE JOIN BLOCK (user request 2026-09-24): the three commands a joiner needs, in one block, at one
 -- moment -- the moment identity's grace expires. It replaces the two separate join lines this plugin used
