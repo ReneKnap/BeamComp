@@ -41,6 +41,22 @@ angular.module('beamng.apps')
   // where it never comes, so the line still says something instead of never being written.
   var ROUTE_ANSWER_TIMEOUT = 2000;
 
+  // How long a capture may hold the player's controls hostage (ms). THE BACKSTOP, not the normal exit:
+  // the normal exit is pressing a key (the capture ends itself) or right-clicking (see CANCEL_CONTROL).
+  // This is what saves a player who armed a capture and then looked away -- BeamNG's own capture has no
+  // limit at all, because it runs in a modal popup in a paused menu; ours runs over a moving car.
+  // Long enough to reach for a wheel button, short enough not to strand anyone.
+  var CAPTURE_TIMEOUT = 8000;
+
+  // The cancel input: the RIGHT mouse button, and it is the only choice that costs nothing.
+  // captureBinding blacklists exactly one input -- `mouse*` + `button1` (ui-vue/src/services/
+  // controls.js:485) -- so it can never be recorded as a binding, which means using it to cancel takes
+  // no key away from the player. Every other candidate (ESC and friends) IS capturable, so reserving it
+  // would make that key unbindable through this window; a Cancel BUTTON is worse still, because the left
+  // click that presses it is itself a capturable control.
+  var CANCEL_DEVICE = 'mouse';
+  var CANCEL_CONTROL = 'button1';
+
   // THE TWO ASSISTS, AND THE ONE PLACE THE CROSSING LIVES IN THIS APP.
   //
   // BeamComp's REPAIR sits on the game's plain `recover_vehicle`, BeamComp's RECOVER on
@@ -106,9 +122,35 @@ angular.module('beamng.apps')
     if (!$injector.has('bindingDirective')) {
       return "angular has no 'binding' directive";
     }
-    var controls = window.bngVue && window.bngVue.controls;
-    if (!controls || typeof controls.makeViewerObj !== 'function') {
+    if (!controlsStore() || typeof controlsStore().makeViewerObj !== 'function') {
       return 'window.bngVue.controls.makeViewerObj is missing';
+    }
+    return null;
+  }
+
+  // The game's own controls store, which it puts on `window` itself (ui-vue/src/main.js:209 ->
+  // exposeControlsStore at :244). Read at call time, never cached: the Vue app assigns it during its own
+  // startup, and a reference taken too early would be a permanent nil.
+  function controlsStore() {
+    return (window.bngVue && window.bngVue.controls) || null;
+  }
+
+  // PROBE 3 -- may we rebind here, or only show? Returns null when yes, else the reason.
+  //
+  // The four calls we need are all on the exposed store and all measured (ui-vue/src/main.js:244). They
+  // are an UNDOCUMENTED surface the game exposes for its own UI, so every one of them is checked rather
+  // than assumed -- when one disappears, this window degrades to what round 2 shipped (the chips open
+  // the settings) instead of throwing on a click.
+  function rebindUnusable() {
+    var controls = controlsStore();
+    if (!controls) {
+      return 'window.bngVue.controls is missing';
+    }
+    var needed = ['captureBinding', 'addNewBinding', 'updateBinding', 'deleteBinding'];
+    for (var i = 0; i < needed.length; i++) {
+      if (typeof controls[needed[i]] !== 'function') {
+        return 'window.bngVue.controls.' + needed[i] + ' is missing';
+      }
     }
     return null;
   }
@@ -225,6 +267,69 @@ angular.module('beamng.apps')
     return rows;
   }
 
+  // Which OTHER actions the captured control already runs, from the same payload the window draws from.
+  // Read locally rather than through the store because it is the identical data (the store fills from
+  // this broadcast) and because a window that shows a key must be able to say what else it does without
+  // a second source that could disagree.
+  //
+  // Reported, never resolved: taking somebody's other binding away because it was in the way is exactly
+  // the kind of silent damage this window must not do.
+  function conflictsFor(data, devname, control, action) {
+    var devices = (data && data.bindings) || [];
+    var out = [];
+    for (var d = 0; d < devices.length; d++) {
+      var device = devices[d] || {};
+      if (device.devname !== devname) { continue; }
+      var list = (device.contents || {}).bindings || [];
+      for (var b = 0; b < list.length; b++) {
+        var bind = list[b] || {};
+        if (bind.control !== control || bind.action === action) { continue; }
+        if (bind.unused === true) { continue; }
+        out.push(actionLabel(data, bind.action));
+      }
+    }
+    return out;
+  }
+
+  // A readable name for an action. The payload carries a TRANSLATION KEY in actions[name].title, so the
+  // translate filter is asked for the text -- through $injector, like everything else that might not be
+  // there. A filter that is missing, or a key it does not know (it returns the key itself), falls back
+  // to the raw action name: unlovely, but never a lie about which action is meant.
+  function actionLabel(data, action) {
+    var meta = (data && data.actions && data.actions[action]) || null;
+    var key = meta && meta.title;
+    if (typeof key === 'string' && key !== '' && $injector.has('translateFilter')) {
+      try {
+        var text = $injector.get('translateFilter')(key);
+        if (typeof text === 'string' && text !== '' && text !== key) {
+          return text;
+        }
+      } catch (e) {
+        // fall through to the raw name
+      }
+    }
+    return action;
+  }
+
+  // The entry to write, built from the payload's own bindingTemplate (core/input/bindings.lua:703 puts
+  // it in every InputBindingsChanged), exactly as addNewBinding does with its copy
+  // (ui-vue/src/services/controls.js:664). A template-shaped entry rather than the old one carried over:
+  // updateBinding REPLACES the entry wholesale, and the stored one carries engine-computed fields
+  // (`unused`, `active`, `player`) that have no business being written back to disk.
+  function bindingEntry(data, devname, control, action) {
+    var entry = {};
+    var template = (data && data.bindingTemplate) || {};
+    for (var k in template) {
+      if (Object.prototype.hasOwnProperty.call(template, k)) {
+        entry[k] = template[k];
+      }
+    }
+    entry.devname = devname;
+    entry.control = control;
+    entry.action = action;
+    return entry;
+  }
+
   return {
     templateUrl: '/ui/modules/apps/BeamCompControls/app.html',
     replace: true,
@@ -239,8 +344,16 @@ angular.module('beamng.apps')
       // player still has to move the mouse onto a chip.
       var rung = legacyRung();
       var settled = false;
+      var noRebind = rebindUnusable();
+      var payload = null;       // the last InputBindingsChanged, kept for the template and conflicts
+      var capture = null;       // {gen, row, control} while a capture holds the player's input
+      var captureGen = 0;       // every started capture takes the next number; see endCapture
+      var captureWait = null;   // the CAPTURE_TIMEOUT handle
       scope.useDirective = !unusable;
       scope.canEdit = !!rung;
+      scope.canBind = !noRebind;
+      scope.prompt = null;      // the "press a key" line while a capture runs
+      scope.status = null;      // the one-line outcome of the last action
       // Deliberately null, not the two empty rows: an early '[N/A]' would tell a correctly bound player
       // that he has no key bound, and a wrong 'you have none' is exactly as bad as a wrong key.
       scope.rows = null;
@@ -256,8 +369,9 @@ angular.module('beamng.apps')
         settled = true;
         scope.canEdit = !!rung;
         geNote('bindings drawn by ' + (unusable ? ('the built-in fallback (' + unusable + ')')
-          : "the game's own directive") + '; clicks open '
-          + (rung ? rung.source : 'nothing (no route in this build)') + note);
+          : "the game's own directive")
+          + '; rebinding ' + (noRebind ? ('unavailable (' + noRebind + ')') : 'in the window')
+          + '; settings open ' + (rung ? rung.source : 'nothing (no route in this build)') + note);
       }
 
       // GE's answer about the new options UI (see the header): a name upgrades the rung, an empty string
@@ -277,35 +391,231 @@ angular.module('beamng.apps')
       var answerWait = $timeout(function () {
         settle(' (asked GE for the new options route, no answer)');
       }, ROUTE_ANSWER_TIMEOUT);
+      // The app can go away under a running capture -- a UI reload during the spawn churn, the HUD-apps
+      // layer unmounting on a menu route, the window being removed from the layout. Nobody would be left
+      // to end it, so end it here. endCapture bumps the generation first, so the promise this leaves
+      // behind resolves into nothing, and it asks GE for the release, which is the side that outlives us.
       scope.$on('$destroy', function () {
         $timeout.cancel(answerWait);
+        if (capture) {
+          endCapture(null);
+        }
       });
 
-      // Close from the window's own X. GE owns the toggle state, so the X and a second /keys agree.
+      // Close from the window's own X. GE owns the toggle state, so the X and a second /keys agree --
+      // and GE's close_controls also releases a capture this window may still be holding.
       scope.close = function () {
         geLua('if beamcomp_init then beamcomp_init.close_controls() end');
       };
 
-      // Open the controls settings for this row. `control` is the chip that was clicked, or null for the
-      // unassigned chip. What reaches the rung differs by rung and that is deliberate: the new UI has no
-      // deep link onto one binding and gets neither, while the legacy dialog lands on the action and
-      // gets both -- an EMPTY oldBinding for the unassigned chip, which is the shape the options UI
-      // itself uses to ADD a binding (ControlsEditCtrl reads $stateParams.oldBinding.sel || {} and only
-      // fills device + control when both are set, options.js:2229). Always allowed, race or not.
+      // ----- the capture cycle ---------------------------------------------------------------------
+      // END A CAPTURE, from wherever. This is the single exit, and everything about the safety promise
+      // hangs on two lines of it: `capture = null` before anything else, and the generation number.
+      //
+      // captureBinding's promise CANNOT be cancelled -- the game keeps no handle to it, and the promise
+      // never rejects (ui-vue/src/services/controls.js:393). An aborted capture therefore stays pending
+      // and will resolve later, whenever some input happens to satisfy it. Nulling `capture` and bumping
+      // the generation is what makes that late resolution land on a closed door: onCaptured compares the
+      // number it was started with against the current one and returns. A flag alone would not do -- a
+      // second capture started in between would clear it and the stale promise would write into the new
+      // one's row.
+      //
+      // The three input switches are restored through GE, not from here, because GE is also the side
+      // that can do it when this app is gone (close_controls, onExtensionUnloaded). One seam, every case.
+      function endCapture(status) {
+        capture = null;
+        captureGen++;
+        scope.prompt = null;
+        if (captureWait) {
+          $timeout.cancel(captureWait);
+          captureWait = null;
+        }
+        scope.status = status || null;
+        geLua('if beamcomp_init then beamcomp_init.release_input_capture() end');
+      }
+
+      // START a capture for `row`. `control` is the chip being changed, or null when adding one.
+      function beginCapture(row, control) {
+        var controls = controlsStore();
+        if (!controls || capture) {
+          return;
+        }
+        captureGen++;
+        var gen = captureGen;
+        capture = {gen: gen, row: row, control: control};
+        scope.status = null;
+        scope.prompt = control
+          ? 'Press a new key for ' + row.label + '. Right-click to cancel.'
+          : 'Press a key for ' + row.label + '. Right-click to cancel.';
+
+        // Tell GE the switches are about to go on, BEFORE they do: if anything below throws, the release
+        // path is already armed and the player still gets his controls back.
+        geLua('if beamcomp_init then beamcomp_init.arm_input_capture() end');
+
+        // The backstop. Not the normal way out -- see CAPTURE_TIMEOUT.
+        captureWait = $timeout(function () {
+          if (capture && capture.gen === gen) {
+            endCapture('Timed out.');
+          }
+        }, CAPTURE_TIMEOUT);
+
+        try {
+          controls.captureBinding(true).then(function (result) {
+            scope.$evalAsync(function () { onCaptured(gen, result); });
+          }, function () {
+            scope.$evalAsync(function () {
+              if (capture && capture.gen === gen) { endCapture(null); }
+            });
+          });
+        } catch (e) {
+          endCapture('Could not start.');
+          geNote('captureBinding threw: ' + e);
+        }
+      }
+
+      // A capture resolved. `gen` is the number it was started with.
+      function onCaptured(gen, result) {
+        // THE GUARD. A capture that was cancelled, timed out, or belongs to a window that has since been
+        // torn down resolves here too, late, with a perfectly valid key -- and must write nothing.
+        if (!capture || capture.gen !== gen) {
+          return;
+        }
+        var row = capture.row;
+        var old = capture.control;
+        var devname = result && result.devName;
+        var control = result && result.control;
+
+        // An axis is a real capture but not a usable one: both assists are hold-a-button actions, and a
+        // binding written as an axis would simply never fire.
+        if (result && result.controlType === 'axis') {
+          endCapture('An axis cannot be used here.');
+          return;
+        }
+        if (typeof devname !== 'string' || typeof control !== 'string' || control === '') {
+          endCapture('Nothing was captured.');
+          return;
+        }
+
+        var clash = conflictsFor(payload, devname, control, row.action);
+        var entry = bindingEntry(payload, devname, control, row.action);
+        try {
+          if (old) {
+            entry.oldDevname = old.device;
+            entry.oldControl = old.key;
+            controlsStore().updateBinding(entry);
+          } else {
+            controlsStore().addNewBinding(entry);
+          }
+        } catch (e) {
+          endCapture('Could not save.');
+          geNote('writing ' + row.action + ' = ' + devname + '/' + control + ' threw: ' + e);
+          return;
+        }
+        // Reported, not resolved -- the other binding stays exactly where it was.
+        endCapture(clash.length ? ('Also bound to ' + clash.join(', ') + '.') : null);
+        refreshBindings();
+      }
+
+      // Right mouse button = cancel (see CANCEL_CONTROL). Heard on the Angular side because the engine
+      // broadcasts RawInputChanged to both realms -- BeamNG's own old options UI listens to exactly this
+      // ($rootScope.$on('RawInputChanged'), options.js:1884).
+      //
+      // This is the FAST exit, never the guaranteed one: if the event stopped reaching Angular the
+      // timeout above still frees the player. Nothing here depends on it arriving.
+      scope.$on('RawInputChanged', function (event, data) {
+        if (!capture || !data) {
+          return;
+        }
+        if (String(data.devName || '').indexOf(CANCEL_DEVICE) !== 0 || data.control !== CANCEL_CONTROL) {
+          return;
+        }
+        scope.$evalAsync(function () {
+          if (capture) { endCapture(null); }
+        });
+      });
+
+      // Clicking a chip: rebind it when we can, otherwise do what round 2 did and open the settings.
       scope.edit = function (row, control) {
-        if (!rung) {
+        if (capture) {
+          return;
+        }
+        if (scope.canBind) {
+          beginCapture(row, control);
+          return;
+        }
+        scope.openSettings(row, control);
+      };
+
+      // The [N/A] chip and the per-row '+': the same capture, written as a new binding.
+      scope.add = function (row) {
+        if (capture) {
+          return;
+        }
+        if (scope.canBind) {
+          beginCapture(row, null);
+          return;
+        }
+        scope.openSettings(row, null);
+      };
+
+      // The small x on a chip. No confirmation dialog: the row shows the result immediately and the same
+      // row can put it straight back, which is a cheaper undo than a prompt nobody reads.
+      scope.remove = function (row, control, $event) {
+        if ($event && $event.stopPropagation) {
+          $event.stopPropagation();   // the x sits inside the chip, which would start a capture
+        }
+        if (capture || !scope.canBind) {
           return;
         }
         try {
-          rung.go(scope, row, control);
+          controlsStore().deleteBinding({
+            devname: control.device,
+            control: control.key,
+            action: row.action
+          });
+        } catch (e) {
+          scope.status = 'Could not remove.';
+          geNote('deleting ' + row.action + ' = ' + control.device + '/' + control.key + ' threw: ' + e);
+          return;
+        }
+        scope.status = null;
+        refreshBindings();
+      };
+
+      // Open the controls settings for this row -- the four-rung chain from round 2, unchanged. Its
+      // trigger moved to the footer button; it is still what a chip click does when rebinding is not
+      // available on this build. `control` is the chip that was clicked, or null. What reaches the rung
+      // differs by rung and that is deliberate: the new UI has no deep link onto one binding and gets
+      // neither, while the legacy dialog lands on the action and gets both -- an EMPTY oldBinding for
+      // the unassigned chip, which is the shape the options UI itself uses to ADD a binding
+      // (ControlsEditCtrl reads $stateParams.oldBinding.sel || {}, options.js:2229).
+      scope.openSettings = function (row, control) {
+        if (capture || !rung) {
+          return;
+        }
+        try {
+          // The footer button passes no row. The new-UI rung ignores both arguments anyway (it opens
+          // the controls page, not an action); the legacy rung needs one, and the first assist is as
+          // good a landing as any -- both are on the same page there.
+          rung.go(scope, row || {action: ASSISTS[0].action}, control || null);
         } catch (e) {
           // A throw is the loud failure and is fine to report; the silent one is what the probes cover.
           geNote('opening ' + rung.source + ' threw: ' + e);
         }
       };
 
+      // Ask the engine to re-broadcast the bindings after a write. saveBindingsToDisk is the game's own
+      // save path, but nothing promises it notifies the UI, and a window showing the key the player just
+      // replaced would be the one wrong thing this window must never show.
+      function refreshBindings() {
+        geLua('extensions.core_input_bindings.notifyUI("beamcomp controls window")');
+      }
+
       scope.$on('InputBindingsChanged', function (event, data) {
         scope.$evalAsync(function () {
+          // Kept whole: the rows are drawn from it, and a write needs its bindingTemplate and its
+          // actions table (the conflict line). One source, so the two can never disagree.
+          payload = data || null;
           scope.rows = buildRows(data);
         });
       });

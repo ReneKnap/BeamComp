@@ -17,7 +17,8 @@
     .bc-ctl-body { flex: 1 1 auto; overflow-y: auto; padding: 6px 8px; }
     .bc-ctl-wait { color: #9aa3ad; font-size: 12px; }
     .bc-ctl-hint { color: #9aa3ad; font-size: 11px; margin-top: 8px;
-      border-top: 1px solid rgba(255,255,255,0.12); padding-top: 5px; }
+      border-top: 1px solid rgba(255,255,255,0.12); padding-top: 5px;
+      display: flex; align-items: center; gap: 8px; }
     .bc-ctl-row { display: flex; align-items: flex-start; gap: 8px; margin: 5px 0; }
     /* Capped, not proportional -- same reasoning as the setup panel's label column: every pixel a
        wider window adds should land on the key chips, not on two captions that never needed it. */
@@ -41,6 +42,20 @@
     .bc-ctl-dev { color: #9aa3ad; font-size: 11px; margin-right: 4px; }
     .bc-ctl-key { font-family: 'Noto Sans Mono', monospace; }
     .bc-ctl-na { font-weight: 700; }
+    /* The remove x and the add +: same chip box, so a row reads as one set of controls. */
+    .bc-ctl-del { margin-left: 5px; color: #9aa3ad; font-size: 10px; line-height: 1; }
+    .bc-ctl-del:hover { color: #ff8a80; }
+    .bc-ctl-add { font-weight: 700; color: #8fd3ff; padding: 1px 8px; }
+    /* The capture prompt is the loudest thing in the window on purpose: while it is up, nothing the
+       player presses does what it normally does. */
+    .bc-ctl-prompt { margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 5px;
+      color: #ffd54f; font-size: 12px; }
+    .bc-ctl-status { margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 5px;
+      color: #8fd3ff; font-size: 11px; }
+    .bc-ctl-settings { margin-left: auto; background: #2a2e35; color: #f0f0f0;
+      border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 1px 7px;
+      font-size: 11px; cursor: pointer; white-space: nowrap; }
+    .bc-ctl-settings:hover { background: #3a4049; }
   </style>
 
   <div class="bc-ctl-bar">
@@ -62,29 +77,44 @@
         <!-- One chip per device carrying this action. `device` and `key` are EXPRESSIONS: the game's
              binding directive binds them with '=' and only `action`/`showunassigned` with '@'
              (ui/modules/options/options.js:912-920). Quoting them as strings renders nothing, silently. -->
-        <span class="bc-ctl-chip" ng-class="{'bc-ctl-hot': canEdit}"
+        <span class="bc-ctl-chip" ng-class="{'bc-ctl-hot': canEdit || canBind}"
               ng-repeat="c in row.controls track by $index"
               ng-click="edit(row, c)">
           <binding ng-if="useDirective" device="c.device" key="c.key"></binding>
           <span ng-if="!useDirective"><span class="bc-ctl-dev">{{c.device}}</span><span
             class="bc-ctl-key">{{c.label}}</span></span>
+          <!-- Remove. stopPropagation lives in the handler, not here: the x sits INSIDE the chip, and
+               without it the click would start a capture on the binding it just deleted. -->
+          <span class="bc-ctl-del" ng-if="canBind" ng-click="remove(row, c, $event)">&#10005;</span>
         </span>
-        <!-- Unassigned: the directive's own [N/A], and the click leads into the same dialog without an
-             oldBinding -- the route the options UI itself takes when adding a binding
-             (controls-bindings.html:44 -> options.js:2189). -->
-        <span class="bc-ctl-chip bc-ctl-na" ng-class="{'bc-ctl-hot': canEdit}"
+        <!-- Unassigned: the directive's own [N/A]. With rebinding it starts a capture, without it it
+             falls back to the settings without an oldBinding -- the route the options UI itself takes
+             when adding a binding (controls-bindings.html:44 -> options.js:2189). -->
+        <span class="bc-ctl-chip bc-ctl-na" ng-class="{'bc-ctl-hot': canEdit || canBind}"
               ng-if="row.controls.length === 0"
-              ng-click="edit(row, null)">
+              ng-click="add(row)">
           <binding ng-if="useDirective" showunassigned="true"></binding>
           <span ng-if="!useDirective">[N/A]</span>
         </span>
+        <!-- Add another device's key to the same action. Only where a capture can actually run. -->
+        <span class="bc-ctl-chip bc-ctl-add bc-ctl-hot"
+              ng-if="canBind && row.controls.length > 0"
+              ng-click="add(row)">+</span>
       </span>
     </div>
 
-    <!-- Says where a click LANDS, not what it lands on. The new options UI has no deep link onto a
-         single binding, so the player arrives at the controls page and finds the row himself; a text
-         promising his key would be a promise the window cannot keep. Only shown when a click leads
-         anywhere at all. -->
-    <div class="bc-ctl-hint" ng-if="canEdit">Click a key to open BeamNG's controls settings.</div>
+    <!-- While a capture runs the player's controls are dead, so this line is the only thing on screen
+         telling him what to do and how to get out. It replaces the footer rather than joining it: two
+         competing instructions at the moment nothing responds is worse than one. -->
+    <div class="bc-ctl-prompt" ng-if="prompt">{{prompt}}</div>
+
+    <!-- The outcome of the last action, one line, cleared by the next one. -->
+    <div class="bc-ctl-status" ng-if="status && !prompt">{{status}}</div>
+
+    <div class="bc-ctl-hint" ng-if="!prompt && (canBind || canEdit)">
+      <span ng-if="canBind">Click a key to change it, + to add one.</span>
+      <span ng-if="!canBind">Click a key to open BeamNG's controls settings.</span>
+      <button class="bc-ctl-settings" ng-if="canEdit" ng-click="openSettings(null, null)">Game settings</button>
+    </div>
   </div>
 </div>

@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "controls-window-r2/2026-09-24"
+local BUILD_MARKER = "controls-rebind-r3/2026-09-24"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -346,6 +346,7 @@ M.state = {
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
     setup_restored = false,   -- one-shot latch: the lost panel has been re-added once for this open, then the watchdog goes quiet (so BeamNG's own app-container X stays usable)
     controls_open = false,    -- the controls window (/keys, ADR-0061) is on the layout: set by M.toggle_controls, cleared by M.close_controls (the window's own X and the toggle's close half). Local-only and not admin-gated -- it shows this player his own key bindings and nothing else. Deliberately NOT reload-proof (ADR-0052): a GE Lua reload rebuilds it as false while the window is still on screen, so the next /keys re-adds it (ensure_visible dedups, nothing visible happens) and the one after closes it -- one wasted command against no new serialization contract. Nothing else in the mod reads it, so a stale true can only cost that one command
+    input_capture = false,    -- the controls window armed BeamNG's input capture and the three global switches (ActionMap.enableBindingCapturing, Input.setForwardRawEvents, setCEFTyping) are presumed on, i.e. the player's controls are dead until something turns them off. Set by M.arm_input_capture, checked and cleared inside M.release_input_capture -- one chokepoint, so no caller can forget the check. Does not survive a GE Lua reload (ADR-0052), which is harmless in the only direction that matters: onExtensionUnloaded runs BEFORE the state is rebuilt and releases there
     server_defaults = nil,    -- the defaults the SERVER owns, as it sent them on setupOpen ({jumpPenalty = 15}, ADR-0043), or nil. Relayed verbatim to the setup panel with EVERY push_setup_data -- not just the opening one -- because the panel also pulls its dataset itself on link (request_setup_data), and a value hanging off setupOpen alone would be gone after a UI reload. GE reads no key of it: the next server-owned default is a key on the server plus a placeholder in the markup. Safe at nil across a GE reload (ADR-0052): it mirrors a server constant and needs no previous value of its own, and nil means "not heard yet", which the panel shows as the neutral "default" rather than a number nothing stands behind. Cleared by setup.clear, which onClientEndMission runs when the player leaves the session -- so one server's numbers can never be shown as the next server's
     own_player_id = nil,      -- the id this connection has on the server, as it named it on setupOpen (yourPlayerId), or nil. Lets the setup panel mark this player's own row in its player list -- the list is a broadcast and cannot say who the reader is. Nil after a GE Lua reload like every other M.state field (ADR-0052), which is why identity.own_id falls back to BeamMP's own copy of the same id -- MPConfig DOES survive a reload. Cleared by setup.clear on leaving the session, so the next server's list is never matched against the previous server's id
     setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
@@ -4166,6 +4167,9 @@ end
 -- ADR-0012), and the toggle's close half.
 function M.close_controls()
     M.state.controls_open = false
+    -- A window closed mid-capture would otherwise leave the player with dead controls: the app is gone,
+    -- so nothing on that side can undo it any more (see release_input_capture). No-op when not armed.
+    M.release_input_capture()
     M.uilayout.remove("beamCompControls")
     log("I", "beamcomp.ui", "controls window hidden")
 end
@@ -4179,6 +4183,58 @@ end
 -- here instead of in the app: an app that could pass its own log tag could pass anything.
 function M.note_controls(msg)
     log("I", "beamcomp.ui", "controls window: " .. tostring(msg))
+end
+
+-- ----- the input capture's safety exit (round 3, 2026-09-24) ---------------------------------------
+-- THE ONE PROMISE THIS FEATURE HAS TO KEEP.
+--
+-- Rebinding a key means asking the engine to capture the next input. `window.bngVue.controls
+-- .captureBinding` does that by switching THREE things on globally: ActionMap.enableBindingCapturing
+-- (so a keypress no longer runs its action -- otherwise ESC would close the menu mid-capture),
+-- Input.setForwardRawEvents and setCEFTyping. While they are on, the player's controls are DEAD, and in
+-- BeamComp that can be a rolling car mid-race.
+--
+-- The engine turns them off again in exactly one place: the capture's own stopListening(), which runs
+-- ONLY when a valid input arrives (ui-vue/src/services/controls.js:498-511). The handle to call it
+-- early -- `_captureHelper` -- is module-local and NOT on the exposed store (ui-vue/src/main.js:244).
+-- There is no cancel. So the way out has to be ours, and it has to hold for every way a capture can end
+-- badly: the player cancels, he closes the window, the app is torn down, GE reloads its Lua.
+--
+-- The levers are the same three calls, and they are reachable from Lua -- BeamNG's own (old) options UI
+-- restores them exactly like this on $destroy (ui/modules/options/options.js:2359). Doing it HERE rather
+-- than in the app is what covers the last two cases: an app that is gone cannot run its own cleanup,
+-- and a GE Lua reload runs onExtensionUnloaded, which can.
+--
+-- The armed flag is what keeps this from being a blunt instrument: a release that fires when we never
+-- armed would switch off a capture somebody else started. It is checked and cleared HERE, not at the
+-- call sites -- one chokepoint is a property, a list of callers that remember to check is a claim.
+-- M.state.input_capture not surviving a GE Lua reload (ADR-0052) is harmless in the only direction that
+-- matters: onExtensionUnloaded runs BEFORE the state is rebuilt, so the release still sees the flag.
+
+-- The app is about to call captureBinding. From here on the three switches are presumed on.
+function M.arm_input_capture()
+    M.state.input_capture = true
+    log("I", "beamcomp.ui", "controls window: input capture armed")
+end
+
+-- Give the player his controls back. A no-op unless we armed, so it can be called from anywhere that
+-- might be the end of a capture without having to know whether one is running.
+--
+-- Each call is on its own pcall: these are engine globals, and one missing on some build must not cost
+-- the other two -- being left with raw-event forwarding on is survivable, being left with every input
+-- swallowed is not.
+function M.release_input_capture()
+    if not M.state.input_capture then
+        return false
+    end
+    M.state.input_capture = false
+    local ok_actions = pcall(function() ActionMap.enableBindingCapturing(false) end)
+    local ok_raw = pcall(function() Input.setForwardRawEvents(false) end)
+    local ok_typing = pcall(function() setCEFTyping(false) end)
+    log("I", "beamcomp.ui", string.format(
+        "controls window: input capture released (bindingCapturing=%s rawEvents=%s cefTyping=%s)",
+        tostring(ok_actions), tostring(ok_raw), tostring(ok_typing)))
+    return true
 end
 
 -- ----- the jump into the key bindings (round 2, 2026-09-24) ---------------------------------------
@@ -7666,6 +7722,10 @@ function M.onExtensionUnloaded()
         RemoveEventHandler(EVENT_CHANNEL, "beamcomp")
     end
     M.state.registered = false
+    -- A GE Lua reload mid-capture takes the controls window's app down with the UI, so nothing over
+    -- there can restore the three input switches any more. This runs BEFORE M.state is rebuilt, so the
+    -- armed flag is still readable (ADR-0052). No-op when no capture is armed.
+    M.release_input_capture()
     grideditor.clear()
     -- Despawn any grid-edit reference props too (their lifecycle is separate from the race props that
     -- teardown_race_world clears), so a reload mid-edit leaves no orphaned scenery.
