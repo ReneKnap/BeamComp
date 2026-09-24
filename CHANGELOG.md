@@ -43,9 +43,12 @@ below rather than hidden.
 - Admin access by password or by BeamMP name -- see `beamcomp.config.ini`.
 - Players pick the name everyone sees with `/name`.
 - Recover and repair as a held key during the race, on by default and switchable per race.
-- On joining, every player is pointed at `/keys`: a window showing which keys his own game has those
-  two on, for every connected device, where he can also rebind or remove them. The setup panel can
-  still send the key lines to everyone in chat.
+- On joining, every player gets one message naming the three commands he needs -- `/raceui`, `/name`
+  and `/keys`. The `/raceui` line says how to get in where a password is set, and is left out where he
+  could not get in at all.
+- `/keys` opens a window showing which keys his own game has those two on, for every connected device,
+  where he can also rebind or remove them. The setup panel can still send the key lines to everyone in
+  chat.
 
 ### Known issues
 

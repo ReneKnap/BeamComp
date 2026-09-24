@@ -55,9 +55,13 @@ That is the name everyone sees in the standings and the results. Without it you 
 BeamMP name -- and while BeamMP login is broken, that is a guest number that changes every time you
 start the game, so nobody will recognise you twice. Two to twenty characters, spaces allowed.
 
-When you join, BeamComp points you at `/keys`. It opens a window showing which keys your game has for
-repairing your car and for getting back to the last checkpoint -- hold one while standing still -- on
-every device you have connected. Click a key there to bind a different one, or remove it.
+When you join, BeamComp writes you one message naming the three commands worth knowing: `/raceui`,
+`/name` and `/keys`. On a server that asks for a password, that first line also says so; on one where
+the panel is not yours to open, it is left out.
+
+`/keys` opens a window showing which keys your game has for repairing your car and for getting back to
+the last checkpoint -- hold one while standing still -- on every device you have connected. Click a key
+there to bind a different one, or remove it.
 
 During a race, `/dnf` gives up and `/results` hides or shows your own results card.
 
