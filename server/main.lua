@@ -8543,6 +8543,11 @@ local function handle_grid_save(player_id, payload)
         MP.SendChatMessage(player_id, message)
         log_info("beamcomp.grid", string.format("saved grid '%s' for race '%s' on map '%s' (%s) by %s",
             payload.name, payload.race, payload.map, tostring(path), player_name))
+        -- Echo the updated list so the grid it was just saved in appears in both panels without a reopen
+        -- (ADR-0023 amendment 2026-09-25) -- they are open at the same time in the normal flow. On the
+        -- SUCCESS path only: send_grid_list reads the in-memory store, and save_grid updates that before
+        -- the file, so echoing after a failed write would state a list the file has not got.
+        grid_store.send_grid_list(player_id, payload.map)
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
@@ -8577,6 +8582,9 @@ local function handle_grid_assign(player_id, payload)
             payload.name, payload.race))
         log_info("beamcomp.grid", string.format("assigned grid '%s' as default for race '%s' on map '%s' by %s",
             payload.name, payload.race, payload.map, player_name))
+        -- Echo the updated list so the (default) marker moves in both panels, not just after a reopen
+        -- (ADR-0023 amendment 2026-09-25). Success path only, for the same reason as the save above.
+        grid_store.send_grid_list(player_id, payload.map)
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
