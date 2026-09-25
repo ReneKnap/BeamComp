@@ -155,7 +155,10 @@ angular.module('beamng.apps')
     reverse: 'Drive the route backwards. A track without its own reverse route refuses this, Force starts it '
       + 'anyway.',
     // --- Vehicles ---
-    carModel: 'The car everyone drives. "keep own" leaves each player in the car they are already in.',
+    // "same as host" is read from the car YOU are sitting in when the race is started, so the text says
+    // "yours" -- the reader of this tip is the one who presses Start.
+    carModel: 'The car everyone drives. "keep own" leaves each player in the car they are already in, '
+      + '"same as host" puts everyone in yours.',
     carConfig: 'Which factory version of the car to spawn.',
     carRandomTrim: 'Give each drawn car a random factory version instead of the standard one.',
     // The filter is a curb-weight ceiling (vehiclespecs.BIG_CAR_MAX_WEIGHT), not a vehicle class, so a
@@ -690,8 +693,8 @@ angular.module('beamng.apps')
       // restore and no loaded preset can ever open this section by itself.
       scope.presetSaveOpen = false;  // the Save name row is revealed
       scope.armedPreset = '';        // name of the preset whose row delete is armed for its confirming click
-      scope.opts = angular.extend({ race: [], carModel: [], carConfig: [], grid: [], aiCar: [],
-        rosterCar: [], preset: [] }, STATIC_OPTS);
+      scope.opts = angular.extend({ race: [], carModel: [], classCar: [], carConfig: [], grid: [],
+        aiCar: [], rosterCar: [], preset: [] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
@@ -733,7 +736,13 @@ angular.module('beamng.apps')
           }
           return { v: m.model, label: m.label || m.model };
         });
-        scope.opts.carModel = [{ v: '', label: 'keep own' }, { v: 'random', label: 'random' }].concat(cars);
+        scope.opts.carModel = [{ v: '', label: 'keep own' }, { v: 'random', label: 'random' },
+          { v: 'host', label: 'same as host' }].concat(cars);
+        // The SAME list minus the host sentinel, for the tournament class car (ADR-0042). A class exists
+        // to separate drivers, so an entry that puts every class in one car works against it -- and the
+        // class dropdown renders this list, so without the split it would have inherited the entry
+        // unnoticed. Filtering here is also what keeps cls.car from ever holding 'host'.
+        scope.opts.classCar = [{ v: '', label: 'keep own' }, { v: 'random', label: 'random' }].concat(cars);
         scope.opts.aiCar = [{ v: '', label: 'default' }, { v: 'random', label: 'random' },
           { v: 'host', label: 'same as host' }].concat(cars);
         // Roster rows pick a CONCRETE car (ADR-0047), so no ''/random sentinels here -- only the host
@@ -1083,13 +1092,15 @@ angular.module('beamng.apps')
         }
       }
 
-      // Car model changed: clear the stale config and lazily fetch this model's configs from GE. The
-      // 'random' sentinel is not a real model (no configs to fetch, no Config row), so skip the fetch.
+      // Car model changed: clear the stale config and lazily fetch this model's configs from GE. Neither
+      // sentinel is a real model -- 'random' is rolled at spawn, 'host' is the issuer's own car, read at
+      // the pre-flight verdict -- so both have no configs to fetch and no Config row, and the cleared
+      // carConfig is what makes the car= token come out as a bare sentinel.
       function onModelChange() {
         scope.form.carConfig = '';
         scope.data.configs = [];
         rebuildConfigOpts();
-        if (scope.form.carModel && scope.form.carModel !== 'random') {
+        if (scope.form.carModel && scope.form.carModel !== 'random' && scope.form.carModel !== 'host') {
           geLuaArg('request_car_configs', scope.form.carModel);
         }
       }
