@@ -328,7 +328,10 @@
           </div>
         </div>
       </div>
-      <div class="bc-row" ng-if="form.carModel && form.carModel !== 'random'" bc-setup-tip="tip('carConfig')">
+      <!-- Neither sentinel is a model, so neither has a config to pick: 'random' is rolled at spawn,
+           'host' is the issuer's own car read at the pre-flight verdict. -->
+      <div class="bc-row" ng-if="form.carModel && form.carModel !== 'random' && form.carModel !== 'host'"
+        bc-setup-tip="tip('carConfig')">
         <span>Config</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carConfig')">{{labelFor('carConfig')}}</button>
@@ -745,8 +748,10 @@
             <span>Car</span>
             <div class="bc-dd">
               <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourCar' + $index)">{{classCarLabel(cls)}}</button>
+              <!-- opts.classCar, not opts.carModel: the same list without "same as host" (a class exists
+                   to separate drivers, so one car for everyone works against it). -->
               <div class="bc-dd-list" ng-if="open === 'tourCar' + $index">
-                <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.carModel" ng-class="{sel: o.v === cls.car}"
+                <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.classCar" ng-class="{sel: o.v === cls.car}"
                   ng-click="pickClassCar(cls, o.v)">{{o.label}}</div>
               </div>
             </div>

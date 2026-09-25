@@ -5361,6 +5361,12 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- with car/maxhp/maxpwr only). nil for a non-random car -- the client ignores them then.
                 randomTrim = overrides.randomTrim,
                 noBigCars = overrides.noBigCars,
+                -- car=host (ADR-0032 amendment): the {model, config} the issuer's client captured at the
+                -- pre-flight verdict, relayed verbatim and never interpreted (ADR-0005) -- the "host"
+                -- sentinel alone means nothing to a client that cannot see the host's car. Read only when
+                -- `car` above is "host", so a tournament's per-driver class car (which keeps precedence)
+                -- simply ignores it. nil for every other race.
+                hostCar = overrides.host_car,
                 -- The issuer-serialized race GEOMETRY (ADR-0039), relayed verbatim and never interpreted
                 -- (ADR-0005): a client without the local race file builds the grid + checkpoints from this,
                 -- so it is scored identically and cannot cut the course. Same for every slot; the host
@@ -6328,7 +6334,7 @@ end
 
 local RACE_USAGE =
     "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
-    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]|random>] "
+    .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]|random|host>] "
     .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
     .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
@@ -6861,6 +6867,25 @@ local function handle_race_validation(player_id, payload)
         -- blob and relayed verbatim into raceStart so a file-less client can build the race. The server
         -- never parses or inspects it -- race-blindness holds (ADR-0005). nil from an older client.
         local race_data = type(payload.raceData) == "table" and payload.raceData or nil
+        -- car=host (ADR-0032 amendment): the car the issuer was sitting in when it answered, captured by
+        -- its own client because we cannot read a vehicle (ADR-0005). Kept on overrides like the sizes
+        -- above so it rides into start_race -- INCLUDING a race queued behind a running one -- and is
+        -- relayed into every player's raceStart. The shallow check asks whether a model field EXISTS and
+        -- is a string, never what it says; `model` and `config` are never read anywhere on this side.
+        if type(payload.hostCar) == "table" and type(payload.hostCar.model) == "string"
+            and payload.hostCar.model ~= "" then
+            overrides.host_car = payload.hostCar
+            -- One line to the host naming the car everyone will race (user decision 2026-09-25). The car
+            -- is read ONCE, at this verdict, so a race QUEUED behind a running one can carry a car the
+            -- host has swapped out since -- this line is what makes that visible instead of silent. The
+            -- name is the client's own display string; nothing here interprets the spec.
+            if type(payload.hostCarName) == "string" and payload.hostCarName ~= "" then
+                MP.SendChatMessage(pending.owner_id,
+                    "BeamComp: car=host -- everyone races your " .. payload.hostCarName)
+            end
+        else
+            overrides.host_car = nil
+        end
         commit_validated_race(pending.race, pending.owner_id, overrides, map, race_id, race_data)
     else
         local reason = type(payload.reason) == "string" and payload.reason or "race options rejected"
