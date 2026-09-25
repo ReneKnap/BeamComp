@@ -63,6 +63,12 @@
 -- detects it (usesOverlayUnitsOnly) and converts it at render time against a fixed 16 px base
 -- (legacyPxToEm), which is why our px-derived placements render at their design size.
 --
+-- The ONE path that replaces a placement classified as "custom" is the player's own "Reset UI layout"
+-- (M.reset_to_defaults, ADR-0012 amendment 2026-09-25). The automatic repair above never does and does
+-- not start: it cannot tell our px from a drag, so it leaves both alone. The reset exists because a
+-- geometry change shipped in an app.json otherwise reaches NOBODY who ever had the app on his layout --
+-- the entry carries its own placement from then on, and this button is the only delivery path there is.
+--
 -- Consequence worth knowing but NOT ours to fix: the render-time clamp reads min-/max-width from the
 -- CATALOGUE app, not from the layout entry -- readSizeConstraint(app, key, ...) with app = item.app,
 -- whose lookup order is app[key] / app.placement[key] / app.css[key], and a catalogue entry has no
@@ -77,7 +83,7 @@
 -- the user's unsaved drag; but every BeamComp caller spends a one-shot (M.close_setup removes once,
 -- setup.step spends its single restore, hud.show/hide are plain calls), so a swallowed call used to
 -- be lost for good. A swallowed call is now recorded as a deferred intent and replayed by M.step
--- once the UI is done -- both directions, last intent per app wins, and a call that DID get through
+-- once the UI is done -- all three actions, last intent per app wins, and a call that DID get through
 -- clears the app's record so a stale intent can never undo a newer decision. Replaying our own
 -- dropped call is deliberately narrower than reconciling against a desired state: it can never
 -- delete an app the player added by hand, which ADR-0012 par. 3 keeps as the guaranteed baseline.
@@ -166,8 +172,8 @@ local function layout_ui_blocked_by(api)
     return nil
 end
 
--- The calls the HUD-apps UI swallowed: app name -> the LAST intent for it, "add" or "remove". nil
--- while nothing is pending, which is the normal state and makes M.step a single nil check.
+-- The calls the HUD-apps UI swallowed: app name -> the LAST intent for it, "add", "remove" or "reset".
+-- nil while nothing is pending, which is the normal state and makes M.step a single nil check.
 --
 -- ADR-0052: this is NOT an edge-detection cache on engine state -- no previous value of isEditing is
 -- ever stored or compared. An entry can only be written from inside the guard, so a non-empty book
@@ -202,6 +208,18 @@ local function clear_deferred(app_name)
     deferred[app_name] = nil
     if next(deferred) == nil then
         deferred = nil
+    end
+end
+
+-- The reset's narrower form of the same rule. A reset that got past the guard settles the GEOMETRY
+-- question for that app and nothing else, so it drops its own pending intent and leaves a pending
+-- add/remove standing -- those decide what is on SCREEN, and every visibility caller spends a one-shot,
+-- so a dropped one is gone for good. The other direction is unchanged: an add or a remove calls the
+-- plain clear_deferred above, because it IS the newer decision about that app and supersedes a reset
+-- waiting behind it.
+local function clear_deferred_reset(app_name)
+    if deferred and deferred[app_name] == "reset" then
+        clear_deferred(app_name)
     end
 end
 
@@ -515,6 +533,115 @@ local function repair_placements(api, layout, app_name, indices)
     return patched
 end
 
+-- ===== reset to the app.json geometry ====================================================
+-- The explicit counterpart to repair_placements: it replaces the whole placement of every BeamComp
+-- entry in the CURRENT layout, "custom" included. See the header for why that is a player action and
+-- not a wider automatic repair.
+
+-- The apps a reset covers, listed exactly ONCE. Both doors (the setup panel's gear, the controls
+-- window) call one GE function which calls this, so neither door can widen or narrow the set.
+local RESET_APPS = {"beamCompSetup", "beamCompGridEditor", "beamCompHud", "beamCompControls"}
+
+-- Put every instance of ONE app in ONE layout back to the geometry its app.json describes. Size and
+-- position together -- the placement is replaced wholesale, which is what "default" means to the player
+-- pressing the button. Returns written, skipped.
+local function reset_placements(api, layout, app_name)
+    local indices = app_indices(layout, app_name)
+    if #indices == 0 then
+        return 0, 0
+    end
+    local placement = derive_placement(app_name)
+    if not placement then
+        -- derive_placement has logged the unreadable app.json. Skipping mirrors the add path, which
+        -- adds without a placement rather than inventing geometry nobody described.
+        return 0, #indices
+    end
+    local written = 0
+    for _, idx in ipairs(indices) do
+        -- the patch API expects 0-based indices, like removeApp
+        if api.applyPlacementPatch(layout.filename, idx - 1, placement) == true then
+            written = written + 1
+        end
+    end
+    return written, #indices - written
+end
+
+-- One app's share of the log line: what happened to it, not what was asked of it.
+local function reset_note(app_name, written, skipped)
+    if written + skipped == 0 then
+        return app_name .. " not on layout"
+    end
+    if skipped == 0 then
+        return app_name .. " " .. written .. " reset"
+    end
+    return app_name .. " " .. written .. " reset, " .. skipped .. " refused"
+end
+
+-- Reset the given apps in the current layout and say which of five things happened. The caller turns
+-- the status into the one line the player reads; it never has to know how this works.
+--
+--   "unavailable" -- the layout system did not answer (no API, no patch call, no readable current
+--                    layout). NOT the same as "nothing to reset", and that is the whole point of
+--                    having it: a fallback that mimics its main path's failure hides that failure
+--                    (ADR-0058).
+--   "deferred"    -- the HUD-apps UI holds the document; one intent per app is recorded and M.step
+--                    replays it. Nothing is written.
+--   "none"        -- the layout was read and carries no BeamComp entry at all.
+--   "reset"       -- `count` placements were written.
+--   "failed"      -- entries were found and not one could be written. Same reasoning as "unavailable"
+--                    one level down: a total write failure must not be able to wear "none"'s clothes.
+local function do_reset_layout(app_names)
+    local api = layout_api()
+    if not api then
+        log("W", LOG_TAG, "cannot reset placements: ui_appLayouts unavailable")
+        return {status = "unavailable"}
+    end
+    if type(api.applyPlacementPatch) ~= "function" then
+        log("W", LOG_TAG, "cannot reset placements: ui_appLayouts.applyPlacementPatch missing")
+        return {status = "unavailable"}
+    end
+    local blocked = layout_ui_blocked_by(api)
+    if blocked then
+        for _, app_name in ipairs(app_names) do
+            defer(app_name, "reset", blocked)
+        end
+        log("I", LOG_TAG, "reset deferred for " .. #app_names .. " app(s): " .. blocked)
+        return {status = "deferred"}
+    end
+    local layout, reason = current_layout_from_disk(api)
+    if not layout then
+        log("W", LOG_TAG, "cannot reset placements: " .. reason)
+        return {status = "unavailable"}
+    end
+
+    local written = 0
+    local found = 0
+    local notes = {}
+    for _, app_name in ipairs(app_names) do
+        clear_deferred_reset(app_name)
+        local app_written, app_skipped = reset_placements(api, layout, app_name)
+        written = written + app_written
+        found = found + app_written + app_skipped
+        notes[#notes + 1] = reset_note(app_name, app_written, app_skipped)
+    end
+    if written > 0 then
+        notify_layouts_changed()
+    end
+    -- The FILENAME is why this line exists: "current" is resolved at call time, and merely opening the
+    -- radial menu makes radial.uilayout.json current (core/quickAccess.lua). Without it there is no way
+    -- to see which document a reset went into.
+    log("I", LOG_TAG, "reset " .. written .. " placement(s) in " .. tostring(layout.filename)
+        .. " -- " .. table.concat(notes, ", "))
+
+    if found == 0 then
+        return {status = "none"}
+    end
+    if written == 0 then
+        return {status = "failed"}
+    end
+    return {status = "reset", count = written}
+end
+
 -- ===== show / remove =====================================================================
 
 -- The appContainer:ensureAppVisible replacement: add app_name to the current layout unless it is
@@ -624,6 +751,11 @@ local function replay_one(app_name, action)
     if action == "add" then
         return do_ensure_visible(app_name)
     end
+    if action == "reset" then
+        -- The button's own path, one app wide: the guard is rechecked there and the log line names the
+        -- layout that was actually written. No second way of resetting exists.
+        return do_reset_layout({app_name}).status == "reset"
+    end
     return do_remove(app_name)
 end
 
@@ -696,6 +828,19 @@ function M.remove(app_name)
         return false
     end
     return removed == true
+end
+
+-- Put every BeamComp window back to the size and position its own app.json describes, in the current
+-- layout only. Returns do_reset_layout's result table; a throw becomes "failed" rather than
+-- "unavailable", because by then the layout system had answered and it is the write that did not
+-- happen.
+function M.reset_to_defaults()
+    local ok, result = pcall(do_reset_layout, RESET_APPS)
+    if not ok then
+        log("W", LOG_TAG, "reset_to_defaults() failed: " .. tostring(result))
+        return {status = "failed"}
+    end
+    return result
 end
 
 return M
