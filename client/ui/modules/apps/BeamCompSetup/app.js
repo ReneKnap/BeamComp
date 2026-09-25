@@ -124,6 +124,9 @@ angular.module('beamng.apps')
     force: 'Start anyway when the track cannot do what you picked: laps on a track that is not a loop, or '
       + 'Reverse without a reverse route. Without this, such a start is refused.',
     tooltips: 'Show these help boxes when the mouse rests on a control.',
+    // The label is the user's wording, picked over "Reset windows". It reads wider than the four
+    // BeamComp windows it moves, so naming the scope is this tooltip's job, not a nicety.
+    resetUiLayout: 'Puts every BeamComp window back to its default size and position.',
     // --- Basics ---
     race: 'The track this race runs on. Pick it first, everything below applies to it.',
     // The track's own type is knowable here, so it is shown rather than hidden behind a word. When it is
@@ -1152,6 +1155,18 @@ angular.module('beamng.apps')
       // every hover, so there is nothing to notify.
       scope.setTooltips = function () {
         writeTooltipPref(scope.ui.tooltips);
+      };
+
+      // Put the four BeamComp windows back to the size and position their app.json describes. GE owns
+      // the whole action and says what happened (beamcomp_init.reset_ui_layout -> race/uilayout.lua);
+      // this is a door, and the controls window has the identical one.
+      //
+      // The menu closes on the way out: it is anchored to a panel that is about to move, and a popover
+      // left hanging over its old spot looks like the reset missed. scope.open = null is what pick()
+      // does for the same reason.
+      scope.resetUiLayout = function () {
+        scope.open = null;
+        geCall('reset_ui_layout');
       };
 
       // Hover help text by key (ADR-0049), read by bc-setup-tip. An unknown key yields '' and the

@@ -408,6 +408,14 @@ angular.module('beamng.apps')
         geLua('if beamcomp_init then beamcomp_init.close_controls() end');
       };
 
+      // Put every BeamComp window back to the size and position its app.json describes -- the same GE
+      // function the setup panel's gear menu calls, with no parameter that could make one door reset
+      // more than the other. This window is the reason the second door exists: the panel sits behind the
+      // admin gate, while any player can open this one with /keys.
+      scope.resetUiLayout = function () {
+        geLua('if beamcomp_init then beamcomp_init.reset_ui_layout() end');
+      };
+
       // ----- the capture cycle ---------------------------------------------------------------------
       // END A CAPTURE, from wherever. This is the single exit, and everything about the safety promise
       // hangs on two lines of it: `capture = null` before anything else, and the generation number.
