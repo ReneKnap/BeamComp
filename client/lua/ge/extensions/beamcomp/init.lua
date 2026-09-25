@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "ui-reset-r1/2026-09-25"
+local BUILD_MARKER = "host-car-r1/2026-09-25"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -879,6 +879,18 @@ local function handle_race_start(payload)
         -- car=random; nil (any other car) is ignored by respawn_own_at.
         randomTrim = payload.randomTrim,
         noBigCars = payload.noBigCars,
+        -- car=host (ADR-0032 amendment): the {model, config} the ISSUER's client captured at the
+        -- pre-flight verdict, relayed opaquely by the vehicle-blind server. Read only for car=host;
+        -- "host" is not a model name and never reaches a car-token parser.
+        hostCar = payload.hostCar,
+        -- Whether THIS client is the one whose car was captured -- IDENTITY, not a value compare. The
+        -- server sets propOwner for entry.id == owner_id, and owner_id is exactly the client that
+        -- answered validateRace, so the flag means "the relayed spec is a copy of my own car". The host
+        -- must therefore be left alone; comparing the relayed config against a fresh partConfig read
+        -- instead would be table == table on two separate reads for a TUNED car -- always false -- and
+        -- would respawn the host into a stock copy, losing its plate, paint and tuning in the one case
+        -- where nothing should happen at all.
+        hostCarIsOwn = payload.propOwner == true,
     }
     -- Remember the Mode-3 caps for the staging swap-compliance gate (ADR-0032): a car swap during staging
     -- must not stage a car over the cap. Mode 3 only -- a fixed car (Mode 2, car=) or no policy (Mode 1)
@@ -2905,6 +2917,53 @@ local function handle_validate_race(payload)
     -- assigns slots, so a bus fixed by car= or pre-picked for an AI reserves its space in the very first
     -- grid instead of in a correction afterwards.
     local sizes = vehicles.resolve_pinned_sizes(payload)
+    -- car=host (ADR-0032 amendment): WE are the issuer, so the car everyone is about to race is the one
+    -- under us right now. It is read ONCE, here: the server cannot read it (vehicle-blind, ADR-0005) and
+    -- no other client can (it never sees this car's config), so this verdict is the only moment the spec
+    -- can enter the race. host_car_spec is the same capture the AI's aicar=host inherits, blob gate
+    -- (safe_config) included -- there is exactly one way a spec is captured in this mod.
+    local host_car, host_car_name
+    if result.ok and type(payload) == "table" and payload.car == "host" then
+        host_car = vehicles.host_car_spec(vehicles.resolve_own_car(M.state.current_vehicle_id))
+        if host_car then
+            -- The first parts table BeamComp puts on the wire (user decision 2026-09-25). Its size was
+            -- never measured, so measure it rather than guess: one line, once per race start, and the
+            -- number is what decides whether relaying the whole spec ever needs revisiting.
+            local encodable, encoded = pcall(jsonEncode, host_car)
+            encodable = encodable and type(encoded) == "string"
+            -- The measurement doubles as an ENCODABILITY probe, which is what earns it its pcall: a config
+            -- jsonEncode cannot take would make send_to_server drop the WHOLE verdict below, and the race
+            -- would then never start with one encode warning to show for it. Dropping the config here
+            -- degrades that to "everyone in the host's model, stock trim" plus a named warning -- and the
+            -- model alone is what the AI's host mode has always been able to fall back to. Dropped BEFORE
+            -- the name is built, so the line cannot promise a tune that is not travelling.
+            if not encodable then
+                log("W", LOG_TAG,
+                    "car=host: the captured config cannot be encoded -- relaying the model only")
+                host_car.config = nil
+            end
+            host_car_name = vehicles.spec_label(host_car)
+            log("I", LOG_TAG, string.format("car=host: captured '%s' (%s B on the wire)", host_car_name,
+                encodable and tostring(#encoded) or "unmeasurable"))
+            -- The footprint IS knowable now, unlike from the "host" token itself (token_size answers
+            -- nothing for a sentinel), and this verdict lands BEFORE the server assigns slots -- so a host
+            -- in a bus reserves everyone's space in the very first grid (ADR-0051 round 2). Best-effort:
+            -- a miss reports nothing and the post-spawn reports correct it, as for every other car.
+            local length, width = vehicles.spec_size_of(host_car)
+            if length then
+                sizes.carSize = {carLength = length, carWidth = width}
+            end
+        else
+            -- No car under the host: refuse (user decision 2026-09-25). Degrading to keep-own would start
+            -- a race nobody asked for, with everyone in a different car, and say nothing about it. The
+            -- server posts this reason to the issuing admin exactly like a geometry refusal, and the
+            -- geometry blob is dropped -- nothing is going to be built from this verdict.
+            result.ok = false
+            result.reason = "car=host needs you in a car -- get in the one everyone should race, "
+                .. "then start again"
+            result.raceData = nil
+        end
+    end
     send_to_server("raceValidation", {
         nonce = type(payload) == "table" and payload.nonce or nil,
         ok = result.ok,
@@ -2932,6 +2991,15 @@ local function handle_validate_race(payload)
         carSize = sizes.carSize,
         aiCarSize = sizes.aiCarSize,
         aiRosterSizes = sizes.aiRosterSizes,
+        -- The issuer's own car for car=host (ADR-0032 amendment): {model, config}, the same shape the AI's
+        -- "same as host" spawns from. The server keeps it opaque and relays it into every player's
+        -- raceStart -- the fifth client-only fact this verdict carries (ADR-0019). nil for every other
+        -- car= value, so an ordinary race ships none of it.
+        hostCar = host_car,
+        -- The captured car's human name for the one chat line the server sends the host. A DISPLAY string,
+        -- relayed like `reason` above -- it is what lets the server name the car in chat without ever
+        -- reading hostCar.model (vehicle-blind, ADR-0005).
+        hostCarName = host_car_name,
     })
 end
 

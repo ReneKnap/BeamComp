@@ -287,8 +287,19 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         -- AI never drift. Empty pool -> the AI best-effort fallback (resolve_random_spec), never a prop or
         -- nothing. Branched BEFORE the split_car_token below so "random" is never spawned as a model name.
         return resolve_random_spec(vehiclespecs.random_spec_from_policy(policy))
-    end
-    if policy.car then
+    elseif policy.car == "host" then
+        -- The players are on car=host and this AI has no explicit aicar= (default): AI without their own
+        -- pick follow the player policy, and "same as host" is no exception (user decision 2026-09-25).
+        -- Resolved from the same host_car the aicar=host branch above uses -- the owner's ACTUAL race car,
+        -- read GE-side at this spawn -- rather than from the relayed policy.hostCar, so AI and host cannot
+        -- drift apart after a car change. An unresolved host car falls through the chain below so the AI
+        -- still races. The elseif is what keeps "host" out of split_car_token: there is no model named
+        -- "host".
+        if type(host_car) == "table" and host_car.model then
+            return host_car.model, host_car.config
+        end
+        log("W", LOG_TAG, "car=host: no resolved host car; falling back to the AI-car chain")
+    elseif policy.car then
         return split_car_token(policy.car)
     end
     if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
@@ -1966,13 +1977,19 @@ end
 
 -- Roll one roster car token for the panel (ADR-0047): the SAME resolution chain as the spawn
 -- (resolve_ai_vehicle) minus the spawn-only inputs -- content defaults come from the parsed race (not
--- available at panel time) and the host car resolves at spawn, so aicar=host stays the opaque "host"
--- sentinel. Because the rolled token then rides the per-slot ai_entry.car with highest precedence, the
--- panel-shown car IS the spawned car by construction (one-truth). `index` is 1-based (varies content
--- cycling if defaults ever apply). Returns "model[:config]" or "host".
+-- available at panel time) and the host car resolves at spawn, so BOTH host modes -- an explicit
+-- aicar=host and an inherited car=host -- stay the opaque "host" sentinel. Because the rolled token then
+-- rides the per-slot ai_entry.car with HIGHEST precedence, the panel-shown car IS the spawned car by
+-- construction (one-truth) -- which is also why the inherited mode must be kept opaque: a token rolled
+-- here would be pinned into the roster row and the AI would race that instead of the host's car.
+-- `index` is 1-based (varies content cycling if defaults ever apply). Returns "model[:config]" or "host".
 function M.roll_roster_car(config, policy, index)
     config = type(config) == "table" and config or {}
-    if config.car == "host" then
+    policy = type(policy) == "table" and policy or {}
+    -- An empty aicar is "no explicit pick" here exactly as it is in resolve_ai_vehicle: split_car_token
+    -- answers nothing for it, so the chain falls through to the player policy.
+    local inherits_policy = config.car == nil or config.car == ""
+    if config.car == "host" or (inherits_policy and policy.car == "host") then
         return "host"
     end
     local model, vehicle_config = resolve_ai_vehicle(config, nil, policy, index or 1, nil, nil)

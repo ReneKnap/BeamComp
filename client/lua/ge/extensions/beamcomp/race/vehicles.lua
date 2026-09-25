@@ -1202,13 +1202,52 @@ local function respawn_random(pose, policy)
     return spawn_default_degraded(pose)
 end
 
+-- car=host (ADR-0032 amendment): everyone races the car the ISSUER was sitting in when the race was
+-- validated. That spec cannot be resolved locally -- a foreign client has never seen the host's car -- so
+-- it travelled with the race start as policy.hostCar, and spawning it from here is the ordinary Mode-2
+-- forced-car path: a player already in that model keeps their own paint exactly as for a typed
+-- car=<model>. Returns the race car, or nil plus a reason.
+--
+-- THE HOST ITSELF IS DECIDED ON IDENTITY, never on a value compare. policy.hostCarIsOwn marks the client
+-- whose car was captured, and that car IS the one to race -- spawn_forced would compare the relayed config
+-- against a fresh capture, which for a tuned car is table == table on two separate partConfig reads (always
+-- false), and would respawn the host into a stock copy. The model check beside it is a string compare and a
+-- different question: the spec is read ONCE, at the verdict, so a race queued behind a running one can
+-- start long after -- a host who swapped cars meanwhile is not in the captured car any more and takes the
+-- ordinary forced path like everybody else, rather than racing something nobody else has.
+local function respawn_host_car(pose, own_car, policy)
+    local spec = type(policy.hostCar) == "table" and policy.hostCar or nil
+    local model = (spec and type(spec.model) == "string" and spec.model ~= "") and spec.model or nil
+    if not model then
+        -- An unusable relay (an older server, a host whose capture failed) degrades to the Mode-1 paths
+        -- and says so. It must never reach parse_car_token: there is no car model called "host".
+        log("W", LOG_TAG, "car=host: no host car in the race start -- keeping own car")
+        if own_car then
+            return keep_own(pose, own_car)
+        end
+        return fresh_spawn_own(pose)
+    end
+    if policy.hostCarIsOwn and own_car and own_car.JBeam == model then
+        log("I", LOG_TAG, "car=host: this is the captured car -- kept untouched")
+        return keep_own(pose, own_car)
+    end
+    -- safe_config again, and it is the SAME gate, not a second one: this value has crossed two process
+    -- boundaries since host_car_spec applied it. Idempotent for everything legitimate -- a parts table and
+    -- a preset name pass through unchanged, only a serialized blob-string is dropped.
+    return spawn_forced(pose, model, safe_config(spec.config), own_car)
+end
+
 -- Place this client's own car at `pose` (the grid start the server assigned), per the relayed vehicle
--- policy (ADR-0032; `policy` = {car, maxhp, maxpwr, maxkg, minkg, randomTrim, noBigCars}, all nil = Mode 1).
+-- policy (ADR-0032; `policy` = {car, maxhp, maxpwr, maxkg, minkg, randomTrim, noBigCars, hostCar,
+-- hostCarIsOwn}, all nil = Mode 1).
 -- Modes:
 --   * Mode 1 (no policy) -- ADR-0007: keep the seated owned car (repair + teleport), else fresh-spawn one.
 --   * car=random -- a per-player random car composing with the active caps (ADR-0032 amendment); the two
 --     random axes ride randomTrim/noBigCars. Branched BEFORE parse_car_token so "random" is not treated as
 --     a model name.
+--   * car=host -- the car the race's issuer was sitting in, relayed as policy.hostCar (ADR-0032
+--     amendment). Branched BEFORE parse_car_token for the same reason as "random": there is no model
+--     called "host".
 --   * Mode 2 (car=<model>) -- fixed model[:config] for everyone; but keep the own car when it already IS the
 --     forced car (colours/plate/tuning preserved), or spawn the forced config in the player's paint when
 --     only the config differs.
@@ -1229,6 +1268,10 @@ function M.respawn_own_at(pose, own_car, policy)
 
     if policy.car == "random" then
         return respawn_random(pose, policy)
+    end
+
+    if policy.car == "host" then
+        return respawn_host_car(pose, own_car, policy)
     end
 
     if policy.car then
@@ -1358,6 +1401,36 @@ function M.spec_size(model, config)
     return usable_size(box.max.y - box.min.y, box.max.x - box.min.x)
 end
 
+-- (public) The grid footprint of a CAPTURED spec ({model, config} from host_car_spec / capture_spec), or
+-- nil, nil. spec_size above takes the engine's config KEY; a captured config is whatever the vehicle
+-- reported -- a .pc PATH, a named preset, or an inline parts table -- so it is normalized here first (see
+-- config_key: a path handed on raw misses every lookup). A tuned car's parts table carries no key and
+-- falls back to the model's stock box, which is best-effort by nature and corrected by the post-spawn
+-- report like every other car.
+function M.spec_size_of(spec)
+    if type(spec) ~= "table" or type(spec.model) ~= "string" or spec.model == "" then
+        return nil, nil
+    end
+    return M.spec_size(spec.model, config_key(spec.config, spec.model))
+end
+
+-- (public) A captured spec as one human line for a chat message: "ETK 800-Series (300d)", "ETK
+-- 800-Series (custom)" for an inline-tuned car, or the bare model name for a stock one. DISPLAY ONLY --
+-- nothing parses this back, which is why the model shows its in-game name rather than its key. Built
+-- here, on the client that captured the spec, so the vehicle-blind server (ADR-0005) can put the car's
+-- name in a chat line without ever reading `model` itself.
+function M.spec_label(spec)
+    if type(spec) ~= "table" or type(spec.model) ~= "string" or spec.model == "" then
+        return "unknown car"
+    end
+    local label = vehiclespecs.model_label(spec.model)
+    if type(spec.config) == "table" then
+        return label .. " (custom)"
+    end
+    local key = config_key(spec.config, spec.model)
+    return key and (label .. " (" .. key .. ")") or label
+end
+
 -- (public) Forward half-length (metres) of a vehicle's spawn bounding box, or nil when the box cannot be
 -- read (no vehicle, jbeam not up yet, bbox API gone). The same measurement front_anchored_target anchors
 -- the car's front from, and the same box car_size measures -- which is why it lives here with them rather
@@ -1411,10 +1484,12 @@ function M.car_size(veh)
     return nil, nil, nil
 end
 
--- (public) The footprint of a "model[:config]" car token, or nil, nil. "random" is branched out ahead of
--- the parse exactly as respawn_own_at does -- a random car is only known once it has been rolled.
+-- (public) The footprint of a "model[:config]" car token, or nil, nil. Both sentinels are branched out
+-- ahead of the parse exactly as respawn_own_at does: a random car is only known once it has been rolled,
+-- and "host" is not a model at all -- the host's car travels as its own spec, resolved at the pre-flight
+-- verdict (spec_size_of), which is where its footprint is reported from instead.
 function M.token_size(token)
-    if type(token) ~= "string" or token == "" or token == "random" then
+    if type(token) ~= "string" or token == "" or token == "random" or token == "host" then
         return nil, nil
     end
     local model, config = parse_car_token(token)
