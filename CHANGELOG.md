@@ -29,8 +29,9 @@ below rather than hidden.
 ### Who you race
 
 - AI opponents, up to 16, with easy / medium / hard presets and their own named drivers.
-- Vehicle rules: everyone in the same car, everyone in a random car, or free choice inside a power
-  and weight limit. A car that does not fit the limit is swapped for one that does.
+- Vehicle rules: everyone in the same car -- one you name, or simply the one you are sitting in when
+  you start -- everyone in a random car, or free choice inside a power and weight limit. A car that
+  does not fit the limit is swapped for one that does.
 - Qualifying, for a grid order that was driven rather than drawn.
 - Championships across several races, and a class-drop tournament that eliminates the back of the
   field each round.

@@ -178,6 +178,7 @@ The same thing from chat, if you know what you want:
 /race <name> 3                       three laps
 /race <name> ai 8 medium             with eight AI opponents
 /race <name> car=<model>             everyone in the same car
+/race <name> car=host                everyone in the car you are sitting in
 /race <name> maxhp=300 order=random  power limit, random grid order
 ```
 
