@@ -4346,6 +4346,52 @@ function M.open_controls_bindings()
     return true
 end
 
+-- ===== reset the BeamComp windows (feature ui-reset-to-default-size) ==============================
+-- ONE function, reached from both doors: the setup panel's gear menu and the controls window. The
+-- setup panel sits behind the admin gate while a plain player's BeamComp windows are the HUD and the
+-- controls window, so neither door alone would reach everybody -- but there is only this one action,
+-- with no parameter that could make one door reset more or less than the other.
+--
+-- The whole reset lives in race/uilayout.lua (RESET_APPS + derive_placement); this says nothing about
+-- geometry and nothing about which apps exist. It turns the seam's status into the one line the player
+-- reads, and the five statuses are five different sentences on purpose: "the layout system did not
+-- answer" must not read like "there was nothing to reset", because a fallback that mimics its main
+-- path's failure makes that failure invisible (ADR-0058).
+--
+-- A field on M, not a top-level local: this file sits at LuaJIT's 200-local ceiling (182/200 measured
+-- 2026-09-25) and the apps reach it by name through bngApi anyway.
+--
+-- One interaction worth knowing before it is rediscovered: in a race notice.say ends in hud.show(), so a
+-- reset that was DEFERRED is immediately followed by a deferred "add" for beamCompHud, which supersedes
+-- the HUD's reset intent (one intent per app, last wins -- race/uilayout.lua). It costs the HUD's
+-- geometry and nothing else, and it can only happen inside a window a button press cannot reach: both
+-- halves of the guard require the player to be inside BeamNG's HUD-apps menu, and that route unmounts the
+-- whole app layer these buttons live on (ADR-0012 amendment 2026-07-31). The deferral is there for the
+-- replay path and for the day that stops being true, not for a case anybody can click into today.
+function M.reset_ui_layout()
+    local result = M.uilayout.reset_to_defaults()
+    local status = type(result) == "table" and result.status or "failed"
+    if status == "reset" then
+        local count = result.count or 0
+        notice.say("Reset " .. count .. " BeamComp window" .. (count == 1 and "" or "s")
+            .. " to default size and position.", "info")
+        return
+    end
+    if status == "none" then
+        notice.say("No BeamComp window on your layout -- nothing to reset.", "info")
+        return
+    end
+    if status == "deferred" then
+        notice.say("The HUD apps menu has your layout -- the reset runs when you leave it.", "info")
+        return
+    end
+    if status == "unavailable" then
+        notice.say("Could not read your window layout -- nothing was reset.", "warning")
+        return
+    end
+    notice.say("Could not write your window layout -- nothing was reset.", "warning")
+end
+
 -- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
 -- Surface it as a toast; the track record wins the message when both are set.
 local function handle_best_notice(payload)
