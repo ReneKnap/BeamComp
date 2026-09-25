@@ -10,7 +10,7 @@
     "ui.apps.categories.racing"
   ],
   "css": {
-    "top": "90px",
+    "top": "70px",
     "left": "50px",
     "width": "min(660px, 92vw)",
     "height": "clamp(420px, calc(100vh - 220px), 1100px)",
