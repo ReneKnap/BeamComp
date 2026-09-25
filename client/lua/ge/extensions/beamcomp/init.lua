@@ -236,7 +236,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "host-car-r1/2026-09-25"
+local BUILD_MARKER = "grid-list-echo-r1/2026-09-25"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -334,7 +334,6 @@ M.state = {
     hud_reshow_wait = 0,      -- seconds since the watchdog's last re-show, compared against the backoff interval below
     hud_reshow_interval = HUD_RESHOW_EVERY,  -- current re-show cadence: starts at HUD_RESHOW_EVERY on each healthy heartbeat, doubles per silent re-show up to HUD_RESHOW_MAX (menu-hidden silence then costs one layout check per 15s)
     idle_info_shown = false,  -- whether the between-races series info box (ADR-0042) currently holds the HUD app up (lobby/free-roam, no race), so it is shown once and taken down when the series ends
-    grid_list_target = nil,   -- routes the next gridList reply by its requester: nil = grid-editor console toast (default) | "setup" = race-setup panel grid dropdown (ADR-0037) | "gridui" = grid-editor panel saved-grid dropdown
     grid_seed_race = nil,     -- a race to pre-select when the grid-editor panel opens (carried from /raceui's "Grid bearbeiten" cross-open); consumed by push_grid_data
     grid_active_name = nil,   -- the saved name of the grid currently being edited (set on save/load, nil for a fresh unsaved grid); reflected to the panel so a reopen restores the overwrite/assign target
     grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
@@ -3533,21 +3532,37 @@ local function handle_grid_data(payload)
     end
 end
 
--- Post the current map's saved grids from a gridListReq (ADR-0023). The reply carries the WHOLE map as
+-- Post the current map's saved grids from a gridList reply (ADR-0023). The reply carries the WHOLE map as
 -- {name, race, isDefault} entries sorted by race then name (ADR-0023 amendment 2026-07-27), so each
--- consumer filters/groups it locally instead of asking again per race. gridListReq has three callers, so
--- the one-shot grid_list_target (set by the requester) routes this reply: "setup" -> the race-setup panel's
--- grid dropdown (ADR-0037); "gridui" -> the grid-editor panel's saved-grid dropdown (ADR-0037 amendment);
--- nil -> the grid-editor console command's toast (beamcomp_grid_list), which groups the entries by race.
+-- consumer filters/groups it locally instead of asking again per race.
+--
+-- It also carries the DESTINATION it is for (ADR-0023 amendment 2026-09-25): the requester names one and
+-- the server relays it back untouched, so nothing has to be remembered between the two halves of the
+-- round trip. That is what the retired one-shot M.state.grid_list_target could not do -- with one slot
+-- and three callers, two requests in flight (both panels link at once after a UI reload) let the first
+-- reply consume the other's destination, stranding a panel on an empty list for the session.
+--   "setup"   -> the race-setup panel's grid dropdown (ADR-0037)
+--   "gridui"  -> the grid-editor panel's saved-grid dropdown (ADR-0037 amendment)
+--   "console" -> the grid-editor console command's toast (beamcomp_grid_list), grouped by race
+--   absent    -> nobody named one: an unsolicited echo after a save/assign/delete, or a server too old
+--                to relay the field. Serve BOTH panel hooks -- they are open at the same time in the
+--                normal flow ("Edit..." leaves the setup panel standing), and a guihooks.trigger at a
+--                panel that is not on screen is a no-op, so this needs to know nothing about what is up.
+-- The console toast is reachable ONLY on the literal "console", which only that one command sends, so a
+-- save can never surface as a toast whatever else is in flight.
 local function handle_grid_list(payload)
     local grids = type(payload) == "table" and type(payload.grids) == "table" and payload.grids or {}
-    local target = M.state.grid_list_target
-    M.state.grid_list_target = nil
+    local target = type(payload) == "table" and payload.target or nil
     if target == "setup" then
         guihooks.trigger("BeamCompSetupGrids", {grids = grids})
         return
     end
     if target == "gridui" then
+        guihooks.trigger("BeamCompGridList", {grids = grids})
+        return
+    end
+    if target ~= "console" then
+        guihooks.trigger("BeamCompSetupGrids", {grids = grids})
         guihooks.trigger("BeamCompGridList", {grids = grids})
         return
     end
@@ -3633,8 +3648,7 @@ local function push_setup_data(include_deprecated)
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
     -- The panel picks names from this instead of free typing.
     guihooks.trigger("BeamCompAiPool", {names = ai.pool_names()})
-    M.state.grid_list_target = "setup"
-    send_to_server("gridListReq", {map = map})
+    send_to_server("gridListReq", {map = map, target = "setup"})
     -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
     send_to_server("presetListReq", {map = map})
 end
@@ -3990,8 +4004,7 @@ local function push_grid_data()
         races = racelist.options(map, true),
         seedRace = M.state.grid_seed_race,
     })
-    M.state.grid_list_target = "gridui"
-    send_to_server("gridListReq", {map = map})
+    send_to_server("gridListReq", {map = map, target = "gridui"})
     -- Reflect the live edit session too, so a reopened panel (its Angular scope is fresh) restores the
     -- active grid's knobs, direction and overwrite/assign target rather than showing a blank form.
     push_grid_state()
@@ -4163,8 +4176,8 @@ function M.grid_assign(race, name)
     editor_feedback("assigning '" .. name .. "' as default for " .. race_id .. " ...")
 end
 
--- Delete one of `race`'s saved grids (UI -> GE -> server, ADR-0023). The server replies with the updated
--- grid list (routed to the panel via grid_list_target), so the dropdown refreshes itself.
+-- Delete one of `race`'s saved grids (UI -> GE -> server, ADR-0023). The server echoes the updated grid
+-- list unasked, so both panels refresh themselves -- no destination is named here (see handle_grid_list).
 function M.grid_delete(race, name)
     if type(race) ~= "string" or race == "" or type(name) ~= "string" or name == "" then
         return
@@ -4174,7 +4187,6 @@ function M.grid_delete(race, name)
         editor_feedback("no map loaded", "warning")
         return
     end
-    M.state.grid_list_target = "gridui"
     send_to_server("gridDelete", {map = map, race = race, name = name})
     editor_feedback("deleting grid '" .. name .. "' ...")
 end
@@ -7919,14 +7931,15 @@ function beamcomp_grid_edit(race_name, grid_name)
 end
 
 -- GE console command (intentionally global): list the grids saved for the current map (gridListReq),
--- grouped by race with the per-race default starred (see handle_grid_list).
+-- grouped by race with the per-race default starred (see handle_grid_list). The ONE caller that names
+-- "console" as its destination, which is what keeps the toast off every other reply.
 function beamcomp_grid_list()
     local map = maps.current()
     if not map then
         editor_feedback("no map loaded", "warning")
         return
     end
-    send_to_server("gridListReq", {map = map})
+    send_to_server("gridListReq", {map = map, target = "console"})
 end
 
 -- GE console command (intentionally global)

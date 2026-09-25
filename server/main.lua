@@ -8456,14 +8456,26 @@ local function player_name_of(player_id)
 end
 
 -- Send a map's saved grids to one client (ADR-0023 amendment 2026-07-27): {grids = {{name, race,
--- isDefault}, ...}}, sorted by race then name. The whole map travels in ONE reply so all three consumers
--- can filter locally -- the setup panel narrows it to the selected race, the grid editor splits it into
--- "this race" plus the rest of the map, and the GE console groups it for its toast -- and so switching
--- race in a panel stays a local, synchronous operation instead of a new round-trip. Shared by the list
--- request and the delete echo, so a panel always sees the post-change truth.
+-- isDefault}, ...}, target = <the requester's routing string>}, sorted by race then name. The whole map
+-- travels in ONE reply so all three consumers can filter locally -- the setup panel narrows it to the
+-- selected race, the grid editor splits it into "this race" plus the rest of the map, and the GE console
+-- groups it for its toast -- and so switching race in a panel stays a local, synchronous operation
+-- instead of a new round-trip. Shared by the list request and by all three write echoes, so a panel
+-- always sees the post-change truth.
+--
+-- `target` is the requester's own opaque routing string, relayed back verbatim and never read here
+-- (race-blind, ADR-0005) -- the same shape as gridData echoing the request's race. It is what lets a
+-- reply find its consumer without the client having to remember who asked, so a second request in flight
+-- can no longer steal a reply's destination (ADR-0023 amendment 2026-09-25). An UNSOLICITED echo passes
+-- none, which the client reads as "serve both panels".
+--
+-- UNICAST, to the one player who asked or wrote. Another admin with a panel open still sees this grid
+-- only when he reopens it -- a deliberate limit, not an oversight: a broadcast would push a list at every
+-- connection over a write only one of them made.
+--
 -- Lives here rather than with the other grid_store helpers because it captures send_event/MSG_GRID_LIST,
 -- which are declared further up the chunk than those.
-function grid_store.send_grid_list(player_id, map)
+function grid_store.send_grid_list(player_id, map, target)
     ensure_grids_loaded()
     local entries = {}
     local map_grids = type(map) == "string" and grid_store.grids[map] or nil
@@ -8488,7 +8500,7 @@ function grid_store.send_grid_list(player_id, map)
         end
         return a.name < b.name
     end)
-    send_event(player_id, MSG_GRID_LIST, {grids = entries})
+    send_event(player_id, MSG_GRID_LIST, {grids = entries, target = target})
 end
 
 -- Store a named grid sent by the in-game editor (ADR-0023). Admin-gated like /race (ADR-0016): only a
@@ -8531,6 +8543,11 @@ local function handle_grid_save(player_id, payload)
         MP.SendChatMessage(player_id, message)
         log_info("beamcomp.grid", string.format("saved grid '%s' for race '%s' on map '%s' (%s) by %s",
             payload.name, payload.race, payload.map, tostring(path), player_name))
+        -- Echo the updated list so the grid it was just saved in appears in both panels without a reopen
+        -- (ADR-0023 amendment 2026-09-25) -- they are open at the same time in the normal flow. On the
+        -- SUCCESS path only: send_grid_list reads the in-memory store, and save_grid updates that before
+        -- the file, so echoing after a failed write would state a list the file has not got.
+        grid_store.send_grid_list(player_id, payload.map)
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
@@ -8565,6 +8582,9 @@ local function handle_grid_assign(player_id, payload)
             payload.name, payload.race))
         log_info("beamcomp.grid", string.format("assigned grid '%s' as default for race '%s' on map '%s' by %s",
             payload.name, payload.race, payload.map, player_name))
+        -- Echo the updated list so the (default) marker moves in both panels, not just after a reopen
+        -- (ADR-0023 amendment 2026-09-25). Success path only, for the same reason as the save above.
+        grid_store.send_grid_list(player_id, payload.map)
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
@@ -8603,7 +8623,11 @@ local function handle_grid_delete(player_id, payload)
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
 
-    -- Always echo the current list so the editor's dropdown reflects the post-delete state.
+    -- Always echo the current list so both panels reflect the post-delete state: the editor's dropdown
+    -- and, since the echo names no target (ADR-0023 amendment 2026-09-25), the setup panel's -- which
+    -- would otherwise keep offering a grid that is gone. UNCONDITIONAL, unlike the save and assign
+    -- echoes: a delete that removed nothing must still un-arm the row the admin clicked, and that
+    -- un-arming is owned by the arriving list (BeamCompGridEditor/app.js rebuildGridOpts).
     grid_store.send_grid_list(player_id, payload.map)
 end
 
@@ -8639,8 +8663,15 @@ local function handle_grid_fetch(player_id, payload)
 end
 
 -- Return the saved grids for a map (ADR-0023). Read-only; see grid_store.send_grid_list for the shape.
+-- The request's `target` names the consumer the reply is for and is relayed back untouched; anything
+-- that is not a string is dropped, so only a client that actually named a destination gets routed to one.
 local function handle_grid_list_request(player_id, payload)
-    grid_store.send_grid_list(player_id, type(payload) == "table" and payload.map or nil)
+    if type(payload) ~= "table" then
+        grid_store.send_grid_list(player_id, nil)
+        return
+    end
+    local target = type(payload.target) == "string" and payload.target or nil
+    grid_store.send_grid_list(player_id, payload.map, target)
 end
 
 -- Preset handlers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200 ceiling);

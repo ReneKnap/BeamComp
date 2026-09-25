@@ -766,6 +766,13 @@ angular.module('beamng.apps')
       //
       // Only prune or preselect once a list has actually arrived: before that, `data.grids` is empty for
       // want of data, not because the race has no grids, and acting would wipe a restored form's choice.
+      //
+      // Since ADR-0023's 2026-09-25 amendment a list also arrives UNASKED, right after someone saves,
+      // assigns or deletes a grid in the editor -- which is open beside this panel in the normal flow.
+      // Both rules above are what make that safe, and both are wanted here: a pick that still exists
+      // passes `stillValid` and is left alone (an explicit pick is a pin), while a race that had no grid
+      // at all carries `form.grid === ''`, fails `stillValid`, and lands on the grid just saved -- which
+      // is the whole point of saving one.
       function rebuildGridOpts() {
         var raceGrids = (scope.data.grids || []).filter(function (g) {
           return g && g.race === scope.form.race;

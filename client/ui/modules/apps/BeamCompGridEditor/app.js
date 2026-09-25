@@ -967,7 +967,8 @@ angular.module('beamng.apps')
       // Write the grid, then collapse the row -- but KEEP the name. It is the overwrite target from here on:
       // savedName mirrors it (gating the default button and the overwrite hint), and a second save of the
       // same session must not have to retype it. Optimistic like every other action in this panel: grid_save
-      // is fire-and-forget and the feedback already exists (the server chats the save and echoes the list).
+      // is fire-and-forget and the feedback already exists -- the server chats the save and, since the
+      // 2026-09-25 amendment, echoes the updated list back to both panels.
       scope.saveGrid = function () {
         if (!scope.canSave()) {
           return;
@@ -994,8 +995,12 @@ angular.module('beamng.apps')
 
       // Pull the dataset now the directive is linked: a freshly-added app misses the open-time push, so it
       // asks GE for the lists itself (data arrives back via the $on handlers above). The only pull the
-      // panel does: GE pushes on open and the server echoes the updated list after a save or a delete,
-      // which together cover every timing -- there is no manual refresh control.
+      // panel does: GE pushes on open, and the server echoes the updated list after a save, an assign and
+      // a delete alike (ADR-0023 amendment 2026-09-25), which together cover every timing.
+      //
+      // There is deliberately no manual refresh control, and that is a decision, not a consequence of the
+      // line above: a button you have to press is this bug again in small, so the lists are kept correct
+      // instead of being made refreshable.
       geCall('request_grid_data');
     },
   };
