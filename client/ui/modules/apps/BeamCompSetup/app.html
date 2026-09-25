@@ -27,6 +27,11 @@
     .bc-row > span { flex: 0 0 min(42%, 185px); }
     .bc-row input[type=number], .bc-row input[type=text] { flex: 1 1 auto; min-width: 0; background: #2a2e35;
       color: #f0f0f0; border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 2px 4px; }
+    /* A standing note that two settings disagree -- amber, not the red of .bc-lock-error below: nothing
+       is broken and nothing is refused, the admin has simply overruled a rule and should see it. Full
+       width by sitting OUTSIDE a .bc-row, so it reads as a remark on the row above rather than a
+       nameless second control. */
+    .bc-warn { font-size: 12px; color: #e8c07a; margin: -2px 0 4px 0; }
     .bc-check { justify-content: flex-start; }
     .bc-check input { flex: 0 0 auto; margin-right: 6px; }
     /* Custom dropdown (native <select> does not open in the BeamNG CEF overlay). */
@@ -482,16 +487,22 @@
             </div>
           </div>
         </div>
+        <!-- "default" here resolves to whatever Car (all) forces, so both the closed head and the open
+             options name it (aiCarLabel in app.js) instead of leaving the admin to know the rule. -->
         <div class="bc-row" bc-setup-tip="tip('aiCar')">
           <span>AI car</span>
           <div class="bc-dd">
-            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiCar')">{{labelFor('aiCar')}}</button>
+            <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('aiCar')">{{aiCarHeadLabel()}}</button>
             <div class="bc-dd-list" ng-if="open === 'aiCar'">
               <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.aiCar" ng-class="{sel: o.v === form.aiCar}"
-                ng-click="pick('aiCar', o.v)">{{o.label}}</div>
+                ng-click="pick('aiCar', o.v)">{{aiCarOptLabel(o)}}</div>
             </div>
           </div>
         </div>
+        <!-- The AI may leave the forced car, and this is the note that says they have. It stands while it
+             is true rather than firing once, so it is still on screen at the moment the race is started --
+             a toast at the moment of picking would be long gone by then. -->
+        <div class="bc-warn" ng-if="aiOverridesForcedCar()">AI ignore Car (all) and drive {{labelFor('aiCar')}}.</div>
         <!-- Composable random-AI axes: only meaningful when the AI car is "random". Trim toggles stock vs
              random config variant; Exclude big vehicles drops buses/trucks/vans by curb weight. -->
         <div ng-if="form.aiCar === 'random'">

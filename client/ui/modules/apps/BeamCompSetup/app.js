@@ -272,7 +272,8 @@ angular.module('beamng.apps')
       }
       return text;
     },
-    aiCar: 'What the computer drivers drive. "default" gives each driver the car that belongs to their name.',
+    aiCar: 'What the computer drivers drive. "default" follows Car (all) where that forces one, and '
+      + 'otherwise gives each driver the car that belongs to their name.',
     aiRandomTrim: 'Give each AI car a random factory version instead of the standard one.',
     aiNoBigCars: 'Leave buses, trucks and vans out of the AI draw (it goes by weight).',
     rosterToggle: 'Show the drivers, so you can change them one by one.',
@@ -1053,6 +1054,36 @@ angular.module('beamng.apps')
           }
         }
         return HEAD_FALLBACK[field] || value;
+      };
+
+      // The AI car "default" is not a car -- it means "whatever the players are forced into", and that
+      // inheritance has always been real: resolve_ai_vehicle's policy tail hands an AI with no pick of its
+      // own the player policy's car, "same as host" and "random" included (ADR-0032 amendment 2026-09-25).
+      // Only nothing on screen ever said so, so an admin reading "default" beside a forced Car (all) had to
+      // know it. The entry now names what it will actually resolve to.
+      //
+      // Composed at RENDER time, never baked into opts.aiCar: that list is rebuilt from the cars push,
+      // which knows nothing about the player car, so a baked suffix would be stale the moment Car (all)
+      // changes -- and stale here means the panel states the wrong car with full confidence.
+      function aiCarLabel(value, label) {
+        if (value !== '' || !scope.form.carModel) {
+          return label;
+        }
+        return label + ' (' + scope.labelFor('carModel') + ')';
+      }
+      scope.aiCarOptLabel = function (o) {
+        return aiCarLabel(o.v, o.label);
+      };
+      scope.aiCarHeadLabel = function () {
+        return aiCarLabel(scope.form.aiCar, scope.labelFor('aiCar'));
+      };
+
+      // Whether the AI have been given a car of their own that overrides a forced Car (all). An explicit
+      // pick WINS -- this is a note, never a block (user decision 2026-09-25) -- but it is the one place in
+      // this panel where two settings quietly disagree, so it says so while it is true. Equal values are
+      // not a deviation: picking the same car twice is agreement spelled out, not a broken rule.
+      scope.aiOverridesForcedCar = function () {
+        return !!scope.form.carModel && !!scope.form.aiCar && scope.form.aiCar !== scope.form.carModel;
       };
 
       scope.pick = function (field, value) {
