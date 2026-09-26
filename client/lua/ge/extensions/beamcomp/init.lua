@@ -8160,6 +8160,11 @@ function M.onClientEndMission(_levelPath)
     -- setup.clear, because that function also runs on the panel's Close, which is not a session boundary
     -- (bug panel-close-wipes-nametag-policy).
     identity.clear_policy()
+    -- Drop the remembered race scan (feature raceui-reopen-without-typing): a level change is the one
+    -- moment the installed set can plausibly have changed since we looked. Required inline rather than at
+    -- the top of the file because init.lua sits at LuaJIT's 200-local ceiling and this is its only caller
+    -- -- require is memoized, so it costs a table lookup (same trade as race/parser.lua's path loader).
+    require("beamcomp/race/discovery").invalidate()
 end
 
 function M.onExtensionUnloaded()
