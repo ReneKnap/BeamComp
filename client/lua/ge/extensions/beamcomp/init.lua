@@ -282,8 +282,8 @@ M.state = {
     prop_map_wait = 0,   -- host only: seconds until the next rebuild attempt while prop_map_pending
     prop_map_budget = 0, -- host only: seconds of rebuild attempts left before we stop and WARN about the vehicles that never registered with BeamMP. A silent give-up on an incomplete map is how the old suppression hid a 49%-coverage gap for a year
     ai_names = nil,      -- non-owner: cross-client BeamMP id -> the AI's standings label, from the relayed aiMap (ADR-0036/0062), or nil
-    show_driver_names = nil,  -- whether drivers (humans AND AI) carry a name over their car on this server (ADR-0062). nil = not heard yet, and the safe reading of nil is ON: a client that never got the policy behaves exactly like plain BeamMP. Only an explicit false hides them. Props are outside this and silent either way
-    tag_written = nil,   -- what THIS client changed on BeamMP's nametag entries: {hidden = {}, named = {}} keyed by cross-client id, so a tag is only ever given back or cleared if we took it away or set it (ADR-0062). Lazily created
+    show_driver_names = nil,  -- whether drivers (humans AND AI) carry a name over their car on this server (ADR-0062). nil = not heard yet, and the safe reading of nil is ON: a client that never got the policy behaves exactly like plain BeamMP. Only an explicit false hides them. Props are outside this and silent either way. Connection-scoped: cleared at the session boundary (identity.clear_policy) and nowhere else -- a race end does not touch it (decision 6), and neither does closing the setup panel (bug panel-close-wipes-nametag-policy)
+    tag_written = nil,   -- what THIS client changed on BeamMP's nametag entries: {hidden = {}, named = {}} keyed by cross-client id, so a tag is only ever given back or cleared if we took it away or set it (ADR-0062). Lazily created. Connection-scoped like the policy itself and dropped only by identity.clear_policy: a client that forgets this record while its writes still stand can never give those tags back, which is what made a panel close reopen the prop defect
     tag_wait = 0,        -- seconds until the next nametag reconcile sweep; the sweep is what beats a rebuilt MPVehicleGE entry, which comes back tagged (hideNametag/customName are not serialized)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
@@ -3417,15 +3417,13 @@ function setup.clear()
     -- Same reason, and here it matters more than for the numbers: BeamMP hands out player ids per
     -- server, so an id kept from the last one would match a stranger's row on the next.
     M.state.own_player_id = nil
-    -- And the same reason once more for the nametag policy (ADR-0062). It belongs to the SERVER, so
-    -- carrying it to the next one would apply a stranger's setting until his own broadcast lands --
-    -- absence has to mean unknown, never "what I saw last". Unknown reads as on, which is what BeamMP
-    -- does by itself. The record of what we wrote goes with it: cross-client ids are per server too, so
-    -- a kept entry could make us give a tag back on a vehicle we never touched.
-    M.state.show_driver_names = nil
-    M.state.tag_written = nil
-    M.state.prop_ids = nil
-    M.state.ai_names = nil
+    -- The nametag policy (ADR-0062) is deliberately NOT cleared here, and that is the whole point of this
+    -- comment: this function has TWO callers and they mean different things. onClientEndMission is a
+    -- session boundary; the panel's own Close is not. Clearing the policy here dropped this client's
+    -- record of what it had already written on every Close -- and a tag is only ever given back by
+    -- whoever remembers taking it away (nametags.lua show_entry), so the props came back named at the
+    -- next BeamMP entry rebuild: exactly the defect ADR-0062 closed, reopened by a button an admin
+    -- presses every race. The session boundary clears it through identity.clear_policy instead.
 end
 
 -- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
@@ -5354,6 +5352,25 @@ end
 
 function identity.apply_tags()
     nametags.apply(identity.tag_policy())
+end
+
+-- Forget the nametag policy. Called at the SESSION boundary and nowhere else (onClientEndMission): the
+-- policy belongs to the SERVER, so carrying it to the next one would apply a stranger's setting until his
+-- own broadcast lands. Absence has to mean unknown, never "what I saw last", and unknown reads as on --
+-- which is what plain BeamMP does by itself.
+--
+-- The record of what this client wrote goes with it, and that is the field that must not be dropped
+-- anywhere else: cross-client ids are per server, so a kept entry could give a tag back on a vehicle we
+-- never touched -- while dropping it too early leaves tags we took away and can no longer return.
+--
+-- The two per-race fields are really teardown_race_world's (it clears them with the props it deletes);
+-- they are restated here so this function is complete on its own rather than depending on the order of
+-- two calls in onClientEndMission.
+function identity.clear_policy()
+    M.state.show_driver_names = nil
+    M.state.tag_written = nil
+    M.state.prop_ids = nil
+    M.state.ai_names = nil
 end
 
 -- Reflect the server's name policy into an open setup panel. Its own dataset push carries the value too,
@@ -8076,6 +8093,10 @@ function M.onClientEndMission(_levelPath)
     -- open state would pop the setup panel back up on the next map, unasked (ADR-0037 stays
     -- command-opened -- bug setup-panel-settings-survive-ui-reload).
     setup.clear()
+    -- Leaving the session is where the server's nametag policy stops applying (ADR-0062). A separate call
+    -- rather than a line inside setup.clear, because that function also runs on the panel's Close, which
+    -- is not a session boundary (bug panel-close-wipes-nametag-policy).
+    identity.clear_policy()
 end
 
 function M.onExtensionUnloaded()
