@@ -331,6 +331,8 @@ angular.module('beamng.apps')
     // --- Players ---
     players: 'Everyone on the server right now. "temporary name" means the player still carries the name '
       + 'BeamMP gave them as guest, they can set their own with "/name <name>" in chat.',
+    showDriverNames: 'Draws each driver\'s race name over his car, for everyone on the server, and '
+      + 'saves it there. Off means no nametags at all. Race props never carry one either way.',
     remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick their '
       + 'own.',
     remindKeys: 'Send every player the keys his own game has for repairing his car and getting back to the '
@@ -714,6 +716,15 @@ angular.module('beamng.apps')
       // payload (and must not join the $$hashKey-sensitive blob).
       scope.ui = { tooltips: readTooltipPref() };
 
+      // The SERVER's own switches, as this panel last heard them (ADR-0062). An object for the same
+      // reason scope.ui is one -- the gear menu lives under an ng-if and gives its contents a child
+      // scope -- and separate from scope.ui because this one is not a preference of the player reading
+      // it: flipping it changes what everybody on the server sees, and it is stored on the server.
+      //
+      // Seeded true, which is the same reading GE and the client policy use for "not heard yet": the
+      // setting defaults to on, so an unknown value must look like plain BeamMP.
+      scope.server = { showDriverNames: true };
+
       // Session-autosave state. The panel links with freshForm() and only THEN pulls the remembered blob
       // (request_setup_form -> BeamCompSetupForm, async), so the form watcher must stay muted until that
       // reply has been applied: a save inside that window would write these DEFAULTS over the good stored
@@ -941,6 +952,10 @@ angular.module('beamng.apps')
           // to the neutral "default". Keeping the last number would hide exactly that and show a figure
           // nothing stands behind any more.
           scope.data.serverDefaults = (payload && payload.serverDefaults) || null;
+          // The server's driver-name switch. Absent reads as ON, not as "keep what I had": GE sends it
+          // on every push, so a missing field means an older GE, and on rather than off is the reading
+          // that cannot make a panel claim the server is hiding names when it is not.
+          scope.server.showDriverNames = !(payload && payload.showDriverNames === false);
           rebuildRaceCarOpts();
           // Keep the grid/config lists if the selected race/car still needs them; a stale config list is
           // harmless (labelFor falls back) and re-fetched on the next model change.
@@ -1565,6 +1580,22 @@ angular.module('beamng.apps')
           scope.temporaryCount = n;
         });
       });
+
+      // The server's driver-name switch, pushed on its own whenever the policy changes -- including a
+      // change another admin made while this panel was already open. The dataset push carries it too,
+      // but that one only happens when the panel pulls.
+      scope.$on('BeamCompNamePolicy', function (event, payload) {
+        scope.$evalAsync(function () {
+          scope.server.showDriverNames = !(payload && payload.showDriverNames === false);
+        });
+      });
+
+      // Flip the server's driver-name switch. Nothing is applied locally and the checkbox is not the
+      // truth -- the server answers with a BeamCompNamePolicy for every client, this one included, so a
+      // refused (non-admin) attempt simply leaves the box where the server says it should be.
+      scope.setDriverNames = function () {
+        geLuaArg('set_driver_names', scope.server.showDriverNames ? '1' : '0');
+      };
 
       // Remind: the server sends the same chat line a joining player gets, to the players marked
       // temporary and to nobody else -- it filters the very list it sent us, so the button can never

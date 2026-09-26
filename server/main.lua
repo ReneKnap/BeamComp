@@ -282,6 +282,7 @@ local session = {
                               -- start. Seeded at the staging entry, dropped by enter_phase on any other phase.
     ai_roster = nil,          -- named AI roster for the active race (ADR-0047): [k] = {name, car?} for AI id "ai:<k>", sanitized from the panel's overrides.ai.roster; nil on the chat path (classic "AI <k>" labels). Per-race, cleared by reset_to_lobby
     runs_logged = nil,        -- whether this race's runs already went into the run log (ADR-0050). Set by runlog.capture, cleared per race, so the finish seam and the two abort paths cannot log the same race twice. Stays nil for the WHOLE race while statistics are off (ADR-0053): runlog.capture returns before it would set this, so the guard reads a consistent "nothing was logged" instead of a half-armed state
+    prop_map = nil,           -- the active race owner's last propMap payload (ADR-0062), kept verbatim and never read: it is replayed to a client the moment this server can reach it, so a mid-race joiner and a mid-race GE Lua reload do not end up with the only tagged props in the session. Per race, cleared by reset_to_lobby
     race_event = nil,         -- id shared by every logged run of THIS race instance (ADR-0050), so field size, start slot and finishing position can be related across rows; assigned in start_race
 }
 
@@ -445,6 +446,20 @@ identity.PULL_TIMEOUT = 300
 -- Cleared on disconnect -- BeamMP reuses player ids, and a `done` left behind would mean the next holder
 -- of the slot is never asked.
 identity.pull = {}
+
+-- THE NAMETAG POLICY (ADR-0062). Which vehicle carries a name over it, and what it says, is decided on
+-- every client -- but two of the three inputs come from here, so the messages ride on this namespace.
+-- It already owns "the name a player is shown under"; this extends it to "and which vehicles show one
+-- at all". A namespace of its own would cost one of main.lua's four remaining top-level locals, the
+-- same trade ADR-0058 made for the connect pull.
+--
+-- The prop map is a RELAY and nothing else: the race's owner derives which vehicles its prefab load
+-- created -- the only machine that can -- and this server hands the list on without reading an id of it
+-- (race-blind, ADR-0005), exactly like aiMap. The last one is cached for the length of the race so a
+-- client that arrives (or reloads its Lua) mid-race is not left looking at a field of named pylons.
+identity.MSG_PROP_MAP = "propMap"
+identity.MSG_NAME_POLICY = "namePolicy"
+identity.MSG_SET_NAMES = "setDriverNames"
 
 -- Everything the assist keys need (ADR-0058): what each connection reported about its own key bindings,
 -- the /keys command and the copy. The two in-race assists (ADR-0017) are on by default and their keys are
@@ -759,6 +774,130 @@ function cfg.boolean(settings, key, default)
     return default
 end
 
+-- The comment block that goes with a key this server appends to a settings file that does not have it
+-- yet. Same voice as the shipped file: what it does, plus the one thing that changes a decision.
+cfg.SETTING_COMMENTS = {
+    showDriverNames = {
+        "# Whether a driver's name is drawn over his car, for everyone on the server.",
+        "# Race props never carry a name, in either setting.",
+    },
+}
+
+-- Write one setting back into the settings file (ADR-0062). The first thing this plugin has ever
+-- written that is not JSON, and the file it writes to belongs to a stranger.
+--
+-- SURGICAL, never re-serialised from parsed state. The file is read as bytes and the only thing that
+-- changes is the text after the first "=" of the FIRST line whose key matches: that line keeps its own
+-- indentation, its own spacing around the "=" and its own line ending, and every other line goes back
+-- out byte for byte. Comments, order, blank lines, CRLF and a password containing "#" or "=" therefore
+-- survive because nothing here CAN touch them -- not because this function remembers to be careful. A
+-- round trip through cfg.parse_ini, however tidy, would destroy all of it.
+--
+-- The key match uses the parser's rules and no others: "#", ";" and "[" start a non-setting line only at
+-- the START of a line, and the key is everything before the FIRST "=", trimmed. A mid-line "#" is an
+-- ordinary character, so the replacement runs to the end of the line -- exactly the span cfg.parse_ini
+-- would have read as the value.
+--
+-- A duplicate key is the one case where writing and reading disagree: the parser lets the LAST one win,
+-- this writes the FIRST. Rather than silently leaving the change without effect after a restart, it says
+-- so and names the line.
+--
+-- Atomic, the same shape as write_grids: fill a temp file, drop the target, rename. os.rename cannot
+-- overwrite on Windows. A failed rename leaves the complete temp file behind on purpose -- it is the
+-- operator's recovery copy.
+--
+-- Returns true, or false plus a reason the caller can say out loud. It never throws.
+function cfg.write_setting(key, value)
+    if not cfg.path then
+        return false, "this server found no settings file when it started"
+    end
+    -- A value is ONE line by construction. Nothing reachable today hands this anything but "true" or
+    -- "false", but a newline arriving from some later caller would write a second setting into the file
+    -- instead of a value -- refused here so it cannot, rather than assumed because nobody does it yet.
+    if type(value) ~= "string" or value:find("\n", 1, true) or value:find("\r", 1, true) then
+        return false, "refusing to write a value that is not a single line"
+    end
+    local file = io.open(cfg.path, "rb")
+    if not file then
+        return false, "cannot read " .. cfg.path
+    end
+    local content = file:read("*a")
+    file:close()
+    if not content then
+        return false, "cannot read " .. cfg.path
+    end
+
+    local out, pos, line_number, replaced_at = {}, 1, 0, nil
+    while pos <= #content do
+        local break_at = content:find("\n", pos, true)
+        local line = content:sub(pos, (break_at or #content + 1) - 1)
+        line_number = line_number + 1
+        local body = line:gsub("\r$", "")
+        local head = body:match("^([^=]*)=")
+        local first = access.trim(body):sub(1, 1)
+        if head and first ~= "#" and first ~= ";" and first ~= "[" and access.trim(head) == key then
+            if replaced_at then
+                log_info("beamcomp.cfg", cfg.path .. " line " .. line_number .. ": '" .. key
+                    .. "' is set here as well, and that later line is the one that counts on the next"
+                    .. " start -- remove it or the saved value will not apply")
+            else
+                local tail = body:sub(#head + 2)
+                local lead = tail:match("^[ \t]*")
+                if tail == "" then
+                    lead = " "
+                end
+                local cr = #line > #body and "\r" or ""
+                line = head .. "=" .. lead .. value .. cr
+                replaced_at = line_number
+            end
+        end
+        out[#out + 1] = line
+        out[#out + 1] = break_at and "\n" or ""
+        pos = (break_at or #content) + 1
+    end
+
+    if not replaced_at then
+        local nl = content:find("\r\n", 1, true) and "\r\n" or "\n"
+        if #content > 0 and content:sub(-1) ~= "\n" then
+            out[#out + 1] = nl
+        end
+        out[#out + 1] = nl
+        for _, comment in ipairs(cfg.SETTING_COMMENTS[key] or {}) do
+            out[#out + 1] = comment .. nl
+        end
+        out[#out + 1] = key .. " = " .. value .. nl
+    end
+
+    local tmp = cfg.path .. ".tmp"
+    local handle = io.open(tmp, "wb")
+    if not handle then
+        return false, "cannot write " .. tmp
+    end
+    local ok_write = handle:write(table.concat(out))
+    local ok_close = handle:close()
+    if not ok_write or not ok_close then
+        os.remove(tmp)
+        return false, "cannot write " .. tmp
+    end
+    os.remove(cfg.path)
+    if not os.rename(tmp, cfg.path) then
+        -- The target is gone and the rename failed. Put the original bytes back -- they are still in
+        -- hand -- because the alternative is a server that comes up next time with NO settings file at
+        -- all: no admin list, no password, the gate inactive and everybody allowed to do everything.
+        -- That is the one failure of this function that must not be allowed to fail open. The complete
+        -- new file stays at .tmp as the operator's copy either way.
+        local restore = io.open(cfg.path, "wb")
+        if restore then
+            restore:write(content)
+            restore:close()
+        end
+        return false, "cannot commit the write at " .. cfg.path .. " (the new file is at " .. tmp .. ")"
+    end
+    log_info("beamcomp.cfg", string.format("%s = %s written to %s (%s)", key, value, cfg.path,
+        replaced_at and ("line " .. replaced_at) or "appended"))
+    return true
+end
+
 -- The settings file BeamComp replaced. Nothing reads it any more, and a SILENT fallback would hide that
 -- from whoever is still editing it -- so its presence is called out loudly when no .ini was found.
 cfg.LEGACY_PATHS = {
@@ -803,8 +942,10 @@ local function load_config()
     cfg.admins = {}
     cfg.admin_gate_active = false
     cfg.use_client_name = true
+    cfg.show_driver_names = true
     cfg.stats_enabled = false
     cfg.password = nil
+    cfg.path = nil
 
     local settings, path = read_config()
     if not settings then
@@ -813,6 +954,7 @@ local function load_config()
         cfg.warn_legacy_json()
         log_info("beamcomp.cfg", "no settings file found; race-admin gate inactive")
         log_info("beamcomp.cfg", "useClientName=on (default; no settings file)")
+        log_info("beamcomp.cfg", "showDriverNames=on (default; no settings file)")
         log_info("beamcomp.cfg", "enableStatistics=off (default; no settings file)")
         return
     end
@@ -827,9 +969,22 @@ local function load_config()
     -- key both mean "no password configured". The VALUE is never logged, here or anywhere else.
     cfg.password = cfg.value(settings, "racePassword")
 
+    -- The file this server actually read, which is also the ONLY file it may write back to
+    -- (cfg.write_setting, ADR-0062). Writing to the first candidate instead would create a second
+    -- settings file next to the one the operator is editing, and the running server would keep reading
+    -- the other one.
+    cfg.path = path
+
     -- Default on (ADR-0054): only an explicit false turns it off; a missing key stays on.
     cfg.use_client_name = cfg.boolean(settings, "useClientName", true)
     log_info("beamcomp.cfg", "useClientName=" .. (cfg.use_client_name and "on" or "off"))
+
+    -- Whether a driver's name is drawn over his car at all (ADR-0062). Default ON, so a server that says
+    -- nothing keeps looking like plain BeamMP. Read here, above the raceAdmins early return, for the same
+    -- reason enableStatistics is: a file that sets this but lists no admins must still be honoured. The
+    -- race props are NOT covered by it -- they never carry a name, in either setting.
+    cfg.show_driver_names = cfg.boolean(settings, "showDriverNames", true)
+    log_info("beamcomp.cfg", "showDriverNames=" .. (cfg.show_driver_names and "on" or "off"))
 
     -- Default OFF (ADR-0053), and the opposite polarity to useClientName above: only an explicit true
     -- enables the statistics subsystem. A missing key, an empty value, a typo -- all stay off, because
@@ -4970,6 +5125,9 @@ local function reset_to_lobby()
     session.spawn_ready_count = 0
     session.identities = nil
     session.owner_id = nil
+    -- The props are despawned with the race, so a cached map could only ever silence ids that no longer
+    -- exist -- and would hand the next race's late joiner the previous race's answer.
+    session.prop_map = nil
     -- session.ai_roster (ADR-0047) is per-race: the panel re-sends the roster with every start, so a
     -- stale one must never name the next race's AI (e.g. a follow-up typed /race without a roster).
     session.ai_roster = nil
@@ -5388,6 +5546,13 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- field as off, so an older server degrades to "no statistics UI" rather than to a button
                 -- with nothing behind it.
                 statsEnabled = cfg.stats_enabled,
+                -- Whether drivers carry a name over their car (ADR-0062). The policy is broadcast on
+                -- every change and pushed at connect, so this is a RE-ASSERTION and not the delivery
+                -- path: it rides here because a race start is the moment it visibly matters and the one
+                -- message that reaches every participant, which closes the window after a level change
+                -- (the client drops the policy when it leaves a level, so one server's setting can never
+                -- travel to the next).
+                showDriverNames = cfg.show_driver_names == true,
             })
         end
     end
@@ -7128,6 +7293,87 @@ function identity.broadcast_players(leaving_id)
     broadcast_event(identity.MSG_PLAYERS, {players = identity.player_list(leaving_id)})
 end
 
+-- Relay the race owner's prop map to every client (ADR-0062): the cross-client ids of the vehicles its
+-- prefab load created, which must never carry a nametag on anybody's screen.
+--
+-- The owner is the only machine that can answer this. It spawned the props, so it holds the before/after
+-- diff of its own prefab load -- and it is also the one player who can never SEE the result, because
+-- BeamMP draws no nametag over your own vehicles. That is why the previous attempt (a jbeam name list,
+-- 270 of 556 prop vehicles) stood for a year.
+--
+-- Accepted only from the active race's owner, rebroadcast verbatim, and cached for a late arrival. This
+-- server reads no id of it.
+function identity.handle_prop_map(player_id, payload)
+    if session.phase == PHASE.lobby or player_id ~= session.owner_id then
+        log_info("beamcomp.net", identity.MSG_PROP_MAP .. " from id " .. tostring(player_id)
+            .. " ignored: not the active race owner")
+        return
+    end
+    local ids = type(payload) == "table" and payload.ids or nil
+    if type(ids) ~= "table" then
+        return
+    end
+    session.prop_map = {ids = ids}
+    broadcast_event(identity.MSG_PROP_MAP, session.prop_map)
+end
+
+-- Everything a single client has to be told the moment this server can reach it, rather than at the next
+-- change (ADR-0062). Called from the two points where reachability is a reading and not a guess: the
+-- first pull request BeamMP accepted, and the client's own answer to it (ADR-0058). Both are cheap and
+-- idempotent, and the second is the stronger one -- a delivered request only proves BeamMP took it.
+function identity.send_connect_state(player_id)
+    send_event(player_id, identity.MSG_NAME_POLICY, identity.name_policy())
+    if session.prop_map then
+        send_event(player_id, identity.MSG_PROP_MAP, session.prop_map)
+    end
+end
+
+-- Whether drivers carry a name on this server (ADR-0062), as it goes on the wire. One shape for the
+-- broadcast, the per-client push and the setup panel, so the three can never disagree.
+function identity.name_policy()
+    return {showDriverNames = cfg.show_driver_names == true}
+end
+
+-- Tell everyone. The policy is applied on each client, so it has to reach the clients that have no
+-- panel open just as much as the admin who changed it.
+function identity.broadcast_name_policy()
+    broadcast_event(identity.MSG_NAME_POLICY, identity.name_policy())
+end
+
+-- An admin flipped the driver-name switch in the race-setup panel (ADR-0062).
+--
+-- Gated on is_race_admin and nothing else: the panel is an operating gate, never a data boundary
+-- (ADR-0056), so the action is re-verified here like every other one. The `what` is worded for the
+-- refusal line the player reads.
+--
+-- The ORDER is load-bearing. The runtime value and the broadcast go first, the file second: a server
+-- whose settings file is read-only, gone, or on a full disk must still be able to change the setting for
+-- the session it is running -- and must then say out loud that it could not save it. A failed write
+-- never costs the effect, and it is never silent.
+function identity.handle_set_names(player_id, payload)
+    local player_name = MP.GetPlayers()[player_id]
+    if not is_race_admin(player_name, player_id) then
+        access.refuse(player_id, "change the driver-name setting")
+        log_info("beamcomp.identity", "denied " .. identity.MSG_SET_NAMES .. " from "
+            .. tostring(player_name) .. " (not a race admin)")
+        return
+    end
+
+    local wanted = type(payload) == "table" and payload.value == true
+    cfg.show_driver_names = wanted
+    identity.broadcast_name_policy()
+    log_info("beamcomp.identity", "showDriverNames=" .. (wanted and "on" or "off") .. " set by "
+        .. tostring(player_name))
+
+    local saved, reason = cfg.write_setting("showDriverNames", wanted and "true" or "false")
+    if saved then
+        return
+    end
+    MP.SendChatMessage(player_id, "BeamComp: driver names are " .. (wanted and "on" or "off")
+        .. " for this session, but the setting could not be saved -- " .. tostring(reason))
+    log_info("beamcomp.cfg", "could not persist showDriverNames: " .. tostring(reason))
+end
+
 -- The Remind button in the race-setup panel (ADR-0054): send the join hint to everyone still on a
 -- temporary name, so the admin can fix a grid full of guest names before the start instead of after it.
 -- The panel lists ALL players but Remind targets only the temporary ones -- it filters the very list the
@@ -7227,6 +7473,10 @@ function identity.note_report(player_id)
     if pull then
         pull.answered = true
     end
+    -- An answer proves the client's extension is listening, which a delivered request does not -- so this
+    -- is also the strongest moment to push the state it cannot ask for (ADR-0062). It runs on a GE Lua
+    -- reload too, where the record is already `done` and nothing else would ever re-send.
+    identity.send_connect_state(player_id)
 end
 
 -- Drive the pull: ask every armed player again until BeamMP takes the event (ADR-0058). Called from
@@ -7270,6 +7520,7 @@ function identity.pull_step()
                             "asked id %s for its connect reports after %.1f s (%d attempt(s))",
                             tostring(player_id), at - pull.armed_at, pull.attempts))
                         identity.arm_hint(player_id)
+                        identity.send_connect_state(player_id)
                     end
                 end
             end
@@ -9076,6 +9327,10 @@ local function handle_client_event(player_id, data)
         handle_client_identity(player_id, decoded.payload)
     elseif decoded.type == identity.MSG_REMIND then
         identity.handle_remind(player_id)
+    elseif decoded.type == identity.MSG_PROP_MAP then
+        identity.handle_prop_map(player_id, decoded.payload)
+    elseif decoded.type == identity.MSG_SET_NAMES then
+        identity.handle_set_names(player_id, decoded.payload)
     elseif decoded.type == keys.MSG_REPORT then
         keys.handle_report(player_id, decoded.payload)
     elseif decoded.type == keys.MSG_REMIND then

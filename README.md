@@ -136,10 +136,14 @@ follows here is the same thing in short.
 raceAdmins = Alice, Bob
 racePassword = something-only-we-know
 useClientName = true
+showDriverNames = true
 ```
 
 - `useClientName` -- whether the name a player set with `/name` is used. `false` always uses the BeamMP
   name.
+- `showDriverNames` -- whether a driver's name is drawn over his car. `false` removes every nametag in
+  the session. The race's props never carry one either way. An admin can also switch it in the setup
+  panel's gear menu, and that change is written back into this file.
 - A line that cannot be read is **skipped with a warning naming its line number**, and every other
   setting still applies. A typo costs you that one line, not the password three lines below it.
 - A `#` (or `;`) starts a comment **only at the start of a line**. Mid-line it is an ordinary character,

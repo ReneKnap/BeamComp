@@ -40,6 +40,7 @@
 local M = {}
 
 local cones = require("beamcomp/race/cones")
+local nametags = require("beamcomp/race/nametags")
 local grinders = require("beamcomp/race/grinders")
 local prefab = require("beamcomp/race/prefab")
 local vehiclespecs = require("beamcomp/race/vehiclespecs")
@@ -92,8 +93,11 @@ end
 -- vehicles the host spawns from a cones-only copy (so it does not re-spawn the track's statics/spheres);
 -- empty for missions, whose cones ride inside `prefab_files`. Non-hosts never spawn it.
 -- Returns the list of prefab names spawned (for prefab cleanup), the list of kept cone vehicle ids
--- (empty unless host; for cone cleanup), and the list of kept powered-prop vehicle ids (the grinders --
--- empty unless host, ADR-0020 amendment). One bad prefab warns and is skipped rather than aborting.
+-- (empty unless host; for cone cleanup), the list of kept powered-prop vehicle ids (the grinders --
+-- empty unless host, ADR-0020 amendment), and the pre-load vehicle snapshot AS STRING KEYS, which the
+-- caller keeps for the whole race so M.live_prop_ids can re-run the diff (ADR-0062) -- nil when nothing
+-- was loaded at all, because an EMPTY snapshot would make live_prop_ids read every vehicle in the scene
+-- as new-since-the-load. One bad prefab warns and is skipped rather than aborting.
 --
 -- NOTE on the two id lists: BeamMP deletes and re-spawns a freshly spawned prop-vehicle under a NEW id a few
 -- seconds later, as part of its ownership/sync round-trip, so both lists go stale (measured, bug
@@ -112,6 +116,13 @@ function M.load(prefab_files, keep_cones, cone_files)
     end
 
     local vehicles_before = current_vehicle_ids()
+    -- The same snapshot keyed by STRING, for the caller to keep: every id comparison that crosses the
+    -- BeamMP boundary is done as a string in this codebase (getOwnMap keys, getId(), relayed ids), and
+    -- one normalized copy here is cheaper than a tostring/tonumber dance at each later lookup.
+    local before_keys = {}
+    for id in pairs(vehicles_before) do
+        before_keys[tostring(id)] = true
+    end
 
     local spawned = {}
     for i, file in ipairs(prefab_files) do
@@ -204,7 +215,59 @@ function M.load(prefab_files, keep_cones, cone_files)
 
     log("I", LOG_TAG, string.format("loaded %d prop prefab(s), %d shared cone(s), %d powered prop(s)",
         #spawned, #cone_ids, #grinder_ids))
-    return spawned, cone_ids, grinder_ids
+    return spawned, cone_ids, grinder_ids, before_keys
+end
+
+
+-- The race's prop vehicles as the SCENE knows them right now, as a set of cross-client BeamMP ids, plus
+-- how many candidates could not be resolved yet (ADR-0062). Host only -- nobody else spawns a prop.
+--
+-- This is the before/after diff of the host's own prefab load, re-runnable instead of captured once:
+--
+--     a prop  <=>  it is in the scene now
+--              and it did NOT exist before this race's prefab load  (`before`)
+--              and it is none of the cars I put there myself        (`exclude`: race car, AI, seat)
+--              and BeamMP does not say it belongs to somebody else  (entry.isLocal ~= false)
+--
+-- Four properties and not one jbeam name, which is the whole point: the old suppression asked
+-- `veh.JBeam == "cones"` and therefore covered 270 of 556 prop vehicles (ADR-0062). Re-running it is
+-- also what survives BeamMP deleting a freshly prefab-spawned vehicle and re-spawning it under a new id
+-- a few seconds later (memory beammp-respawns-prefab-vehicles-under-new-ids): the replacement is still
+-- new-since-the-load and still ours, so the next call finds it, while the dead id simply stops
+-- appearing. An id list captured at load time is what silently broke the grinder spin and the prop
+-- cleanup for weeks.
+--
+-- A vehicle BeamMP has not registered yet counts as UNRESOLVED, never as done -- the caller reports
+-- "n of m" and keeps trying, because a confident "all props are nameless" over an incomplete set is
+-- exactly how this defect stayed invisible for a year.
+function M.live_prop_ids(before, exclude)
+    local ids, unresolved = {}, 0
+    if not be then
+        return ids, unresolved
+    end
+    before = before or {}
+    exclude = exclude or {}
+    for i = 0, be:getObjectCount() - 1 do
+        local veh = be:getObject(i)
+        local game_id = veh and veh:getID() or nil
+        local key = game_id and tostring(game_id) or nil
+        if key and not before[key] and not exclude[key] then
+            local entry = nametags.entry_for(game_id)
+            -- An entry that says isLocal == false is somebody else's car arriving: not a prop, and
+            -- nothing to wait for either.
+            if entry == nil or entry.isLocal ~= false then
+                local server_id = entry and nametags.id_of(entry) or nil
+                if server_id ~= nil then
+                    ids[tostring(server_id)] = true
+                else
+                    -- No entry at all, or ours but not yet carrying a cross-client id: both are
+                    -- "ask again", never "done".
+                    unresolved = unresolved + 1
+                end
+            end
+        end
+    end
+    return ids, unresolved
 end
 
 -- Remove every prop prefab previously spawned, by name. Tolerant of names whose object is

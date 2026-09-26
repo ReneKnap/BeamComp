@@ -273,6 +273,12 @@
              It governs the grid editor too (shared localStorage key, same origin), which is why that
              panel has no menu of its own. -->
         <label class="bc-tog bc-settings-item" bc-setup-tip="tip('tooltips')"><input type="checkbox" ng-model="ui.tooltips" ng-change="setTooltips()"><span>Show tooltips</span></label>
+        <!-- The one SERVER setting in this menu (ADR-0062), hence `server.` and not `ui.` / `form.`: it
+             changes what every client draws and is written back into beamcomp.config.ini. Same
+             object-property rule as the two above -- this list sits under an ng-if and has its own child
+             scope. The checkbox is not the truth: the server answers every flip with a broadcast that
+             sets it, so a refused attempt puts it straight back. -->
+        <label class="bc-tog bc-settings-item" bc-setup-tip="tip('showDriverNames')"><input type="checkbox" ng-model="server.showDriverNames" ng-change="setDriverNames()"><span>Show driver names</span></label>
         <!-- The only entry here that acts instead of storing a preference, hence the separator. It is
              the same GE function the controls window's footer calls -- the gear sits behind the admin
              gate, and a plain player never sees this panel. -->

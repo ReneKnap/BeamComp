@@ -24,6 +24,7 @@ local M = {}
 
 local vehicles = require("beamcomp/race/vehicles")
 local cones = require("beamcomp/race/cones")
+local nametags = require("beamcomp/race/nametags")
 local vehiclespecs = require("beamcomp/race/vehiclespecs")
 -- The dev-authored driver definitions (ADR-0048): the SINGLE source of the named-AI pool -- every driver's
 -- name -> preferred car + preferred colour. Replaces the old built-in NAME_POOL and the runtime-writable,
@@ -110,10 +111,6 @@ function M.preset_defaults()
     end
     return {presets = presets, fallback = DEFAULT_PRESET}
 end
-
--- Candidate MPVehicleGE entry fields that carry a vehicle's cross-client BeamMP id (spike #2). Tried in
--- order until one yields a value; logged so the handover test can pin the real field.
-local SERVER_ID_FIELDS = {"serverVehicleString", "serverVehicleID", "remoteVehID", "gameVehicleID"}
 
 -- Deferred-restage bounds for AI cars (ADR-0036), mirroring the player restage (init.lua): a freshly
 -- spawned car reports a stale spawn bbox while its jbeam loads, so front-anchoring immediately lands it
@@ -1762,46 +1759,35 @@ function M.clear(cars)
     return cleared
 end
 
--- Suppress the owner's BeamMP nametag on a (host-local or remote-synced) AI car and keep it out of the
--- Tab vehicle cycle (ADR-0036), reusing the cone policy. Best-effort + guarded; a not-yet-registered
--- vehicle keeps its tag and is retried by the caller. Returns true if the nametag was hidden this call.
+-- Keep a (host-local or remote-synced) AI car out of the Tab vehicle cycle (ADR-0036), reusing the cone
+-- policy. Returns whether the attempt ran.
+--
+-- It no longer touches the NAMETAG. An AI is a driver now and races under its standings name, which
+-- race/nametags.lua puts there from the label the aiMap already relays (ADR-0062, decision 3) -- and
+-- which the server's showDriverNames can take away again, exactly like a human's. Hiding it here as
+-- well would be a second answer to the same question.
 function M.suppress(veh)
     if not veh then
         return false
     end
-    cones.exclude_from_cycle(veh)
-    return cones.hide_vehicle_nametag(veh)
+    return cones.exclude_from_cycle(veh)
 end
 
 -- A vehicle's cross-client BeamMP id, or nil (SPIKE #2). The owner reads it for each AI car to build the
--- aiMap; a remote reads it per synced vehicle to match the relayed set. Tries the candidate MPVehicleGE
--- fields in order, fully guarded; logs the first field that yields a value so the handover test can pin
--- it. nil outside a BeamMP session or when no field resolves.
+-- aiMap; a remote reads it per synced vehicle to match the relayed set. The entry lookup and the
+-- candidate-field list live in race/nametags.lua -- one list, because two copies are two different
+-- answers to "which vehicle is this". nil outside a BeamMP session or when no field resolves.
 function M.server_id_of(veh)
     if not veh then
         return nil
     end
-    if type(MPVehicleGE) ~= "table" or type(MPVehicleGE.getVehicleByGameID) ~= "function" then
-        return nil
-    end
-    local ok, server_id = pcall(function()
-        local entry = MPVehicleGE.getVehicleByGameID(veh:getID())
-        if type(entry) ~= "table" then
-            return nil
-        end
-        for _, field in ipairs(SERVER_ID_FIELDS) do
-            local value = entry[field]
-            if value ~= nil and value ~= "" then
-                return value
-            end
-        end
-        return nil
-    end)
+    -- getID() guarded too: callers hand this vehicles from tracked id lists, and a handle whose vehicle
+    -- BeamMP has already deleted must answer nil rather than throw inside onUpdate.
+    local ok, game_id = pcall(function() return veh:getID() end)
     if not ok then
-        log("W", LOG_TAG, "server_id_of failed: " .. tostring(server_id))
         return nil
     end
-    return server_id
+    return nametags.id_of(nametags.entry_for(game_id))
 end
 
 -- ===== Named AI driver pool (ADR-0047 roster + ADR-0048 file-defined pool) =====

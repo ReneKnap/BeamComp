@@ -58,6 +58,7 @@ local race_start = require("beamcomp/race/start")
 local vehicles = require("beamcomp/race/vehicles")
 local props = require("beamcomp/race/props")
 local cones = require("beamcomp/race/cones")
+local nametags = require("beamcomp/race/nametags")
 local grinders = require("beamcomp/race/grinders")
 local spawn_mute = require("beamcomp/race/spawn_mute")
 local countdown = require("beamcomp/race/countdown")
@@ -214,13 +215,6 @@ local SWITCH_BLOCK_TOAST_THROTTLE = 2.0
 -- spawn block throttles.
 local CAP_SWAP_TOAST_THROTTLE = 2.0
 
--- How long to keep retrying BeamMP nametag suppression on a freshly synced cone before giving up. A
--- remote-synced cone is registered in MPVehicleGE asynchronously, a frame or two after onVehicleSpawned
--- fires, so the one-shot hide_nametag there misses it; we retry from onUpdate until it sticks. The
--- timeout is only the give-up bound (registration normally settles almost immediately); on timeout the
--- tag simply stays -- the same accepted fallback as before (ADR-0020 finding #4).
-local NAMETAG_RETRY_TIMEOUT = 10.0
-
 -- Seconds to wait for a (swapped or freshly-spawned) car's jbeam to finish loading before re-placing it
 -- anyway (fallback for a same-footprint swap, where the bbox never visibly changes). Forward
 -- half-length change (metres) that signals the new jbeam has loaded and the bbox now reflects the
@@ -236,7 +230,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "setup-anchor-ai-inherit-r1/2026-09-25"
+local BUILD_MARKER = "prop-nametags-and-race-names-r1/2026-09-26"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -281,7 +275,16 @@ M.state = {
     cone_ids = nil,      -- ids of the shared cone vehicles we spawned + must clear (host only, ADR-0020)
     prop_owner = false,  -- whether we are (or were) the client that spawns + owns the shared prop-vehicles (payload.propOwner, ADR-0020); gates the grinder activation window and the scene-scan cleanup long after handle_race_start, and survives teardown on purpose so a repeat cleanup pass still reaps a late re-spawn (see teardown_race_world)
     grinder_activate = nil,  -- powered-prop activation window state owned by race/grinders (arm/step/note_spinning): tracked + pending ids, confirmations, deadline; nil when idle/non-host or the window has closed. No spawn-time id list is kept any more -- BeamMP re-spawns the props under new ids, so the window re-derives them from the scene (ADR-0020 amendment, bug race-prop-steals-player-seat rounds 2+3)
-    pending_nametag = nil,  -- map of cone game-id -> seconds waited for MPVehicleGE nametag suppression to stick; lazily created, nil when idle (ADR-0020)
+    prop_before = nil,   -- host only: the vehicle ids that existed BEFORE this race's prefab load, as string keys (props.load). The whole basis of prop identity (ADR-0062): everything new since then, minus the cars we put there ourselves, is a prop. Kept for the race, not just the load, because BeamMP re-spawns props under new ids and the diff has to be re-runnable. nil off-race / on a non-host
+    prop_ids = nil,      -- set of cross-client BeamMP ids of the race's props, as string keys: derived locally on the host, relayed (propMap) everywhere else. nil = nothing to silence (ADR-0062)
+    prop_map_pending = false,  -- host only: the prop map has to be rebuilt and, if it changed, re-sent. Set by the prefab load and by every vehicle spawn during a race we own the props of -- which is what catches BeamMP's ~5 s delete-and-respawn of the props under new ids
+    prop_map_sent = nil,  -- host only: signature of the last propMap that went out, so an unchanged map costs no message
+    prop_map_wait = 0,   -- host only: seconds until the next rebuild attempt while prop_map_pending
+    prop_map_budget = 0, -- host only: seconds of rebuild attempts left before we stop and WARN about the vehicles that never registered with BeamMP. A silent give-up on an incomplete map is how the old suppression hid a 49%-coverage gap for a year
+    ai_names = nil,      -- non-owner: cross-client BeamMP id -> the AI's standings label, from the relayed aiMap (ADR-0036/0062), or nil
+    show_driver_names = nil,  -- whether drivers (humans AND AI) carry a name over their car on this server (ADR-0062). nil = not heard yet, and the safe reading of nil is ON: a client that never got the policy behaves exactly like plain BeamMP. Only an explicit false hides them. Props are outside this and silent either way
+    tag_written = nil,   -- what THIS client changed on BeamMP's nametag entries: {hidden = {}, named = {}} keyed by cross-client id, so a tag is only ever given back or cleared if we took it away or set it (ADR-0062). Lazily created
+    tag_wait = 0,        -- seconds until the next nametag reconcile sweep; the sweep is what beats a rebuilt MPVehicleGE entry, which comes back tagged (hideNametag/customName are not serialized)
     current_vehicle_id = nil,  -- game id of the vehicle the player is in, tracked via onVehicleSwitched
     race_car_id = nil,   -- game id of this client's race car; bounce target for the in-race switch lock
     detection = nil,     -- checkpoint-detection progress (race/checkpoints), armed on the racing phase
@@ -645,6 +648,12 @@ local function handle_race_start(payload)
     -- non-boolean -- every one of them leaves the analysis UI hidden. Absence never resurrects the feature.
     M.state.stats_enabled = type(payload) == "table" and payload.statsEnabled == true
 
+    -- The server's nametag policy, re-asserted with every race (ADR-0062). Unlike statsEnabled the safe
+    -- reading of "unknown" here is ON, not off: this setting defaults to on, so an absent field, an
+    -- older server or a dropped message has to leave the session looking like plain BeamMP rather than
+    -- silently stripping everybody's name. The props are outside it and silent either way.
+    M.state.show_driver_names = not (type(payload) == "table" and payload.showDriverNames == false)
+
     -- A starting race ends any in-progress grid edit so its preview pillars never bleed into the race
     -- (the ADR-0023 editor is a lobby-only authoring tool); clear its reference props and drop the panel.
     if grideditor.state.active then
@@ -824,9 +833,19 @@ local function handle_race_start(payload)
     if M.state.prop_owner or payload.propOwner then
         grinders.clear_scene()
     end
-    local grinder_seed
-    M.state.prop_names, M.state.cone_ids, grinder_seed = props.load(race.prefabFiles or {},
+    local grinder_seed, prop_before
+    M.state.prop_names, M.state.cone_ids, grinder_seed, prop_before = props.load(race.prefabFiles or {},
         payload.propOwner, race.coneFiles or {})
+    -- The host keeps the pre-load vehicle snapshot for the whole race: it is what "a prop" MEANS
+    -- (ADR-0062). Everything that appeared since, minus the cars this client put on the grid itself, is
+    -- one -- re-derivable, so BeamMP re-spawning the props under new ids a few seconds from now changes
+    -- nothing. Non-hosts spawn no prop and derive nothing; they are told (propMap).
+    M.state.prop_before = payload.propOwner and prop_before or nil
+    M.state.prop_ids = nil
+    M.state.prop_map_sent = nil
+    M.state.prop_map_pending = M.state.prop_before ~= nil
+    M.state.prop_map_wait = 0
+    M.state.prop_map_budget = identity.PROP_MAP_BUDGET
     -- Whether we are the client that spawns and owns the shared prop-vehicles (ADR-0020). Kept in state
     -- because the grinder paths need it long after this handler: the activation window and the scene-scan
     -- cleanup must both stay host-only, and teardown runs with no payload in hand.
@@ -858,6 +877,7 @@ local function handle_race_start(payload)
     M.state.ai_map_pending = false
     M.state.ai_remote_ids = nil
     M.state.ai_server_ids = nil
+    M.state.ai_names = nil
 
     -- Place this client's own car at the assigned grid pose: the car the player is in is repaired +
     -- teleported in place (preserving its settings), or a fresh one is spawned as a fallback
@@ -1147,6 +1167,15 @@ local function teardown_race_world()
     M.state.prop_names = nil
     M.state.cone_ids = nil
     M.state.grinder_activate = nil
+    -- The nametag half of the props goes with them (ADR-0062). The props themselves are deleted just
+    -- above, so their BeamMP entries disappear and nothing is left half-silenced; the driver policy is
+    -- connection-scoped and deliberately NOT cleared here (ADR-0062 decision 6: it applies to the whole
+    -- session, not to a race).
+    M.state.prop_before = nil
+    M.state.prop_ids = nil
+    M.state.prop_map_pending = false
+    M.state.prop_map_sent = nil
+    M.state.ai_names = nil
     -- Drop the staging-swap pre-anchor hook with the race that installed it, so no closure outlives the
     -- pose it was built for (ADR-0051 round 2). Re-installed on the next staging phase.
     lock.on_before_replace = nil
@@ -3295,6 +3324,18 @@ function M.remind_keys()
     send_to_server("remindKeys", {})
 end
 
+-- The panel's "Show driver names" switch (ADR-0062). This is a SERVER setting, not a local preference,
+-- so nothing is applied here: the server verifies the caller is a race admin, changes the value, writes
+-- it back to beamcomp.config.ini and broadcasts the new policy -- and the broadcast is what moves both
+-- the nametags and this panel's checkbox, on every client rather than just this one. A non-admin panel
+-- gets a refusal in chat and nothing changes anywhere, exactly like Remind.
+--
+-- The argument arrives as the panel's "1"/"0" string (geLuaArg), the same shape request_setup_data uses.
+-- Public as beamcomp_init.set_driver_names.
+function M.set_driver_names(flag)
+    send_to_server("setDriverNames", {value = flag == "1" or flag == true})
+end
+
 -- Push one model's configs to the open race-setup panel (UI -> GE, ADR-0037). The panel calls this when
 -- the car model changes; configs are probed lazily per model since an all-models probe is heavy. Public
 -- so the app can reach it as beamcomp_init.request_car_configs.
@@ -3376,6 +3417,15 @@ function setup.clear()
     -- Same reason, and here it matters more than for the numbers: BeamMP hands out player ids per
     -- server, so an id kept from the last one would match a stranger's row on the next.
     M.state.own_player_id = nil
+    -- And the same reason once more for the nametag policy (ADR-0062). It belongs to the SERVER, so
+    -- carrying it to the next one would apply a stranger's setting until his own broadcast lands --
+    -- absence has to mean unknown, never "what I saw last". Unknown reads as on, which is what BeamMP
+    -- does by itself. The record of what we wrote goes with it: cross-client ids are per server too, so
+    -- a kept entry could make us give a tag back on a vehicle we never touched.
+    M.state.show_driver_names = nil
+    M.state.tag_written = nil
+    M.state.prop_ids = nil
+    M.state.ai_names = nil
 end
 
 -- Watchdog step, called from onUpdate while the panel is meant to be open -- phase-independently, since
@@ -3643,6 +3693,10 @@ local function push_setup_data(include_deprecated)
         -- included: the panel must read an absent table as "unknown" and fall back to a neutral
         -- "default", never keep showing a number GE can no longer vouch for.
         serverDefaults = M.state.server_defaults,
+        -- Whether drivers carry a name over their car (ADR-0062) -- a SERVER setting the panel can flip,
+        -- not a local preference, so it rides the dataset the panel already pulls on link. Unknown reads
+        -- as on, exactly as the policy itself does.
+        showDriverNames = M.state.show_driver_names ~= false,
     })
     -- The driver NAME list for the panel's roster name picker (ADR-0048): sourced from the mod-bundled
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
@@ -4541,14 +4595,24 @@ local function handle_ai_map(payload)
     if type(entries) ~= "table" then
         return
     end
-    local pending = {}
+    local pending, labels = {}, {}
     for _, entry in ipairs(entries) do
         if entry.serverId ~= nil then
-            pending[tostring(entry.serverId)] = true
+            local key = tostring(entry.serverId)
+            pending[key] = true
+            -- The label has ridden in this message since ADR-0036 and no remote has ever read it. It is
+            -- the name the standings show for that car -- ai_entry.label = entry.name =
+            -- grid_store.ai_display_name(id), the same call make_slot_entry uses -- so an AI races under
+            -- exactly the name the board gives it, with no (AI) and no number (ADR-0062, decision 3).
+            if type(entry.label) == "string" and entry.label ~= "" then
+                labels[key] = entry.label
+            end
         end
     end
     M.state.ai_server_ids = pending
+    M.state.ai_names = next(labels) ~= nil and labels or nil
     resolve_remote_ai()
+    identity.apply_tags()
 end
 
 local HANDLERS = {
@@ -4608,6 +4672,9 @@ local HANDLERS = {
         M.state.player_list = (type(payload) == "table" and type(payload.players) == "table")
             and payload.players or {}
         identity.push_players()
+        -- The same list is what every driver's nametag says (ADR-0062), so a join, a leave and an
+        -- accepted /name all reach the cars in the same message that reaches the panel.
+        identity.apply_tags()
     end,
     championship = handle_championship,
     tournament = handle_tournament,
@@ -4620,6 +4687,47 @@ local HANDLERS = {
     listVehicles = handle_list_vehicles,
     regrid = handle_regrid,
     aiMap = handle_ai_map,
+    -- Whether drivers carry a name over their car on this server (ADR-0062). Broadcast on every change
+    -- and pushed to each client the moment the server can reach it, so a client with no panel open is
+    -- just as current as the admin who flipped it.
+    --
+    -- A payload without the field reads as ON, the same reading as never having heard the message at
+    -- all: the setting defaults to on, so "unknown" must look like plain BeamMP rather than like a
+    -- server that silently stripped everybody's name. Defined inline -- a table field costs no top-level
+    -- local.
+    namePolicy = function(payload)
+        M.state.show_driver_names = not (type(payload) == "table" and payload.showDriverNames == false)
+        identity.apply_tags()
+        identity.push_name_policy()
+        log("I", LOG_TAG, "driver names are " .. (M.state.show_driver_names and "on" or "off")
+            .. " on this server")
+    end,
+    -- The cross-client BeamMP ids of the vehicles the owner's prefab load created (ADR-0062). They carry
+    -- no name on any client, in either setting of showDriverNames -- a prop is never a driver.
+    --
+    -- The set is REPLACED, not merged. Every message carries the whole truth, which is what keeps a prop
+    -- BeamMP deleted and re-spawned under a new id from leaving its dead id behind while its live one
+    -- goes uncovered. The host derives its own set (identity.prop_map_step) and ignores the echo of its
+    -- own message, exactly like the owner ignores its own aiMap. Defined inline: a table field costs no
+    -- top-level local, and init.lua is near LuaJIT's ceiling.
+    propMap = function(payload)
+        if M.state.prop_before then
+            return
+        end
+        local ids = type(payload) == "table" and payload.ids or nil
+        local set, count = {}, 0
+        if type(ids) == "table" then
+            for _, id in ipairs(ids) do
+                if id ~= nil then
+                    set[tostring(id)] = true
+                    count = count + 1
+                end
+            end
+        end
+        M.state.prop_ids = count > 0 and set or nil
+        identity.apply_tags()
+        log("I", RACE_LOG_TAG, string.format("race props: %d vehicle(s) carry no name here", count))
+    end,
     validateRace = handle_validate_race,
     -- On-demand scenery pull for a client without the track (ADR-0046).
     trackProbe = handle_track_probe,
@@ -5120,6 +5228,163 @@ function identity.push_players()
     end
 end
 
+
+-- ===== nametags: which vehicle carries a name, and what it says (ADR-0062) =========================
+-- On `identity` rather than on a namespace of its own for the reason its header gives: this namespace
+-- owns the name a player is shown under, and a floating nametag is that name on a car. race/nametags.lua
+-- owns the BeamMP boundary; everything here is the policy this client can state.
+
+identity.SWEEP_INTERVAL = 0.5     -- seconds between reconcile sweeps
+identity.PROP_MAP_RETRY = 0.25    -- seconds between prop-map rebuild attempts while something is unresolved
+identity.PROP_MAP_BUDGET = 20.0   -- seconds of attempts before giving up on the stragglers -- loudly
+
+-- Vehicles this client knowingly put on the grid, as string keys. They are the exception to "everything
+-- that appeared after the prefab load is a prop": the own race car (possibly freshly spawned, so not in
+-- the pre-load snapshot) and the AI field.
+--
+-- The two seated-car reads are the belt to race_car_id's braces. A staging swap and a quali re-grid both
+-- replace the own car, and for the frames between the spawn and the state write the tracked seat is the
+-- only current answer. A stale answer costs nothing here: it can only name a car that existed before the
+-- load, which the snapshot already excludes.
+function identity.race_car_ids()
+    local ids = {}
+    local function keep(id)
+        if id ~= nil then
+            ids[tostring(id)] = true
+        end
+    end
+    keep(M.state.race_car_id)
+    keep(M.state.current_vehicle_id)
+    for _, car in ipairs(M.state.ai_cars or {}) do
+        keep(car.veh_id)
+    end
+    if be then
+        local ok, seated = pcall(function() return be:getPlayerVehicle(0) end)
+        if ok and seated then
+            keep(seated:getId())
+        end
+    end
+    return ids
+end
+
+-- The prop ids in a stable order: the wire payload and, concatenated, the signature that decides whether
+-- anything has to be sent at all.
+function identity.prop_list(ids)
+    local list = {}
+    for id in pairs(ids or {}) do
+        list[#list + 1] = id
+    end
+    table.sort(list)
+    return list
+end
+
+-- HOST ONLY: re-derive this race's prop set and relay it when it changed (ADR-0062).
+--
+-- Idle cost is one boolean test. While pending, it re-runs every PROP_MAP_RETRY seconds -- which is what
+-- covers BeamMP registering a fresh prop asynchronously and, ~5 s later, deleting and re-spawning the
+-- whole set under new ids (memory beammp-respawns-prefab-vehicles-under-new-ids). onVehicleSpawned
+-- re-arms it, so a prop that appears at any later point gets back in.
+--
+-- The three endings are three different log lines on purpose. "all 14 props are silent", "12 of 14, still
+-- asking" and "gave up with 2 unregistered" must not look alike: a confident line over an incomplete set
+-- is how the old suppression's 49 % coverage went unnoticed for a year.
+function identity.prop_map_step(dt)
+    if not M.state.prop_map_pending or not M.state.prop_before then
+        return
+    end
+    M.state.prop_map_wait = (M.state.prop_map_wait or 0) - (dt or 0)
+    if M.state.prop_map_wait > 0 then
+        return
+    end
+    M.state.prop_map_wait = identity.PROP_MAP_RETRY
+
+    local ids, unresolved = props.live_prop_ids(M.state.prop_before, identity.race_car_ids())
+    local list = identity.prop_list(ids)
+    local signature = table.concat(list, ",")
+    if signature ~= M.state.prop_map_sent then
+        M.state.prop_ids = ids
+        M.state.prop_map_sent = signature
+        send_to_server("propMap", {ids = list})
+        -- Our own props too: invisible to us (BeamMP never draws a tag over an own vehicle), but it keeps
+        -- one rule for both sides instead of a host that is quietly exempt from its own policy.
+        identity.apply_tags()
+        -- The set changed, so the derivation is making progress -- give the stragglers the full budget
+        -- again rather than timing out mid-churn.
+        M.state.prop_map_budget = identity.PROP_MAP_BUDGET
+        log("I", RACE_LOG_TAG, string.format("relayed %d race prop(s) as nameless", #list))
+    end
+
+    if unresolved == 0 then
+        M.state.prop_map_pending = false
+        return
+    end
+    M.state.prop_map_budget = (M.state.prop_map_budget or 0) - identity.PROP_MAP_RETRY
+    if M.state.prop_map_budget <= 0 then
+        M.state.prop_map_pending = false
+        log("W", RACE_LOG_TAG, string.format("%d race prop(s) relayed as nameless, but %d vehicle(s) "
+            .. "never registered with BeamMP -- those keep the host's name", #list, unresolved))
+    end
+end
+
+-- Everything this client currently knows about who carries a name, in the shape race/nametags.apply
+-- consumes. Rebuilt per call: it is three table reads and a walk over the player list, and a cached copy
+-- would be one more thing to invalidate on every join, leave, rename and race start.
+function identity.tag_policy()
+    local names = nil
+    local rows = M.state.player_list
+    if rows then
+        names = {}
+        for _, row in ipairs(rows) do
+            if row.id ~= nil and type(row.name) == "string" then
+                names[tostring(row.id)] = row.name
+            end
+        end
+    end
+    M.state.tag_written = M.state.tag_written or {}
+    return {
+        props = M.state.prop_ids,
+        ai = M.state.ai_names,
+        names = names,
+        -- Only an explicit false hides drivers: a client that has not heard the policy looks exactly like
+        -- plain BeamMP, which is the safe reading of "unknown" for a setting that defaults to on.
+        show = M.state.show_driver_names ~= false,
+        written = M.state.tag_written,
+    }
+end
+
+function identity.apply_tags()
+    nametags.apply(identity.tag_policy())
+end
+
+-- Reflect the server's name policy into an open setup panel. Its own dataset push carries the value too,
+-- but that one is pulled on link -- this is what moves the checkbox when another admin flips it while
+-- this panel is already on screen, the same reason the player list has a push of its own.
+function identity.push_name_policy()
+    if guihooks then
+        guihooks.trigger("BeamCompNamePolicy", {showDriverNames = M.state.show_driver_names ~= false})
+    end
+end
+
+-- Re-assert the policy on a slow tick. This is the part that makes it a property instead of a claim:
+-- neither hideNametag nor customName is in Vehicle:onSerialized(), and BeamMP rebuilds an entry on a
+-- vehicle EDIT as well as on a spawn -- and an edit fires no BeamNG spawn hook, so no event of ours
+-- would ever hear about it. A sweep over an unchanged scene writes nothing at all.
+--
+-- The guard above it is the idle path: a client that knows no props, no AI, no players and no "off"
+-- policy has nothing to assert and pays four nil tests.
+function identity.tag_step(dt)
+    if M.state.prop_ids == nil and M.state.ai_names == nil and M.state.player_list == nil
+            and M.state.show_driver_names ~= false then
+        return
+    end
+    M.state.tag_wait = (M.state.tag_wait or 0) - (dt or 0)
+    if M.state.tag_wait > 0 then
+        return
+    end
+    M.state.tag_wait = identity.SWEEP_INTERVAL
+    identity.apply_tags()
+end
+
 -- Report which keys the two in-race assists sit on here, so the server can name them in this player's
 -- chat (ADR-0058). Only the client knows its own bindings and only the server can write a chat line, so
 -- the knowledge has to travel.
@@ -5320,42 +5585,6 @@ function M.onVehicleSwitched(_oldId, newId)
     M.state.current_vehicle_id = newId
 end
 
--- Retry BeamMP nametag suppression for any cone still awaiting MPVehicleGE registration (queued by
--- onVehicleSpawned). Zero-work on the idle path: pending_nametag is nil until a cone misses its
--- one-shot hide, and is reset to nil once the set empties, so this only runs in the brief window after
--- a cone-bearing race start. An id is dropped once its tag is hidden, its vehicle is gone, or the
--- retry window elapses (the tag then stays -- the accepted fallback, ADR-0020 finding #4).
-local function retry_pending_nametags(dt)
-    local pending = M.state.pending_nametag
-    if not pending then
-        return
-    end
-    -- Collect ids to drop and remove them after the loop (never mutate the table mid-pairs).
-    local drop = nil
-    for id, waited in pairs(pending) do
-        local veh = be and be:getObjectByID(id)
-        if not veh or cones.hide_nametag(veh) then
-            drop = drop or {}
-            drop[#drop + 1] = id
-        else
-            local elapsed = waited + (dt or 0)
-            pending[id] = elapsed
-            if elapsed >= NAMETAG_RETRY_TIMEOUT then
-                drop = drop or {}
-                drop[#drop + 1] = id
-            end
-        end
-    end
-    if drop then
-        for _, id in ipairs(drop) do
-            pending[id] = nil
-        end
-    end
-    if next(pending) == nil then
-        M.state.pending_nametag = nil
-    end
-end
-
 -- Min seconds between reload re-arms. One config respawn raises several vehicle-lifecycle events
 -- (onVehicleResetted plus the onVehicleSpawned of its despawn/respawn cycle); this collapses them into a
 -- single re-arm so nothing stacks or re-fires. os.clock() is monotonic CPU seconds -- far shorter than any
@@ -5450,12 +5679,14 @@ local function rearm_own_car_on_reload(vehicle_id)
         .. "; re-armed assist" .. freeze_note)
 end
 
--- As each shared cone appears -- the host's local set when its prefab load spawns them, and the
--- remote synced set on every other client (BeamMP vehicle spawns fire this hook too) -- keep it out
--- of the Tab vehicle cycle and suppress BeamMP's owner nametag on it. The bounce (onVehicleSwitched)
--- is the non-enterable guarantee; the nametag suppression is best-effort but no longer one-shot: a
--- remote-synced cone is registered in MPVehicleGE asynchronously, so the first hide here misses it and
--- the cone is queued for retry_pending_nametags (onUpdate) until registration lands (ADR-0020).
+-- Every vehicle appearing in the scene passes here -- the host's own prefab spawns, the AI field, and
+-- every BeamMP-synced car and prop on every client. Four consequences are drawn from that, and the
+-- nametag one is deliberately the cheapest: this hook only ARMS the work, it does not do it.
+--
+-- Arming rather than deciding matters. A spawn lands in the middle of handle_race_start (the own car,
+-- then the AI field, all synchronous), so a decision taken here would read a half-built M.state and
+-- could mistake this client's own fresh race car for a prop. onUpdate runs after the handler has
+-- finished, where race_car_id and ai_cars are both current (ADR-0062).
 function M.onVehicleSpawned(vehicleId)
     if not be then
         return
@@ -5487,17 +5718,18 @@ function M.onVehicleSpawned(vehicleId)
     -- here too. The guard no-ops for cones, AI, remotes, and any vehicle that is not the player's own race
     -- car -- see onVehicleResetted, the primary hook.
     rearm_own_car_on_reload(vehicleId)
-    if not cones.is_cone(veh) then
-        return
+    -- Host: a vehicle appearing while we own this race's props may BE a prop -- either one the prefab load
+    -- just created, or BeamMP re-spawning one under a new id ~5 s later (memory
+    -- beammp-respawns-prefab-vehicles-under-new-ids). Re-arm the derivation; onUpdate re-runs the diff and
+    -- re-sends the map only if it actually changed (ADR-0062).
+    if M.state.prop_before then
+        M.state.prop_map_pending = true
+        M.state.prop_map_budget = identity.PROP_MAP_BUDGET
     end
-    if cones.hide_nametag(veh) then
-        if M.state.pending_nametag then
-            M.state.pending_nametag[vehicleId] = nil
-        end
-    else
-        M.state.pending_nametag = M.state.pending_nametag or {}
-        M.state.pending_nametag[vehicleId] = 0
-    end
+    -- Everyone: a new entry in BeamMP's vehicle table starts tagged with its owner's name, so whatever
+    -- this client already knows about props, AI and race names is applied to it now instead of at the
+    -- next sweep.
+    identity.apply_tags()
 end
 
 -- BeamNG fires this GE hook (lua/ge/main.lua vehicleReset -> extensions.hook('onVehicleResetted', vid))
@@ -7560,9 +7792,6 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if not M.state.registered then
         ensure_registered()
     end
-    -- Phase-independent: a synced cone's MPVehicleGE registration can land a frame or two after its
-    -- spawn, so this runs until the queued nametag suppressions stick (no-op when nothing is pending).
-    retry_pending_nametags(dtReal)
     -- Phase-independent, host-only: drive the powered props' (grinders') activation readiness window. The
     -- `spinner` main-controller only comes up after the freshly spawned grinder VE's powertrain init, so a
     -- single activation at spawn lands before getControllerSafe("spinner") is non-nil (-> no-op); step
@@ -7708,6 +7937,12 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     end
     -- Non-owner: keep resolving the relayed aiMap to local handles until every synced AI car is found.
     resolve_remote_ai()
+    -- Host only: keep the race's prop set derived and relayed while anything about it is still moving
+    -- (ADR-0062). One boolean test when there is nothing pending.
+    identity.prop_map_step(dtReal)
+    -- Everyone: re-assert who carries a name. Slow tick, writes only on a difference, and guarded by a
+    -- nil chain when this client knows nothing about names at all.
+    identity.tag_step(dtReal)
     -- Host only: deferred front-anchor restage of the AI cars onto the grid over the frozen phases, once
     -- each car's jbeam has loaded (ADR-0036) -- the per-car mirror of the player restage above. Includes
     -- qualiResults so the quali re-spawned AI (which now spawn a lead time before the countdown, ADR-0041)
