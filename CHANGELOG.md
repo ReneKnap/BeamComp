@@ -14,6 +14,10 @@ below rather than hidden.
 - A results screen on finish, and a free-roam window afterwards before everything is cleaned up.
 - Laps, direction and sprint-or-circuit can be overridden per race.
 - `/dnf` to give up, `/results` to hide or show your own results card.
+- **The race's props carry no name.** Every cone, hay bale, barrel and barrier the race spawns is
+  nameless on every screen, not just the ones the host can see.
+- Over the cars, each driver is shown under the name he picked with `/name` -- his guest name if he
+  picked none -- and an AI under the same name the standings give it.
 
 ### Starting the field
 
@@ -42,6 +46,9 @@ below rather than hidden.
   that can be reloaded.
 - A grid editor (`/gridui`).
 - Admin access by password or by BeamMP name -- see `beamcomp.config.ini`.
+- `showDriverNames` decides whether names are drawn over the cars at all. It can be switched from the
+  setup panel's gear menu while the server runs, and the change is written back into
+  `beamcomp.config.ini` -- the rest of the file, comments and password included, is left untouched.
 - Players pick the name everyone sees with `/name`.
 - Recover and repair as a held key during the race, on by default and switchable per race.
 - On joining, every player gets one message naming the three commands he needs -- `/raceui`, `/name`
