@@ -44,6 +44,8 @@ below rather than hidden.
 
 - A setup panel (`/raceui`) with every option and an explanation on every field, and saved setups
   that can be reloaded.
+- The results screen offers a **Race setup** button to anyone who may open the panel, so the next race
+  can be set up without typing `/raceui` again.
 - A grid editor (`/gridui`).
 - Admin access by password or by BeamMP name -- see `beamcomp.config.ini`.
 - `showDriverNames` decides whether names are drawn over the cars at all. It can be switched from the
