@@ -1,7 +1,8 @@
 -- BeamComp -- GE-side race discovery and name resolution.
 --
 -- Lives at lua/ge/extensions/beamcomp/race/discovery.lua inside the client mod zip.
--- Stateless: require it and call M.list() / M.resolve(name).
+-- Require it and call M.list() / M.resolve(name). One piece of module state: M.list remembers its scan
+-- until M.invalidate is called (the level change in init.lua M.onClientEndMission).
 --
 -- Discovers installed races by scanning the BeamNG virtual filesystem, from two roots: the freeroam
 -- mission set under /gameplay/missions/<map>/<type>/, whose race-source mission types are timeTrial
@@ -119,10 +120,11 @@ local function level_names()
     return names
 end
 
--- Every installed race across all sources, as locators, sorted by id: the freeroam mission set
--- (timeTrial + aiRace + rallyStage + crawl, ADR-0024/0035) and the level quickrace set (the Time Trial
--- menu, ADR-0024).
-function M.list()
+-- Walk the VFS for every installed race across all sources, as locators, sorted by id: the freeroam
+-- mission set (timeTrial + aiRace + rallyStage + crawl, ADR-0024/0035) and the level quickrace set (the
+-- Time Trial menu, ADR-0024). One mission-tree walk plus one folder walk per level -- on the owner's
+-- install (257 races, 4 levels) that is 6 findFiles calls, and it is why M.list caches.
+local function scan()
     local locators = {}
 
     for _, race_file in ipairs(FS:findFiles(MISSIONS_ROOT, RACE_FILENAME, -1, false, true)) do
@@ -145,6 +147,58 @@ function M.list()
     table.sort(locators, function(a, b) return a.id < b.id end)
     log("I", LOG_TAG, "discovered " .. #locators .. " race(s)")
     return locators
+end
+
+-- The last scan's locators, until M.invalidate drops them. Module state, so EVERY reader of M.list gets
+-- the saving and not just the path that asked for it -- there are three (the race-setup panel's and the
+-- grid editor's option lists through racelist.options, the /races chat list through racelist.build, and
+-- every name resolve through M.resolve).
+--
+-- It was worth having before and became worth fixing when the results screen grew a button that reopens
+-- the setup panel: opening that panel calls racelist.options THREE times (the setupOpen push, the app's
+-- own link-time pull, and the stored-form restore), and each one walked the whole tree.
+--
+-- NOT keyed on anything. M.list answers "every race installed", the same answer on every map -- the map
+-- filter and the deprecated filter both run on the result -- so keying it per map would re-scan on each
+-- map change for an identical list, and keying it per include-deprecated flag would re-scan for a filter
+-- that never touches disk.
+local cache = nil
+
+-- Every installed race, as locators sorted by id. Scans the VFS on the first read after a level change
+-- and hands out the remembered list after that.
+--
+-- The returned ARRAY is fresh per call, exactly as it was before the cache existed, so a caller that
+-- sorts or appends to what it gets cannot poison the next reader. The locator TABLES inside it are
+-- shared: no reader writes a field of one (checked across every caller of M.list and M.resolve,
+-- 2026-09-26), and copying 257 of them per call to defend against a caller that does not exist would
+-- cost more than the scan this cache removes.
+--
+-- An EMPTY result is not remembered. "No races found" is either true -- in which case the re-scan is two
+-- findFiles calls that find nothing -- or a VFS that was not ready, and pinning that answer for the rest
+-- of the level would leave every list in the mod empty with no way back.
+function M.list()
+    if not cache or #cache == 0 then
+        cache = scan()
+    end
+    local out = {}
+    for index = 1, #cache do
+        out[index] = cache[index]
+    end
+    return out
+end
+
+-- Forget the scanned list, so the next M.list walks the tree again. Called on a level change
+-- (init.lua M.onClientEndMission), which is the one moment the installed set can plausibly differ from
+-- what we remember -- a mod mounted while the player was on the previous map.
+--
+-- A GE Lua reload needs no call: it rebuilds this module's state along with everything else (ADR-0052).
+-- Silent when there is nothing cached, so the common case adds no line to a log that goes blind after
+-- 15k of them (memory beamng-client-log-blind-after-15k-lines).
+function M.invalidate()
+    if cache then
+        cache = nil
+        log("I", LOG_TAG, "race list forgotten; the next read rescans")
+    end
 end
 
 -- Whether a locator belongs to the deprecated source (ADR-0026): the level quickrace ("menu:") set.

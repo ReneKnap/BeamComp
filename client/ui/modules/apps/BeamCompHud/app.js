@@ -618,6 +618,18 @@ angular.module('beamng.apps')
         }
       };
 
+      // Ask the server to open the race-setup panel (feature raceui-reopen-without-typing): the results
+      // card's "Race setup" button, which saves typing /raceui once per race. This app decides nothing --
+      // neither whether the button is shown (hud.setupReopenAvailable is the server's own statement,
+      // relayed through the GE snapshot) nor whether the panel opens (GE only asks; the server's /raceui
+      // gate answers). bngApi is the typeof-guarded core UI global (ADR-0012), so a miss is inert and
+      // /raceui stays the way in.
+      scope.openRaceSetup = function () {
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.open_race_setup() end');
+        }
+      };
+
       // Cycle the live-standings interval reference (self -> ahead -> leader) via the GE flag (single
       // source of truth): the REL toggle on the standings panel routes here. bngApi is the typeof-guarded
       // core UI global (not an injected service -- ADR-0012), so a miss is inert.

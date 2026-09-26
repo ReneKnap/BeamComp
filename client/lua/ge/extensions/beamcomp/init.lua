@@ -230,7 +230,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
-local BUILD_MARKER = "prop-nametags-and-race-names-r2/2026-09-26"
+-- Names BOTH items in this build on purpose: the nametag policy's own live check
+-- (prop-nametags-and-race-names-r2) is still outstanding and needs a second machine, and this build
+-- contains it. A client logging r2 has the nametags but no race-setup button; one logging r3 has both.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3/2026-09-26"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -351,6 +354,7 @@ M.state = {
     input_capture = false,    -- the controls window armed BeamNG's input capture and the three global switches (ActionMap.enableBindingCapturing, Input.setForwardRawEvents, setCEFTyping) are presumed on, i.e. the player's controls are dead until something turns them off. Set by M.arm_input_capture, checked and cleared inside M.release_input_capture -- one chokepoint, so no caller can forget the check. Does not survive a GE Lua reload (ADR-0052), which is harmless in the only direction that matters: onExtensionUnloaded runs BEFORE the state is rebuilt and releases there
     server_defaults = nil,    -- the defaults the SERVER owns, as it sent them on setupOpen ({jumpPenalty = 15}, ADR-0043), or nil. Relayed verbatim to the setup panel with EVERY push_setup_data -- not just the opening one -- because the panel also pulls its dataset itself on link (request_setup_data), and a value hanging off setupOpen alone would be gone after a UI reload. GE reads no key of it: the next server-owned default is a key on the server plus a placeholder in the markup. Safe at nil across a GE reload (ADR-0052): it mirrors a server constant and needs no previous value of its own, and nil means "not heard yet", which the panel shows as the neutral "default" rather than a number nothing stands behind. Cleared by setup.clear, which onClientEndMission runs when the player leaves the session -- so one server's numbers can never be shown as the next server's
     own_player_id = nil,      -- the id this connection has on the server, as it named it on setupOpen (yourPlayerId), or nil. Lets the setup panel mark this player's own row in its player list -- the list is a broadcast and cannot say who the reader is. Nil after a GE Lua reload like every other M.state field (ADR-0052), which is why identity.own_id falls back to BeamMP's own copy of the same id -- MPConfig DOES survive a reload. Cleared by setup.clear on leaving the session, so the next server's list is never matched against the previous server's id
+    setup_may_open = false,   -- whether the SERVER has told this connection it may open the race-setup panel (setupAccess, feature raceui-reopen-without-typing). The one and only thing the final-standings card's "Race setup" button is drawn off. Set ONLY by that message -- like setup_locked beside it, the client never decides for itself that it is admin, and it derives this from no circumstantial evidence of its own ("I once got a setupOpen", "I have an own_player_id"): those guess right nearly always, which is what makes them the wrong shape. Default false and fail-closed: unknown means no button, so an older server, a dropped message and the ADR-0052 reload rebuild all hide it rather than show a button that would refuse. Connection-scoped, cleared by identity.clear_policy and NOWHERE else -- the grant belongs to the connection (ADR-0056), so dropping it when the panel closes would be the panel-close-wipes-nametag-policy mistake again, with a button that vanishes the first time an admin closes his panel
     setup_locked = false,     -- the race-setup panel shows only its password box (ADR-0056). Set ONLY by a server message -- setupLocked sets it, setupOpen and a successful unlockResult clear it -- so the panel never decides for itself that it is admin. Cleared by setup.clear, and a GE reload rebuilds it as false while taking the panel down with it (ADR-0052), so its correctness never depends on its own previous value. Remembered across the watchdog's re-add, which is why it lives here and not in the app
     championship = nil,       -- latest server-broadcast championship snapshot {active, preset, order, raceCount, rows} (ADR-0040), or nil; rendered on the HUD finished card + the setup panel
     tournament = nil,         -- latest server-broadcast class-drop tournament snapshot {active, ended, winner, classes, rows} (ADR-0042), or nil; rendered on the HUD finished card + the setup panel
@@ -3802,6 +3806,28 @@ function M.request_setup_lock()
     setup.push_lock()
 end
 
+-- Ask the SERVER to open this client's race-setup panel (UI -> GE -> server, feature
+-- raceui-reopen-without-typing). Public as beamcomp_init.open_race_setup so the final-standings card's
+-- "Race setup" button reaches it via bngApi.engineLua, exactly like M.toggle_analysis.
+--
+-- It asks; it does not open. Opening the panel from here would need the things only a server message
+-- brings (the server-owned defaults, this connection's player id, the lock state), and ADR-0037's
+-- panel is an admin-gated open for a reason -- so this is a second SENDER in front of the /raceui
+-- path, nothing more. The server answers it through handle_raceui_command, i.e. through the very
+-- same gate (ADR-0056).
+--
+-- Deliberately NO local permission check. The client's one reading of the server's statement is the
+-- button's visibility (build_hud_snapshot); asking it a second time here would be a second place that
+-- could disagree with the server, and it would buy nothing -- the gate is server-side and re-answers this
+-- message on arrival. A forced call therefore lands exactly where typing /raceui lands.
+--
+-- Not a toggle (user decision 6): a second press re-opens and re-fills, which is what a second /raceui
+-- does today. The panel's own Close stays the only way to shut it.
+function M.open_race_setup()
+    log("I", RACE_LOG_TAG, "asking the server to open the race-setup panel")
+    send_to_server("setupReopen", {})
+end
+
 -- Push the dataset on demand (UI -> GE, ADR-0037): the panel calls this on link -- so a freshly-added app
 -- that missed the open-time push still fills -- and from its Refresh / include-deprecated toggle. The arg
 -- is the toggle's string flag ("1" = include deprecated races in the list). Public as
@@ -4754,6 +4780,23 @@ local HANDLERS = {
     -- Race-setup panel password lock (ADR-0056): the locked open and the verdict on an attempt.
     setupLocked = setup.handle_locked,
     unlockResult = setup.handle_result,
+    -- Whether the SERVER says this connection may open the race-setup panel (feature
+    -- raceui-reopen-without-typing). The single writer of M.state.setup_may_open, which is the single
+    -- thing the final-standings card's button is drawn off -- so the whole chain from the server's
+    -- is_race_admin to the ng-if has exactly one link on this side.
+    --
+    -- Anything but an explicit true reads as FALSE: a payload without the field, a garbled one and a
+    -- never-sent one all mean no button. That is the opposite reading from namePolicy above, and
+    -- deliberately so -- an unknown name policy must look like plain BeamMP, while an unknown permission
+    -- must look like no permission. Defined inline: a table field costs no top-level local.
+    setupAccess = function(payload)
+        M.state.setup_may_open = type(payload) == "table" and payload.mayOpen == true
+        -- beamcomp.race, not the net tag the handler beside it uses: on_server_event has already logged
+        -- the arrival, and what this line adds is what it MEANS -- so it reads under the same subsystem as
+        -- the press it enables (M.open_race_setup), and the pair greps as one.
+        log("I", RACE_LOG_TAG, "race setup is "
+            .. (M.state.setup_may_open and "mine to open" or "not mine to open"))
+    end,
     gridSetupOpen = handle_grid_setup_open,
 }
 
@@ -5354,10 +5397,14 @@ function identity.apply_tags()
     nametags.apply(identity.tag_policy())
 end
 
--- Forget the nametag policy. Called at the SESSION boundary and nowhere else (onClientEndMission): the
--- policy belongs to the SERVER, so carrying it to the next one would apply a stranger's setting until his
--- own broadcast lands. Absence has to mean unknown, never "what I saw last", and unknown reads as on --
--- which is what plain BeamMP does by itself.
+-- Forget what THIS server told this connection about itself. Called at the SESSION boundary and nowhere
+-- else (onClientEndMission): every field here belongs to the server we are leaving, so carrying one
+-- to the next server would apply a stranger's statement until his own lands. Absence has to mean
+-- unknown, never "what I saw last".
+--
+-- Unknown is not the same value for every field, and that is the whole care this function needs: an
+-- unheard name policy reads as ON (plain BeamMP), while an unheard permission reads as NO (fail-closed).
+-- Each field's own comment in M.state says which and why.
 --
 -- The record of what this client wrote goes with it, and that is the field that must not be dropped
 -- anywhere else: cross-client ids are per server, so a kept entry could give a tag back on a vehicle we
@@ -5371,6 +5418,12 @@ function identity.clear_policy()
     M.state.tag_written = nil
     M.state.prop_ids = nil
     M.state.ai_names = nil
+    -- Whether the race-setup panel is this player's to open (feature raceui-reopen-without-typing). It
+    -- belongs here and NOT in setup.clear: the password grant behind it hangs off the connection
+    -- (ADR-0056), while setup.clear also runs on the panel's own Close button -- so a button that
+    -- disappeared the first time an admin closed his panel would be bug panel-close-wipes-nametag-policy
+    -- a second time. Cleared to false rather than nil, because false IS the unknown value here.
+    M.state.setup_may_open = false
 end
 
 -- Reflect the server's name policy into an open setup panel. Its own dataset push carries the value too,
@@ -6909,6 +6962,15 @@ local function build_hud_snapshot()
         -- F1 light start active this race (ADR-0043): gates the standings React column.
         f1Start = (race and race.startMode == "f1") or false,
         resultsMin = M.state.results_min or false,
+        -- The "Race setup" button on the final-standings card (feature raceui-reopen-without-typing): the
+        -- server's own verdict (setupAccess), narrowed to the finished phase. That window is where
+        -- the next race gets set up and it lasts 900 s, and it is the ONLY place this button appears
+        -- -- not in the lobby, not on the provisional card, not on the quali-results card (decision 4).
+        --
+        -- Phase-gated here as well as by the card's own ng-if, exactly like analysisAvailable above: the
+        -- reach of the button is a requirement, so it is readable in one place rather than inferred from
+        -- which template happens to hold it.
+        setupReopenAvailable = (phase == "finished" and M.state.setup_may_open == true) or false,
         analysisAvailable = analysis_available,
         analysisOpen = M.state.analysis_open or false,
         analysis = analysis,
@@ -8093,10 +8155,16 @@ function M.onClientEndMission(_levelPath)
     -- open state would pop the setup panel back up on the next map, unasked (ADR-0037 stays
     -- command-opened -- bug setup-panel-settings-survive-ui-reload).
     setup.clear()
-    -- Leaving the session is where the server's nametag policy stops applying (ADR-0062). A separate call
-    -- rather than a line inside setup.clear, because that function also runs on the panel's Close, which
-    -- is not a session boundary (bug panel-close-wipes-nametag-policy).
+    -- Leaving the session is where the server's nametag policy stops applying (ADR-0062), and where its
+    -- statement about the race-setup panel stops too. A separate call rather than a line inside
+    -- setup.clear, because that function also runs on the panel's Close, which is not a session boundary
+    -- (bug panel-close-wipes-nametag-policy).
     identity.clear_policy()
+    -- Drop the remembered race scan (feature raceui-reopen-without-typing): a level change is the one
+    -- moment the installed set can plausibly have changed since we looked. Required inline rather than at
+    -- the top of the file because init.lua sits at LuaJIT's 200-local ceiling and this is its only caller
+    -- -- require is memoized, so it costs a table lookup (same trade as race/parser.lua's path loader).
+    require("beamcomp/race/discovery").invalidate()
 end
 
 function M.onExtensionUnloaded()
