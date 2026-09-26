@@ -1231,8 +1231,15 @@
         </tr>
       </table>
     </div>
+    <!-- Race setup (feature raceui-reopen-without-typing): opens the admin panel for the next race without
+         typing /raceui again. Shown only to a player the SERVER has said may open it (hud.setupReopenAvailable
+         mirrors its setupAccess message and nothing else), and only here -- the card's own ng-if is the
+         finished phase. It lives INSIDE .bc-results-card on purpose: the app frame is pointer-events:none
+         ("interactive": "no" in app.json) and the card takes its own back, so a button placed outside it
+         would be drawn and would silently accept no click. -->
     <div class="bc-results-actions">
       <button type="button" class="bc-analysis-btn" ng-if="hud.analysisAvailable" ng-click="toggleAnalysis()">&#9656; Analysis</button>
+      <button type="button" class="bc-analysis-btn" ng-if="hud.setupReopenAvailable" ng-click="openRaceSetup()">&#9656; Race setup</button>
       <button type="button" class="bc-analysis-btn" ng-click="toggleResultsMin()">Minimize</button>
     </div>
   </div>
