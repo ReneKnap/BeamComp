@@ -461,6 +461,24 @@ identity.MSG_PROP_MAP = "propMap"
 identity.MSG_NAME_POLICY = "namePolicy"
 identity.MSG_SET_NAMES = "setDriverNames"
 
+-- THE RACE-SETUP BUTTON (feature raceui-reopen-without-typing). A race evening runs the same loop every
+-- time -- race over, set the next one up -- and today that means opening the chat and typing /raceui
+-- again on every lap of it. So the final-standings card grows a button, and these two messages are what
+-- it needs.
+--
+-- WHO MAY SEE THAT BUTTON IS A STATEMENT OF THIS SERVER, never a guess of the client. The client holds no
+-- admin knowledge at all today (see the setupLocked comment in access above and ADR-0056) and must not
+-- start inventing any: a button whose visibility a client derives from its own circumstantial evidence --
+-- "I once got a setupOpen", "I have an own_player_id" -- is the same confusion in new clothes, even while
+-- it guesses right. So the verdict travels, per player, from the one predicate that owns it.
+--
+-- Its own message type rather than a field on identity.name_policy(): that one is a BROADCAST shape
+-- shared by three senders precisely so they can never disagree, and hanging a per-player answer in it
+-- would be the mistake it exists to rule out. On `identity` rather than in a namespace of its own for the
+-- usual reason (the 200-local ceiling), and beside send_connect_state because that is its carrier.
+identity.MSG_SETUP_ACCESS = "setupAccess"   -- server -> ONE client: may you open the race-setup panel
+identity.MSG_SETUP_REOPEN = "setupReopen"   -- client -> server: the button was pressed, open it for me
+
 -- Everything the assist keys need (ADR-0058): what each connection reported about its own key bindings,
 -- the /keys command and the copy. The two in-race assists (ADR-0017) are on by default and their keys are
 -- bound by default, but nothing in the game ever told a player which key that is -- the only place the
@@ -1032,11 +1050,12 @@ end
 --   * `player_id` is a plain second argument and Lua does not enforce it -- which FAILS CLOSED. A call
 --     site that forgets it can never see a grant, so the worst a missed site can do is refuse an
 --     unlocked admin; it can never admit a stranger. That is the safe direction for an omitted argument.
---   * This stays the SINGLE chokepoint. All 16 call sites call exactly this function; there is no
+--   * This stays the SINGLE chokepoint. All 18 call sites call exactly this function; there is no
 --     second predicate anywhere in the plugin, and adding one is how a refusal path silently goes open.
---     Fifteen of them are gates. The sixteenth, identity.join_block, is a READING: it refuses nothing,
---     it only picks which of three /raceui wordings a joiner reads -- but it asks the same question, so
---     it asks it here.
+--     Sixteen of them are gates. The other two are READINGS -- they refuse nothing, they only pick what
+--     a player is shown: identity.join_block picks which of three /raceui wordings a joiner reads, and
+--     identity.setup_access answers whether his results screen offers the race-setup button. Both ask
+--     the same question, so both ask it here.
 --
 -- The name check reads the RAW BeamMP name at every site (ADR-0054): a name the player can set with
 -- /name must never be an authorization key. A player_id is not settable by the player, so keying the
@@ -7323,6 +7342,12 @@ end
 -- idempotent, and the second is the stronger one -- a delivered request only proves BeamMP took it.
 function identity.send_connect_state(player_id)
     send_event(player_id, identity.MSG_NAME_POLICY, identity.name_policy())
+    -- Whether this player's results screen offers the race-setup button (feature
+    -- raceui-reopen-without-typing). THIS is the moment that covers both cases there are: a fresh join,
+    -- and a GE Lua reload mid-session -- see identity.note_report, where the record is already `done` and
+    -- nothing else would ever re-send. An allowlist admin therefore has the button before he has typed
+    -- anything at all, which is exactly what was asked for.
+    send_event(player_id, identity.MSG_SETUP_ACCESS, identity.setup_access(player_id))
     if session.prop_map then
         send_event(player_id, identity.MSG_PROP_MAP, session.prop_map)
     end
@@ -7332,6 +7357,27 @@ end
 -- broadcast, the per-client push and the setup panel, so the three can never disagree.
 function identity.name_policy()
     return {showDriverNames = cfg.show_driver_names == true}
+end
+
+-- Whether ONE player may open the race-setup panel, as it goes on the wire (feature
+-- raceui-reopen-without-typing). The client draws its button off this and off nothing else.
+--
+-- A READING of the gate, not a gate: it refuses nothing, it only decides whether a button is painted --
+-- the same relationship identity.join_block has to the /raceui line it words. So it asks the same
+-- question through the same single predicate (ADR-0056), because a second way of answering "does this
+-- player count as an admin" is how the two answers start to drift. The action behind the button is
+-- /raceui itself, which re-verifies server-side like every other one, so this adds no gated action.
+--
+-- THE NAME COMES STRAIGHT OFF MP.GetPlayers, exactly as identity.handle_remind and access.handle_unlock
+-- take it: player_name_of is declared further down this chunk, so a closure created here cannot see it.
+-- Getting that wrong FAILS CLOSED AND SILENTLY -- is_race_admin with a nil name can still answer true
+-- through the session grant, so a password admin would look fine while every allowlist admin simply
+-- never got a button, with nothing in any log to say why.
+--
+-- It is the RAW BeamMP name (ADR-0054), never resolve_identity: a name a player can set with /name must
+-- not decide an authorization question, not even one that only paints a button.
+function identity.setup_access(player_id)
+    return {mayOpen = is_race_admin(MP.GetPlayers()[player_id], player_id) == true}
 end
 
 -- Tell everyone. The policy is applied on each client, so it has to reach the clients that have no
@@ -8148,6 +8194,13 @@ function access.open_setup(player_id)
     -- Same deal for the connected players (ADR-0054): seed the freshly opened panel, then let
     -- identity.broadcast_players keep it current.
     send_event(player_id, identity.MSG_PLAYERS, {players = identity.player_list()})
+    -- And that this player's results screen may offer the race-setup button (feature
+    -- raceui-reopen-without-typing). This is the SECOND and last moment the statement goes out, and the
+    -- only one where the truth can have changed mid-session: a successful password unlock. It sits here
+    -- rather than in access.handle_unlock because this function is what that unlock calls -- along with
+    -- /raceui and the already-granted branch -- and every caller of it is downstream of the admin check
+    -- by contract. One place that cannot be forgotten beats three that each have to remember.
+    send_event(player_id, identity.MSG_SETUP_ACCESS, identity.setup_access(player_id))
 end
 
 -- A password attempt from the locked race-setup panel (ADR-0056). Verifies, grants or refuses, and
@@ -9331,6 +9384,21 @@ local function handle_client_event(player_id, data)
         identity.handle_prop_map(player_id, decoded.payload)
     elseif decoded.type == identity.MSG_SET_NAMES then
         identity.handle_set_names(player_id, decoded.payload)
+    elseif decoded.type == identity.MSG_SETUP_REOPEN then
+        -- The race-setup button on the final-standings card (feature raceui-reopen-without-typing). It
+        -- runs THE /raceui PATH, not a second one: same function, same gate, only the sender is new -- so
+        -- there is no new gated action to keep correct, and a non-admin who forced this message reaches
+        -- exactly what typing /raceui would have got him (a locked panel on a password server, the
+        -- refusal line otherwise).
+        --
+        -- player_name_of is declared above this dispatch, so unlike the handlers further up the chunk
+        -- this branch may use it. A nil name means the player left between the press and this line;
+        -- handle_raceui_command concatenates the name into its log lines, so hand it a real one or
+        -- nothing at all, exactly as identity.handle_remind does.
+        local reopen_name = player_name_of(player_id)
+        if reopen_name then
+            handle_raceui_command(player_id, reopen_name)
+        end
     elseif decoded.type == keys.MSG_REPORT then
         keys.handle_report(player_id, decoded.payload)
     elseif decoded.type == keys.MSG_REMIND then
