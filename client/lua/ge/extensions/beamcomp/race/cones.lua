@@ -14,6 +14,12 @@
 -- (The earlier non-host "delete your own cones" path is gone: it relied on BeamMP's getOwnMap()
 -- ownership, which a freshly-spawned cone is not yet in synchronously, so it deleted nothing.)
 --
+-- This module no longer decides anything about NAMETAGS. It used to carry the suppression, keyed on
+-- is_cone -- which covered 270 of 556 prop vehicles in the shipped missions and left the rest tagged for
+-- a year (ADR-0062). A prop's identity is now the host's own before/after prefab diff (race/props.lua
+-- M.live_prop_ids), and the tag itself is race/nametags.lua's business. is_cone stays for what it can
+-- genuinely answer: whether a vehicle is a knockable cone.
+--
 -- The cones must never be enterable or clutter the Tab vehicle cycle, on every client. Two layers:
 --   * the GUARANTEED bounce -- it lives in race/props.lua now (props.is_race_prop /
 --     props.enforce_non_enterable), because it must cover every prop, not just cones. It still keys off
@@ -101,44 +107,6 @@ function M.exclude_from_cycle(veh)
         return false
     end
     return true
-end
-
--- Suppress BeamMP's floating owner-nametag + "spawned a vehicle" label on any synced vehicle (ADR-0020,
--- finding #2). BeamMP's nametag draw loop skips a vehicle whose MPVehicleGE entry has `hideNametag` set;
--- BeamMP never sets the field itself, so it is the sanctioned per-vehicle opt-out. Generic over the
--- vehicle (no cone check), so the AI module (race/ai, ADR-0036) reuses it on host-owned AI cars. Best-
--- effort, fully guarded: a freshly synced vehicle may not be registered in MPVehicleGE yet, in which case
--- this no-ops (the accepted fallback is that the tag stays). No-op outside a BeamMP session or for a nil
--- vehicle. Returns true if the tag was hidden.
-function M.hide_vehicle_nametag(veh)
-    if not veh then
-        return false
-    end
-    if type(MPVehicleGE) ~= "table" or type(MPVehicleGE.getVehicleByGameID) ~= "function" then
-        return false
-    end
-    local ok, hidden = pcall(function()
-        local entry = MPVehicleGE.getVehicleByGameID(veh:getID())
-        if type(entry) == "table" then
-            entry.hideNametag = true
-            return true
-        end
-        return false
-    end)
-    if not ok then
-        log("W", LOG_TAG, "hide_vehicle_nametag attempt failed: " .. tostring(hidden))
-        return false
-    end
-    return hidden
-end
-
--- Cone wrapper over M.hide_vehicle_nametag: the cone-spawn paths call this so a non-cone is never
--- touched. No-op for non-cones; otherwise defers to the generic suppressor above.
-function M.hide_nametag(veh)
-    if not M.is_cone(veh) then
-        return false
-    end
-    return M.hide_vehicle_nametag(veh)
 end
 
 return M
