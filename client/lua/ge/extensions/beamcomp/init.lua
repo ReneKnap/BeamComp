@@ -230,10 +230,11 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
--- Names BOTH items in this build on purpose: the nametag policy's own live check
--- (prop-nametags-and-race-names-r2) is still outstanding and needs a second machine, and this build
--- contains it. A client logging r2 has the nametags but no race-setup button; one logging r3 has both.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3/2026-09-26"
+-- Names every item in this build on purpose, because two of their live checks are still outstanding: the
+-- nametag policy (prop-nametags-and-race-names-r2, which needs a second machine) and the race-setup
+-- button. A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
+-- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1/2026-09-28"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -3982,9 +3983,11 @@ function M.roll_ai_roster(json)
 end
 
 -- Re-draw one roster entry's name (UI -> GE, ADR-0047): payload {index, exclude, ai, policy}. When the
--- drawn name carries a preferred car that applies (aiCar rolled, restrictions pass), the car rides the
--- reply too -- decision 4's "they always get it". Result pushed via BeamCompAiRosterName. Public as
--- beamcomp_init.reroll_ai_name.
+-- drawn name carries a preferred car that applies (nothing else names a car, restrictions pass), the car
+-- rides the reply too -- decision 4's "they always get it". The policy goes into preferred_applies for the
+-- same reason entry_from_drawn passes it: a forced Car (all) beats the driver file (ADR-0048 amendment
+-- 2026-09-28), and omitting it here would leave this one path handing out preferred cars silently.
+-- Result pushed via BeamCompAiRosterName. Public as beamcomp_init.reroll_ai_name.
 function M.reroll_ai_name(json)
     local ok, request = pcall(jsonDecode, json)
     if not ok or type(request) ~= "table" or tonumber(request.index) == nil then
@@ -3993,7 +3996,7 @@ function M.reroll_ai_name(json)
     end
     local drawn = ai.draw_roster_names(1, request.exclude)[1]
     local reply = {index = tonumber(request.index), name = drawn.name}
-    if drawn.preferred and ai.preferred_applies(request.ai)
+    if drawn.preferred and ai.preferred_applies(request.ai, request.policy)
             and ai.preferred_car_compliant(drawn.preferred, request.ai, request.policy) then
         reply.car = drawn.preferred
         reply.carLabel = ai.car_label(drawn.preferred)

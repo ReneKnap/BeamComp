@@ -1101,6 +1101,32 @@ angular.module('beamng.apps')
         return !!scope.form.carModel && !!scope.form.aiCar && scope.form.aiCar !== scope.form.carModel;
       };
 
+      // Whether a lineup row still holds a car that Car (all) does not force any more. This is a
+      // TRIPWIRE, not a routine note: with the roll triggers below and the driver file losing to a forced
+      // car (ADR-0048 amendment 2026-09-28) it should never be true. It stands so the same contradiction
+      // cannot survive another release unnoticed the way it did once -- do not remove it as dead code.
+      // Three conditions, and the middle one is what keeps it a warning rather than noise:
+      //   * "AI car" on default. An explicit AI pick has its own note above and is allowed to win.
+      //   * The forced car is a CONCRETE one. Under car=random every row holds its own rolled car, so a
+      //     naive compare would fire there always; the host sentinel is concrete and compares to itself.
+      //   * A row genuinely disagrees. An empty token names no car and falls through to the forced one at
+      //     spawn, so it is not a disagreement.
+      // The token comes from buildRosterPolicy, the same function the roll request builds its policy from,
+      // so the panel cannot answer this differently from GE -- and under a forced car roll_roster_car
+      // resolves to exactly that token, which is what makes the comparison an equality.
+      scope.rosterIgnoresForcedCar = function () {
+        if (scope.form.aiCar) {
+          return false;
+        }
+        var forced = buildRosterPolicy(scope.form).car;
+        if (!forced || forced === 'random') {
+          return false;
+        }
+        return (scope.form.aiRoster || []).some(function (e) {
+          return !!(e && e.car) && e.car !== forced;
+        });
+      };
+
       scope.pick = function (field, value) {
         scope.form[field] = value;
         scope.open = null;
@@ -1974,20 +2000,30 @@ angular.module('beamng.apps')
       };
 
       // ----- The live settings ------------------------------------------------------------------------
-      // Exactly four form fields drive a ROLL on their own: the enable checkbox and the three AI-CAR axes.
-      // The omissions are deliberate. The player restriction fields (carModel/maxhp/maxkg/
-      // restrictVehicles…) feed a roll too, through buildRosterPolicy -- but re-rolling on every keystroke
-      // in a caps field would be churn, and "the roster was rolled before the caps changed" is exactly
-      // what the panel did before, so nothing regresses. The AI difficulty Preset is not a roll input at
-      // all (rosterRollSpec never reads it). The Count field IS live too (round 2) but stays out of this
-      // watcher on purpose: it resizes the roster instead of re-rolling its cars, and it needs a debounce
-      // that a digest-driven watcher cannot give it -- see resizeRosterTo below.
+      // Six form fields drive a ROLL on their own: the enable checkbox, the three AI-CAR axes, and the
+      // player's own car (Car (all) plus its version). The player car joined them with the forced-car
+      // precedence (ADR-0048 amendment 2026-09-28): a forced car now beats a driver's file-preferred one,
+      // so a roster rolled under the previous setting sits there naming a car the header no longer
+      // promises. It is a discrete pick(), not a typed field, so the churn argument below does not reach
+      // it -- and picking a model clears carConfig in the same digest (onModelChange), which the deep
+      // compare sees as ONE change and rolls once.
+      // The omissions stay deliberate. The caps and restrictVehicles feed a roll too, through
+      // buildRosterPolicy, but re-rolling on every keystroke in a caps field would be churn, and "the
+      // roster was rolled before the caps changed" is exactly what the panel did before. The player's
+      // random axes (carRandomTrim/carNoBigCars) only bite under car=random, where every roster row holds
+      // a rolled car anyway, so a stale row is a different random car rather than a broken promise. The AI
+      // difficulty Preset is not a roll input at all (rosterRollSpec never reads it). The Count field IS
+      // live too (round 2) but stays out of this watcher on purpose: it resizes the roster instead of
+      // re-rolling its cars, and it needs a debounce that a digest-driven watcher cannot give it -- see
+      // resizeRosterTo below.
       function aiLiveState() {
         return {
           enabled: !!scope.form.aiEnabled,
           car: scope.form.aiCar || '',
           randomTrim: !!scope.form.aiRandomTrim,
           noBigCars: !!scope.form.aiNoBigCars,
+          playerCar: scope.form.carModel || '',
+          playerConfig: scope.form.carConfig || '',
         };
       }
 
@@ -2015,7 +2051,8 @@ angular.module('beamng.apps')
           return;  // AI off: the checkbox gates the spawn, the roster is simply left alone
         }
         if (now.car !== prev.car || now.randomTrim !== prev.randomTrim
-            || now.noBigCars !== prev.noBigCars) {
+            || now.noBigCars !== prev.noBigCars || now.playerCar !== prev.playerCar
+            || now.playerConfig !== prev.playerConfig) {
           rerollRosterCars();
         }
       }, true);

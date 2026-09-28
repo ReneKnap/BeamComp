@@ -509,6 +509,14 @@
              is true rather than firing once, so it is still on screen at the moment the race is started --
              a toast at the moment of picking would be long gone by then. -->
         <div class="bc-warn" ng-if="aiOverridesForcedCar()">AI ignore Car (all) and drive {{labelFor('aiCar')}}.</div>
+        <!-- A tripwire, not a note: the lineup's cars follow Car (all) now (ADR-0048 amendment
+             2026-09-28), so this line is expected to stay hidden. It is here because the contradiction it
+             names shipped once unseen (bug ai-roster-car-ignores-forced-car) -- keep it, and see
+             rosterIgnoresForcedCar in app.js for why car=random is excluded.
+             It names the SETTING, not its value: the mismatch can be the version rather than the model
+             (covet:base forced against a bare covet row), and a line reading "other than Ibishu Covet"
+             above rows that all say Ibishu Covet would look like the warning was the broken part. -->
+        <div class="bc-warn" ng-if="rosterIgnoresForcedCar()">AI lineup holds a different car than Car (all) forces.</div>
         <!-- Composable random-AI axes: only meaningful when the AI car is "random". Trim toggles stock vs
              random config variant; Exclude big vehicles drops buses/trucks/vans by curb weight. -->
         <div ng-if="form.aiCar === 'random'">
