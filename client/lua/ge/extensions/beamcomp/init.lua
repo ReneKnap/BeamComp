@@ -230,9 +230,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
--- Names every item in this build on purpose, because two of their live checks are still outstanding: the
--- nametag policy (prop-nametags-and-race-names-r2, which needs a second machine) and the race-setup
--- button. A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
+-- Names every item in this build on purpose, because four of their live checks are still outstanding: the
+-- nametag policy (prop-nametags-and-race-names-r2, which needs a second machine), the race-setup button,
+-- the AI car precedence and this list normalisation.
+-- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
 -- HUD standings during a race started over a running one).
