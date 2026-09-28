@@ -6,6 +6,24 @@
 // No GE round-trip on load -- the per-frame push covers a mid-race add.
 angular.module('beamng.apps')
 .directive('beamCompHud', ['$timeout', '$interval', function ($timeout, $interval) {
+  // A list pushed from GE, as a JavaScript array. Lua cannot tell an empty list from an empty map, so
+  // every encoder sends an empty table as {} -- which is truthy and carries no .length. That defeats BOTH
+  // shapes of guard this code uses: `x || []` keeps the {} (it is truthy), and `x.length <= n` lets it
+  // straight through (undefined <= n is false). Applied in the push handlers, at the one point a field
+  // enters the panel, so that "a list from GE is a list" is a property of the transition rather than a
+  // claim about every call site that reads it -- including the call site added next week.
+  //
+  // What it cannot do: a NON-empty non-list also becomes [] and disappears without a sound. That is
+  // acceptable because every list on this channel is built with t[#t+1] = ... and so is gap-free -- and
+  // it is why this must NEVER be pointed at a map. The setup panel's configsByModel is model -> list:
+  // the VALUES are lists, the map is not, and sending it through here would silently discard real data.
+  //
+  // One copy per app on purpose: the panels share no module space (client/ui/modules holds nothing but
+  // the four app folders), the same reason keyLabel exists three times.
+  function asArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
   // Live HUD row cap: the leader plus a slice around the local player (see windowLiveEntries). The
   // finished results card is exempt -- it renders the whole field.
   var MAX_LIVE_ROWS = 7;
@@ -694,10 +712,21 @@ angular.module('beamng.apps')
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
           scope.hud = data || {active: false, entries: []};
+          // The three list fields on this snapshot, normalised before anything reads them. `entries` is
+          // the one that fired: it is empty for the whole abort window of a race started while another
+          // runs, and GE pushes through here about four times a frame while that lasts. The sub-tables
+          // GE relays opaquely (championship, tournament, quali, analysis, sectorBar) are NOT touched:
+          // their inner lists are rendered by ng-repeat, which walks a {} without complaint, and reaching
+          // into them from here would mean this handler knowing a shape it is deliberately blind to.
+          scope.hud.entries = asArray(scope.hud.entries);
+          scope.hud.qualiQueue = asArray(scope.hud.qualiQueue);
+          // Absent means "bind `entries` unchanged" (GE sends nil when nothing is re-ranked), and an
+          // empty array is truthy -- so the fallback below tests for rows, not for presence.
+          scope.hud.provisionalEntries = asArray(scope.hud.provisionalEntries);
           if (scope.hud.phase === 'finished') {
             resetFlashState();
           } else {
-            trackPositionGains(scope.hud.entries || []);
+            trackPositionGains(scope.hud.entries);
           }
           scope.hud.liveEntries = windowLiveEntries(scope.hud.entries);
           for (var i = 0; i < scope.hud.liveEntries.length; i++) {
@@ -729,8 +758,9 @@ angular.module('beamng.apps')
           // That card is a result view, so it ranks with the F1 jump-start penalty applied (ADR-0043) --
           // the GE side ships the re-ranked rows. Absent (non-F1 race / nobody jumped) it falls back to
           // the live rows, unchanged. The live corner board keeps binding `entries` either way.
-          scope.hud.provisionalRows = scope.hud.provisionalEntries || scope.hud.entries;
-          var shown = scope.hud.phase === 'finished' ? (scope.hud.entries || []) : scope.hud.liveEntries;
+          scope.hud.provisionalRows = scope.hud.provisionalEntries.length
+            ? scope.hud.provisionalEntries : scope.hud.entries;
+          var shown = scope.hud.phase === 'finished' ? scope.hud.entries : scope.hud.liveEntries;
           scope.hud.sizeBucket = computeSizeBucket(shown);
         });
       });

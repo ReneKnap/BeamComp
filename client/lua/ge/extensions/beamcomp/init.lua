@@ -233,8 +233,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Names every item in this build on purpose, because two of their live checks are still outstanding: the
 -- nametag policy (prop-nametags-and-race-names-r2, which needs a second machine) and the race-setup
 -- button. A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
--- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1/2026-09-28"
+-- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
+-- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
+-- HUD standings during a race started over a running one).
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1/2026-09-29"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
