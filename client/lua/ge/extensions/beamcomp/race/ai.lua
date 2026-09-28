@@ -1907,14 +1907,28 @@ function M.draw_roster_names(count, exclude)
     return drawn
 end
 
--- Whether a pool name's PREFERRED CAR participates in a roster roll (ADR-0047 amendment R2): it replaces
--- a car ONLY in the "default" AI-car mode (aicar unset/empty). aicar=random now IGNORES the preferred car
--- and rolls a fresh random one (the R2 flip -- default = each AI's preferred, random = surprise field); an
--- explicit concrete admin choice -- a fixed aicar=<model> or aicar=host -- stays authoritative as before.
--- Colour is orthogonal and stays always-applied (round-3), so this gate is the CAR precedence only.
-function M.preferred_applies(config)
-    local car = type(config) == "table" and config.car or nil
-    return car == nil or car == ""
+-- Whether a driver's PREFERRED CAR participates in a roster roll (ADR-0047 R2, ADR-0048 amendment
+-- 2026-09-28). It applies only while NEITHER axis names a car, and both are read as "no explicit pick"
+-- with the same nil-or-empty rule roll_roster_car and resolve_ai_vehicle use:
+--   * the AI axis (config.car) is the "default" mode. aicar=random rolls a fresh random car instead (the
+--     R2 flip -- default = each driver's own car, random = surprise field), and a concrete aicar=<model>
+--     or aicar=host is an explicit admin choice that stays authoritative.
+--   * the player policy (policy.car) forces a car on the whole field -- a fixed car, car=random and
+--     car=host alike -- and a preference out of the driver file does not beat a setting out of the race
+--     options (bug ai-roster-car-ignores-forced-car). Caps are NOT part of this question: they keep
+--     filtering the preferred car through preferred_car_compliant, exactly as before.
+-- This is the ONE place the car precedence is decided, which is what keeps the two roll paths
+-- (roll_roster_entries, resolve_pick) from drifting; colour is orthogonal and stays always-applied
+-- (round 3). An absent policy means "forces nothing", i.e. the pre-fix behaviour -- so a caller that
+-- passes none still hands out preferred cars over a forced one, silently. Both call sites pass it
+-- (race/ai.lua entry_from_drawn, init.lua reroll_ai_name); a third one must too.
+function M.preferred_applies(config, policy)
+    local ai_car = type(config) == "table" and config.car or nil
+    if ai_car ~= nil and ai_car ~= "" then
+        return false
+    end
+    local forced = type(policy) == "table" and policy.car or nil
+    return forced == nil or forced == ""
 end
 
 -- Whether a preferred-car token passes the ACTIVE vehicle restrictions, with the same filter set the
@@ -2069,16 +2083,17 @@ function M.car_label(token)
 end
 
 -- Resolve one drawn candidate ({name, preferred, preferredColor}) to a full roster entry
--- {name, car, carLabel, color} (ADR-0047/0048). Car: the name's preferred car when the row's car would be
--- rolled at all (preferred_applies) and it passes the active restrictions (preferred_car_compliant), else a
--- car rolled through the spawn chain (roll_roster_car). Colour: the name's preferred colour ALWAYS when it
+-- {name, car, carLabel, color} (ADR-0047/0048). Car: the name's preferred car when nothing else names one
+-- (preferred_applies -- neither the AI axis nor the player policy) and it passes the active restrictions
+-- (preferred_car_compliant), else a car rolled through the spawn chain (roll_roster_car), which under a
+-- forced car resolves to exactly that car. Colour: the name's preferred colour ALWAYS when it
 -- carries one (colour is unrestricted -- no compliance, ADR-0047 round 3), else a palette colour drawn
 -- without replacement across `used`. `index` cycles content defaults if they ever apply; `used` is the
 -- colour set for the fallback draws. Shared by roll_roster_entries (random names) and resolve_pick (a
 -- pinned name), so the two never drift.
 local function entry_from_drawn(drawn, config, policy, index, used)
     local car
-    if drawn.preferred and M.preferred_applies(config)
+    if drawn.preferred and M.preferred_applies(config, policy)
             and M.preferred_car_compliant(drawn.preferred, config, policy) then
         car = drawn.preferred
     else
