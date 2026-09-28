@@ -21,6 +21,24 @@
 // list, ng-click): native <select> does not open in the BeamNG CEF overlay.
 angular.module('beamng.apps')
 .directive('beamCompGridEditor', [function () {
+  // A list pushed from GE, as a JavaScript array. Lua cannot tell an empty list from an empty map, so
+  // every encoder sends an empty table as {} -- which is truthy and carries no .length. That defeats BOTH
+  // shapes of guard this code uses: `x || []` keeps the {} (it is truthy), and `x.length <= n` lets it
+  // straight through (undefined <= n is false). Applied in the push handlers, at the one point a field
+  // enters the panel, so that "a list from GE is a list" is a property of the transition rather than a
+  // claim about every call site that reads it -- including the call site added next week.
+  //
+  // What it cannot do: a NON-empty non-list also becomes [] and disappears without a sound. That is
+  // acceptable because every list on this channel is built with t[#t+1] = ... and so is gap-free -- and
+  // it is why this must NEVER be pointed at a map. The setup panel's configsByModel is model -> list:
+  // the VALUES are lists, the map is not, and sending it through here would silently discard real data.
+  //
+  // One copy per app on purpose: the panels share no module space (client/ui/modules holds nothing but
+  // the four app folders), the same reason keyLabel exists three times.
+  function asArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
   // The upper bound of the two width pins (rows/columns), hand-mirrored from grid.MAX_AXIS_PIN in
   // race/grid.lua the way PREVIEW_MIN/PREVIEW_MAX mirror their GE constants. Deliberately its OWN
   // constant even where it holds the same number as PREVIEW_MAX: that one is how many cars the preview
@@ -570,7 +588,7 @@ angular.module('beamng.apps')
 
       scope.$on('BeamCompGridData', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.races = (payload && payload.races) || [];
+          scope.data.races = asArray(payload && payload.races);
           rebuildRaceOpts();
           // Pre-select the carried race only while no choice has been made, so a later push that still
           // carries the seed never overrides a manual pick.
@@ -585,7 +603,7 @@ angular.module('beamng.apps')
       // The map's saved grids as {name, race, isDefault} (ADR-0023 amendment).
       scope.$on('BeamCompGridList', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.grids = (payload && payload.grids) || [];
+          scope.data.grids = asArray(payload && payload.grids);
           rebuildGridOpts();
         });
       });
@@ -593,6 +611,11 @@ angular.module('beamng.apps')
       scope.$on('BeamCompGridState', function (event, payload) {
         scope.$evalAsync(function () {
           scope.state = payload || scope.state;
+          // The breakpoint boundaries are a list, and GE.segment_bounds() returns an EMPTY one whenever
+          // no edit session is running -- the case that crosses the bridge as {}. The template reads
+          // state.segments.length, which would then be undefined: "Editing segment 1 of " with nothing
+          // after it. Normalised here, so the field matches the [] this scope was seeded with.
+          scope.state.segments = asArray(scope.state.segments);
           // savedName tracks the active grid's persisted name (gates the default button, marks the
           // overwrite target).
           scope.savedName = scope.state.name || null;

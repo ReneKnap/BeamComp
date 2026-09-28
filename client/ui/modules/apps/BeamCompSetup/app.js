@@ -17,6 +17,24 @@
 // (bug setup-panel-settings-survive-ui-reload).
 angular.module('beamng.apps')
 .directive('beamCompSetup', ['$interval', '$timeout', function ($interval, $timeout) {
+  // A list pushed from GE, as a JavaScript array. Lua cannot tell an empty list from an empty map, so
+  // every encoder sends an empty table as {} -- which is truthy and carries no .length. That defeats BOTH
+  // shapes of guard this code uses: `x || []` keeps the {} (it is truthy), and `x.length <= n` lets it
+  // straight through (undefined <= n is false). Applied in the push handlers, at the one point a field
+  // enters the panel, so that "a list from GE is a list" is a property of the transition rather than a
+  // claim about every call site that reads it -- including the call site added next week.
+  //
+  // What it cannot do: a NON-empty non-list also becomes [] and disappears without a sound. That is
+  // acceptable because every list on this channel is built with t[#t+1] = ... and so is gap-free -- and
+  // it is why this must NEVER be pointed at a map. The setup panel's configsByModel is model -> list:
+  // the VALUES are lists, the map is not, and sending it through here would silently discard real data.
+  //
+  // One copy per app on purpose: the panels share no module space (client/ui/modules holds nothing but
+  // the four app folders), the same reason keyLabel exists three times.
+  function asArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
   // How long after the last form change the panel pushes the form to GE (ms). Each save serialises the
   // whole form and costs a bngApi round-trip, so it is slow enough to collapse a burst of typing or
   // clicking into one write, and fast enough that a UI reload can lose nothing that matters.
@@ -929,11 +947,14 @@ angular.module('beamng.apps')
       // refreshes. The form is seeded once on link and restored from GE via BeamCompSetupForm.
       scope.$on('BeamCompSetupData', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.races = (payload && payload.races) || [];
-          scope.data.cars = (payload && payload.cars) || [];
+          scope.data.races = asArray(payload && payload.races);
+          scope.data.cars = asArray(payload && payload.cars);
           // The AI roster colour palette (ADR-0047 round 3): the swatch picker + the JS-side colour reroll
           // draw from this. Static, pushed with the setup data so it is present on link and after restore.
-          scope.data.aiPalette = (payload && payload.aiPalette) || scope.data.aiPalette || [];
+          // Kept on a miss like the three fields below, and a palette that arrives empty counts as a miss:
+          // GE's own list is a non-empty constant, so nothing usable arrived either way.
+          var palette = asArray(payload && payload.aiPalette);
+          scope.data.aiPalette = palette.length ? palette : scope.data.aiPalette;
           // The default values behind the optional number fields (see defaultHint). Kept on a miss like
           // the palette above, so a partial/older GE push never blanks a hint the panel already has. The
           // hold is tested explicitly rather than with `||`, because a numeric default may legitimately be
@@ -968,7 +989,8 @@ angular.module('beamng.apps')
       // with the setup data and again after a pool save, so the per-AI name dropdown reflects the pool.
       scope.$on('BeamCompAiPool', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.aiPoolNames = (payload && payload.names) || scope.data.aiPoolNames || [];
+          var names = asArray(payload && payload.names);
+          scope.data.aiPoolNames = names.length ? names : scope.data.aiPoolNames;
         });
       });
 
@@ -1000,7 +1022,7 @@ angular.module('beamng.apps')
       // the dropdown can re-filter on a race change without asking again.
       scope.$on('BeamCompSetupGrids', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.grids = (payload && payload.grids) || [];
+          scope.data.grids = asArray(payload && payload.grids);
           gridsLoaded = true;
           rebuildGridOpts();
         });
@@ -1012,7 +1034,7 @@ angular.module('beamng.apps')
       // admin while this list stayed open) would otherwise render already-armed and delete on ONE click.
       scope.$on('BeamCompSetupPresets', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.data.presets = (payload && payload.names) || [];
+          scope.data.presets = asArray(payload && payload.names);
           rebuildPresetOpts();
           if (scope.selectedPreset && scope.data.presets.indexOf(scope.selectedPreset) === -1) {
             scope.selectedPreset = '';
@@ -1045,11 +1067,14 @@ angular.module('beamng.apps')
           if (!payload || !payload.model) {
             return;
           }
+          // Normalised ONCE here, because both readers below take the same list -- and because
+          // configsByModel is the map asArray must never be pointed at: its VALUES are lists, it is not.
+          var configs = asArray(payload.configs);
           // Cache by model so each class row's config dropdown can resolve its own model (ADR-0042).
-          scope.configsByModel[payload.model] = payload.configs || [];
+          scope.configsByModel[payload.model] = configs;
           // The per-race vehicle-policy picker tracks the single selected model.
           if (payload.model === scope.form.carModel) {
-            scope.data.configs = payload.configs || [];
+            scope.data.configs = configs;
             rebuildConfigOpts();
           }
         });
@@ -1596,7 +1621,7 @@ angular.module('beamng.apps')
       scope.temporaryCount = 0;
       scope.$on('BeamCompPlayers', function (event, payload) {
         scope.$evalAsync(function () {
-          scope.players = (payload && payload.players) || [];
+          scope.players = asArray(payload && payload.players);
           // Counted once per push, not from the template: an ng-disabled or a label that filtered the
           // array would re-run on every digest.
           var n = 0;
@@ -2165,7 +2190,7 @@ angular.module('beamng.apps')
           if (!payload || payload.token !== rosterRollToken || !scope.form.aiEnabled) {
             return;
           }
-          var entries = (payload.entries || []).map(function (e) {
+          var entries = asArray(payload.entries).map(function (e) {
             return { name: e.name, car: e.car, carLabel: e.carLabel, color: e.color };
           });
           if (payload.mode === 'cars') {
@@ -2227,13 +2252,11 @@ angular.module('beamng.apps')
           if (!payload || payload.token !== rosterRepairToken) {
             return;
           }
-          // GE sends this event only when it has repairs, so a list is expected -- but an empty Lua table
-          // would cross the bridge as {} rather than [], and asking is cheaper than trusting that.
-          if (!angular.isArray(payload.entries)) {
-            return;
-          }
+          // GE sends this event only when it has repairs, so a list is expected. asArray is what makes
+          // that true; the local isArray guard this handler used to carry was a second answer to the
+          // question the transition now answers for every pushed list, and two answers is how they drift.
           var fixByName = {};
-          payload.entries.forEach(function (e) {
+          asArray(payload.entries).forEach(function (e) {
             if (e && e.name) { fixByName[e.name] = e; }
           });
           var changed = [];
