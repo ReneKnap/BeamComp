@@ -4212,6 +4212,16 @@ function M.grid_set_direction(direction)
     push_grid_state()
 end
 
+-- Put the camera back above slot 1 of the grid being edited (UI -> GE, the panel's Camera to grid,
+-- ADR-0063). Never during a race. The admin just pressed a button, so a refusal is said out loud instead
+-- of leaving him with a camera that did nothing.
+function M.grid_camera_to_grid()
+    local ok, reason = M.gridcam.to_grid(grideditor.state, M.state.race ~= nil, "button")
+    if not ok then
+        editor_feedback(tostring(reason), "warning")
+    end
+end
+
 -- Set how many slots the preview shows (UI -> GE) and reflect.
 function M.grid_set_preview(count)
     local ok, reason = grideditor.set_preview_count(count)

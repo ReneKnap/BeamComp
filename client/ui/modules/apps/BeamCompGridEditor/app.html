@@ -205,6 +205,11 @@
         <button ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
       </div>
       <div class="bc-hint">Reverse is only saved if you edit it; a race with no reverse geometry is rejected.</div>
+      <!-- Next to Forward/Reverse because both are about where on the map the grid is. Needs no ng-disabled:
+           this whole section only exists while a session runs, and GE refuses (and says so) during a race. -->
+      <div class="bc-row bc-grid-actions">
+        <button class="bc-mini" ng-click="cameraToGrid()" bc-grid-tip="tip('cameraToGrid')">Camera to grid</button>
+      </div>
     </div>
 
     <!-- Segment / breakpoint. Every slot number in this section is written the way the admin reads it on
