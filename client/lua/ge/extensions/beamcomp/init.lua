@@ -80,6 +80,10 @@ local qualisprint = require("beamcomp/race/qualisprint")
 -- to spare a slot under the 200-local ceiling (see the header) -- which also makes it reachable
 -- from the in-game console as beamcomp_init.uilayout for manual verification.
 M.uilayout = require("beamcomp/race/uilayout")
+-- The grid editor's camera (ADR-0063): jumps above the grid being edited and owns every way back out.
+-- Hung on M for the same reason as uilayout -- it costs no top-level local -- which also lets its pose
+-- constants be tuned live from the console (beamcomp_init.gridcam.PITCH_DEG = 45).
+M.gridcam = require("beamcomp/race/gridcam")
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -672,6 +676,10 @@ local function handle_race_start(payload)
         M.state.grid_edit_checkpoint = nil
         M.uilayout.remove("beamCompGridEditor")
     end
+    -- ...and the camera that followed the edit is NOT given back: the race placement owns the camera from
+    -- here (ADR-0063). Outside the branch above on purpose -- a remembered camera can outlive its session
+    -- (M.clear_grid_editor alone leaves it standing), and it must not reach into a race either way.
+    M.gridcam.leave("race")
 
     local race, reason = race_start.prepare(payload)
     if not race then
@@ -4285,12 +4293,16 @@ function M.close_grid_editor()
     M.state.grid_seed_race = nil
     -- Reuse the full teardown primitive (session + name + props + checkpoint + reflect); no duplication.
     M.clear_grid_editor()
+    -- The end of the visit: the camera goes back to where it was before the first jump (ADR-0063).
+    M.gridcam.leave("close")
     M.uilayout.remove("beamCompGridEditor")
 end
 
 -- Clear the grid-editor session (GE): end editing, drop the preview pillars + reference props, and reflect
 -- the now-empty state so the panel returns to its "pick a race" start. The panel stays open. This is the
 -- shared teardown primitive -- Close reuses it (and then removes the panel).
+-- Deliberately does NOT give the camera back (ADR-0063): this looks like the end of a session and is not
+-- one. The camera follows Close and the other exits in gridcam's EXITS table, never this primitive alone.
 function M.clear_grid_editor()
     grideditor.clear()
     M.state.grid_active_name = nil
@@ -8103,6 +8115,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- phases (bug default-dashboard-ui-missing-at-race-start). Idle unless a rebind is queued.
         step_dashboard_refresh(dtReal)
     end
+    -- Phase-independent: follow the grid editor's session with the camera (ADR-0063). It watches the
+    -- session counter instead of being called by every New / Load / console start, so a session start
+    -- added later moves the camera too. One boolean read while nobody is editing. Last in this function on
+    -- purpose: whatever it ever does wrong, it can never skip a line of the race loop above.
+    M.gridcam.step(grideditor.state, M.state.race ~= nil)
 end
 
 function M.onPreRender(dtReal, dtSim, dtRaw)
@@ -8166,6 +8183,9 @@ function M.onClientEndMission(_levelPath)
     -- setup.clear, because that function also runs on the panel's Close, which is not a session boundary
     -- (bug panel-close-wipes-nametag-policy).
     identity.clear_policy()
+    -- Drop the grid editor's remembered camera, never restore it: a pose on the old level means nothing
+    -- on the next one (ADR-0063). The edit session itself is left as it was.
+    M.gridcam.leave("level")
     -- Drop the remembered race scan (feature raceui-reopen-without-typing): a level change is the one
     -- moment the installed set can plausibly have changed since we looked. Required inline rather than at
     -- the top of the file because init.lua sits at LuaJIT's 200-local ceiling and this is its only caller
@@ -8182,6 +8202,13 @@ function M.onExtensionUnloaded()
     -- there can restore the three input switches any more. This runs BEFORE M.state is rebuilt, so the
     -- armed flag is still readable (ADR-0052). No-op when no capture is armed.
     M.release_input_capture()
+    -- Give the grid editor's camera back while somebody still knows where it was: after the reload nothing
+    -- does (ADR-0063, ADR-0052). Guarded on its own because this hook is called without a pcall, and a
+    -- throw here would skip the whole teardown below.
+    local cam_ok, cam_err = pcall(M.gridcam.leave, "reload")
+    if not cam_ok then
+        log("W", "beamcomp.grid", "camera could not be given back on unload: " .. tostring(cam_err))
+    end
     grideditor.clear()
     -- Despawn any grid-edit reference props too (their lifecycle is separate from the race props that
     -- teardown_race_world clears), so a reload mid-edit leaves no orphaned scenery.
@@ -8370,6 +8397,8 @@ function beamcomp_grid_cancel()
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
     M.state.grid_edit_checkpoint = nil
+    -- The console's Close: the camera goes back to where it was before the first jump (ADR-0063).
+    M.gridcam.leave("cancel")
     editor_feedback("grid editing ended -- pillars cleared")
 end
 

@@ -3,7 +3,9 @@
 -- Lives at lua/ge/extensions/beamcomp/race/grideditor.lua inside the client mod zip. Target: client GE
 -- (LuaJIT 5.1). Reload-safe: holds only plain tables in M.state, no engine handles, and previews with
 -- immediate-mode draws (init.lua redraws each frame), so a Lua reload just drops the edit session with
--- nothing to clean up.
+-- nothing to clean up. The camera that follows a session is NOT kept here: it is the one part of an edit
+-- that does have something to put back, so it lives in race/gridcam.lua (ADR-0063). That module reads
+-- M.state (the session counter, the direction, slot 1) and never writes it.
 --
 -- Authoring side of named parametric grids (ADR-0023). The admin enters edit mode against a race on the
 -- current map; the editor anchors a preview-count-sized grid to that race's real start line (via
@@ -151,6 +153,9 @@ M.state = {
     anchors = nil,     -- cached {forward = {base_pose, gate_normal}, reverse = ...} per direction
     poses = nil,       -- current preview poses for the active direction (drawn by init.lua)
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
+    -- Bumped by every session start (enter, under both start_fresh and open) and never reset, not even
+    -- by clear: race/gridcam.lua watches it to jump the camera on EVERY session start, whoever started it.
+    session = 0,
 }
 
 -- The active direction's ordered segment list, or nil when not editing.
@@ -225,6 +230,8 @@ local function enter(race_name_or_id, blocks, preview_count)
     M.state.anchors = {forward = anchor}
     M.state.preview_count = coerce_preview_count(preview_count)
     recompute()
+    -- Only now: a session counts as started once its preview poses exist, which is what the camera flies to.
+    M.state.session = M.state.session + 1
     return true, anchor.raceId
 end
 
