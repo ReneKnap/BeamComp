@@ -12,8 +12,8 @@
 --                            state.session whoever called it, so a session start nobody here has heard
 --                            of still moves the camera.
 --   M.to_grid(...)           the jump itself, for step and for the panel's Camera to grid button.
---   M.leave(exit)            the ONE way out. EXITS states for every exit whether the camera goes back
---                            or the remembered camera is dropped; a call site only names itself.
+--   M.leave(exit)            the ONE way out. EXITS states for every exit what happens to the camera;
+--                            a call site only names itself.
 --
 -- The remembered camera (M.state.saved) is written by the FIRST jump of a visit and by nothing else, and
 -- it is written BEFORE anything moves: no jump without a way back. A later jump -- another grid loaded, a
@@ -46,20 +46,25 @@ M.LOOK_ALONG_TRAVEL = false
 -- A direction switch moves the camera only when slot 1 moved further than this, in meters.
 M.FOLLOW_DISTANCE = 100.0
 
-local RESTORE = "restore"
-local DROP = "drop"
+-- The three things an exit can do. Every one of them forgets the remembered camera.
+local RESTORE = "restore"        -- put the camera back exactly as it was before the first jump
+local TO_VEHICLE = "to_vehicle"  -- no old pose: a camera still free from our jump goes into the car
+local DROP = "drop"              -- leave the camera where it is
 
--- What every way out of an edit visit does with the remembered camera. The whole answer, in one place.
+-- What every way out of an edit visit does with the camera. The whole answer, in one place.
 -- NOT an exit, on purpose: init.lua's M.clear_grid_editor on its own. It looks like the end of a session
 -- and is not one -- it is the teardown primitive Close is built from, and it leaves the remembered camera
 -- standing for the Close that follows. An exit missing from this table is reported and dropped, so the
 -- camera never moves on a path nobody decided.
 local EXITS = {
-    close = RESTORE,   -- the panel's Close (M.close_grid_editor)
-    cancel = RESTORE,  -- the beamcomp_grid_cancel console command
-    reload = RESTORE,  -- a GE Lua reload: afterwards nothing knows where the camera was
-    race = DROP,       -- raceStart: the race placement owns the camera, going back would fight it
-    level = DROP,      -- onClientEndMission: a pose on the old level means nothing on the next one
+    close = RESTORE,      -- the panel's Close (M.close_grid_editor)
+    cancel = RESTORE,     -- the beamcomp_grid_cancel console command
+    reload = RESTORE,     -- a GE Lua reload: afterwards nothing knows where the camera was
+    -- raceStart: an old pose would fight the race placement, so none comes back. But a start that only
+    -- teleports the car spawns nothing, BeamMP then never switches to the vehicle camera, and the driver
+    -- would sit in our free camera above some grid (owner's decision 2026-10-06).
+    race = TO_VEHICLE,
+    level = DROP,         -- onClientEndMission: a pose on the old level means nothing on the next one
 }
 
 M.state = {
@@ -191,14 +196,19 @@ local function jump(slot)
     return remembered
 end
 
+-- commands.setGameCamera ends in setGlobalCameraByName(nil), which silently refuses without a player
+-- vehicle -- so the callers ask first and say it instead.
+local function has_player_vehicle()
+    return type(getPlayerVehicle) ~= "function" or getPlayerVehicle(0) ~= nil
+end
+
 -- Put the camera back as `saved` describes it. Returns the log text for what happened.
 local function restore(saved)
     if saved.map ~= maps.current() then
         return "stays where it is, " .. describe_camera(saved) .. " was remembered on another level"
     end
     if saved.kind == "vehicle" then
-        -- setGlobalCameraByName(nil) silently refuses without a player vehicle, so say it instead.
-        if type(getPlayerVehicle) == "function" and not getPlayerVehicle(0) then
+        if not has_player_vehicle() then
             return "stays free, there is no vehicle to go back to"
         end
         commands.setGameCamera()
@@ -209,6 +219,27 @@ local function restore(saved)
         return "back to the old pose in the free camera (it was the '" .. saved.name .. "' camera)"
     end
     return "back to the free camera at its old pose via commands.setFreeCamera + core_camera.setPosRot"
+end
+
+local function is_free_camera()
+    if type(commands.isFreeCamera) == "function" then
+        return commands.isFreeCamera()
+    end
+    return core_camera.getActiveGlobalCameraName(0) == "free"
+end
+
+-- Hand a camera that is still free from our jump to the car, without any old pose (`_saved` is not
+-- needed: whatever was remembered, the car is where the camera goes). A player who already went back to
+-- his car himself is left alone. Returns the log text for what happened.
+local function to_vehicle_camera(_saved)
+    if not is_free_camera() then
+        return "stays, the player is already back in the vehicle camera"
+    end
+    if not has_player_vehicle() then
+        return "stays free, there is no vehicle to go to"
+    end
+    commands.setGameCamera()
+    return "to the vehicle camera via commands.setGameCamera, the old pose is not given back"
 end
 
 -- Put the camera above slot 1 of `editor`'s session. `in_race` refuses it (no jump while a race runs);
@@ -243,8 +274,9 @@ function M.to_grid(editor, in_race, trigger)
     return true
 end
 
--- The one way out of an edit visit. Clears the remembered camera on every path -- first, so a restore
--- that throws can never leave it armed for the next exit -- and lets EXITS decide whether it goes back.
+-- The one way out of an edit visit. Clears the remembered camera on every path -- first, so a camera call
+-- that throws can never leave it armed for the next exit -- and lets EXITS decide what the camera does.
+-- Nothing at all happens without a memory: then this visit never moved the camera.
 function M.leave(exit)
     local saved = M.state.saved
     M.state.saved = nil
@@ -262,11 +294,12 @@ function M.leave(exit)
             .. " is forgotten, not given back")
         return
     end
-    local ok, result = pcall(restore, saved)
+    local action = (answer == TO_VEHICLE) and to_vehicle_camera or restore
+    local ok, result = pcall(action, saved)
     if ok then
         log("I", LOG_TAG, "camera " .. result .. " (" .. exit .. ")")
     else
-        log("W", LOG_TAG, "camera could not go back to " .. describe_camera(saved) .. " (" .. exit .. "): "
+        log("W", LOG_TAG, "camera left as it is (" .. exit .. ", " .. answer .. " failed): "
             .. tostring(result))
     end
 end

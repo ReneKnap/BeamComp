@@ -677,9 +677,10 @@ local function handle_race_start(payload)
         M.state.grid_edit_checkpoint = nil
         M.uilayout.remove("beamCompGridEditor")
     end
-    -- ...and the camera that followed the edit is NOT given back: the race placement owns the camera from
-    -- here (ADR-0063). Outside the branch above on purpose -- a remembered camera can outlive its session
-    -- (M.clear_grid_editor alone leaves it standing), and it must not reach into a race either way.
+    -- ...and the camera that followed the edit gets no old pose back, which would fight the race placement;
+    -- if it is still free from our jump, it goes into the car instead (ADR-0063). Outside the branch above
+    -- on purpose -- a remembered camera can outlive its session (M.clear_grid_editor alone leaves it
+    -- standing), and it must not reach into a race either way.
     M.gridcam.leave("race")
 
     local race, reason = race_start.prepare(payload)
