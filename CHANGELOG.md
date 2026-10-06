@@ -46,6 +46,8 @@ below rather than hidden.
   that can be reloaded.
 - The results screen offers a **Race setup** button to anyone who may open the panel, so the next race
   can be set up without typing `/raceui` again.
+- Change a setting after **Confirm & Build Grid** and the setup panel says so and lights the button up:
+  **Start Race** starts the grid as it was built.
 - A grid editor (`/gridui`).
 - Admin access by password or by BeamMP name -- see `beamcomp.config.ini`.
 - `showDriverNames` decides whether names are drawn over the cars at all. It can be switched from the

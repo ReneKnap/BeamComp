@@ -102,8 +102,9 @@ M.gridcam = require("beamcomp/race/gridcam")
 --          recover-unguarded-when-assists-disabled).
 -- setup -- the race-setup panel's GE-side presence: the session open-state set by the admin-gated
 --          /raceui open, the one-shot watchdog that re-adds the app when a UI reload drops it
---          (bug setup-panel-settings-survive-ui-reload), and the panel's AI-roster car re-resolve
---          (ADR-0047 live amendment).
+--          (bug setup-panel-settings-survive-ui-reload), the panel's AI-roster car re-resolve
+--          (ADR-0047 live amendment), and the record of which panel request the staged grid was
+--          built from (feature setup-confirm-grid-stale-hint).
 -- stall -- the client half of the driver-liveness predicate (feature
 --          stall-detection-client-measured-movement): measure whether each car THIS client owns has
 --          actually covered ground, and report the verdict to the race-blind server while a finish
@@ -236,7 +237,8 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
 -- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
--- camera, and partlock (the forced-car part lock) is new in this build.
+-- camera, partlock (the forced-car part lock) is new since then, and confirmhint (the setup panel's
+-- stale-grid hint) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -244,8 +246,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- moves the camera above the grid being edited and gives it back when the editor closes; one logging
 -- gridcam-r2 also puts a camera still free from the editor back into the car when a race starts; one
 -- logging gridcam-r3 also shows every checkpoint in the grid editor (CP0 red, CP1 yellow, the rest grey);
--- one logging partlock-r1 also locks a forced car's parts and its staging swap, with tuning left free.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1/2026-10-06"
+-- one logging partlock-r1 also locks a forced car's parts and its staging swap, with tuning left free;
+-- one logging confirmhint-r1 also has the setup panel point at Confirm & Build Grid when the settings
+-- differ from the staged grid, and shows Start Race only while a race is staging.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1/2026-10-06"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -359,6 +363,8 @@ M.state = {
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoints = nil,  -- the active direction's checkpoints in traversal order, CP0 first ({index, pos, normal, radius} each), drawn immediate-mode during a grid edit -- CP0 red, CP1 yellow, the rest grey -- so the grid can be placed against the start line and the route seen from the free camera
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037). The panel autosaves it on every change, so it also survives a UI reload that never runs the panel's Close (bug setup-panel-settings-survive-ui-reload)
+    setup_built = nil,        -- the race request (the panel's JSON string, VERBATIM -- never decoded and re-encoded, which would reorder keys and turn an empty list into {}) the staged race was built from, or nil when that is not known: no race, or one this panel did not build (another admin's, a typed /race). The panel compares its form against it and points at Confirm & Build Grid when they differ (feature setup-confirm-grid-stale-hint, ADR-0037 amendment 2026-10-06). Set ONLY by setup.note_race_start; survives the panel's Close on purpose -- the grid is still standing -- and is dropped by teardown_race_world. nil after a GE Lua reload (ADR-0052), and nil means "no hint", so the reload can cost a hint but never fake one
+    setup_request = nil,      -- the panel's last Confirm & Build Grid that has not become a race yet: {json, race, overrides, validated, sends}. Tied to its race by setup.note_validation (the validateRace the server sends this client for it) and promoted into setup_built by the raceStart that carries propOwner for it; `sends` counts a double click. A newer Confirm replaces it; a refusal, another request of ours or leaving the session drops it. Deliberately NOT reset by teardown_race_world (it can still become the next race); nil after a GE Lua reload, which costs that one race its hint and nothing else (ADR-0052)
     setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037). Does NOT survive a Lua reload: this extension has no onSerialize/onDeserialize, so a reload rebuilds M.state from this literal -- the panel stays on screen but is no longer watched until the next /raceui
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
@@ -745,10 +751,18 @@ local function handle_race_start(payload)
         disarm_freeze_hold_ve()
         countdown.clear()
         hud.clear()
+        -- No race on this client means no grid the setup panel could describe -- and if this was the
+        -- panel's own Confirm, it will not stage here either.
+        setup.forget_build("race start rejected")
+        setup.drop_request("race start rejected")
         return
     end
 
     M.state.race = race
+    -- Whether the setup panel built this race decides whether it may compare against it (feature
+    -- setup-confirm-grid-stale-hint). Here, before the spawn below: the panel hears the answer before
+    -- the staging phase that shows it.
+    setup.note_race_start(payload)
 
     -- Backstop for the scenery pull (ADR-0046): we are racing off the host's relayed definition -- so we
     -- do NOT have this track -- and have no scenery for it. Either the prefetch probe never reached us or
@@ -1219,6 +1233,10 @@ local function teardown_race_world()
     M.state.race_car_id = nil
     M.state.detection = nil
     M.state.laptimer = nil
+    -- The grid the setup panel compares against goes with the race (feature
+    -- setup-confirm-grid-stale-hint). A Confirm still on its way is left alone: it can still become the
+    -- next race, and only this client's own race check ties it to one.
+    setup.forget_build("race torn down")
     -- Drop any queued stock-dashboard rebind so it never fires in free-roam after teardown
     -- (bug default-dashboard-ui-missing-at-race-start).
     M.state.dash_refresh_pending = false
@@ -3061,6 +3079,10 @@ local function handle_validate_race(payload)
         -- reading hostCar.model (vehicle-blind, ADR-0005).
         hostCarName = host_car_name,
     })
+    -- This check is how a race request of ours is tied to the race it becomes: the setup panel's
+    -- Confirm, or something else this client asked for in the meantime (feature
+    -- setup-confirm-grid-stale-hint). Read with the FINAL verdict, car=host refusal included.
+    setup.note_validation(payload, result.ok)
 end
 
 -- ===== the on-demand scenery pull (ADR-0046) =============================================
@@ -3251,6 +3273,9 @@ function M.start_race_from_ui(json)
         log("W", RACE_LOG_TAG, "start_race_from_ui: bad payload")
         return
     end
+    -- Remember what this Confirm asked for, so the grid it builds can be compared with the panel later.
+    -- The string as the panel sent it, not `decoded` re-encoded (see M.state.setup_built).
+    setup.note_request(json, decoded)
     send_to_server("startRace", {race = decoded.race, overrides = decoded.overrides})
 end
 
@@ -3880,6 +3905,145 @@ end
 function M.request_setup_form()
     guihooks.trigger("BeamCompSetupForm", {form = M.state.setup_form})
 end
+
+-- ===== the setup panel's build record (feature setup-confirm-grid-stale-hint) ======================
+-- Which race request the staged grid was built from, so the setup panel can point at Confirm & Build
+-- Grid when its settings have moved on since (ADR-0037 amendment 2026-10-06). Start Race only ends the
+-- staging of the race that is already built, so a setting changed after the build silently does
+-- nothing -- this is what makes that visible. The panel decides nothing about attribution: it is handed
+-- a request or nil and compares. Whether the staged race was built from the panel at all is decided here.
+--
+-- The tie is the pre-flight handshake (ADR-0019). Every race request this client issues -- from the
+-- panel or typed as /race -- comes back to THIS client as exactly one validateRace before any raceStart
+-- can carry propOwner for it, and the server starts no race that did not pass one. So the panel's
+-- request is matched to the validateRace that comes back for it, and only a validated request is
+-- promoted by the propOwner raceStart of its race. A typed /race in between never inherits it: its own
+-- validateRace does not match and drops the request. Every doubt ends in nil, and nil means no hint --
+-- the one direction that cannot claim anything false about a grid.
+
+setup.LOG_TAG = "beamcomp.setup"
+
+-- Hand the panel the request the staged grid was built from, verbatim (nil = not known, no hint). Also
+-- the answer to the panel's link-time pull, since a freshly-added app misses every earlier push.
+function setup.push_build()
+    if guihooks then
+        guihooks.trigger("BeamCompSetupBuild", {request = M.state.setup_built})
+    end
+end
+
+-- Forget the staged grid's request. Logs and pushes only when one was remembered, so every lobby
+-- after a race this panel did not build stays silent.
+function setup.forget_build(reason)
+    if M.state.setup_built == nil then
+        return
+    end
+    M.state.setup_built = nil
+    log("I", setup.LOG_TAG, "staged grid forgotten: " .. reason)
+    setup.push_build()
+end
+
+-- Drop the Confirm that has not become a race yet. The staged grid is untouched: whatever stands is
+-- still what the last promoted request built.
+function setup.drop_request(reason)
+    local request = M.state.setup_request
+    if not request then
+        return
+    end
+    M.state.setup_request = nil
+    log("I", setup.LOG_TAG, string.format("grid request for '%s' dropped: %s", tostring(request.race),
+        reason))
+end
+
+-- Confirm & Build Grid sent `json`, which `decoded` is the table of. A newer Confirm replaces a request
+-- still on its way -- it is the one the panel shows. The SAME request again (a double click) is counted
+-- instead: each send gets its own validateRace from the server and can become its own race, and starting
+-- over would let the second check drop the first one's record.
+function setup.note_request(json, decoded)
+    log("I", setup.LOG_TAG, string.format("grid request sent for '%s'", decoded.race))
+    local request = M.state.setup_request
+    if request and request.json == json then
+        request.sends = request.sends + 1
+        return
+    end
+    M.state.setup_request = {
+        json = json,
+        race = decoded.race,
+        overrides = type(decoded.overrides) == "table" and decoded.overrides or {},
+        validated = false,
+        sends = 1,
+    }
+end
+
+-- A lap count the way the server's sanitize_overrides leaves it (whole, at least 1), so a value the
+-- server rounds on the way still matches the request it came from.
+function setup.lap_count(value)
+    local laps = tonumber(value)
+    return laps and math.max(1, math.floor(laps)) or nil
+end
+
+-- Whether a validateRace is the check of `request`. Compares the fields the server relays back in it, so
+-- a typed /race for the same track still differs in practice: the panel always names the track's mode,
+-- a typed race rarely does. A false "no" costs one hint; a false "yes" would cost a true one.
+function setup.same_request(request, payload)
+    local overrides = request.overrides
+    local ai = type(overrides.ai) == "table" and overrides.ai or {}
+    return payload.race == request.race
+        and payload.mode == overrides.mode
+        and payload.direction == overrides.direction
+        and payload.laps == setup.lap_count(overrides.laps)
+        and payload.car == overrides.car
+        and payload.aiCar == ai.car
+        and (payload.force == true) == (overrides.force == true)
+        and (payload.all == true) == (overrides.all == true)
+end
+
+-- The server's pre-flight check of a request from THIS client, with our own verdict on it (ADR-0019).
+-- A check that does not match the Confirm is something else this client asked for -- a typed /race --
+-- which is now ahead of it on the server, so the Confirm can no longer be told apart from it. A matching
+-- one is the Confirm's own (or its double click's).
+function setup.note_validation(payload, ok)
+    local request = M.state.setup_request
+    if not request or type(payload) ~= "table" then
+        return
+    end
+    if not setup.same_request(request, payload) then
+        setup.drop_request("another race request from this client")
+        return
+    end
+    if not ok then
+        setup.drop_request("refused by the race check")
+        return
+    end
+    request.validated = true
+end
+
+-- A race has started and this client resolved it. It was built from the panel exactly when it is ours
+-- (propOwner: this client issued it) and our validated request is for this race; anything else -- another
+-- admin's race, a typed /race -- leaves the panel without knowledge of the grid, so it says nothing.
+-- A request not validated yet is kept: this race cannot be it, and it can still become the next one.
+function setup.note_race_start(payload)
+    local request = M.state.setup_request
+    if payload.propOwner == true and request and request.validated and request.race == payload.race then
+        -- One race per send: a double click's second send may still start a race of its own.
+        request.sends = request.sends - 1
+        if request.sends <= 0 then
+            M.state.setup_request = nil
+        end
+        M.state.setup_built = request.json
+        log("I", setup.LOG_TAG, string.format("staged grid remembered as built from the panel ('%s')",
+            request.race))
+        setup.push_build()
+        return
+    end
+    setup.forget_build("this race was not built from the panel")
+end
+
+-- Push the staged grid's request on demand (UI -> GE): the panel's link-time pull. Public as
+-- beamcomp_init.request_setup_build.
+function M.request_setup_build()
+    setup.push_build()
+end
+-- ===== end the setup panel's build record ==========================================================
 
 -- Save the current race-setup form as a named, map-scoped preset (UI -> GE -> server, ADR-0037 amendment).
 -- The panel serialises its form minus the tournament/championship fields and passes {name, form}; GE relays
@@ -8228,6 +8392,9 @@ function M.onClientEndMission(_levelPath)
     -- setup.clear, because that function also runs on the panel's Close, which is not a session boundary
     -- (bug panel-close-wipes-nametag-policy).
     identity.clear_policy()
+    -- A Confirm still on its way belongs to the server we just left (teardown above already dropped the
+    -- staged grid's record). Not in setup.clear, which the panel's Close runs too.
+    setup.drop_request("left the session")
     -- Drop the grid editor's remembered camera, never restore it: a pose on the old level means nothing
     -- on the next one (ADR-0063). The edit session itself is left as it was.
     M.gridcam.leave("level")
