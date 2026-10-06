@@ -3,7 +3,9 @@
 -- Lives at lua/ge/extensions/beamcomp/race/grideditor.lua inside the client mod zip. Target: client GE
 -- (LuaJIT 5.1). Reload-safe: holds only plain tables in M.state, no engine handles, and previews with
 -- immediate-mode draws (init.lua redraws each frame), so a Lua reload just drops the edit session with
--- nothing to clean up.
+-- nothing to clean up. The camera that follows a session is NOT kept here: it is the one part of an edit
+-- that does have something to put back, so it lives in race/gridcam.lua (ADR-0063). That module reads
+-- M.state (the session counter, the direction, slot 1) and never writes it.
 --
 -- Authoring side of named parametric grids (ADR-0023). The admin enters edit mode against a race on the
 -- current map; the editor anchors a preview-count-sized grid to that race's real start line (via
@@ -140,6 +142,15 @@ end
 M.SAMPLE_BLOB_RADIUS = 0.16
 M.SAMPLE_BLOB_HEIGHT = 0.03
 
+-- The preview's route: every checkpoint after CP1 is drawn grey (CP0 keeps the red start-line style, CP1
+-- the yellow look-ahead the race itself uses, both in init.lua). The area fill is dimmed well below the
+-- other two, because a long route stacks dozens of these columns over the grid being edited. A field
+-- here for the same reason as the blobs above: init.lua sits at the 200-local ceiling.
+M.ROUTE_CHECKPOINT_STYLE = {
+    area = {r = 0.6, g = 0.62, b = 0.66, a = 0.04},
+    post = {r = 0.62, g = 0.64, b = 0.68, a = 0.7},
+}
+
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
@@ -151,6 +162,9 @@ M.state = {
     anchors = nil,     -- cached {forward = {base_pose, gate_normal}, reverse = ...} per direction
     poses = nil,       -- current preview poses for the active direction (drawn by init.lua)
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
+    -- Bumped by every session start (enter, under both start_fresh and open) and never reset, not even
+    -- by clear: race/gridcam.lua watches it to jump the camera on EVERY session start, whoever started it.
+    session = 0,
 }
 
 -- The active direction's ordered segment list, or nil when not editing.
@@ -225,6 +239,8 @@ local function enter(race_name_or_id, blocks, preview_count)
     M.state.anchors = {forward = anchor}
     M.state.preview_count = coerce_preview_count(preview_count)
     recompute()
+    -- Only now: a session counts as started once its preview poses exist, which is what the camera flies to.
+    M.state.session = M.state.session + 1
     return true, anchor.raceId
 end
 
@@ -487,8 +503,9 @@ function M.preview_count()
 end
 
 -- The reference scene for the active direction, for the caller (init.lua) to spawn/draw alongside the
--- preview: {prefabFiles = {...}, checkpoint = {pos, normal, radius}|nil}. The anchor for each direction
--- already carries these (start.anchor), so switching direction switches the scene too. Nil when not editing.
+-- preview: {prefabFiles = {...}, checkpoints = {...}} -- every checkpoint in this direction's order, CP0
+-- first. The anchor for each direction already carries these (start.anchor), so switching direction
+-- switches the scene too, red and yellow included. Nil when not editing.
 function M.current_scene()
     if not M.state.active then
         return nil
@@ -497,7 +514,7 @@ function M.current_scene()
     if not anchor then
         return nil
     end
-    return {prefabFiles = anchor.prefabFiles, checkpoint = anchor.checkpoint}
+    return {prefabFiles = anchor.prefabFiles, checkpoints = anchor.checkpoints}
 end
 
 -- The current edit as a save payload: the map, the anchored race (which OWNS the saved grid -- re-anchoring

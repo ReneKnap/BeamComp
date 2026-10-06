@@ -172,6 +172,7 @@ angular.module('beamng.apps')
     gridRow: 'Load this grid for editing.',
     gridDelete: 'Delete this saved grid.',
     direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
+    cameraToGrid: 'Move the camera above P1 of this grid. Not during a race.',
 
     breakpoint: 'The starting position where a new part of the grid begins.',
     addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
@@ -809,6 +810,12 @@ angular.module('beamng.apps')
 
       scope.setDirection = function (direction) {
         geLuaArg('grid_set_direction', direction);
+      };
+
+      // Put the camera back above P1 of the grid being edited (ADR-0063). The camera already jumps on
+      // every New and Load by itself; this button is for after the admin has flown somewhere else.
+      scope.cameraToGrid = function () {
+        geCall('grid_camera_to_grid');
       };
 
       // Where a knob's hold starts: the current authoritative value (auto/blank starts at 0) -- the GE

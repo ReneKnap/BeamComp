@@ -80,6 +80,10 @@ local qualisprint = require("beamcomp/race/qualisprint")
 -- to spare a slot under the 200-local ceiling (see the header) -- which also makes it reachable
 -- from the in-game console as beamcomp_init.uilayout for manual verification.
 M.uilayout = require("beamcomp/race/uilayout")
+-- The grid editor's camera (ADR-0063): jumps above the grid being edited and owns every way back out.
+-- Hung on M for the same reason as uilayout -- it costs no top-level local -- which also lets its pose
+-- constants be tuned live from the console (beamcomp_init.gridcam.PITCH_DEG = 45).
+M.gridcam = require("beamcomp/race/gridcam")
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -230,14 +234,17 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Distinctive build marker logged at load so a redeploy can be proven live in beamng.log before trusting
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
--- Names every item in this build on purpose, because four of their live checks are still outstanding: the
--- nametag policy (prop-nametags-and-race-names-r2, which needs a second machine), the race-setup button,
--- the AI car precedence and this list normalisation.
+-- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
+-- named here only the list normalisation (lists-r1) is still outstanding, and gridcam is the grid
+-- editor's camera, new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
--- HUD standings during a race started over a running one).
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1/2026-09-29"
+-- HUD standings during a race started over a running one); one logging gridcam-r1 on top of that also
+-- moves the camera above the grid being edited and gives it back when the editor closes; one logging
+-- gridcam-r2 also puts a camera still free from the editor back into the car when a race starts; one
+-- logging gridcam-r3 also shows every checkpoint in the grid editor (CP0 red, CP1 yellow, the rest grey).
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3/2026-10-06"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -348,7 +355,7 @@ M.state = {
     grid_active_name = nil,   -- the saved name of the grid currently being edited (set on save/load, nil for a fresh unsaved grid); reflected to the panel so a reopen restores the overwrite/assign target
     grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
-    grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
+    grid_edit_checkpoints = nil,  -- the active direction's checkpoints in traversal order, CP0 first ({index, pos, normal, radius} each), drawn immediate-mode during a grid edit -- CP0 red, CP1 yellow, the rest grey -- so the grid can be placed against the start line and the route seen from the free camera
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037). The panel autosaves it on every change, so it also survives a UI reload that never runs the panel's Close (bug setup-panel-settings-survive-ui-reload)
     setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037). Does NOT survive a Lua reload: this extension has no onSerialize/onDeserialize, so a reload rebuilds M.state from this literal -- the panel stays on screen but is no longer watched until the next /raceui
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
@@ -669,9 +676,14 @@ local function handle_race_start(payload)
         M.state.grid_active_name = nil
         props.clear(M.state.grid_edit_prop_names or {})
         M.state.grid_edit_prop_names = nil
-        M.state.grid_edit_checkpoint = nil
+        M.state.grid_edit_checkpoints = nil
         M.uilayout.remove("beamCompGridEditor")
     end
+    -- ...and the camera that followed the edit gets no old pose back, which would fight the race placement;
+    -- if it is still free from our jump, it goes into the car instead (ADR-0063). Outside the branch above
+    -- on purpose -- a remembered camera can outlive its session (M.clear_grid_editor alone leaves it
+    -- standing), and it must not reach into a race either way.
+    M.gridcam.leave("race")
 
     local race, reason = race_start.prepare(payload)
     if not race then
@@ -3532,15 +3544,16 @@ local function push_grid_state()
 end
 
 -- Sync the grid editor's reference scene to the active session (ADR-0037 amendment, tweak): the track's
--- static props + first checkpoint, so the admin places the grid against the real start area. Always drops
--- the previous editor props first. Props are spawned only in the lobby -- during a race the real race props
+-- static props + its checkpoints in this direction's order, so the admin places the grid against the real
+-- start area and sees the route from the free camera (ADR-0023 amendment 2026-10-06). Always drops the
+-- previous editor props first. Props are spawned only in the lobby -- during a race the real race props
 -- are already in the scene (and share these object names), so we never double-spawn over them; the
--- checkpoint is drawn immediate-mode regardless. Reload-safe: only the prop names are persistent (tracked
--- in M.state), the checkpoint is plain data.
+-- checkpoints are drawn immediate-mode regardless. Reload-safe: only the prop names are persistent
+-- (tracked in M.state), the checkpoints are plain data.
 local function refresh_grid_edit_scene()
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
-    M.state.grid_edit_checkpoint = nil
+    M.state.grid_edit_checkpoints = nil
     if not grideditor.state.active then
         return
     end
@@ -3548,7 +3561,7 @@ local function refresh_grid_edit_scene()
     if not scene then
         return
     end
-    M.state.grid_edit_checkpoint = scene.checkpoint
+    M.state.grid_edit_checkpoints = scene.checkpoints
     if M.state.race == nil then
         M.state.grid_edit_prop_names = props.load(scene.prefabFiles or {}, false)
     end
@@ -4204,6 +4217,16 @@ function M.grid_set_direction(direction)
     push_grid_state()
 end
 
+-- Put the camera back above slot 1 of the grid being edited (UI -> GE, the panel's Camera to grid,
+-- ADR-0063). Never during a race. The admin just pressed a button, so a refusal is said out loud instead
+-- of leaving him with a camera that did nothing.
+function M.grid_camera_to_grid()
+    local ok, reason = M.gridcam.to_grid(grideditor.state, M.state.race ~= nil, "button")
+    if not ok then
+        editor_feedback(tostring(reason), "warning")
+    end
+end
+
 -- Set how many slots the preview shows (UI -> GE) and reflect.
 function M.grid_set_preview(count)
     local ok, reason = grideditor.set_preview_count(count)
@@ -4285,12 +4308,16 @@ function M.close_grid_editor()
     M.state.grid_seed_race = nil
     -- Reuse the full teardown primitive (session + name + props + checkpoint + reflect); no duplication.
     M.clear_grid_editor()
+    -- The end of the visit: the camera goes back to where it was before the first jump (ADR-0063).
+    M.gridcam.leave("close")
     M.uilayout.remove("beamCompGridEditor")
 end
 
 -- Clear the grid-editor session (GE): end editing, drop the preview pillars + reference props, and reflect
 -- the now-empty state so the panel returns to its "pick a race" start. The panel stays open. This is the
 -- shared teardown primitive -- Close reuses it (and then removes the panel).
+-- Deliberately does NOT give the camera back (ADR-0063): this looks like the end of a session and is not
+-- one. The camera follows Close and the other exits in gridcam's EXITS table, never this primitive alone.
 function M.clear_grid_editor()
     grideditor.clear()
     M.state.grid_active_name = nil
@@ -8103,6 +8130,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- phases (bug default-dashboard-ui-missing-at-race-start). Idle unless a rebind is queued.
         step_dashboard_refresh(dtReal)
     end
+    -- Phase-independent: follow the grid editor's session with the camera (ADR-0063). It watches the
+    -- session counter instead of being called by every New / Load / console start, so a session start
+    -- added later moves the camera too. One boolean read while nobody is editing. Last in this function on
+    -- purpose: whatever it ever does wrong, it can never skip a line of the race loop above.
+    M.gridcam.step(grideditor.state, M.state.race ~= nil)
 end
 
 function M.onPreRender(dtReal, dtSim, dtRaw)
@@ -8123,11 +8155,23 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
     -- free-roam); the next-checkpoint marker only while a race is racing.
     local ok, err = pcall(function()
         draw_editor_grid()
-        -- The grid edit's reference first checkpoint, so the admin can place the grid relative to where
-        -- cars first head. Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil ->
-        -- full area + stored-normal posts).
-        if grideditor.state.active and M.state.grid_edit_checkpoint then
-            draw_checkpoint_marker(M.state.grid_edit_checkpoint, CHECKPOINT_STYLE, nil, nil)
+        -- The grid edit's route (ADR-0023 amendment 2026-10-06): CP0 red, CP1 in the yellow the race uses
+        -- for "the one after", every other checkpoint grey, no distance limit and no finish colour. Drawn
+        -- grey first, then yellow, then red, so the two that matter win where columns overlap. Inline
+        -- rather than a helper because a helper here would be a top-level local (200-local ceiling).
+        -- Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil -> full area +
+        -- stored-normal posts).
+        local route = grideditor.state.active and M.state.grid_edit_checkpoints
+        if route then
+            for i = #route, 3, -1 do
+                draw_checkpoint_marker(route[i], grideditor.ROUTE_CHECKPOINT_STYLE, nil, nil)
+            end
+            if route[2] then
+                draw_checkpoint_marker(route[2], LOOKAHEAD_STYLE, nil, nil)
+            end
+            if route[1] then
+                draw_checkpoint_marker(route[1], CHECKPOINT_STYLE, nil, nil)
+            end
         end
         local race = M.state.race
         if race then
@@ -8166,6 +8210,9 @@ function M.onClientEndMission(_levelPath)
     -- setup.clear, because that function also runs on the panel's Close, which is not a session boundary
     -- (bug panel-close-wipes-nametag-policy).
     identity.clear_policy()
+    -- Drop the grid editor's remembered camera, never restore it: a pose on the old level means nothing
+    -- on the next one (ADR-0063). The edit session itself is left as it was.
+    M.gridcam.leave("level")
     -- Drop the remembered race scan (feature raceui-reopen-without-typing): a level change is the one
     -- moment the installed set can plausibly have changed since we looked. Required inline rather than at
     -- the top of the file because init.lua sits at LuaJIT's 200-local ceiling and this is its only caller
@@ -8182,12 +8229,19 @@ function M.onExtensionUnloaded()
     -- there can restore the three input switches any more. This runs BEFORE M.state is rebuilt, so the
     -- armed flag is still readable (ADR-0052). No-op when no capture is armed.
     M.release_input_capture()
+    -- Give the grid editor's camera back while somebody still knows where it was: after the reload nothing
+    -- does (ADR-0063, ADR-0052). Guarded on its own because this hook is called without a pcall, and a
+    -- throw here would skip the whole teardown below.
+    local cam_ok, cam_err = pcall(M.gridcam.leave, "reload")
+    if not cam_ok then
+        log("W", "beamcomp.grid", "camera could not be given back on unload: " .. tostring(cam_err))
+    end
     grideditor.clear()
     -- Despawn any grid-edit reference props too (their lifecycle is separate from the race props that
     -- teardown_race_world clears), so a reload mid-edit leaves no orphaned scenery.
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
-    M.state.grid_edit_checkpoint = nil
+    M.state.grid_edit_checkpoints = nil
     spawn_mute.restore()
     -- Despawn props/cones, lift the in-race lock + start freeze, and drop all race state so a reload
     -- mid-race never leaves orphaned scenery or a stuck-frozen/locked car (ADR-0017).
@@ -8369,7 +8423,9 @@ function beamcomp_grid_cancel()
     grideditor.clear()
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
-    M.state.grid_edit_checkpoint = nil
+    M.state.grid_edit_checkpoints = nil
+    -- The console's Close: the camera goes back to where it was before the first jump (ADR-0063).
+    M.gridcam.leave("cancel")
     editor_feedback("grid editing ended -- pillars cleared")
 end
 
