@@ -235,14 +235,15 @@ local DASH_REFRESH_SETTLE = 0.75
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
--- named here only the list normalisation (lists-r1) is still outstanding, and gridcam-r1 is the grid
+-- named here only the list normalisation (lists-r1) is still outstanding, and gridcam is the grid
 -- editor's camera, new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
 -- HUD standings during a race started over a running one); one logging gridcam-r1 on top of that also
--- moves the camera above the grid being edited and gives it back when the editor closes.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r1/2026-10-06"
+-- moves the camera above the grid being edited and gives it back when the editor closes; one logging
+-- gridcam-r2 also puts a camera still free from the editor back into the car when a race starts.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r2/2026-10-06"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
