@@ -28,6 +28,11 @@
 --   * full -- the original fixed-car lock. install() with no opts, or re-installed at countdown to
 --     upgrade the staging lock: setGroup redefines the action group and the replace guard is added.
 --
+-- A race that FORCES this player's car (ADR-0064) narrows both modes: the replace is refused from staging
+-- on, and a guard on core_vehicle_partmgmt refuses every parts change before its respawn, while tuning
+-- and paint go through untouched. Whether the race forces the car is asked of M.car_is_forced on every
+-- install, never passed in.
+--
 -- On top of those, an independent HOLD LOCK (ADR-0017 amendment, quali-hold-reset-and-repaint-leak)
 -- blocks the two recover keys for the span of a qualifying hold -- see set_recover_blocked below. It is
 -- a separate action group with its own toggle, so it composes with either mode above without touching it.
@@ -45,6 +50,15 @@ M.on_before_replace = nil
 -- staging, consumed by init.lua (consume_replace) to re-stage the new car. A replace keeps the same
 -- vehicle id, so this event flag is the only reliable signal that a swap happened.
 M.replace_seen = false
+
+-- Whether the running race forces this player's car: car=<model[:config]>, car=random, car=host, or a
+-- class-drop class with a car (ADR-0064). init.lua installs the real predicate in onExtensionLoaded, the
+-- same shape as M.notify below. install() asks it on EVERY call rather than taking an option, so the quali
+-- re-grid's remove/install pair re-arms the parts lock without knowing it exists. This default answers
+-- false: a seam nobody installed keeps the lock exactly as it was before forced cars locked their parts.
+function M.car_is_forced()
+    return false
+end
 
 -- Shared input filter id. BeamNG convention (scenarios.lua, career.lua, ...): every subsystem toggles
 -- its own named group on filter 0, so we only ever flip our group on/off and never clear(0).
@@ -134,6 +148,19 @@ local ORIG_REPLACE_KEY = "beamcomp_orig_replaceVehicle"
 -- toast, not a flood. os.clock() is monotonic CPU seconds -- precise enough to gate a toast.
 local SPAWN_BLOCK_TOAST_THROTTLE = 2.0
 local last_spawn_block_toast_at = 0
+
+-- What a refused parts change tells the player, throttled like the spawn refusal but on its own clock, so
+-- a refused car pick right before it does not swallow it.
+local PARTS_LOCKED_NOTICE = "Parts are locked for this race"
+local last_parts_block_notice_at = 0
+
+-- Prefix of the per-function stash keys on core_vehicle_partmgmt. On the engine table for the same reason
+-- as ORIG_SPAWN_KEY: a present original means we are already guarding, whatever this module's state says.
+local PARTS_ORIG_PREFIX = "beamcomp_orig_"
+
+-- The config keys a tuning or paint change carries (partmgmt setConfigVars / setConfigPaints). licenseName
+-- is the plate, not a part.
+local TUNING_KEYS = {vars = true, paints = true, licenseName = true}
 
 -- Where a player-facing refusal from this module goes. init.lua installs its phase-routing chokepoint
 -- here (notice.say) in onExtensionLoaded: during a race the message belongs in the screen centre, outside
@@ -409,16 +436,203 @@ local function unguard_core_vehicles()
     end
 end
 
+-- Whether a mergeConfig payload changes more than tuning and paint. A whitelist on purpose: partsTree and
+-- parts are the obvious keys, but a mainPartName or model would be another car altogether, and an unknown
+-- key refused costs a notice where one let through costs the race its forced car. Anything that is not a
+-- table goes to the original, which rejects it with its own warning.
+local function carries_parts(config)
+    if type(config) ~= "table" then
+        return false
+    end
+    for key in pairs(config) do
+        if not TUNING_KEYS[key] then
+            return true
+        end
+    end
+    return false
+end
+
+-- Whether `veh` is the vehicle the player sits in -- the car every other partmgmt entry acts on. A handle
+-- whose id cannot be read is not provably the player's; it goes to the original, which fails on it exactly
+-- as it always did.
+local function is_player_vehicle(veh)
+    local ok, is_player = pcall(function()
+        return veh:getID() == be:getPlayerVehicleID(0)
+    end)
+    return ok and is_player == true
+end
+
+local function always()
+    return true
+end
+
+-- Every core_vehicle_partmgmt entry that can change the player's parts (ADR-0064), in log order, each with
+-- the question that decides whether THIS call does. The engine routes its own calls between these through
+-- file locals, so wrapping the fields never reaches setConfigVars / setConfigPaints: tuning and paint stay
+-- free without being named here. loadLocal and resetAllToLoadedConfig end in replaceVehicle, which the
+-- forced-car lock refuses anyway; catching them here answers with the parts notice and the menu resync.
+local PARTS_ENTRIES = {
+    {name = "setPartsTreeConfig", changes_parts = always},
+    {name = "setPartsConfig", changes_parts = always},
+    {name = "loadLocal", changes_parts = always},
+    {name = "resetAllToLoadedConfig", changes_parts = always},
+    {name = "resetPartsToLoadedConfig", changes_parts = always},
+    {name = "resetConfig", changes_parts = always},
+    {name = "setConfig", changes_parts = carries_parts},
+    {name = "setConfigOfVehicle", changes_parts = function(veh, config)
+        return carries_parts(config) and is_player_vehicle(veh)
+    end},
+}
+
+-- Hand the parts menu the car as it really is. Not cosmetic: on Apply the menu disables itself and waits
+-- for VehicleConfigChange (Parts.vue write -> waitForData), so a refusal that only said no would leave it
+-- greyed out for good. sendDataToUI pushes the car's real parts tree, and the menu rebuilds from it showing
+-- the old part again.
+local function resync_parts_menu(partmgmt)
+    local ok, err = pcall(partmgmt.sendDataToUI)
+    if not ok then
+        log("W", LOG_TAG, "parts menu resync failed: " .. tostring(err))
+    end
+end
+
+-- One refused parts change: a log line every time (a click, never a frame), the menu resync, and the
+-- notice at most every SPAWN_BLOCK_TOAST_THROTTLE seconds. The resync goes first: it is the part the menu
+-- cannot do without.
+local function refuse_parts_change(partmgmt, name)
+    log("I", LOG_TAG, "refused a parts change (" .. name .. "): this race forces the car")
+    resync_parts_menu(partmgmt)
+    local now = os.clock()
+    if now - last_parts_block_notice_at >= SPAWN_BLOCK_TOAST_THROTTLE then
+        last_parts_block_notice_at = now
+        M.notify(PARTS_LOCKED_NOTICE, "warning")
+    end
+end
+
+-- The wrapper for one PARTS_ENTRIES function. It refuses a call that changes parts -- or one it cannot
+-- read, fail-closed -- and hands every other call to the original with all its arguments. Once the stash
+-- is gone (the lock was removed) it is a plain pass-through, so a copy of it that somebody kept outlives
+-- nothing.
+local function parts_guard_for(partmgmt, entry, stash_key)
+    local original = partmgmt[stash_key]
+    return function(...)
+        if partmgmt[stash_key] == nil then
+            return original(...)
+        end
+        local ok, changes = pcall(entry.changes_parts, ...)
+        if not ok then
+            log("W", LOG_TAG, "could not read a " .. entry.name .. " call, refusing it: "
+                .. tostring(changes))
+        elseif not changes then
+            return original(...)
+        end
+        local refused, err = pcall(refuse_parts_change, partmgmt, entry.name)
+        if not refused then
+            log("W", LOG_TAG, "parts change refused, but answering it failed: " .. tostring(err))
+        end
+        return nil
+    end
+end
+
+-- Wrap every PARTS_ENTRIES function present on core_vehicle_partmgmt. Same shape as guard_core_vehicles:
+-- the original is stashed once on the engine table, the wrapper is (re)assigned on every install, so a
+-- second install never captures our own wrapper as the "original". Returns the wrapped and the missing
+-- names, or nil when the module is not loaded at all.
+--
+-- The plain global is the right table: the UI's call string resolves extensions.core_vehicle_partmgmt,
+-- and lua/common/extensions.lua registers that and _G.core_vehicle_partmgmt as the same module table, read
+-- by name when the string runs -- so replacing the field is what catches the menu's Apply.
+local function guard_partmgmt()
+    local partmgmt = core_vehicle_partmgmt
+    if type(partmgmt) ~= "table" then
+        return nil
+    end
+    local wrapped, missing = {}, {}
+    for _, entry in ipairs(PARTS_ENTRIES) do
+        local stash_key = PARTS_ORIG_PREFIX .. entry.name
+        if partmgmt[stash_key] == nil and type(partmgmt[entry.name]) == "function" then
+            partmgmt[stash_key] = partmgmt[entry.name]
+        end
+        if partmgmt[stash_key] ~= nil then
+            partmgmt[entry.name] = parts_guard_for(partmgmt, entry, stash_key)
+            wrapped[#wrapped + 1] = entry.name
+        else
+            missing[#missing + 1] = entry.name
+        end
+    end
+    return wrapped, missing
+end
+
+-- Put back every stashed partmgmt original. Returns how many were restored (0 when nothing was guarded).
+local function unguard_partmgmt()
+    local partmgmt = core_vehicle_partmgmt
+    if type(partmgmt) ~= "table" then
+        return 0
+    end
+    local restored = 0
+    for _, entry in ipairs(PARTS_ENTRIES) do
+        local stash_key = PARTS_ORIG_PREFIX .. entry.name
+        if partmgmt[stash_key] ~= nil then
+            partmgmt[entry.name] = partmgmt[stash_key]
+            partmgmt[stash_key] = nil
+            restored = restored + 1
+        end
+    end
+    return restored
+end
+
+-- One line per forced-car install naming what is wrapped. A function missing after a game update is the
+-- tripwire, so it is named at W; the count alone would read as success with one route open.
+local function report_parts_guard(wrapped, missing)
+    if wrapped == nil then
+        log("W", LOG_TAG,
+            "parts lock (forced car): core_vehicle_partmgmt is not loaded, parts are NOT locked")
+        return
+    end
+    local summary = string.format("parts lock (forced car): wrapped %d of %d (%s)",
+        #wrapped, #PARTS_ENTRIES, table.concat(wrapped, ", "))
+    if #missing == 0 then
+        log("I", LOG_TAG, summary)
+    else
+        log("W", LOG_TAG, summary .. "; not found: " .. table.concat(missing, ", ")
+            .. " -- re-check the engine's core/vehicle/partmgmt.lua")
+    end
+end
+
+-- The answer of the installed M.car_is_forced. A predicate that throws reads as "not forced" -- the same
+-- answer as no predicate at all, i.e. the lock as it was before ADR-0064 -- and says so.
+local function race_forces_car()
+    local ok, forced = pcall(M.car_is_forced)
+    if not ok then
+        log("W", LOG_TAG, "could not read the race's car policy, parts stay unlocked: " .. tostring(forced))
+        return false
+    end
+    return forced == true
+end
+
 -- Arm the lock: block the input actions and guard the spawn/replace functions. Idempotent. With
 -- opts.allow_replace the swap-allowed staging mode is installed (replace + the car selector stay open,
 -- extra spawn + everything else blocked); with no opts (or false) the full fixed-car lock. Calling it
 -- again without allow_replace upgrades a swap-allowed lock to full (ADR-0021/0017 amendments).
+--
+-- A race that forces the car (M.car_is_forced, ADR-0064) overrides allow_replace for the replace only:
+-- the replace is refused from staging on, while the selector keys stay open -- the parts-selector key is
+-- the way into the tuning menu, and the vehicle selector answers a pick with the vehicle notice. The parts
+-- guard follows the same answer on every install, so it is armed or put back declaratively.
 function M.install(opts)
     local allow_replace = opts ~= nil and opts.allow_replace == true
+    local is_forced = race_forces_car()
     set_action_filter(true, allow_replace)
-    guard_core_vehicles(allow_replace)
-    log("I", LOG_TAG, "in-race vehicle-action lock installed ("
-        .. (allow_replace and "swap-allowed" or "full") .. ")")
+    guard_core_vehicles(allow_replace and not is_forced)
+    if is_forced then
+        report_parts_guard(guard_partmgmt())
+    else
+        unguard_partmgmt()
+    end
+    local mode = allow_replace and "swap-allowed" or "full"
+    if is_forced then
+        mode = (allow_replace and "staging" or "full") .. ", forced car"
+    end
+    log("I", LOG_TAG, "in-race vehicle-action lock installed (" .. mode .. ")")
 end
 
 -- Block or unblock the two recover keys for a qualifying hold (ADR-0017 amendment): while a driver waits in
@@ -443,14 +657,17 @@ function M.set_recover_blocked(blocked)
     log("I", LOG_TAG, "recover keys " .. (blocked and "blocked (quali hold)" or "released"))
 end
 
--- Lift the lock: unblock the input actions and restore the spawn/replace functions. Idempotent, so
--- it is safe to call on lobby, on a fresh race start, and on extension unload. Clears the hold group too --
--- without that, a race ending while a driver is held would leave the recover keys dead in the finished
--- free-roam window and the lobby.
+-- Lift the lock: unblock the input actions and restore the spawn/replace functions and the parts guard.
+-- Idempotent, so it is safe to call on lobby, on a fresh race start, and on extension unload. Clears the
+-- hold group too -- without that, a race ending while a driver is held would leave the recover keys dead in
+-- the finished free-roam window and the lobby.
 function M.remove()
     set_action_filter(false)
     set_hold_filter(false)
     unguard_core_vehicles()
+    if unguard_partmgmt() > 0 then
+        log("I", LOG_TAG, "parts lock lifted")
+    end
     M.replace_seen = false
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
 end

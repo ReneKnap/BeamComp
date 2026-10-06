@@ -235,16 +235,17 @@ local DASH_REFRESH_SETTLE = 0.75
 -- an in-game result -- the BeamMP client mod is served from a cache that can go stale (memory
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
--- named here only the list normalisation (lists-r1) is still outstanding, and gridcam is the grid
--- editor's camera, new in this build.
+-- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
+-- camera, and partlock (the forced-car part lock) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
 -- HUD standings during a race started over a running one); one logging gridcam-r1 on top of that also
 -- moves the camera above the grid being edited and gives it back when the editor closes; one logging
 -- gridcam-r2 also puts a camera still free from the editor back into the car when a race starts; one
--- logging gridcam-r3 also shows every checkpoint in the grid editor (CP0 red, CP1 yellow, the rest grey).
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3/2026-10-06"
+-- logging gridcam-r3 also shows every checkpoint in the grid editor (CP0 red, CP1 yellow, the rest grey);
+-- one logging partlock-r1 also locks a forced car's parts and its staging swap, with tuning left free.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1/2026-10-06"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -333,6 +334,7 @@ M.state = {
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
+    race_forced_car = false,  -- whether the active race forces this player's car (payload.car: car=<model[:config]>, random, host, or a class-drop class with a car). Read by race/lock.lua through lock.car_is_forced on every install: true locks the parts and the staging swap, tuning and paint stay free (ADR-0064). Set at raceStart; the literal's false is also the teardown value (ADR-0052)
     staged_spec = nil,        -- spec {model, config, paint...} of the last COMPLIANT staged car, to revert an over-cap staging swap back to (ADR-0032), or nil
     revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
     staging_swap_reverting = false,  -- true only for the restage cycle that our revert started, so its known-compliant car is adopted without re-gating; recomputed from revert_pending at each consume (prevents a revert loop, ADR-0032)
@@ -701,6 +703,7 @@ local function handle_race_start(payload)
         M.state.race = nil
         M.state.race_car_id = nil
         M.state.race_caps = nil
+        M.state.race_forced_car = false
         M.state.staged_spec = nil
         M.state.revert_pending = false
         M.state.staging_swap_reverting = false
@@ -937,6 +940,11 @@ local function handle_race_start(payload)
     -- an over-cap swap back to) is captured at staging entry, once the placed car's jbeam is loaded.
     M.state.race_caps = (not policy.car and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg))
         and {maxhp = policy.maxhp, maxpwr = policy.maxpwr, maxkg = policy.maxkg, minkg = policy.minkg} or nil
+    -- Whether this race forces the car, for the race lock's parts guard (ADR-0064). All four forced modes
+    -- (a model, random, host, a class-drop class with a car) arrive in this one field, so the lock never
+    -- needs to know which. Decided on the policy, not on the car that ends up on the slot: a car=host whose
+    -- relay failed keeps the own car, and the lock then freezes that car as it stands.
+    M.state.race_forced_car = type(policy.car) == "string" and policy.car ~= ""
     M.state.staged_spec = nil
     M.state.revert_pending = false
     M.state.staging_swap_reverting = false
@@ -1269,6 +1277,7 @@ local function teardown_race_world()
     M.state.restage_pending = false
     M.state.restage_plate = nil
     M.state.race_caps = nil
+    M.state.race_forced_car = false
     M.state.staged_spec = nil
     M.state.revert_pending = false
     M.state.staging_swap_reverting = false
@@ -1682,6 +1691,9 @@ local function handle_race_phase(payload)
         -- full fixed-car lock at countdown. The car is already frozen at its grid slot
         -- (handle_race_start) and stays so until racing. Force the HUD app visible now so the countdown
         -- overlay it hosts is present before the count starts (ADR-0021), and seed the staging indicator.
+        -- A race that forces the car narrows this (ADR-0064): the lock asks lock.car_is_forced itself, then
+        -- refuses the replace and every parts change from here on while tuning and paint stay free -- so
+        -- under a forced car neither the swap below nor its pre-anchor hook ever runs.
         lock.install({allow_replace = true})
         -- Make a staging car swap land on the grid slot WITHOUT the visible correction afterwards
         -- (ADR-0051 round 2). BeamNG's replaceVehicle gives the new car the outgoing car's reference
@@ -5543,6 +5555,12 @@ function M.onExtensionLoaded()
     -- default is the old top-left toast, so a load path that missed this line degrades to the previous
     -- surface rather than to silence. Re-installed here because a GE Lua reload re-requires the module.
     lock.notify = notice.say
+    -- Hand it the race's car policy the same way (ADR-0064): every lock.install asks this, so a parts lock
+    -- re-armed by the quali re-grid's remove/install needs nothing from that call site. Reads M.state live,
+    -- so the closure never holds a stale answer; re-installed here after a GE Lua reload like notify above.
+    lock.car_is_forced = function()
+        return M.state.race_forced_car == true
+    end
     -- Blank the centred surfaces from the freshly rebuilt (empty) state. onExtensionUnloaded runs WITHOUT
     -- a pcall, so a teardown that threw part way is no guarantee its clearing push went out (ADR-0052) --
     -- and after the reload M.state carries no message left to expire, so nothing else would ever take a
