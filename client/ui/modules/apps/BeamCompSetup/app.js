@@ -705,7 +705,6 @@ angular.module('beamng.apps')
       scope.raceMetaById = {};
       scope.form = freshForm();
       scope.open = null;       // name of the currently open dropdown, or null
-      scope.prepared = false;  // true after Confirm & Build Grid: the race is staging, so reveal Start Race
       scope.presetName = '';       // the name field of the revealed Save row (ADR-0037 amendment)
       scope.selectedPreset = '';   // the preset last loaded: marks its row and prefills the save name
       // The Presets section is collapsed to its two buttons and reveals what each action needs (ADR-0037
@@ -720,7 +719,7 @@ angular.module('beamng.apps')
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
       scope.configsByModel = {};               // model -> configs cache for the per-class config dropdowns (ADR-0042)
-      scope.phase = 'lobby';                   // latest GE-pushed race phase, gates the race-stop controls (ADR-0038)
+      scope.phase = 'lobby';                   // latest GE-pushed race phase, gates Start Race and the race-stop controls (ADR-0038)
       // The hover-help switch (ADR-0049), restored from localStorage so it survives a game restart.
       //
       // An OBJECT property, and that is load-bearing rather than stylistic: the gear menu's contents sit
@@ -750,7 +749,6 @@ angular.module('beamng.apps')
       var autosaveArmed = false;   // true once the initial restore (or its confirmed absence) has landed
       var autosaveTimer = null;    // pending debounced save, re-armed on every change
       var lastStoredJson = null;   // last blob handed to GE, so an unchanged form is never re-sent
-      var phaseSeeded = false;     // the first phase push has run, so it can no longer touch `prepared`
       var gridsLoaded = false;     // a saved-grid list has arrived, so `data.grids` may be trusted as truth
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
@@ -1395,7 +1393,8 @@ angular.module('beamng.apps')
       });
 
       // Confirm & Build Grid (the button; this handler keeps the `prepare` name, see the label comment in
-      // app.html): send the structured request -- the race spawns + enters staging. Reveals Start Race.
+      // app.html): send the structured request -- the race spawns + enters staging, and the staging phase
+      // push reveals Start Race.
       // While a championship is active, omit order= so the server applies the championship's grid order
       // (ADR-0040) instead of this panel's default; an explicit per-race order would otherwise win.
       scope.prepareRace = function () {
@@ -1410,7 +1409,6 @@ angular.module('beamng.apps')
         }
         var request = { race: scope.form.race, overrides: overrides };
         geLuaArg('start_race_from_ui', JSON.stringify(request));
-        scope.prepared = true;
       };
 
       // Start Race: end staging -> countdown (the /go equivalent) and close the panel.
@@ -1552,19 +1550,19 @@ angular.module('beamng.apps')
       // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
       // Sync the section's dropdowns to the active settings so the controls reflect reality, not stale form.
       // GE pushes the race phase on every transition and on request (request_race_phase). Gates the
-      // race-stop controls so they appear only while a race is active (ADR-0038 amendment).
+      // race-stop controls so they appear only while a race is active (ADR-0038 amendment), and Start Race
+      // so it appears only while a race is staging.
+      //
+      // Start Race used to be revealed by Confirm & Build Grid itself (a `prepared` flag) and was never
+      // hidden again, so it stood in the lobby after every race. The phase is the server's own answer to
+      // "is there a grid waiting for the host": it is pulled on link (so a panel reopened or reloaded
+      // during staging still shows the button, the job the old one-shot seed had) and pushed on every
+      // transition (so the button goes at the countdown and never lingers). Shown for ANY staging race,
+      // as the old seed already did on a reopen: raceGo is the /go equivalent and checks admin and phase
+      // on the server for itself.
       scope.$on('BeamCompSetupPhase', function (event, payload) {
         scope.$evalAsync(function () {
           scope.phase = (payload && payload.phase) || 'lobby';
-          // The Start Race button is revealed by Confirm & Build Grid (scope.prepared), which is link-time
-          // state -- so a panel restored after a UI reload would show a staged race with no way to start it.
-          // The FIRST phase push after link (request_race_phase, pulled below) therefore seeds prepared
-          // from server truth: a race already in staging IS prepared. One-shot, so a live panel behaves
-          // exactly as before -- someone else's later prepare changes nothing here.
-          if (!phaseSeeded) {
-            phaseSeeded = true;
-            scope.prepared = scope.prepared || scope.phase === 'staging';
-          }
         });
       });
 

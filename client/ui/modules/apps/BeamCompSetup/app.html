@@ -873,15 +873,17 @@
 
   <div class="bc-actions" ng-show="!locked">
     <!-- Label and code diverge on purpose: the button says "Confirm & Build Grid" (the press commits every
-         setting in this panel AND spawns the field), while the handler stays prepareRace(), the flag
-         `prepared` and the class .bc-prepare. Renaming those would be churn with no user-visible value and
-         would reach the GE seam start_race_from_ui plus the server's "the host who prepared the race left"
-         chat lines, which describe the ACTION and read correctly under any label. Do not "fix" it back.
+         setting in this panel AND spawns the field), while the handler stays prepareRace() and the class
+         .bc-prepare. Renaming those would be churn with no user-visible value and would reach the GE seam
+         start_race_from_ui plus the server's "the host who prepared the race left" chat lines, which
+         describe the ACTION and read correctly under any label. Do not "fix" it back.
          Keep labels in this row short: .bc-actions button has no nowrap/overflow/text-overflow, so a label
          that does not fit WRAPS and makes the row two lines tall. Measured worst case for this one (360px
-         panel min-width, all three buttons showing): 118px of label in a 155px button. -->
+         panel min-width, all three buttons showing): 118px of label in a 155px button.
+         Start Race follows the server's phase, not this panel's own press: a grid is waiting exactly while
+         the race is staging, whoever built it, and the button never lingers into the lobby. -->
     <button class="bc-prepare" ng-disabled="!form.race" ng-click="prepareRace()" bc-setup-tip="tip('prepare')">Confirm &amp; Build Grid</button>
-    <button class="bc-start" ng-if="prepared" ng-click="startRaceGo()" bc-setup-tip="tip('startRace')">Start Race</button>
+    <button class="bc-start" ng-if="phase === 'staging'" ng-click="startRaceGo()" bc-setup-tip="tip('startRace')">Start Race</button>
     <button class="bc-close" ng-click="close()" bc-setup-tip="tip('close')">Close</button>
   </div>
 
