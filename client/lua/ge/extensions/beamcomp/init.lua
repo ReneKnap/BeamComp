@@ -242,8 +242,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
 -- HUD standings during a race started over a running one); one logging gridcam-r1 on top of that also
 -- moves the camera above the grid being edited and gives it back when the editor closes; one logging
--- gridcam-r2 also puts a camera still free from the editor back into the car when a race starts.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r2/2026-10-06"
+-- gridcam-r2 also puts a camera still free from the editor back into the car when a race starts; one
+-- logging gridcam-r3 also shows every checkpoint in the grid editor (CP0 red, CP1 yellow, the rest grey).
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3/2026-10-06"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
