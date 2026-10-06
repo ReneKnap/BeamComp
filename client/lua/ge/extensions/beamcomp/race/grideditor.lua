@@ -142,6 +142,15 @@ end
 M.SAMPLE_BLOB_RADIUS = 0.16
 M.SAMPLE_BLOB_HEIGHT = 0.03
 
+-- The preview's route: every checkpoint after CP1 is drawn grey (CP0 keeps the red start-line style, CP1
+-- the yellow look-ahead the race itself uses, both in init.lua). The area fill is dimmed well below the
+-- other two, because a long route stacks dozens of these columns over the grid being edited. A field
+-- here for the same reason as the blobs above: init.lua sits at the 200-local ceiling.
+M.ROUTE_CHECKPOINT_STYLE = {
+    area = {r = 0.6, g = 0.62, b = 0.66, a = 0.04},
+    post = {r = 0.62, g = 0.64, b = 0.68, a = 0.7},
+}
+
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
@@ -494,8 +503,9 @@ function M.preview_count()
 end
 
 -- The reference scene for the active direction, for the caller (init.lua) to spawn/draw alongside the
--- preview: {prefabFiles = {...}, checkpoint = {pos, normal, radius}|nil}. The anchor for each direction
--- already carries these (start.anchor), so switching direction switches the scene too. Nil when not editing.
+-- preview: {prefabFiles = {...}, checkpoints = {...}} -- every checkpoint in this direction's order, CP0
+-- first. The anchor for each direction already carries these (start.anchor), so switching direction
+-- switches the scene too, red and yellow included. Nil when not editing.
 function M.current_scene()
     if not M.state.active then
         return nil
@@ -504,7 +514,7 @@ function M.current_scene()
     if not anchor then
         return nil
     end
-    return {prefabFiles = anchor.prefabFiles, checkpoint = anchor.checkpoint}
+    return {prefabFiles = anchor.prefabFiles, checkpoints = anchor.checkpoints}
 end
 
 -- The current edit as a save payload: the map, the anchored race (which OWNS the saved grid -- re-anchoring

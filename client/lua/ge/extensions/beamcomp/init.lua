@@ -354,7 +354,7 @@ M.state = {
     grid_active_name = nil,   -- the saved name of the grid currently being edited (set on save/load, nil for a fresh unsaved grid); reflected to the panel so a reopen restores the overwrite/assign target
     grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
-    grid_edit_checkpoint = nil,  -- the active direction's first checkpoint {pos, normal, radius}, drawn immediate-mode during a grid edit so the grid can be placed relative to it
+    grid_edit_checkpoints = nil,  -- the active direction's checkpoints in traversal order, CP0 first ({index, pos, normal, radius} each), drawn immediate-mode during a grid edit -- CP0 red, CP1 yellow, the rest grey -- so the grid can be placed against the start line and the route seen from the free camera
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037). The panel autosaves it on every change, so it also survives a UI reload that never runs the panel's Close (bug setup-panel-settings-survive-ui-reload)
     setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037). Does NOT survive a Lua reload: this extension has no onSerialize/onDeserialize, so a reload rebuilds M.state from this literal -- the panel stays on screen but is no longer watched until the next /raceui
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
@@ -675,7 +675,7 @@ local function handle_race_start(payload)
         M.state.grid_active_name = nil
         props.clear(M.state.grid_edit_prop_names or {})
         M.state.grid_edit_prop_names = nil
-        M.state.grid_edit_checkpoint = nil
+        M.state.grid_edit_checkpoints = nil
         M.uilayout.remove("beamCompGridEditor")
     end
     -- ...and the camera that followed the edit gets no old pose back, which would fight the race placement;
@@ -3543,15 +3543,16 @@ local function push_grid_state()
 end
 
 -- Sync the grid editor's reference scene to the active session (ADR-0037 amendment, tweak): the track's
--- static props + first checkpoint, so the admin places the grid against the real start area. Always drops
--- the previous editor props first. Props are spawned only in the lobby -- during a race the real race props
+-- static props + its checkpoints in this direction's order, so the admin places the grid against the real
+-- start area and sees the route from the free camera (ADR-0023 amendment 2026-10-06). Always drops the
+-- previous editor props first. Props are spawned only in the lobby -- during a race the real race props
 -- are already in the scene (and share these object names), so we never double-spawn over them; the
--- checkpoint is drawn immediate-mode regardless. Reload-safe: only the prop names are persistent (tracked
--- in M.state), the checkpoint is plain data.
+-- checkpoints are drawn immediate-mode regardless. Reload-safe: only the prop names are persistent
+-- (tracked in M.state), the checkpoints are plain data.
 local function refresh_grid_edit_scene()
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
-    M.state.grid_edit_checkpoint = nil
+    M.state.grid_edit_checkpoints = nil
     if not grideditor.state.active then
         return
     end
@@ -3559,7 +3560,7 @@ local function refresh_grid_edit_scene()
     if not scene then
         return
     end
-    M.state.grid_edit_checkpoint = scene.checkpoint
+    M.state.grid_edit_checkpoints = scene.checkpoints
     if M.state.race == nil then
         M.state.grid_edit_prop_names = props.load(scene.prefabFiles or {}, false)
     end
@@ -8153,11 +8154,23 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
     -- free-roam); the next-checkpoint marker only while a race is racing.
     local ok, err = pcall(function()
         draw_editor_grid()
-        -- The grid edit's reference first checkpoint, so the admin can place the grid relative to where
-        -- cars first head. Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil ->
-        -- full area + stored-normal posts).
-        if grideditor.state.active and M.state.grid_edit_checkpoint then
-            draw_checkpoint_marker(M.state.grid_edit_checkpoint, CHECKPOINT_STYLE, nil, nil)
+        -- The grid edit's route (ADR-0023 amendment 2026-10-06): CP0 red, CP1 in the yellow the race uses
+        -- for "the one after", every other checkpoint grey, no distance limit and no finish colour. Drawn
+        -- grey first, then yellow, then red, so the two that matter win where columns overlap. Inline
+        -- rather than a helper because a helper here would be a top-level local (200-local ceiling).
+        -- Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil -> full area +
+        -- stored-normal posts).
+        local route = grideditor.state.active and M.state.grid_edit_checkpoints
+        if route then
+            for i = #route, 3, -1 do
+                draw_checkpoint_marker(route[i], grideditor.ROUTE_CHECKPOINT_STYLE, nil, nil)
+            end
+            if route[2] then
+                draw_checkpoint_marker(route[2], LOOKAHEAD_STYLE, nil, nil)
+            end
+            if route[1] then
+                draw_checkpoint_marker(route[1], CHECKPOINT_STYLE, nil, nil)
+            end
         end
         local race = M.state.race
         if race then
@@ -8227,7 +8240,7 @@ function M.onExtensionUnloaded()
     -- teardown_race_world clears), so a reload mid-edit leaves no orphaned scenery.
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
-    M.state.grid_edit_checkpoint = nil
+    M.state.grid_edit_checkpoints = nil
     spawn_mute.restore()
     -- Despawn props/cones, lift the in-race lock + start freeze, and drop all race state so a reload
     -- mid-race never leaves orphaned scenery or a stuck-frozen/locked car (ADR-0017).
@@ -8409,7 +8422,7 @@ function beamcomp_grid_cancel()
     grideditor.clear()
     props.clear(M.state.grid_edit_prop_names or {})
     M.state.grid_edit_prop_names = nil
-    M.state.grid_edit_checkpoint = nil
+    M.state.grid_edit_checkpoints = nil
     -- The console's Close: the camera goes back to where it was before the first jump (ADR-0063).
     M.gridcam.leave("cancel")
     editor_feedback("grid editing ended -- pillars cleared")

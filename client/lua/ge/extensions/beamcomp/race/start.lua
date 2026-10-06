@@ -663,10 +663,10 @@ end
 -- editor (race/grideditor) to preview poses against the same geometry a real race start uses. Also returns
 -- the reference scene the editor can spawn/draw alongside the preview (so the grid is positioned against
 -- the real start area): `prefabFiles` -- the track's static-scenery prefabs for this direction (the same
--- set a real start loads) -- and `checkpoint` -- the first checkpoint {pos, normal, radius} for this
--- direction. Returns {base_pose = {pos, rot}, gate_normal = {x,y,z}|nil, raceId = string, prefabFiles =
--- {...}, checkpoint = {pos, normal, radius}|nil} or nil plus a reason. raceId is the canonical id the
--- default-grid assignment is keyed on (ADR-0023).
+-- set a real start loads) -- and `checkpoints` -- every checkpoint {index, pos, normal, radius} in this
+-- direction's traversal order, CP0 (the start line) first. Returns {base_pose = {pos, rot}, gate_normal =
+-- {x,y,z}|nil, raceId = string, prefabFiles = {...}, checkpoints = {...}} or nil plus a reason. raceId
+-- is the canonical id the default-grid assignment is keyed on (ADR-0023).
 function M.anchor(race_name, direction)
     if type(race_name) ~= "string" then
         return nil, "no race name"
@@ -690,18 +690,31 @@ function M.anchor(race_name, direction)
     end
     local first_checkpoint = race_checkpoints[1]
     local gate_normal = first_checkpoint and first_checkpoint.normal
-    local checkpoint = first_checkpoint and {
-        pos = first_checkpoint.pos,
-        normal = first_checkpoint.normal,
-        radius = first_checkpoint.radius,
-    } or nil
+
+    -- The editor draws the whole route (CP0 red, CP1 yellow, the rest grey), so the ordered list travels,
+    -- not just its head. Already in this direction's order: the reversed list is the one CP0 came from.
+    -- A closed loop never lists CP0 twice (the parser skips node ids it has emitted); the index check
+    -- keeps that true for any source, so the start line is never drawn a second time in grey.
+    local route = {}
+    for i, checkpoint in ipairs(race_checkpoints) do
+        local is_cp0_again = i > 1 and checkpoint.index ~= nil
+            and checkpoint.index == first_checkpoint.index
+        if not is_cp0_again then
+            route[#route + 1] = {
+                index = checkpoint.index,
+                pos = checkpoint.pos,
+                normal = checkpoint.normal,
+                radius = checkpoint.radius,
+            }
+        end
+    end
 
     return {
         base_pose = base_pose,
         gate_normal = gate_normal,
         raceId = locator.id,
         prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
-        checkpoint = checkpoint,
+        checkpoints = route,
     }
 end
 
