@@ -7287,7 +7287,9 @@ end
 -- The recover target for the local player: the last passed checkpoint (ADR-0010/0013) facing the
 -- next one, or -- before any checkpoint is passed -- the grid start pose facing the first checkpoint.
 -- Returns {pos = {x,y,z}, dir = {x,y,z} or nil, up = {x,y,z} or nil}; `up` is the surface normal
--- placement measured under the final position, and a nil dir or up puts the car down level.
+-- placement measured under the final position, and a nil dir or up puts the car down level. `pos` is
+-- where the car's box centre-bottom goes (ADR-0034 amendment 2026-10-07) -- the target itself is
+-- unchanged by that.
 local function recover_target(race, detection)
     local seq = (detection and detection.seq) or 0
     local target_pos, face_pos
@@ -7420,7 +7422,7 @@ local function perform_assist(kind)
         pcall(function() own_car:queueLuaCommand("recovery.recoverInPlace()") end)
     else
         local target = recover_target(race, M.state.detection)
-        local placed, err = vehicles.recover_to(own_car, target.pos, target.dir, target.up)
+        local placed, err = vehicles.recover_to(own_car, target)
         if not placed then
             log("W", RACE_LOG_TAG, "recover-to-checkpoint failed: " .. tostring(err))
             return

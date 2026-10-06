@@ -15,8 +15,9 @@
 -- It also measures the surface's SLOPE (ADR-0034 amendment 2026-08-30): four more casts, at the corners
 -- of a nominal car footprint, span the plane the car will stand on, and that plane's normal rides along
 -- on the pose as `up`. race/vehicles.lua turns it into the spawn orientation, the front anchor and (since
--- the 2026-09-01 recover-follows-surface-slope amendment) the recover orientation, and the grid editor
--- draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour.
+-- the 2026-09-01 recover-follows-surface-slope amendment) the recover orientation -- and since 2026-10-07
+-- the recover's box anchor too -- and the grid editor draws it. Without a normal every consumer keeps its
+-- pre-slope, world-up behaviour.
 --
 -- WHERE that footprint sits depends on what the pose means, and the two paths here disagree: a GRID pose
 -- is the car's front edge, so the footprint is set back half a car to land under the body; a RECOVER
@@ -120,11 +121,13 @@ local NORMAL_HALF_WIDTH = 0.8
 --                                            centre lands exactly on it -> set the footprint back by
 --                                            half a nominal car (NORMAL_SET_BACK).
 --   a RECOVER target is the car's MIDDLE  -- a checkpoint's authored centre, and vehicles.recover_to
---                                            puts the reference point straight there with no
---                                            front-anchor correction -> no set-back at all.
+--                                            puts the car's BOX CENTRE there (its bottom face on the
+--                                            surface) -> no set-back at all.
 --
 -- Which of the two a pose follows is stated at every call site and never defaulted: a forgotten caller
--- must fail loudly rather than quietly measure the grid 2.2 m off (see cast_normal_samples).
+-- must fail loudly rather than quietly measure the grid 2.2 m off (see cast_normal_samples). The vehicle
+-- side mirrors this split one-to-one: vehicles.lua's ANCHOR_FRONT / ANCHOR_MIDDLE say which point of the
+-- car's box lands on the pose, so the footprint measured here and the box placed there are the same car.
 --
 -- The grid's set-back (ADR-0034 amendment 2026-09-01, slope-samples-on-the-car): a footprint centred ON
 -- a front-edge pose sampled 1.35 m of ground IN FRONT OF the bumper and only the first 1.35 m of the
@@ -411,9 +414,9 @@ end
 -- shares one read-only `forward` table across slots and reuses `rot`, so those pass through by reference
 -- while a NEW pos table is built.
 --
--- The slope is sampled with NO set-back: this pose is the car's MIDDLE (recover_to puts the reference
--- point straight on it), not the front edge a grid slot describes -- see NORMAL_SET_BACK. Its corners
--- take the grid's narrow SLOPE_UP_MARGIN, not the centre drop's 10 m (ADR-0034 amendment 2026-10-07).
+-- The slope is sampled with NO set-back: this pose is the car's MIDDLE (recover_to puts the box centre
+-- on it), not the front edge a grid slot describes -- see NORMAL_SET_BACK. Its corners take the grid's
+-- narrow SLOPE_UP_MARGIN, not the centre drop's 10 m (ADR-0034 amendment 2026-10-07).
 function M.ground_pose(pose)
     local pos = pose.pos
     local ground = M.ground_z(pos.x, pos.y, pos.z)

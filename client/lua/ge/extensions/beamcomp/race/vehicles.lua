@@ -394,26 +394,116 @@ local function model_config_of(veh)
     return model, config_key(config, model)
 end
 
--- The world position to put a vehicle's REFERENCE POINT at so its front-centre lands on `pose` and its
--- bounding-box bottom sits on the pose Z -- the same anchor front_anchored_target computes, but derived
--- from the config's METADATA box (vehiclespecs.config_anchor) instead of a live getSpawnWorldOOBB read.
--- That makes it usable BEFORE the car exists (the spawn pre-position) and as the stand-in when the live
--- read fails.
+-- WHICH point of the car's box a pose names -- the anchor convention (ADR-0034 amendment 2026-10-07,
+-- recover-anchors-the-box). Both conventions put that point on the box's BOTTOM face and on its centre
+-- line, so the wheels meet the surface however high the reference node sits; they differ only in how far
+-- behind the box's FRONT face the point lies, counted in half box-lengths:
 --
--- config_anchor has already resolved the vehicle-local axes into forward/lateral/bottom; here those three
--- numbers are re-projected onto the TARGET pose's frame (pose_frame) exactly as front_anchored_target
--- re-projects its measured ones, so both paths aim at the same point and can be compared. On a tilted
--- pose that frame is tilted too -- including `bottom`, which is an offset along the CAR's up, not along
--- world Z (ADR-0034 amendment 2026-08-30).
+--   ANCHOR_FRONT  (0) -- a GRID pose is the car's front edge: its front-centre lands on the pose
+--                        (ADR-0034 amendments 2026-07-06 and 2026-08-29).
+--   ANCHOR_MIDDLE (1) -- a RECOVER target is the car's middle: its box centre lands on the target.
+--
+-- The vehicle-side twin of placement.lua's NORMAL_SET_BACK / NORMAL_NO_SET_BACK -- one pose, two meanings
+-- -- and handled the same way: every caller states its convention and nothing defaults it, so a caller
+-- that forgot raises (require_anchor) instead of silently landing a car half a length off. A wrong number
+-- is invisible in-game; a missing one is not.
+local ANCHOR_FRONT = 0
+local ANCHOR_MIDDLE = 1
+
+-- Raise unless `anchor` is one of the two conventions. Each anchoring function calls it BEFORE its own
+-- pcall, so a forgotten convention surfaces as an error instead of quietly degrading into the metadata or
+-- reference-node fallback.
+local function require_anchor(anchor)
+    if anchor ~= ANCHOR_FRONT and anchor ~= ANCHOR_MIDDLE then
+        error("no anchor convention given (ANCHOR_FRONT or ANCHOR_MIDDLE): " .. tostring(anchor), 3)
+    end
+end
+
+-- A car's box as seen from its REFERENCE POINT (the point veh:getPosition() returns and
+-- setPositionRotation places), in the car's OWN axes:
+--   front       -- reference -> the box's FRONT face, along the car's forward (metres)
+--   lateral     -- reference -> the box centre, along the car's right (signed)
+--   bottom      -- reference -> the box BOTTOM, along the car's up (signed, normally negative)
+--   half_length -- half the box's length
+-- Exactly two sources fill it -- the LIVE spawn box (measure_box) and the config METADATA box
+-- (metadata_box) -- and everything after that, the anchor convention and the target frame, is shared by
+-- the grid and the recover alike.
+
+-- The LIVE box, measured off the car's CURRENT transform. Read it BEFORE moving the car: a
+-- getSpawnWorldOOBB read right after setPositionRotation still reflects the old transform. Raises when an
+-- engine read fails; the caller owns the pcall and the fallback.
+--
+-- The car is decomposed along its OWN forward/right/up (getDirectionVectorUp), not along a flattened
+-- forward plus world Z: getHalfExtents is body-local, so mixing it with a world-Z offset was only correct
+-- while the car stood level (ADR-0034 amendment 2026-08-30) -- and cars stand tilted on a slope, which is
+-- exactly when every restage, quali hold and staging repair re-measures one, and a car waiting to be
+-- RECOVERED may be lying on its side. This needs no vehicle-local axis or quaternion-flip assumption: it
+-- reads the real geometry.
+local function measure_box(veh)
+    local bb = veh:getSpawnWorldOOBB()
+    local half = bb:getHalfExtents()
+    local to_centre = bb:getCenter() - veh:getPosition()
+    local fwd = veh:getDirectionVector()
+    fwd = vec3(fwd.x, fwd.y, fwd.z)
+    fwd:normalize()
+    -- getDirectionVectorUp is a core vehicle method (lua/ge/spawn.lua:685, :780) but has never been
+    -- read under BeamMP from here. Guarded on its own so a missing one costs the car's up axis and
+    -- nothing else: world up reproduces exactly the pre-amendment decomposition, which beats failing
+    -- the whole measurement and dropping to the coarser metadata box.
+    local ok_up, raw_up = pcall(function() return veh:getDirectionVectorUp() end)
+    local up = (ok_up and raw_up) and vec3(raw_up.x, raw_up.y, raw_up.z) or vec3(0, 0, 1)
+    up:normalize()
+    local right = fwd:cross(up)
+    right:normalize()
+    return {
+        front = to_centre:dot(fwd) + half.y,
+        lateral = to_centre:dot(right),
+        bottom = to_centre:dot(up) - half.z,
+        half_length = half.y,
+    }
+end
+
+-- The config METADATA box (vehiclespecs.config_anchor, which has already resolved the jbeam frame into
+-- these axes), or nil when no box is known. Usable BEFORE the car exists -- the spawn pre-position -- and
+-- as the stand-in when the live read fails.
+local function metadata_box(model, config)
+    local anchor = vehiclespecs.config_anchor(model, config)
+    if not anchor then
+        return nil
+    end
+    return {
+        front = anchor.forward,
+        lateral = anchor.lateral,
+        bottom = anchor.bottom,
+        half_length = anchor.half.y,
+    }
+end
+
+-- Where the REFERENCE POINT goes so that the point `anchor` names on `box` lands on `base`, with the car
+-- standing in the target frame (forward, right, up) that pose_frame built. On a tilted pose that frame is
+-- tilted too -- `bottom` included, so the box bottom meets the surface along the surface's own normal and
+-- not along world Z (ADR-0034 amendment 2026-08-30). On level ground it reduces to "subtract the offsets,
+-- the bottom one from z", and ANCHOR_FRONT reproduces the pre-convention arithmetic bit for bit
+-- (front - 0 * half_length is front).
+local function place_box(base, forward, right, up, box, anchor)
+    local reach = box.front - anchor * box.half_length
+    return base - (forward * reach + right * box.lateral + up * box.bottom)
+end
+
+-- The world position to put a vehicle's REFERENCE POINT at so the point `anchor` names lands on `pose`,
+-- derived from the config's METADATA box instead of a live getSpawnWorldOOBB read -- plus that box, so a
+-- caller can say what it placed. The same anchor anchored_target computes from the live box, so the two
+-- aim at the same point and can be compared (report_prediction_gap does).
 --
 -- Returns nil -- never a guess -- when the pose carries no forward axis, no box is known, or the
--- arithmetic degenerates; the caller then keeps today's centre-anchored behaviour.
-local function metadata_anchored_target(pose, model, config)
+-- arithmetic degenerates; the caller then keeps its previous behaviour.
+local function metadata_anchored_target(pose, model, config, anchor)
+    require_anchor(anchor)
     if type(pose) ~= "table" or type(pose.pos) ~= "table" or not pose.forward then
         return nil
     end
-    local anchor = vehiclespecs.config_anchor(model, config)
-    if not anchor then
+    local box = metadata_box(model, config)
+    if not box then
         return nil
     end
     local ok, target = pcall(function()
@@ -422,97 +512,76 @@ local function metadata_anchored_target(pose, model, config)
             return nil
         end
         local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
-        return base - (target_fwd * anchor.forward + target_right * anchor.lateral
-            + target_up * anchor.bottom)
+        return place_box(base, target_fwd, target_right, target_up, box, anchor)
     end)
     -- A degenerate forward axis normalizes to NaN instead of raising, and a NaN spawn position would lose
     -- the car entirely -- so validate the value, not just the pcall.
     if not ok or not target or target.x ~= target.x or target.y ~= target.y or target.z ~= target.z then
         return nil
     end
-    return target
+    return target, box
 end
 
--- The world position to place the reference point at so the car's FRONT-centre lands on the grid
--- pose (horizontally) and its wheels sit ON the surface (vertically), instead of the reference point
--- BeamNG puts there (which sits mid-car, ~on the seats -- above the wheels).
+-- THE placement measurement behind every anchored teleport, grid and recover alike: the world position
+-- to put `veh`'s REFERENCE POINT at so the point `anchor` names lands on `pose` -- horizontally on the
+-- pose, and with the box BOTTOM on the grounded surface rather than the reference point, which sits
+-- anywhere from 0.12 m (a bolide) to 0.81 m (a race truck) above it on the stock default configs.
 --
--- The spawn bounding box is measured from the car's CURRENT, pre-teleport transform -- a
--- getSpawnWorldOOBB read right after setPositionRotation still reflects the old transform, so we must
--- measure before moving. We learn the reference->front-centre offset there (decomposed along the
--- car's current forward/right via the OOBB centre and its forward half-length, getHalfExtents().y),
--- then re-apply it along the grid's target forward/right. This needs no vehicle-local axis or
--- quaternion-flip assumption -- it reads the real geometry and re-projects it.
+-- Returns the position plus `info` = {source, box, reason}: where the box came from ("live box", "config
+-- box", "reference node"), the box itself when there was one, and why the better source failed. It logs
+-- nothing -- the grid (front_anchored_target) and the recover (M.recover_to) each report it in their own
+-- words.
 --
--- The SAME OOBB read also anchors the Z axis: the grid pose Z is the grounded surface (placement.lua,
--- ADR-0034) with the reference point placed there, but the reference sits above the wheels, so a
--- taller car buried its wheels below the surface. We instead place the bounding-box BOTTOM at the
--- grounded Z, so wheels of any size car meet the surface.
---
--- BOTH the measurement and the re-projection are done in a real 3-D frame, because "down" stops being
--- world Z the moment a pose follows the ground (ADR-0034 amendment 2026-08-30):
---   * measuring -- the car is decomposed along its OWN forward/right/up (getDirectionVectorUp), not
---     along a flattened forward plus world Z. getHalfExtents is body-local, so mixing it with a
---     world-Z offset was only correct while the car stood level -- and this feature makes cars stand
---     tilted, which is exactly when every restage, quali hold and staging repair re-measures one.
---   * re-projecting -- the three offsets go back onto the TARGET pose's frame (pose_frame), bottom
---     included, so the bbox bottom meets the surface along the surface's own normal.
--- On level ground both reduce to the previous arithmetic exactly: up is (0,0,1), so the dot products
--- are the old components and the horizontal terms contribute no z.
---
--- When the live measurement is unavailable the fallback is two-stage: the car's own config METADATA box
--- first (a real footprint, just not this car's deformed one), and only if that is unknown too the raw
--- grid pose -- which centre-anchors the car and leaves it standing roughly half its length too far
--- forward. Returns the grid pose unchanged when the pose carries no forward axis at all.
-local function front_anchored_target(veh, pose)
+-- Three sources, best first: the LIVE box measured off the car -- so the car must not have been moved
+-- yet -- then the config METADATA box (a real footprint, just not this car's deformed one), and last the
+-- raw pose: the reference point itself on it, which is exactly the behaviour before any anchoring existed.
+-- A pose with no forward axis has no frame to anchor in and gets the raw pose straight away, silently
+-- ("no frame") -- for a grid that is the normal case of a pure-radius CP0.
+local function anchored_target(veh, pose, anchor)
+    require_anchor(anchor)
     local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
     local target_fwd, target_right, target_up = pose_frame(pose)
     if not target_fwd then
-        return base
+        return base, {source = "no frame"}
     end
+    local box = nil
     local ok, target = pcall(function()
-        local bb = veh:getSpawnWorldOOBB()
-        local half = bb:getHalfExtents()
-        local to_centre = bb:getCenter() - veh:getPosition()
-        local fwd = veh:getDirectionVector()
-        fwd = vec3(fwd.x, fwd.y, fwd.z)
-        fwd:normalize()
-        -- getDirectionVectorUp is a core vehicle method (lua/ge/spawn.lua:685, :780) but has never been
-        -- read under BeamMP from here. Guarded on its own so a missing one costs the car's up axis and
-        -- nothing else: world up reproduces exactly the pre-amendment decomposition, which beats failing
-        -- the whole measurement and dropping to the coarser metadata box.
-        local ok_up, raw_up = pcall(function() return veh:getDirectionVectorUp() end)
-        local up = (ok_up and raw_up) and vec3(raw_up.x, raw_up.y, raw_up.z) or vec3(0, 0, 1)
-        up:normalize()
-        local right = fwd:cross(up)
-        right:normalize()
-        -- reference -> the car's front-centre-bottom point, split along the car's own three axes:
-        -- forward (+ its half-length), lateral, and down to the bbox bottom.
-        local forward_dist = to_centre:dot(fwd) + half.y
-        local lateral_dist = to_centre:dot(right)
-        local bottom_offset = to_centre:dot(up) - half.z
-        -- Put that same point on the pose: the grounded grid position (already lifted by
-        -- placement.GROUND_CLEARANCE), with the car's front-centre on it horizontally and its bbox
-        -- bottom -- not its mid-car reference -- on the surface.
-        return base - (target_fwd * forward_dist + target_right * lateral_dist
-            + target_up * bottom_offset)
+        box = measure_box(veh)
+        return place_box(base, target_fwd, target_right, target_up, box, anchor)
     end)
     if ok and target then
-        return target
+        return target, {source = "live box", box = box}
     end
     -- Measurement failed (bbox API gone / vehicle handle unusable): stand in with the config box before
-    -- giving up on the anchor entirely. Every placement path reaches this -- the deferred restage, the
-    -- staged-quali hold and requeue, the staging repair and the quali re-grid.
+    -- giving up on the anchor entirely.
     local model, config = model_config_of(veh)
-    local predicted = model and metadata_anchored_target(pose, model, config) or nil
+    local predicted, predicted_box = nil, nil
+    if model then
+        predicted, predicted_box = metadata_anchored_target(pose, model, config, anchor)
+    end
     if predicted then
+        return predicted, {source = "config box", box = predicted_box, reason = tostring(target)}
+    end
+    return base, {source = "reference node", reason = tostring(target)}
+end
+
+-- The world position to place the reference point at so the car's FRONT-centre lands on the grid pose
+-- (horizontally) and its wheels sit ON the surface (vertically) -- anchored_target under the grid's
+-- convention (ANCHOR_FRONT), with the grid's own two fallback warnings. Every grid placement path reaches
+-- this -- the deferred restage, the staged-quali hold and requeue, the staging repair and the quali
+-- re-grid. Without a box the car is centre-anchored, i.e. stands roughly half its length too far forward;
+-- without a forward axis it gets the grid pose unchanged.
+local function front_anchored_target(veh, pose)
+    local target, info = anchored_target(veh, pose, ANCHOR_FRONT)
+    if info.source == "config box" then
+        local model = model_config_of(veh)
         log("W", LOG_TAG, string.format(
             "front-anchor measurement unavailable for '%s' (%s); using its config box",
-            tostring(model), tostring(target)))
-        return predicted
+            tostring(model), info.reason))
+    elseif info.source == "reference node" then
+        log("W", LOG_TAG, "front-anchor unavailable; centre-anchoring: " .. info.reason)
     end
-    log("W", LOG_TAG, "front-anchor unavailable; centre-anchoring: " .. tostring(target))
-    return base
+    return target
 end
 
 -- Race-scoped tally of the pre-spawn bounding-box lookup: how many of the cars this client puts on the
@@ -587,7 +656,7 @@ local function spawn_vehicle_at(pose, spec)
     -- replaces. With the box that correction is known up front and the car lands right the first time.
     -- No box (unknown config, unreadable field, metadata not reaching us under BeamMP) -> the raw pose,
     -- byte-for-byte the previous behaviour; the restage still corrects it.
-    local anchored = metadata_anchored_target(pose, model, spec and spec.config)
+    local anchored = metadata_anchored_target(pose, model, spec and spec.config, ANCHOR_FRONT)
     bbox_report.attempted = bbox_report.attempted + 1
     if anchored then
         bbox_report.resolved = bbox_report.resolved + 1
@@ -793,7 +862,7 @@ end
 -- would show here as a car-length-sized gap naming the exact model and config. No log when they match.
 local function report_prediction_gap(veh, pose, measured)
     local model, config = model_config_of(veh)
-    local predicted = model and metadata_anchored_target(pose, model, config) or nil
+    local predicted = model and metadata_anchored_target(pose, model, config, ANCHOR_FRONT) or nil
     if not predicted then
         return
     end
@@ -904,7 +973,7 @@ function M.preplace_at_grid(veh, pose)
     if not model then
         return nil, "vehicle model unreadable"
     end
-    local target = metadata_anchored_target(pose, model, config)
+    local target = metadata_anchored_target(pose, model, config, ANCHOR_FRONT)
     if not target then
         return nil, "no config box for '" .. tostring(model) .. "'"
     end
@@ -945,7 +1014,7 @@ function M.preplace_for_replacement(veh, pose, model, config)
     if type(model) ~= "string" or model == "" then
         return nil, "no replacement model"
     end
-    local target = metadata_anchored_target(pose, model, config_key(config, model))
+    local target = metadata_anchored_target(pose, model, config_key(config, model), ANCHOR_FRONT)
     if not target then
         return nil, "no config box for '" .. model .. "'"
     end
@@ -1292,40 +1361,54 @@ function M.respawn_own_at(pose, own_car, policy)
     return fresh_spawn_own(pose)
 end
 
--- Teleport + repair a vehicle to a recover pose: `pos` ({x,y,z}) facing along `dir` ({x,y,z}) and lying
--- in the surface whose normal is `up` -- placement measured that normal at exactly this spot, and a nil
--- one means nothing was measured, so the car stands level (ADR-0034 amendment 2026-09-01,
--- recover-follows-surface-slope). Like repair_and_place, veh:setPositionRotation resets the car to its
--- undamaged rest state at the pose, and the same 180-degree Z-flip (quat(0,0,1,0) * ...) matches the
--- engine's repair branch (verified in-game for grid placement). Used by the recover-to-last-checkpoint
--- assist (ADR-0017). Returns true, or nil plus a reason.
+-- Teleport + repair a vehicle to a recover target: {pos, dir, up} as init.recover_target builds it
+-- from placement.resolve. The car faces along `dir` and lies in the surface whose normal is `up`
+-- -- placement measured that normal at exactly this spot, and a nil one means nothing was measured, so the
+-- car stands level (ADR-0034 amendment 2026-09-01, recover-follows-surface-slope). Like repair_and_place,
+-- veh:setPositionRotation resets the car to its undamaged rest state at the pose, and the same 180-degree
+-- Z-flip (quat(0,0,1,0) * ...) matches the engine's repair branch (verified in-game for grid placement).
+-- Used by the recover-to-last-checkpoint assist (ADR-0017). Returns true, or nil plus a reason.
+--
+-- WHERE the car goes is the grid's own anchoring, under the recover's convention (ADR-0034 amendment
+-- 2026-10-07, recover-anchors-the-box): the car's BOX CENTRE lands on the target horizontally and its box
+-- BOTTOM on the grounded surface along the measured normal -- anchored_target with ANCHOR_MIDDLE, live box
+-- first, measured BEFORE the teleport. Until then the REFERENCE POINT went onto the target, a clearance
+-- above the surface: the box bottom ended up below the road by however high that point sits in the car
+-- (a few centimetres for most cars, half a metre for a truck or an off-roader), and off-centre by the
+-- reference's own offset in the box.
 --
 -- The orientation is built by pose_orientation, the grid's own recipe, rather than by a second
 -- hand-rolled quaternion here: quatFromDir keeps `dir` VERBATIM and only orthogonalises `up` against it,
 -- so handing it a heading plus a surface normal yields roll and exactly zero pitch. That trap is
--- answered once, in pose_frame/plane_axis, and this path now shares the answer. The pose deliberately
--- carries no `rot`: pose_orientation's authored-start-quaternion fallback is unreachable from here,
--- because a `forward` with a compass heading always produces a frame.
+-- answered once, in pose_frame/plane_axis, and this path shares the answer -- `dir`'s own z is read as
+-- nothing but a heading there. The pose deliberately carries no `rot`: pose_orientation's
+-- authored-start-quaternion fallback is unreachable from here, because a `forward` with a compass heading
+-- always produces a frame.
 --
 -- A dir with NO compass heading (straight up or down -- two checkpoints stacked exactly above each
 -- other) says nothing about where to point the car and would normalize to NaN, so it counts as no dir
--- at all: keep the car's current rotation, untouched by the flip, exactly as before.
-function M.recover_to(veh, pos, dir, up)
+-- at all: keep the car's current rotation, untouched by the flip, with the reference point on the target
+-- exactly as before -- there is no target frame to anchor a box in.
+function M.recover_to(veh, target)
     if not veh then
         return nil, "no vehicle"
     end
-    if type(pos) ~= "table" then
+    if type(target) ~= "table" or type(target.pos) ~= "table" then
         return nil, "invalid recover pose"
     end
+    local pos, dir = target.pos, target.dir
     local ok, err = pcall(function()
         local heading_length = dir and math.sqrt(dir.x * dir.x + dir.y * dir.y) or 0
-        if heading_length >= MIN_AXIS_LENGTH then
-            local rot = quat(0, 0, 1, 0) * pose_orientation({forward = dir, up = up})
-            veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
-        else
+        if heading_length < MIN_AXIS_LENGTH then
             local rot = quat(veh:getRotation())
             veh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+            return
         end
+        local pose = {pos = pos, forward = dir, up = target.up}
+        -- Anchor FIRST: the live box is read off the car's current transform, which the teleport replaces.
+        local anchored = anchored_target(veh, pose, ANCHOR_MIDDLE)
+        local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
+        veh:setPositionRotation(anchored.x, anchored.y, anchored.z, rot.x, rot.y, rot.z, rot.w)
     end)
     if not ok then
         return nil, "recover_to failed: " .. tostring(err)
