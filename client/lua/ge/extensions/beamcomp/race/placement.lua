@@ -86,7 +86,8 @@ local CHAIN_UP_MARGIN = 3.0
 -- Derived from the chain window rather than restated, so the grid's in-game-verified slope is measured
 -- with the same number as before and the two windows can never drift apart. What it cannot do: an object
 -- LOWER than 3 m above a corner -- a barrier, a kerb stone, a parked prop -- is still sampled, because
--- inside the window it is indistinguishable from a step in the road.
+-- inside the window it is indistinguishable from a step in the road. The log line vehicles.recover_to
+-- writes names the four corner heights so such a case shows as a number.
 local SLOPE_UP_MARGIN = CHAIN_UP_MARGIN
 
 -- Nominal car footprint for the horizontal wall test (no real vehicle exists when a grid is computed or
@@ -417,6 +418,10 @@ end
 -- The slope is sampled with NO set-back: this pose is the car's MIDDLE (recover_to puts the box centre
 -- on it), not the front edge a grid slot describes -- see NORMAL_SET_BACK. Its corners take the grid's
 -- narrow SLOPE_UP_MARGIN, not the centre drop's 10 m (ADR-0034 amendment 2026-10-07).
+--
+-- `surface` is the raw height the centre drop found (nil when nothing answered), published so the
+-- recover's log line can state the corner samples relative to it -- a corner standing on a barrier then
+-- reads as "+1.00 m" instead of hiding inside a normal vector.
 function M.ground_pose(pose)
     local pos = pose.pos
     local ground = M.ground_z(pos.x, pos.y, pos.z)
@@ -424,6 +429,7 @@ function M.ground_pose(pose)
         pos = {x = pos.x, y = pos.y, z = ground and (ground + GROUND_CLEARANCE) or pos.z},
         rot = pose.rot,
         forward = pose.forward,
+        surface = ground,
     }
     attach_slope(grounded, pos.x, pos.y, ground, pose.forward, SLOPE_UP_MARGIN, NORMAL_NO_SET_BACK)
     return grounded
@@ -521,7 +527,7 @@ end
 -- normal measured there would be the slope of a patch of ground it never touches -- and since
 -- vehicles.recover_to orients into that normal now, a stale one would tilt the car wrongly rather than
 -- go unread. Both exits re-measure, the nudged-clear one and the gave-up one, with the same narrow
--- SLOPE_UP_MARGIN as ground_pose.
+-- SLOPE_UP_MARGIN as ground_pose, and both publish the `surface` they measured from.
 function M.clear_pose(pose)
     local grounded = M.ground_pose(pose)
     local forward = horizontal_unit(pose.forward)
@@ -541,7 +547,12 @@ function M.clear_pose(pose)
     -- last step's own cast found -- the same seed ground_pose uses -- so a step whose cast found nothing
     -- leaves the pose without a normal and the car flat, rather than tilted by a guess.
     local function nudged_pose()
-        local moved = {pos = {x = x, y = y, z = z}, rot = pose.rot, forward = pose.forward}
+        local moved = {
+            pos = {x = x, y = y, z = z},
+            rot = pose.rot,
+            forward = pose.forward,
+            surface = surface,
+        }
         attach_slope(moved, x, y, surface, forward, SLOPE_UP_MARGIN, NORMAL_NO_SET_BACK)
         return moved
     end

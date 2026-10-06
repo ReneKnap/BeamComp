@@ -7286,10 +7286,11 @@ end
 
 -- The recover target for the local player: the last passed checkpoint (ADR-0010/0013) facing the
 -- next one, or -- before any checkpoint is passed -- the grid start pose facing the first checkpoint.
--- Returns {pos = {x,y,z}, dir = {x,y,z} or nil, up = {x,y,z} or nil}; `up` is the surface normal
--- placement measured under the final position, and a nil dir or up puts the car down level. `pos` is
--- where the car's box centre-bottom goes (ADR-0034 amendment 2026-10-07) -- the target itself is
--- unchanged by that.
+-- Returns {pos = {x,y,z}, dir = {x,y,z} or nil, up = {x,y,z} or nil, samples, surface}; `up` is the
+-- surface normal placement measured under the final position, and a nil dir or up puts the car down
+-- level. `samples` (the four points that normal was measured at) and `surface` (the ground under the
+-- target) only feed vehicles.recover_to's log line. `pos` is where the car's box centre-bottom goes
+-- (ADR-0034 amendment 2026-10-07) -- the target itself is unchanged by that.
 local function recover_target(race, detection)
     local seq = (detection and detection.seq) or 0
     local target_pos, face_pos
@@ -7321,7 +7322,13 @@ local function recover_target(race, detection)
     -- `up` is the slope placement measured under the position it settled on -- the car is laid INTO
     -- that surface instead of flat into the landscape (ADR-0034 amendment 2026-09-01).
     local grounded = placement.resolve({pos = target_pos, forward = dir})
-    return {pos = grounded.pos, dir = dir, up = grounded.up}
+    return {
+        pos = grounded.pos,
+        dir = dir,
+        up = grounded.up,
+        samples = grounded.samples,
+        surface = grounded.surface,
+    }
 end
 
 -- Arm the seated car's VE key forwarders for the race (ADR-0017). GE owns the enable check, countdown,
@@ -8118,6 +8125,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- is a one-shot, so a call that lands in that window used to be lost for good -- the seam now
     -- records it and replays it here once the UI is done. One nil check when nothing is pending.
     M.uilayout.step()
+    -- Phase-independent: write the one delayed read-back line of the last recover (how the car actually
+    -- stands a second after the teleport, ADR-0034 amendment 2026-10-07) -- even if the race ended in
+    -- that second. Physics time, so a paused game does not read a car that has not moved yet. One nil
+    -- check when no recover is pending.
+    vehicles.step_recover_readback(dtSim)
     -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
     -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
     -- polling lives in race/vehicles (it is a measurement of the car); this is only the wiring, kept

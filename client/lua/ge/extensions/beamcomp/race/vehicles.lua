@@ -1,8 +1,9 @@
 -- BeamComp -- race vehicle lifecycle (despawn + own-car respawn on a race start).
 --
 -- Lives at lua/ge/extensions/beamcomp/race/vehicles.lua inside the client mod zip. Stateless and
--- reload-safe: no M.state, and the one piece of file-scope mutable state (bbox_report, a per-race
--- diagnostic counter) is reset at every race start and carries nothing a reload could corrupt.
+-- reload-safe: no M.state, and the two pieces of file-scope mutable state are diagnostics that carry
+-- nothing a reload could corrupt -- bbox_report (a per-race counter, reset at every race start) and
+-- recover_readback (at most one pending read-back line, which a reload simply drops).
 -- Target: client GE (LuaJIT 5.1).
 --
 -- On a race start each client places its own car at the grid pose the server assigned it
@@ -1361,8 +1362,99 @@ function M.respawn_own_at(pose, own_car, policy)
     return fresh_spawn_own(pose)
 end
 
--- Teleport + repair a vehicle to a recover target: {pos, dir, up} as init.recover_target builds it
--- from placement.resolve. The car faces along `dir` and lies in the surface whose normal is `up`
+-- Seconds of PHYSICS time between a recover teleport and its read-back (M.step_recover_readback): long
+-- enough for a car set down a clearance above the surface to drop onto its wheels and settle on its
+-- springs, short enough that the player has rarely driven off yet.
+local RECOVER_READBACK_DELAY = 1.0
+
+-- The one pending read-back, or nil: {id, model, wait, pitch, roll, up, surface_point}. File scope, with
+-- bbox_report's lifetime argument: a Lua reload drops at most one diagnostic line. A second recover inside
+-- the delay replaces the first's -- at most one line per recover, never a queue.
+local recover_readback = {pending = nil}
+
+-- Pitch and roll in degrees of a frame given by its forward and right axes: pitch > 0 is nose UP, roll > 0
+-- is the RIGHT side DOWN. Both read straight off the axes' world z, so they mean the same thing for the
+-- frame a recover intends (pose_frame) and for the car as it actually stands afterwards.
+local function pitch_roll(forward, right)
+    local function asin_degrees(value)
+        return math.deg(math.asin(math.max(-1, math.min(1, value))))
+    end
+    return asin_degrees(forward.z), asin_degrees(-right.z)
+end
+
+-- The four slope samples (front-left, front-right, rear-left, rear-right) as heights above `surface`, the
+-- ground found under the target itself: "+0.00/+0.01/-0.02/+1.00". nil when either is missing. On a
+-- uniform slope the four spread evenly around zero; one corner far off the others is a corner that landed
+-- on something that is not the road.
+local function corner_heights(samples, surface)
+    if type(samples) ~= "table" or #samples ~= 4 or type(surface) ~= "number" then
+        return nil
+    end
+    local heights = {}
+    for index = 1, 4 do
+        heights[index] = string.format("%+.2f", samples[index].z - surface)
+    end
+    return table.concat(heights, "/")
+end
+
+-- How a recover's anchor is named in its log line, with the reason when it fell back.
+local function anchor_text(info)
+    local text = "anchor " .. info.source
+    if info.box then
+        text = text .. string.format(" (box bottom %.2f m below the reference)", -info.box.bottom)
+    end
+    if info.reason then
+        text = text .. " [" .. info.reason .. "]"
+    end
+    return text
+end
+
+-- Write the ONE line a recover leaves in the log and arm its read-back. Called after the teleport went
+-- through, and guarded on its own: a reporting fault must never turn a placed car into a failed recover.
+--
+--   recover placed '<model>': anchor <source> (box bottom <m> below the reference), slope pitch <deg>
+--   roll <deg> deg, corners FL/FR/RL/RR <m> above the surface, box centre-bottom at (<x>, <y>, <z>)
+--
+-- The pitch and roll are what the car was SET to -- the measured slope. A large roll here, with one corner
+-- far off the other three, is the slope measurement meeting something that is not the road; a level
+-- line here followed by a rolled read-back is the physics moving the car after the teleport.
+local function report_recover(veh, target, placed)
+    local ok, err = pcall(function()
+        local model = model_config_of(veh)
+        local pos = target.pos
+        if not placed then
+            log("I", LOG_TAG, string.format(
+                "recover placed '%s': no heading -- rotation kept, reference point on the target "
+                .. "(%.2f, %.2f, %.2f)", tostring(model), pos.x, pos.y, pos.z))
+            return
+        end
+        local forward, right, up = pose_frame(placed.pose)
+        local pitch, roll = pitch_roll(forward, right)
+        local slope = target.up and string.format("slope pitch %+.1f roll %+.1f deg", pitch, roll)
+            or "no slope measured (placed level)"
+        local corners = corner_heights(target.samples, target.surface)
+        log("I", LOG_TAG, string.format(
+            "recover placed '%s': %s, %s%s, box centre-bottom at (%.2f, %.2f, %.2f)",
+            tostring(model), anchor_text(placed.info), slope,
+            corners and (", corners FL/FR/RL/RR " .. corners .. " m above the surface") or "",
+            pos.x, pos.y, pos.z))
+        recover_readback.pending = {
+            id = veh:getId(),
+            model = model,
+            wait = RECOVER_READBACK_DELAY,
+            pitch = pitch,
+            roll = roll,
+            up = up,
+            surface_point = type(target.surface) == "number" and vec3(pos.x, pos.y, target.surface) or nil,
+        }
+    end)
+    if not ok then
+        log("W", LOG_TAG, "could not report the recover placement: " .. tostring(err))
+    end
+end
+
+-- Teleport + repair a vehicle to a recover target: {pos, dir, up, samples, surface} as init.recover_target
+-- builds it from placement.resolve. The car faces along `dir` and lies in the surface whose normal is `up`
 -- -- placement measured that normal at exactly this spot, and a nil one means nothing was measured, so the
 -- car stands level (ADR-0034 amendment 2026-09-01, recover-follows-surface-slope). Like repair_and_place,
 -- veh:setPositionRotation resets the car to its undamaged rest state at the pose, and the same 180-degree
@@ -1397,6 +1489,7 @@ function M.recover_to(veh, target)
         return nil, "invalid recover pose"
     end
     local pos, dir = target.pos, target.dir
+    local placed = nil
     local ok, err = pcall(function()
         local heading_length = dir and math.sqrt(dir.x * dir.x + dir.y * dir.y) or 0
         if heading_length < MIN_AXIS_LENGTH then
@@ -1406,14 +1499,74 @@ function M.recover_to(veh, target)
         end
         local pose = {pos = pos, forward = dir, up = target.up}
         -- Anchor FIRST: the live box is read off the car's current transform, which the teleport replaces.
-        local anchored = anchored_target(veh, pose, ANCHOR_MIDDLE)
+        local anchored, info = anchored_target(veh, pose, ANCHOR_MIDDLE)
         local rot = quat(0, 0, 1, 0) * pose_orientation(pose)
         veh:setPositionRotation(anchored.x, anchored.y, anchored.z, rot.x, rot.y, rot.z, rot.w)
+        placed = {pose = pose, info = info}
     end)
     if not ok then
         return nil, "recover_to failed: " .. tostring(err)
     end
+    report_recover(veh, target, placed)
     return true
+end
+
+-- (public) Advance the pending recover read-back by `dt` seconds of physics time and, once it is due,
+-- write its ONE line: how the car actually stands RECOVER_READBACK_DELAY after the teleport, next to how it
+-- was set down.
+--
+--   recover read-back 1.0 s after placing '<model>': standing pitch <deg> roll <deg> deg (set to <deg> /
+--   <deg>), box bottom <m> from the surface
+--
+-- That line is what tells the two remaining explanations of a rolled car apart in a live test: set level
+-- but standing rolled means the physics moved it (a car pushed out of the ground unevenly, a collision);
+-- set rolled means the slope measurement was wrong, and the placement line names the corner that did it.
+-- The box-bottom figure is the box's bottom-face centre measured along the intended normal from the
+-- ground under the target: a few centimetres below zero is the car settling on its springs, tens of
+-- centimetres below zero is a car in the ground. Called every frame from init.lua's onUpdate; one nil
+-- check while nothing is pending.
+function M.step_recover_readback(dt)
+    local pending = recover_readback.pending
+    if not pending then
+        return
+    end
+    pending.wait = pending.wait - (tonumber(dt) or 0)
+    if pending.wait > 0 then
+        return
+    end
+    recover_readback.pending = nil
+    local ok, line = pcall(function()
+        local veh = be:getObjectByID(pending.id)
+        if not veh then
+            return string.format("recover read-back skipped: '%s' (%s) is gone",
+                tostring(pending.model), tostring(pending.id))
+        end
+        local forward = veh:getDirectionVector()
+        forward = vec3(forward.x, forward.y, forward.z)
+        forward:normalize()
+        local up = veh:getDirectionVectorUp()
+        up = vec3(up.x, up.y, up.z)
+        up:normalize()
+        local right = forward:cross(up)
+        right:normalize()
+        local pitch, roll = pitch_roll(forward, right)
+        local height = "unknown (no surface measured)"
+        if pending.surface_point then
+            local box = veh:getSpawnWorldOOBB()
+            local bottom = box:getCenter() - up * box:getHalfExtents().z
+            height = string.format("%+.2f m", (bottom - pending.surface_point):dot(pending.up))
+        end
+        return string.format(
+            "recover read-back %.1f s after placing '%s': standing pitch %+.1f roll %+.1f deg "
+            .. "(set to %+.1f / %+.1f), box bottom %s from the surface",
+            RECOVER_READBACK_DELAY, tostring(pending.model), pitch, roll, pending.pitch, pending.roll,
+            height)
+    end)
+    if ok then
+        log("I", LOG_TAG, line)
+    else
+        log("W", LOG_TAG, "recover read-back failed: " .. tostring(line))
+    end
 end
 
 -- Best-effort "has this car been modified from stock parts" check for the records vehicle field
