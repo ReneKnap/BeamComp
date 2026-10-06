@@ -558,6 +558,20 @@ angular.module('beamng.apps')
     return isNaN(n) ? undefined : n;
   }
 
+  // A race request GE hands back as the JSON string this panel once sent, as an object -- or null for
+  // anything else. Null is "not known", and the stale-grid note claims nothing it does not know.
+  function parseRequest(json) {
+    if (typeof json !== 'string' || !json) {
+      return null;
+    }
+    try {
+      var parsed = JSON.parse(json);
+      return (parsed && typeof parsed === 'object') ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // The grey placeholder of an OPTIONAL number field: "<value> (default)" (e.g. "5 (default)"), so an
   // empty field names the value that actually applies instead of just saying "default". CEF renders a
   // placeholder grey by itself -- no CSS involved.
@@ -750,6 +764,13 @@ angular.module('beamng.apps')
       var autosaveTimer = null;    // pending debounced save, re-armed on every change
       var lastStoredJson = null;   // last blob handed to GE, so an unchanged form is never re-sent
       var gridsLoaded = false;     // a saved-grid list has arrived, so `data.grids` may be trusted as truth
+      // The request the staged grid was built from (BeamCompSetupBuild), parsed, or null when GE does not
+      // know it. Deliberately not on `form`: it must never ride into the session blob or a preset.
+      var builtRequest = null;
+      // Whether GE has told this panel the multi-race state at least once. Until then
+      // championship/tournament.active read false whatever the server runs, and the race request would
+      // carry an order= the built one does not.
+      var formatsHeard = { championship: false, tournament: false };
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
@@ -1392,24 +1413,69 @@ angular.module('beamng.apps')
         }
       });
 
+      // The race request Confirm & Build Grid sends, in the {race, overrides} shape the server's startRace
+      // takes (ADR-0037). The ONE builder of it: prepareRace sends what this returns and gridStale compares
+      // what this returns, so the button and the note can never disagree about what a press would send.
+      // While a championship (ADR-0040) or a class-drop tournament (ADR-0042) is active, order= is omitted
+      // so the server applies the active format's grid order -- an explicit per-race order would win. A
+      // comparison that skipped this would call every grid of a running championship stale.
+      function raceRequest() {
+        var overrides = buildOverrides(scope.form);
+        if (scope.championship.active || scope.tournament.active) {
+          delete overrides.order;
+        }
+        return { race: scope.form.race, overrides: overrides };
+      }
+
       // Confirm & Build Grid (the button; this handler keeps the `prepare` name, see the label comment in
       // app.html): send the structured request -- the race spawns + enters staging, and the staging phase
       // push reveals Start Race.
-      // While a championship is active, omit order= so the server applies the championship's grid order
-      // (ADR-0040) instead of this panel's default; an explicit per-race order would otherwise win.
       scope.prepareRace = function () {
         if (!scope.form.race) {
           return;
         }
-        var overrides = buildOverrides(scope.form);
-        // A championship (ADR-0040) or a class-drop tournament (ADR-0042) drives the grid order server-side,
-        // so omit the per-race order= and let the active format apply its own.
-        if (scope.championship.active || scope.tournament.active) {
-          delete overrides.order;
-        }
-        var request = { race: scope.form.race, overrides: overrides };
-        geLuaArg('start_race_from_ui', JSON.stringify(request));
+        // GE gets the form this grid is built from NOW, not after the autosave's debounce: a hard UI reload
+        // inside that window would restore an older form against the newer grid and show a stale-grid
+        // note nobody caused.
+        flushAutosave();
+        geLuaArg('start_race_from_ui', JSON.stringify(raceRequest()));
       };
+
+      // Whether the staged grid was built from something other than what Confirm & Build Grid would send
+      // now. Start Race only ends the staging of the grid that is already built, so the race would start
+      // without those changes -- the note above the action row says so and the Confirm button pulses
+      // (feature setup-confirm-grid-stale-hint). A change that is undone undoes the answer.
+      //
+      // A pure function of the form, the built request, the phase and the multi-race state, read by the
+      // template: nothing ACTS on its answer, so applyStoredForm swapping the whole form (a preset load, a
+      // UI reload) can only re-ask it, never set anything off. Every unknown answers false:
+      //   * not staging -- in the lobby nothing is built, and from the countdown on a Confirm would abort
+      //     the running race, which is no place to lure anyone;
+      //   * no built request -- the staged grid was not built here (another admin, a typed /race) and is
+      //     not this panel's to describe;
+      //   * the restore has not landed, or the championship / tournament state has not been heard -- the
+      //     form is still freshForm() and `active` still reads false, and either would make a correct
+      //     grid look stale until those pushes arrive.
+      // angular.equals compares structure, not text: key order does not matter, an absent key equals an
+      // undefined one (JSON drops both on the way out), and $-prefixed keys are ignored.
+      scope.gridStale = function () {
+        if (scope.phase !== 'staging' || !builtRequest || !scope.form.race) {
+          return false;
+        }
+        if (!autosaveArmed || !formatsHeard.championship || !formatsHeard.tournament) {
+          return false;
+        }
+        return !angular.equals(raceRequest(), builtRequest);
+      };
+
+      // The request the staged grid was built from, as GE remembers it (init.lua setup.note_race_start):
+      // the verbatim string this panel sent at Confirm, or nothing when the staged race was not built here
+      // or there is none. Parsed once per push rather than on every digest.
+      scope.$on('BeamCompSetupBuild', function (event, payload) {
+        scope.$evalAsync(function () {
+          builtRequest = parseRequest(payload && payload.request);
+        });
+      });
 
       // Start Race: end staging -> countdown (the /go equivalent) and close the panel.
       scope.startRaceGo = function () {
@@ -1513,6 +1579,18 @@ angular.module('beamng.apps')
         geLuaArg('store_setup_form', json);
       }
 
+      // Write a save that is still waiting out its debounce, now. Nothing pending means GE already has the
+      // form on screen -- and before the restore has landed nothing can be pending, because the watcher
+      // below does not schedule until then.
+      function flushAutosave() {
+        if (!autosaveTimer) {
+          return;
+        }
+        $timeout.cancel(autosaveTimer);
+        autosaveTimer = null;
+        storeForm();
+      }
+
       function scheduleStore() {
         if (autosaveTimer) {
           $timeout.cancel(autosaveTimer);
@@ -1540,11 +1618,7 @@ angular.module('beamng.apps')
         // Flush a pending save, so a clean removal (Close, or BeamNG's own app-container X) loses
         // nothing. A hard UI reload kills the page without ever firing $destroy -- that case is what the
         // debounce window bounds.
-        if (autosaveTimer) {
-          $timeout.cancel(autosaveTimer);
-          autosaveTimer = null;
-          storeForm();
-        }
+        flushAutosave();
       });
 
       // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
@@ -1569,6 +1643,7 @@ angular.module('beamng.apps')
       scope.$on('BeamCompChampionship', function (event, payload) {
         scope.$evalAsync(function () {
           scope.championship = payload || { active: false };
+          formatsHeard.championship = true;
           if (scope.championship.active) {
             scope.form.tourMode = 'championship';  // reflect the active format in the mode selector (ADR-0042)
             scope.form.champPreset = scope.championship.preset || scope.form.champPreset;
@@ -1667,6 +1742,7 @@ angular.module('beamng.apps')
       scope.$on('BeamCompTournament', function (event, payload) {
         scope.$evalAsync(function () {
           scope.tournament = payload || { active: false };
+          formatsHeard.tournament = true;
           if (scope.tournament.active) {
             scope.form.tourMode = 'classdrop';
           }
@@ -2451,6 +2527,9 @@ angular.module('beamng.apps')
       geCall('request_setup_lock');
       geCall('request_championship');
       geCall('request_tournament');
+      // What the staged grid was built from (the stale-grid note), after the multi-race state it is
+      // compared under and before the phase that lets the note show.
+      geCall('request_setup_build');
       geCall('request_race_phase');
       geCall('request_players');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config

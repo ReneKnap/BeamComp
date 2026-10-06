@@ -94,6 +94,22 @@
       font-weight: 700; cursor: pointer; }
     .bc-prepare { background: #2e7d32; color: #fff; }
     .bc-prepare[disabled] { background: #444; color: #999; cursor: default; }
+    /* The staged grid no longer matches the settings (feature setup-confirm-grid-stale-hint, gridStale in
+       app.js). The note sits above the action row, amber like .bc-warn: nothing is broken and nothing is
+       refused, the admin just must not press Start Race believing his changes are in. The row under it
+       drops its own top border, so note and buttons read as one footer. */
+    .bc-stale-note { flex: 0 0 auto; padding: 6px 10px 0 10px; font-size: 12px; color: #e8c07a;
+      border-top: 1px solid rgba(255,255,255,0.12); }
+    .bc-stale-note + .bc-actions { border-top: none; }
+    /* ...and Confirm & Build Grid pulses until it is pressed. background-color and box-shadow only, both
+       paint properties: never transform and never will-change, which would hand the button its own
+       compositing layer and render its label blurry (see the marquee comment above). The label itself is
+       untouched, so the measured fit of this row (the comment at the button) still holds. */
+    .bc-prepare.bc-stale { animation: bc-stale-pulse 1.2s ease-in-out infinite alternate; }
+    @keyframes bc-stale-pulse {
+      from { background-color: #2e7d32; box-shadow: 0 0 0 1px rgba(232, 192, 122, 0.35); }
+      to { background-color: #43a047; box-shadow: 0 0 0 2px #e8c07a, 0 0 8px rgba(232, 192, 122, 0.6); }
+    }
     .bc-start { background: #1565c0; color: #fff; }
     .bc-refresh { background: #355; color: #cde; padding: 3px 10px; border: none; border-radius: 3px;
       font-weight: 700; cursor: pointer; }
@@ -871,6 +887,13 @@
 
   </div>
 
+  <!-- The staged grid was built from other settings than the ones above, so Start Race would start it
+       without them (feature setup-confirm-grid-stale-hint; gridStale in app.js decides, and only while a
+       race this panel built is staging). Its own block OUTSIDE the .bc-actions flex row, so it can never
+       make that row wrap, and a flex child of .bc-setup with flex: 0 0 auto, so the scrolling body above
+       gives up the room instead of being overlapped. ng-if is safe: there is no ng-model inside. -->
+  <div class="bc-stale-note" ng-if="!locked && gridStale()">Settings changed. Confirm to rebuild the grid.</div>
+
   <div class="bc-actions" ng-show="!locked">
     <!-- Label and code diverge on purpose: the button says "Confirm & Build Grid" (the press commits every
          setting in this panel AND spawns the field), while the handler stays prepareRace() and the class
@@ -882,7 +905,7 @@
          panel min-width, all three buttons showing): 118px of label in a 155px button.
          Start Race follows the server's phase, not this panel's own press: a grid is waiting exactly while
          the race is staging, whoever built it, and the button never lingers into the lobby. -->
-    <button class="bc-prepare" ng-disabled="!form.race" ng-click="prepareRace()" bc-setup-tip="tip('prepare')">Confirm &amp; Build Grid</button>
+    <button class="bc-prepare" ng-class="{'bc-stale': gridStale()}" ng-disabled="!form.race" ng-click="prepareRace()" bc-setup-tip="tip('prepare')">Confirm &amp; Build Grid</button>
     <button class="bc-start" ng-if="phase === 'staging'" ng-click="startRaceGo()" bc-setup-tip="tip('startRace')">Start Race</button>
     <button class="bc-close" ng-click="close()" bc-setup-tip="tip('close')">Close</button>
   </div>
