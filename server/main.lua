@@ -3902,6 +3902,24 @@ function quali.anyone_lapping()
     return anyone
 end
 
+-- How many of the still-circulating drivers (stall.remaining, the same set the grace waits on) had set a
+-- timed lap when the quali clock ran out, and how many there are. For the grace-armed log line (bug
+-- quali-ai-drives-only-one-lap): "0 of N" means the session was shorter than one lap of this track, so
+-- every driver's FIRST lap closes inside the finish-your-lap grace and every AI is parked after it -- by
+-- design, and readable from the server log, which never runs out of budget the way the client's does.
+function quali.timed_field()
+    local timed, field = 0, 0
+    for _, record in pairs(session.progress or {}) do
+        if stall.remaining(record) then
+            field = field + 1
+            if (tonumber(record.best_lap) or 0) > 0 then
+                timed = timed + 1
+            end
+        end
+    end
+    return timed, field
+end
+
 -- Advance the qualifying phase from the tick (ADR-0041): run for session.quali.duration, then arm a
 -- bounded finish-your-lap grace (so an in-progress lap still counts), then broadcast the classification and
 -- enter the results pause. Mirrors the racing finish-grace handling -- handled explicitly (not by the
@@ -3934,8 +3952,11 @@ function quali.advance_qualifying()
         -- window tracks the field's slowest best lap, so its length varies with the track/pace rather
         -- than being a flat cap.
         broadcast_event(MSG_FINISH_GRACE, {duration = window})
-        log_info("beamcomp.race",
-            string.format("quali clock expired; finish-your-lap grace armed (%.1fs)", window))
+        local timed, field = quali.timed_field()
+        log_info("beamcomp.race", string.format(
+            "quali clock expired after %.0fs with %d of %d circulating driver(s) on a timed lap; "
+            .. "finish-your-lap grace armed (%.1fs)%s", q.duration, timed, field, window,
+            (timed == 0 and field > 0) and " -- nobody completed a lap inside the session" or ""))
         return
     end
     if quali.anyone_lapping() and t < q.lap_grace_deadline then
