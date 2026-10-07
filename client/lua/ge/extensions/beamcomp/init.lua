@@ -237,8 +237,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
 -- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
--- camera, partlock (the forced-car part lock) and confirmhint (the setup panel's stale-grid hint) are new
--- since then, and recoverground (the recover assist's placement) is new in this build.
+-- camera, partlock (the forced-car part lock), confirmhint (the setup panel's stale-grid hint) and
+-- recoverground (the recover assist's placement) are new since then, and qualilaps (the circuit-quali AI
+-- lap supply) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -250,8 +251,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- one logging confirmhint-r1 also has the setup panel point at Confirm & Build Grid when the settings
 -- differ from the staged grid, and shows Start Race only while a race is staging; one logging
 -- recoverground-r1 also has the recover assist set the car's box bottom on the surface the way the grid
--- does and measure the slope with the grid's window.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1/2026-10-07"
+-- does and measure the slope with the grid's window; one logging qualilaps-r1 also has the circuit-quali
+-- AI keep lapping until the quali clock ends, and names the path in its arming, park and grace lines.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1/2026-10-07"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
