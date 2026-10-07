@@ -237,8 +237,8 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
 -- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
--- camera, partlock (the forced-car part lock) is new since then, and confirmhint (the setup panel's
--- stale-grid hint) is new in this build.
+-- camera, partlock (the forced-car part lock) and confirmhint (the setup panel's stale-grid hint) are new
+-- since then, and recoverground (the recover assist's placement) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -248,8 +248,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- logging gridcam-r3 also shows every checkpoint in the grid editor (CP0 red, CP1 yellow, the rest grey);
 -- one logging partlock-r1 also locks a forced car's parts and its staging swap, with tuning left free;
 -- one logging confirmhint-r1 also has the setup panel point at Confirm & Build Grid when the settings
--- differ from the staged grid, and shows Start Race only while a race is staging.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1/2026-10-06"
+-- differ from the staged grid, and shows Start Race only while a race is staging; one logging
+-- recoverground-r1 also has the recover assist set the car's box bottom on the surface the way the grid
+-- does and measure the slope with the grid's window.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1/2026-10-07"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -7286,8 +7288,11 @@ end
 
 -- The recover target for the local player: the last passed checkpoint (ADR-0010/0013) facing the
 -- next one, or -- before any checkpoint is passed -- the grid start pose facing the first checkpoint.
--- Returns {pos = {x,y,z}, dir = {x,y,z} or nil, up = {x,y,z} or nil}; `up` is the surface normal
--- placement measured under the final position, and a nil dir or up puts the car down level.
+-- Returns {pos = {x,y,z}, dir = {x,y,z} or nil, up = {x,y,z} or nil, samples, surface}; `up` is the
+-- surface normal placement measured under the final position, and a nil dir or up puts the car down
+-- level. `samples` (the four points that normal was measured at) and `surface` (the ground under the
+-- target) only feed vehicles.recover_to's log line. `pos` is where the car's box centre-bottom goes
+-- (ADR-0034 amendment 2026-10-07) -- the target itself is unchanged by that.
 local function recover_target(race, detection)
     local seq = (detection and detection.seq) or 0
     local target_pos, face_pos
@@ -7319,7 +7324,13 @@ local function recover_target(race, detection)
     -- `up` is the slope placement measured under the position it settled on -- the car is laid INTO
     -- that surface instead of flat into the landscape (ADR-0034 amendment 2026-09-01).
     local grounded = placement.resolve({pos = target_pos, forward = dir})
-    return {pos = grounded.pos, dir = dir, up = grounded.up}
+    return {
+        pos = grounded.pos,
+        dir = dir,
+        up = grounded.up,
+        samples = grounded.samples,
+        surface = grounded.surface,
+    }
 end
 
 -- Arm the seated car's VE key forwarders for the race (ADR-0017). GE owns the enable check, countdown,
@@ -7420,7 +7431,7 @@ local function perform_assist(kind)
         pcall(function() own_car:queueLuaCommand("recovery.recoverInPlace()") end)
     else
         local target = recover_target(race, M.state.detection)
-        local placed, err = vehicles.recover_to(own_car, target.pos, target.dir, target.up)
+        local placed, err = vehicles.recover_to(own_car, target)
         if not placed then
             log("W", RACE_LOG_TAG, "recover-to-checkpoint failed: " .. tostring(err))
             return
@@ -8116,6 +8127,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- is a one-shot, so a call that lands in that window used to be lost for good -- the seam now
     -- records it and replays it here once the UI is done. One nil check when nothing is pending.
     M.uilayout.step()
+    -- Phase-independent: write the one delayed read-back line of the last recover (how the car actually
+    -- stands a second after the teleport, ADR-0034 amendment 2026-10-07) -- even if the race ended in
+    -- that second. Physics time, so a paused game does not read a car that has not moved yet. One nil
+    -- check when no recover is pending.
+    vehicles.step_recover_readback(dtSim)
     -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
     -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
     -- polling lives in race/vehicles (it is a measurement of the car); this is only the wiring, kept

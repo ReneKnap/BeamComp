@@ -15,8 +15,9 @@
 -- It also measures the surface's SLOPE (ADR-0034 amendment 2026-08-30): four more casts, at the corners
 -- of a nominal car footprint, span the plane the car will stand on, and that plane's normal rides along
 -- on the pose as `up`. race/vehicles.lua turns it into the spawn orientation, the front anchor and (since
--- the 2026-09-01 recover-follows-surface-slope amendment) the recover orientation, and the grid editor
--- draws it. Without a normal every consumer keeps its pre-slope, world-up behaviour.
+-- the 2026-09-01 recover-follows-surface-slope amendment) the recover orientation -- and since 2026-10-07
+-- the recover's box anchor too -- and the grid editor draws it. Without a normal every consumer keeps its
+-- pre-slope, world-up behaviour.
 --
 -- WHERE that footprint sits depends on what the pose means, and the two paths here disagree: a GRID pose
 -- is the car's front edge, so the footprint is set back half a car to land under the body; a RECOVER
@@ -34,8 +35,10 @@
 -- one starts its search at the surface the slot BEFORE it found, not at its own authored z. The search
 -- window therefore travels with the terrain and can be small (CHAIN_UP_MARGIN, 3 m) instead of the fixed
 -- 10 m a per-slot search needed -- small enough that a bridge deck overhead is no longer the first thing
--- a ray meets, and still enough to climb a hill. The recover assist keeps the wide window: it has no
--- chain to inherit from.
+-- a ray meets, and still enough to climb a hill. The recover assist's CENTRE drop keeps the wide window:
+-- it has no chain to inherit from. Its four SLOPE casts do not (ADR-0034 amendment 2026-10-07,
+-- recover-anchors-the-box): they start from a surface already measured, exactly like the grid's, and take
+-- the same narrow window -- see SLOPE_UP_MARGIN.
 --
 -- Degrade-don't-crash (like ADR-0017's engine wrappers): every engine read is pcall/type-guarded, and a
 -- missing/unhappy cast API leaves the pose UNCHANGED -- never worse than the pre-ADR-0034 behaviour. The
@@ -54,8 +57,9 @@ local LOG_TAG = "beamcomp.spawn"
 -- even when the hint is slightly underground (a checkpoint centre), then drops up to MAX_DROP.
 -- GROUND_CLEARANCE lifts the car a hair off the surface so it settles rather than clips.
 --
--- UP_MARGIN is the RECOVER assist's window: its hint is a checkpoint's authored centre, a single point
--- with nothing before it to inherit from, so it keeps the wide 10 m it has always had.
+-- UP_MARGIN is the RECOVER assist's window for its CENTRE drop: its hint is a checkpoint's authored
+-- centre, a single point with nothing before it to inherit from, so it keeps the wide 10 m it has always
+-- had. Its slope corners do NOT use it (see SLOPE_UP_MARGIN).
 local UP_MARGIN = 10.0
 local MAX_DROP = 200.0
 local GROUND_CLEARANCE = 0.2
@@ -67,6 +71,24 @@ local GROUND_CLEARANCE = 0.2
 -- above it first and spawn the field on the bridge. A segment whose FIRST slot genuinely starts far
 -- below its ground has the per-segment castHeight knob to lift its own window.
 local CHAIN_UP_MARGIN = 3.0
+
+-- The window of the four SLOPE corner casts, for the grid AND the recover assist alike (ADR-0034
+-- amendment 2026-10-07, recover-anchors-the-box): metres above the surface already found under the pose.
+--
+-- The corners are seeded at a height that was just MEASURED, so the window does not have to find the
+-- ground -- it only has to see over the rise across half a footprint. What a wider window adds is
+-- STRUCTURE: everything static between the road and the top of the window counts as the ground under
+-- that wheel. The recover used to take UP_MARGIN (10 m) here, so an arch, a banner, a sign gantry, a
+-- bridge deck or a canopy 3..10 m above ONE corner was sampled as the road there -- a strong roll (and
+-- pitch) on perfectly flat ground. The grid had already been cured of exactly that ("the bridge defect
+-- one level down", amendment 2026-09-01); the recover never got the same cure.
+--
+-- Derived from the chain window rather than restated, so the grid's in-game-verified slope is measured
+-- with the same number as before and the two windows can never drift apart. What it cannot do: an object
+-- LOWER than 3 m above a corner -- a barrier, a kerb stone, a parked prop -- is still sampled, because
+-- inside the window it is indistinguishable from a step in the road. The log line vehicles.recover_to
+-- writes names the four corner heights so such a case shows as a number.
+local SLOPE_UP_MARGIN = CHAIN_UP_MARGIN
 
 -- Nominal car footprint for the horizontal wall test (no real vehicle exists when a grid is computed or
 -- previewed). Half-length/half-width of a typical car plus a clearance margin; the rays fire from
@@ -100,11 +122,13 @@ local NORMAL_HALF_WIDTH = 0.8
 --                                            centre lands exactly on it -> set the footprint back by
 --                                            half a nominal car (NORMAL_SET_BACK).
 --   a RECOVER target is the car's MIDDLE  -- a checkpoint's authored centre, and vehicles.recover_to
---                                            puts the reference point straight there with no
---                                            front-anchor correction -> no set-back at all.
+--                                            puts the car's BOX CENTRE there (its bottom face on the
+--                                            surface) -> no set-back at all.
 --
 -- Which of the two a pose follows is stated at every call site and never defaulted: a forgotten caller
--- must fail loudly rather than quietly measure the grid 2.2 m off (see cast_normal_samples).
+-- must fail loudly rather than quietly measure the grid 2.2 m off (see cast_normal_samples). The vehicle
+-- side mirrors this split one-to-one: vehicles.lua's ANCHOR_FRONT / ANCHOR_MIDDLE say which point of the
+-- car's box lands on the pose, so the footprint measured here and the box placed there are the same car.
 --
 -- The grid's set-back (ADR-0034 amendment 2026-09-01, slope-samples-on-the-car): a footprint centred ON
 -- a front-edge pose sampled 1.35 m of ground IN FRONT OF the bumper and only the first 1.35 m of the
@@ -140,7 +164,8 @@ end
 
 -- Downward ray to the nearest static surface (terrain AND static meshes/roads) below (x, y), or nil. The
 -- ray starts `up_margin` (default UP_MARGIN) above `hint_z` and a miss is taken as dist >= MAX_DROP
--- (see ENGINE-API NOTE). The grid chain passes CHAIN_UP_MARGIN; the recover assist takes the default.
+-- (see ENGINE-API NOTE). The grid chain passes CHAIN_UP_MARGIN, every slope corner SLOPE_UP_MARGIN; only
+-- the recover assist's centre drop takes the default.
 local function cast_ground_z(x, y, hint_z, up_margin)
     if type(castRayStatic) ~= "function" or type(vec3) ~= "function" then
         return nil
@@ -184,9 +209,10 @@ end
 -- degrade to flat rather than guess. Terrain height is deliberately not a fallback here either -- it
 -- knows nothing about the bridge or road deck the cast found.
 --
--- `up_margin` is passed through to the corner casts, and the grid hands down its narrow chain window on
--- purpose: with the wide default, a deck 4 m above a corner would still be sampled and tilt the slot
--- towards a surface the car will never stand on -- the bridge defect one level down.
+-- `up_margin` is passed through to the corner casts, and both callers hand down the narrow
+-- SLOPE_UP_MARGIN on purpose: with the wide default, a deck 4 m above a corner would still be sampled and
+-- tilt the car towards a surface it will never stand on -- the bridge defect one level down. The recover
+-- assist took the wide window until 2026-10-07, the prime suspect for its cars rolled on flat ground.
 --
 -- The set-back is what a corner has to reach across from that seed (up to 3.55 m behind a grid pose), so
 -- on ground falling away steeply enough behind the pose -- roughly 40 degrees over the chain's 3 m window
@@ -384,13 +410,18 @@ end
 
 -- A copy of `pose` dropped onto the surface: z = ground + GROUND_CLEARANCE, or the original z when no
 -- surface is found (degrade-don't-crash). The single-pose, UN-CHAINED form -- the recover assist's pass
--- (via clear_pose), which searches from the pose's own authored z through the wide UP_MARGIN window.
--- The grid goes through ground_all instead, which chains. Never mutates the input: grid.poses shares one
--- read-only `forward` table across slots and reuses `rot`, so those pass through by reference while a
--- NEW pos table is built.
+-- (via clear_pose), whose centre drop searches from the pose's own authored z through the wide UP_MARGIN
+-- window. The grid goes through ground_all instead, which chains. Never mutates the input: grid.poses
+-- shares one read-only `forward` table across slots and reuses `rot`, so those pass through by reference
+-- while a NEW pos table is built.
 --
--- The slope is sampled with NO set-back: this pose is the car's MIDDLE (recover_to puts the reference
--- point straight on it), not the front edge a grid slot describes -- see NORMAL_SET_BACK.
+-- The slope is sampled with NO set-back: this pose is the car's MIDDLE (recover_to puts the box centre
+-- on it), not the front edge a grid slot describes -- see NORMAL_SET_BACK. Its corners take the grid's
+-- narrow SLOPE_UP_MARGIN, not the centre drop's 10 m (ADR-0034 amendment 2026-10-07).
+--
+-- `surface` is the raw height the centre drop found (nil when nothing answered), published so the
+-- recover's log line can state the corner samples relative to it -- a corner standing on a barrier then
+-- reads as "+1.00 m" instead of hiding inside a normal vector.
 function M.ground_pose(pose)
     local pos = pose.pos
     local ground = M.ground_z(pos.x, pos.y, pos.z)
@@ -398,8 +429,9 @@ function M.ground_pose(pose)
         pos = {x = pos.x, y = pos.y, z = ground and (ground + GROUND_CLEARANCE) or pos.z},
         rot = pose.rot,
         forward = pose.forward,
+        surface = ground,
     }
-    attach_slope(grounded, pos.x, pos.y, ground, pose.forward, UP_MARGIN, NORMAL_NO_SET_BACK)
+    attach_slope(grounded, pos.x, pos.y, ground, pose.forward, SLOPE_UP_MARGIN, NORMAL_NO_SET_BACK)
     return grounded
 end
 
@@ -441,7 +473,7 @@ local function ground_chained(pose, hint_z)
         if not seed and pose.noDowncast then
             seed = hint_z
         end
-        attach_slope(grounded, pos.x, pos.y, seed, pose.forward, CHAIN_UP_MARGIN, NORMAL_SET_BACK)
+        attach_slope(grounded, pos.x, pos.y, seed, pose.forward, SLOPE_UP_MARGIN, NORMAL_SET_BACK)
     end
     return grounded, surface
 end
@@ -494,7 +526,8 @@ end
 -- recover-follows-surface-slope): the car stands metres from the checkpoint centre by then, so the
 -- normal measured there would be the slope of a patch of ground it never touches -- and since
 -- vehicles.recover_to orients into that normal now, a stale one would tilt the car wrongly rather than
--- go unread. Both exits re-measure, the nudged-clear one and the gave-up one.
+-- go unread. Both exits re-measure, the nudged-clear one and the gave-up one, with the same narrow
+-- SLOPE_UP_MARGIN as ground_pose, and both publish the `surface` they measured from.
 function M.clear_pose(pose)
     local grounded = M.ground_pose(pose)
     local forward = horizontal_unit(pose.forward)
@@ -514,8 +547,13 @@ function M.clear_pose(pose)
     -- last step's own cast found -- the same seed ground_pose uses -- so a step whose cast found nothing
     -- leaves the pose without a normal and the car flat, rather than tilted by a guess.
     local function nudged_pose()
-        local moved = {pos = {x = x, y = y, z = z}, rot = pose.rot, forward = pose.forward}
-        attach_slope(moved, x, y, surface, forward, UP_MARGIN, NORMAL_NO_SET_BACK)
+        local moved = {
+            pos = {x = x, y = y, z = z},
+            rot = pose.rot,
+            forward = pose.forward,
+            surface = surface,
+        }
+        attach_slope(moved, x, y, surface, forward, SLOPE_UP_MARGIN, NORMAL_NO_SET_BACK)
         return moved
     end
 
