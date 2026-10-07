@@ -55,6 +55,8 @@ below rather than hidden.
   `beamcomp.config.ini` -- the rest of the file, comments and password included, is left untouched.
 - Players pick the name everyone sees with `/name`.
 - Recover and repair as a held key during the race, on by default and switchable per race.
+  A recovered car stands on its wheels at the checkpoint, following the slope of the road, instead of
+  rolled onto its side or sunk into the surface.
 - On joining, every player gets one message naming the three commands he needs -- `/raceui`, `/name`
   and `/keys`. The `/raceui` line says how to get in where a password is set, and is left out where he
   could not get in at all.
