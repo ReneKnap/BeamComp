@@ -5860,6 +5860,14 @@ function M.onExtensionLoaded()
     lock.car_is_forced = function()
         return M.state.race_forced_car == true
     end
+    -- Listen to BeamMP's two nametag switches (the "Player Nametags" key and hideNicknames), so the AI tags
+    -- the host draws itself go on and off with every other tag (ADR-0062 amendment 2026-10-08). Given back
+    -- in onExtensionUnloaded; a second install unwraps an earlier one instead of stacking on it. Guarded
+    -- like its counterpart there: nothing below in this hook may depend on it.
+    local tags_ok, tags_err = pcall(nametags.install_toggle_mirror)
+    if not tags_ok then
+        log("W", "beamcomp.nametags", "nametag toggles could not be mirrored: " .. tostring(tags_err))
+    end
     -- Blank the centred surfaces from the freshly rebuilt (empty) state. onExtensionUnloaded runs WITHOUT
     -- a pcall, so a teardown that threw part way is no guarantee its clearing push went out (ADR-0052) --
     -- and after the reload M.state carries no message left to expire, so nothing else would ever take a
@@ -8582,6 +8590,12 @@ function M.onExtensionUnloaded()
     -- mid-race never leaves orphaned scenery or a stuck-frozen/locked car (ADR-0017).
     teardown_race_world()
     M.state.phase = nil
+    -- Give BeamMP its nametag switches back. Guarded on its own like the camera above: this hook has no
+    -- pcall around it, and the unwrap must not be the reason the log line below never comes.
+    local tags_ok, tags_err = pcall(nametags.uninstall_toggle_mirror)
+    if not tags_ok then
+        log("W", "beamcomp.nametags", "nametag toggles could not be given back: " .. tostring(tags_err))
+    end
     log("I", LOG_TAG, "unloaded")
 end
 
