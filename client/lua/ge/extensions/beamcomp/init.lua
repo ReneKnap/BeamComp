@@ -5735,8 +5735,28 @@ function identity.tag_policy()
     }
 end
 
+-- Apply the policy, and keep it for the per-frame draw of the host's own AI tags (identity.draw_tags),
+-- together with the ai_cars table it was built from. The draw reads exactly what was just applied -- never
+-- a second build -- so a frame can never name a car the sweep did not, and per frame nothing is allocated.
 function identity.apply_tags()
-    nametags.apply(identity.tag_policy())
+    local policy = identity.tag_policy()
+    nametags.apply(policy)
+    identity.drawn_policy = policy
+    identity.drawn_cars = M.state.ai_cars
+end
+
+-- HOST ONLY, every frame: draw the names over this client's own AI cars, which BeamMP never draws because
+-- they are local here (ADR-0062 amendment 2026-10-08). Only the owner spawns AI (ADR-0036), so without
+-- ai_cars there is no AI entry BeamMP skips, and the idle path is this one nil test. A policy built from
+-- an earlier ai_cars table -- before the quali despawn, before the re-grid -- is void: BeamMP may have
+-- handed one of its ids to the host's own new car. Nothing is drawn until the next sweep (<= 0.5 s)
+-- builds one from the cars that exist now.
+function identity.draw_tags()
+    local cars = M.state.ai_cars
+    if cars == nil or identity.drawn_policy == nil or identity.drawn_cars ~= cars then
+        return
+    end
+    nametags.draw_local_ai(identity.drawn_policy)
 end
 
 -- Forget what THIS server told this connection about itself. Called at the SESSION boundary and nowhere
@@ -8482,7 +8502,9 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         return
     end
     -- Nothing to draw with no race and no edit session (the common free-roam case): skip before building
-    -- the pcall closure so the idle path stays zero-work.
+    -- the pcall closure so the idle path stays zero-work. This never hides an AI tag: the host's AI cars
+    -- are spawned only after raceStart has set M.state.race and are all gone before anything sets it back
+    -- to nil (teardown, a rejected raceStart) -- checked 2026-10-08, feature host-sees-ai-nametags.
     if not M.state.race and not grideditor.state.active then
         return
     end
@@ -8530,6 +8552,10 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         M.state.marker_warned = true
         log("W", RACE_LOG_TAG, "marker draw failed (debugDrawer API?): " .. tostring(err))
     end
+    -- The names over the host's own AI cars (ADR-0062 amendment 2026-10-08). Outside the marker pcall on
+    -- purpose: it guards itself and warns under its own tag, so a marker failure can never hide the tags
+    -- and a tag failure can never hide the markers.
+    identity.draw_tags()
 end
 
 -- The level is ending -- the player left the BeamMP session or changed level, possibly mid-race.

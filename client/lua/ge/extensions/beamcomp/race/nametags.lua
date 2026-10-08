@@ -6,8 +6,10 @@
 -- to lose. Target: client GE (LuaJIT 5.1).
 --
 -- BeamMP draws one tag per SYNCED vehicle and skips its own (`if v.isLocal or not owner then goto
--- skip_vehicle`), which is why the host can never see what this module does -- every race prop belongs
--- to him. Two fields on the MPVehicleGE entry decide the outcome, and neither is in
+-- skip_vehicle`), which is why the host can never see what M.apply does to the props -- every race prop
+-- belongs to him. His AI cars belong to him too, and those he should see named: M.draw_local_ai draws
+-- that tag itself (ADR-0062 amendment 2026-10-08). Two fields on the MPVehicleGE entry decide the
+-- outcome of M.apply, and neither is in
 -- `Vehicle:onSerialized()`: `hideNametag` takes the tag away (checked above both the main and the
 -- spectator tag), `customName` replaces the owner's name in it. A rebuilt entry therefore starts tagged
 -- again with the owner's name -- so this is a RECONCILER that is re-run, never a one-shot that is
@@ -388,6 +390,296 @@ function M.uninstall_toggle_mirror()
         log("W", LOG_TAG, summary .. "; the rest are wrapped over by something else and now pass every "
             .. "call straight through")
     end
+end
+
+
+-- ===== The host's own AI cars: BeamComp draws their tag (ADR-0062 amendment 2026-10-08) =============
+--
+-- BeamMP skips every vehicle this client owns before it draws a tag, and only the owner spawns AI
+-- (ADR-0036): every player but the host sees a name over each AI car, the host none. This draws the
+-- host's half, as a copy of BeamMP's own draw block (MPVehicleGE.lua onPreRender) rather than a style of
+-- its own: the entry's cached nameTag (which M.apply has already built from the AI's label), white text on
+-- the owner's role colour, the same height above the car, the same fade, the same distance suffix -- and
+-- the same switches: the host's BeamMP nametag settings and BeamMP's two toggles (M.toggles above).
+--
+-- Not copied, on purpose: the spectator line (nobody spectates an AI), fadeVehicles (a mesh effect on
+-- REMOTE cars, not a tag), BeamMP's distance map and the queue blobs (unspawned remote cars).
+
+-- BeamMP's roleToInfo.USER background, used when a role carries no readable colour.
+local USER_BACKCOLOR = {r = 0, g = 0, b = 0}
+
+-- The draw path's own bookkeeping. All of it may be lost on a reload: it resolves and logs again.
+local draw = {
+    kit = nil,           -- the resolved draw call {text = fn, source = name}; false once found missing
+    first_logged = false,
+    warned = false,      -- a frame threw; said once
+    role_warned = false,
+    owner_warned = false,
+    premise_policy = nil,  -- the policy object the premise line was last evaluated for
+    premise = nil,       -- the counts it last logged
+}
+
+-- The settings and the camera of the current frame, refilled every frame: nothing is allocated per frame.
+local frame = {}
+
+-- Whether `owner[name]` resolves. Engine objects are userdata whose missing members may raise rather than
+-- answer nil, hence the pcall; only ever run while resolving, never per frame.
+local function has_member(owner, name)
+    if owner == nil then
+        return false
+    end
+    local ok, member = pcall(function() return owner[name] end)
+    return ok and member ~= nil
+end
+
+-- BeamMP's own call first: the FFI text draw it binds at load (cdefDebugDraw.lua), garbage-free, packed
+-- colours through the engine's color(). debugDrawer's method is the named fallback, with colour objects.
+local function resolve_text_draw()
+    local ok, ffi_lib = pcall(require, "ffi")
+    if ok and type(ffi_lib) == "table" and type(color) == "function" then
+        local found, ffi_draw = pcall(function() return ffi_lib.C.BNG_DBG_DRAW_TextAdvanced end)
+        if found and ffi_draw ~= nil then
+            return function(x, y, z, text, alpha, r, g, b, use_z)
+                ffi_draw(x, y, z, text, color(255, 255, 255, alpha * 254), true, false,
+                    color(r, g, b, math.floor(alpha * 127)), false, use_z)
+            end, "ffi.C.BNG_DBG_DRAW_TextAdvanced"
+        end
+    end
+    if has_member(debugDrawer, "drawTextAdvanced") and vec3 and ColorF and ColorI then
+        return function(x, y, z, text, alpha, r, g, b, use_z)
+            debugDrawer:drawTextAdvanced(vec3(x, y, z), text, ColorF(1, 1, 1, alpha * 254 / 255), true,
+                false, ColorI(r, g, b, math.floor(alpha * 127)), false, use_z)
+        end, "debugDrawer:drawTextAdvanced"
+    end
+    return nil
+end
+
+-- Every engine touchpoint the draw needs, looked up once (ADR-0017). Anything missing is named in ONE W
+-- line and no tag is drawn for the rest of this module's life; the engine surface does not change at run
+-- time, so a per-frame retry would only cost every frame.
+local function resolve_kit()
+    if draw.kit ~= nil then
+        return draw.kit or nil
+    end
+    local absent = {}
+    local function need(present, name)
+        if not present then
+            absent[#absent + 1] = name
+        end
+    end
+    need(has_member(settings, "getValue"), "settings.getValue")
+    need(has_member(core_camera, "getPositionXYZ"), "core_camera.getPositionXYZ")
+    need(has_member(commands, "isFreeCamera"), "commands.isFreeCamera")
+    need(has_member(be, "getPlayerVehicle"), "be:getPlayerVehicle")
+    need(has_member(be, "getObjectByID"), "be:getObjectByID")
+    need(has_member(be, "getObjectOOBBCenterXYZ"), "be:getObjectOOBBCenterXYZ")
+    local text, source = resolve_text_draw()
+    need(text, "a text draw (ffi.C.BNG_DBG_DRAW_TextAdvanced, debugDrawer:drawTextAdvanced)")
+    if #absent > 0 then
+        draw.kit = false
+        log("W", LOG_TAG, "the host's AI tags are not drawn: missing " .. table.concat(absent, ", "))
+        return nil
+    end
+    draw.kit = {text = text, source = source}
+    return draw.kit
+end
+
+-- Read this frame's settings and camera into `frame`, exactly where BeamMP reads them. False when the host
+-- has nametags switched off in BeamMP's settings.
+local function read_frame()
+    local get = settings.getValue
+    if get("hideNameTags") then
+        return false
+    end
+    frame.fade_enabled = get("nameTagFadeEnabled") and true or false
+    frame.fade_distance = tonumber(get("nameTagFadeDistance", 40)) or 40
+    frame.fade_invert = get("nameTagFadeInvert") and true or false
+    frame.dont_fully_hide = get("nameTagDontFullyHide") and true or false
+    frame.show_distance = get("nameTagShowDistance") and true or false
+    frame.imperial = get("uiUnitLength") == "imperial"
+    frame.use_z = get("nameTagsHideBehindObjects") and true or false
+    -- The reference point: the camera, or the seated car while not in the free camera.
+    frame.free_camera = commands.isFreeCamera() and true or false
+    local x, y, z = core_camera.getPositionXYZ()
+    local seated = be:getPlayerVehicle(0)
+    if seated and not frame.free_camera then
+        x, y, z = seated:getPositionXYZ()
+    end
+    frame.x, frame.y, frame.z = x, y, z
+    return true
+end
+
+-- BeamMP's fade, operation for operation: clamp(linearScale(distance, fadeDistance, 0, 0, 1), 0, 1)
+-- (lua/common/mathlib.lua), inverted only while fading outside the free camera, 1 with fading off, and
+-- never below 0.3 with "don't fully hide".
+local function tag_alpha(distance)
+    local fade = frame.fade_distance
+    local alpha = math.min(math.max((distance - fade) / (0 - fade), 0), 1)
+    alpha = math.min(math.max(alpha, 0), 1)
+    if frame.fade_enabled and not frame.free_camera and frame.fade_invert then
+        alpha = 1 - alpha
+    end
+    if not frame.fade_enabled then
+        alpha = 1
+    end
+    if frame.dont_fully_hide then
+        alpha = math.max(0.3, alpha)
+    end
+    return alpha
+end
+
+-- BeamMP's distance suffix, beyond 10 m and only with "show distance", metric or imperial.
+local function distance_suffix(distance)
+    if distance <= 10 or not frame.show_distance then
+        return ""
+    end
+    if frame.imperial then
+        local feet = distance * 3.28084
+        if feet > 5280 then
+            return string.format("%.2f mi ", math.floor((feet / 5280 * 100) + 0.5) / 100)
+        end
+        return string.format("%.f ft ", math.floor(feet))
+    end
+    if distance >= 1000 then
+        return string.format("%.2f km ", math.floor((distance / 10) + 0.5) / 100)
+    end
+    return string.format("%.f m ", math.floor(distance))
+end
+
+-- The background colour of the owner's role, BeamMP's precedence: the vehicle's custom role, the owner's
+-- custom role, the owner's role. A role without a readable colour is drawn on BeamMP's USER black, once
+-- said in the log.
+local function role_backcolor(entry, owner)
+    local role = entry.customRole or owner.customRole or owner.role
+    local back = type(role) == "table" and role.backcolor or nil
+    if type(back) == "table" and type(back.r) == "number" and type(back.g) == "number"
+            and type(back.b) == "number" then
+        return back.r, back.g, back.b
+    end
+    if not draw.role_warned then
+        draw.role_warned = true
+        log("W", LOG_TAG, "an AI tag's owner role has no readable colour; drawn on BeamMP's USER black")
+    end
+    return USER_BACKCOLOR.r, USER_BACKCOLOR.g, USER_BACKCOLOR.b
+end
+
+-- One entry, as BeamMP draws a remote one. False when it carries no tag: no owner, a tag hidden on the
+-- vehicle or its owner, no cached text yet, or a car that is not in the world (BeamMP would fall back to a
+-- stored position it never keeps for a local entry).
+local function draw_entry(entry, text_draw)
+    if type(entry.getOwner) ~= "function" then
+        if not draw.owner_warned then
+            draw.owner_warned = true
+            log("W", LOG_TAG, "an MPVehicleGE entry has no getOwner(); its AI tag is not drawn")
+        end
+        return false
+    end
+    local owner = entry:getOwner()
+    if type(owner) ~= "table" or entry.hideNametag or owner.hideNametag or entry.nameTag == nil
+            or entry.isSpawned == false then
+        return false
+    end
+    local game_id = entry.gameVehicleID
+    local veh = be:getObjectByID(game_id)
+    if not veh or not veh:getActive() then
+        return false
+    end
+    local x, y, z = be:getObjectOOBBCenterXYZ(game_id)
+    z = z + veh:getInitialHeight() * 0.5 + 0.2
+    local dx, dy, dz = x - frame.x, y - frame.y, z - frame.z
+    local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    local r, g, b = role_backcolor(entry, owner)
+    -- Concatenated even with no suffix, exactly like BeamMP: that is what turns the cached String into the
+    -- text the draw call takes.
+    text_draw(x, y, z, entry.nameTag .. distance_suffix(distance), tag_alpha(distance), r, g, b,
+        frame.use_z)
+    return true
+end
+
+-- Whether an entry carries the AI's label: M.apply sets it as customName, except when the label already IS
+-- the owner's name and nothing needs overriding.
+local function carries_label(entry, label)
+    return entry.customName == label or (entry.customName == nil and entry.ownerName == label)
+end
+
+-- The premise this draw stands on, measured where it runs: the host's AI entries are local to it (so
+-- BeamMP skips them) and carry the label in a cached nameTag. Evaluated once per policy object -- a new one
+-- comes with every sweep, so at most twice a second -- and logged only when the counts change; W when they
+-- disagree, because then either BeamMP draws these tags itself or there is nothing right to draw.
+local function note_premise(policy, entries)
+    if policy == draw.premise_policy then
+        return
+    end
+    draw.premise_policy = policy
+    local total, is_local, named, tagged = 0, 0, 0, 0
+    for key, label in pairs(policy.ai) do
+        total = total + 1
+        local entry = entries[key]
+        if type(entry) == "table" then
+            is_local = is_local + (entry.isLocal == true and 1 or 0)
+            named = named + (carries_label(entry, label) and 1 or 0)
+            tagged = tagged + ((entry.nameTag ~= nil and entry.nameTag ~= "") and 1 or 0)
+        end
+    end
+    local counts = string.format("%d AI in the policy, %d local to this client, %d named after their "
+        .. "label, %d with a cached nameTag", total, is_local, named, tagged)
+    if counts == draw.premise then
+        return
+    end
+    draw.premise = counts
+    local agree = is_local == total and named == total and tagged == total
+    log(agree and "I" or "W", LOG_TAG, "host AI tags: " .. counts)
+end
+
+local function draw_frame(policy)
+    if type(policy) ~= "table" or type(policy.ai) ~= "table" then
+        return 0
+    end
+    local entries = M.entries()
+    if not entries then
+        return 0
+    end
+    note_premise(policy, entries)
+    -- Only an explicit false hides drivers -- the same reading M.apply hides them on.
+    if policy.show == false or not M.toggles.allowed or M.toggles.toggled_off then
+        return 0
+    end
+    local kit = resolve_kit()
+    if not kit or not read_frame() then
+        return 0
+    end
+    local drawn = 0
+    for key in pairs(policy.ai) do
+        -- The prop branch stays first and unconditional, as in M.apply: a prop is never a driver.
+        if not (policy.props and policy.props[key]) then
+            local entry = entries[key]
+            -- Local entries only: BeamMP draws every other one itself, so a tag of ours there is a second.
+            if type(entry) == "table" and entry.isLocal == true and draw_entry(entry, kit.text) then
+                drawn = drawn + 1
+            end
+        end
+    end
+    if drawn > 0 and not draw.first_logged then
+        draw.first_logged = true
+        log("I", LOG_TAG, string.format("drawing the host's own AI tags through %s (%d this frame)",
+            kit.source, drawn))
+    end
+    return drawn
+end
+
+-- Draw the tag over every AI car in `policy.ai` that BeamMP skips because this client owns it. Called every
+-- frame on the host with the policy identity.apply_tags last handed to M.apply. Returns the number drawn.
+-- A frame that throws is said once and then quietly retried every frame -- the marker draw's pattern.
+function M.draw_local_ai(policy)
+    local ok, result = pcall(draw_frame, policy)
+    if ok then
+        return result
+    end
+    if not draw.warned then
+        draw.warned = true
+        log("W", LOG_TAG, "drawing the host's AI tags failed: " .. tostring(result))
+    end
+    return 0
 end
 
 return M
