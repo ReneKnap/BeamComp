@@ -37,6 +37,8 @@ below rather than hidden.
   you start -- everyone in a random car, or free choice inside a power and weight limit. A car that
   does not fit the limit is swapped for one that does.
 - Qualifying, for a grid order that was driven rather than drawn.
+  The AI lap until the qualifying clock runs out and stop as they finish their lap -- on a track
+  where one lap takes longer than the session, that is after the first one.
 - Championships across several races, and a class-drop tournament that eliminates the back of the
   field each round.
 
