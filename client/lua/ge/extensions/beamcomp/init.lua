@@ -304,7 +304,7 @@ M.state = {
     prop_map_sent = nil,  -- host only: signature of the last propMap that went out, so an unchanged map costs no message
     prop_map_wait = 0,   -- host only: seconds until the next rebuild attempt while prop_map_pending
     prop_map_budget = 0, -- host only: seconds of rebuild attempts left before we stop and WARN about the vehicles that never registered with BeamMP. A silent give-up on an incomplete map is how the old suppression hid a 49%-coverage gap for a year
-    ai_names = nil,      -- non-owner: cross-client BeamMP id -> the AI's standings label, from the relayed aiMap (ADR-0036/0062), or nil
+    ai_names = nil,      -- non-owner: cross-client BeamMP id -> the AI's standings label, from the relayed aiMap (ADR-0036/0062), or nil. The owner ignores its own aiMap, so this stays nil there; the owner's policy derives the same map from its live ai_cars instead (identity.own_ai_names)
     show_driver_names = nil,  -- whether drivers (humans AND AI) carry a name over their car on this server (ADR-0062). nil = not heard yet, and the safe reading of nil is ON: a client that never got the policy behaves exactly like plain BeamMP. Only an explicit false hides them. Props are outside this and silent either way. Connection-scoped: cleared at the session boundary (identity.clear_policy) and nowhere else -- a race end does not touch it (decision 6), and neither does closing the setup panel (bug panel-close-wipes-nametag-policy)
     tag_written = nil,   -- what THIS client changed on BeamMP's nametag entries: {hidden = {}, named = {}} keyed by cross-client id, so a tag is only ever given back or cleared if we took it away or set it (ADR-0062). Lazily created. Connection-scoped like the policy itself and dropped only by identity.clear_policy: a client that forgets this record while its writes still stand can never give those tags back, which is what made a panel close reopen the prop defect
     tag_wait = 0,        -- seconds until the next nametag reconcile sweep; the sweep is what beats a rebuilt MPVehicleGE entry, which comes back tagged (hideNametag/customName are not serialized)
@@ -5682,6 +5682,32 @@ function identity.prop_map_step(dt)
     end
 end
 
+-- HOST ONLY: the AI cars this client spawned, as {[cross-client id] = label} -- the shape the relayed aiMap
+-- gives every other client (ADR-0062 decision 5, which never excluded the host). nil when this client owns
+-- no AI; a car BeamMP has not registered yet is simply absent until the next sweep.
+--
+-- The owner ignores its own aiMap (handle_ai_map), so without this its policy had no AI at all and named
+-- them after himself -- invisible, because BeamMP never draws an own vehicle, until the host draws them.
+--
+-- Derived from the live ai_cars on every call and never remembered: BeamMP hands a freed vehicle id to the
+-- next car spawned, so after the quali despawn and the re-grid the host's own new race car can carry an id
+-- an AI had. A map kept from the broadcast would put an AI's name on the host's own car; one built from
+-- ai_cars cannot contain it.
+function identity.own_ai_names()
+    local cars = M.state.ai_cars
+    if not cars then
+        return nil
+    end
+    local names = nil
+    for _, entry in ipairs(ai.server_map(cars)) do
+        if type(entry.label) == "string" and entry.label ~= "" then
+            names = names or {}
+            names[tostring(entry.serverId)] = entry.label
+        end
+    end
+    return names
+end
+
 -- Everything this client currently knows about who carries a name, in the shape race/nametags.apply
 -- consumes. Rebuilt per call: it is three table reads and a walk over the player list, and a cached copy
 -- would be one more thing to invalidate on every join, leave, rename and race start.
@@ -5699,7 +5725,8 @@ function identity.tag_policy()
     M.state.tag_written = M.state.tag_written or {}
     return {
         props = M.state.prop_ids,
-        ai = M.state.ai_names,
+        -- The owner knows its AI from the cars it spawned, everybody else from the relayed aiMap.
+        ai = identity.own_ai_names() or M.state.ai_names,
         names = names,
         -- Only an explicit false hides drivers: a client that has not heard the policy looks exactly like
         -- plain BeamMP, which is the safe reading of "unknown" for a setting that defaults to on.
@@ -5756,10 +5783,12 @@ end
 -- would ever hear about it. A sweep over an unchanged scene writes nothing at all.
 --
 -- The guard above it is the idle path: a client that knows no props, no AI, no players and no "off"
--- policy has nothing to assert and pays four nil tests.
+-- policy has nothing to assert and pays five nil tests. ai_cars is the owner's half of "knows AI": a host
+-- with AI but no props, no player list and names on would otherwise never sweep, and nothing would name
+-- (or draw) his AI.
 function identity.tag_step(dt)
     if M.state.prop_ids == nil and M.state.ai_names == nil and M.state.player_list == nil
-            and M.state.show_driver_names ~= false then
+            and M.state.show_driver_names ~= false and M.state.ai_cars == nil then
         return
     end
     M.state.tag_wait = (M.state.tag_wait or 0) - (dt or 0)

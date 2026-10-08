@@ -17,7 +17,8 @@
 --   * a race prop         -> no name, in BOTH settings of the policy. Not negotiable: a prop is never
 --                            a driver, and the prop set is a derivation of the host's own prefab load
 --                            (race/props.lua M.live_prop_ids), never a jbeam name.
---   * an AI car           -> the label the aiMap already relays, which IS the standings name (ADR-0036)
+--   * an AI car           -> the label the aiMap already relays, which IS the standings name (ADR-0036);
+--                            the host, who sends that map, names his own AI from the cars he spawned
 --   * anybody's car       -> his race name (identity.player_list), or no tag when names are switched off
 --
 -- Three rules keep it from doing damage:
