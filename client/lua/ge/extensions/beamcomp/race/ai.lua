@@ -1260,7 +1260,14 @@ end
 -- whose targets sit close together -- less than REFILL_DISTANCE of armed route is left while no more than
 -- a block is still ahead. That last clause is the window's bound: a refill adds one block, so a car never
 -- holds more than two blocks of unreached targets.
+--
+-- A car re-armed out of an open supply (window.rearm) waits until it has reached a target of its new slice
+-- before it is topped up again. Without that, a slice shorter than the refill margin plus an expansion
+-- that keeps failing would hard-reset the car every other frame; with it, a re-arm costs real driving.
 function window.needs_refill(entry)
+    if entry.resume_after and entry.cursor <= entry.resume_after then
+        return false
+    end
     if entry.retry ~= nil then
         return true
     end
@@ -1339,12 +1346,13 @@ function window.drop_passed(targets, positions, position)
     return skip
 end
 
--- The rest of a degraded car's sequence from `from`, as a FRESH list (targets + positions). Built into a
--- scratch list on purpose: the descriptor is shared, so one car's give-up must never truncate another
--- car's supply. Capped at back_laps -- the race lap count -- so a degraded car in a 60-lap qualifying
--- supply gets today's pre-window behaviour (run the race distance, then idle) instead of the
--- laps x targets runaway the window exists to avoid. The cap is never allowed to hand the car less than
--- one more full lap from where it stands.
+-- The rest of a degraded car's sequence from `from`, as a FRESH list (targets + positions), plus whether
+-- that list runs to the sequence's end. Built into a scratch list on purpose: the descriptor is shared, so
+-- one car's give-up must never truncate another car's supply. Capped at back_laps -- the race lap count --
+-- so no re-arm, however long the supply, is ever the laps x targets runaway the window exists to avoid.
+-- The cap is never allowed to hand the car less than one more full lap from where it stands. For a race
+-- (and every staged-quali run) the cap always reaches the end, so the list is the whole rest; only an open
+-- qualifying supply comes back as a slice, and the caller keeps refilling after it.
 function window.remaining(seq, from)
     local per_lap = math.max(1, #seq.lap)
     local budget = per_lap * math.max(1, seq.back_laps or seq.laps)
@@ -1357,10 +1365,11 @@ function window.remaining(seq, from)
         out_pos[#out] = seq.built_pos[i]
     end
     -- Only a list that really runs to the end of the sequence carries the finish decoration.
-    if upto >= body and seq.tail_built then
+    local to_the_end = upto >= body and seq.tail_built
+    if to_the_end then
         window.append_tail(seq, out, out_pos)
     end
-    return out, out_pos
+    return out, out_pos, to_the_end
 end
 
 -- The give-up fallback (R4, user decision): re-arm this ONE car with ai.driveUsingPath over its entire
@@ -1368,11 +1377,17 @@ end
 -- hard reset that re-plans from the car's live position, which is exactly what makes it survive a joint
 -- that could not be extended. An AI is never left without a route; that is the single most important rule
 -- in this feature, so this path sends something in every case it can and says loudly when it cannot.
+--
+-- An open qualifying supply has no "entire remaining route" -- the re-arm is a back_laps slice -- so there
+-- the window is NOT given up (bug quali-ai-drives-only-one-lap): stopping the refill would park the car
+-- after the race distance with the quali clock still running. The slice's last target is where the reset
+-- ends the live path (driveUsingPath ends on its last target), i.e. built[armed] is the joint again, and
+-- the seamless refill simply resumes from it once the car has driven into the slice.
 function window.rearm(car, entry, position, reason)
     local seq = entry.seq
     entry.done = true
     entry.retry = nil
-    local rest, rest_pos = window.remaining(seq, entry.cursor)
+    local rest, rest_pos, to_the_end = window.remaining(seq, entry.cursor)
     if #rest == 0 then
         log("W", LOG_TAG, string.format(
             "AI '%s' route refill failed (%s) and nothing is left to re-arm; keeping its current route",
@@ -1391,11 +1406,23 @@ function window.rearm(car, entry, position, reason)
         return
     end
     entry.armed = entry.cursor + #rest
+    if to_the_end then
+        log("W", LOG_TAG, string.format(
+            "AI '%s' route refill gave up (%s): re-armed the whole remaining route with %d target(s) "
+            .. "('%s' -> '%s', %d leading target(s) already passed) and stopped refilling it",
+            tostring(car.label), tostring(reason), #targets, tostring(targets[1]),
+            tostring(targets[#targets]), skip))
+        return
+    end
+    entry.done = false
+    entry.resume_after = entry.cursor + skip
+    entry.rearms = (entry.rearms or 0) + 1
     log("W", LOG_TAG, string.format(
-        "AI '%s' route refill gave up (%s): re-armed the whole remaining route with %d target(s) "
-        .. "('%s' -> '%s', %d leading target(s) already passed) and stopped refilling it",
-        tostring(car.label), tostring(reason), #targets, tostring(targets[1]),
-        tostring(targets[#targets]), skip))
+        "AI '%s' route refill gave up (%s): re-armed %d target(s) of the open qualifying supply "
+        .. "('%s' -> '%s', %d leading target(s) already passed) and keeps refilling from '%s' "
+        .. "(re-arm %d of this car)",
+        tostring(car.label), tostring(reason), #targets, tostring(targets[1]), tostring(targets[#targets]),
+        skip, tostring(seq.built[entry.armed]), entry.rearms))
 end
 
 -- Top one car's armed route up by one block, seamlessly. Failure never sends a partial command: it
@@ -1488,9 +1515,10 @@ end
 -- go out now, and M.step_window tops each car up as it drives. `opts` carries that:
 --   * opts.store      -- the caller's per-race window table keyed by AI id (init.lua M.state.ai_window).
 --                        Without it nothing is registered and the whole sequence is armed at once.
---   * opts.backLaps   -- the lap count the give-up fallback caps a degraded car's route at (the RACE lap
---                        count; a qualifying supply is far longer than the race, and a fallback must not
---                        re-create the runaway the window exists to avoid).
+--   * opts.backLaps   -- the lap count the give-up fallback caps each re-arm of a degraded car at (the RACE
+--                        lap count; a qualifying supply is far longer than the race, and a fallback must
+--                        not re-create the runaway the window exists to avoid). It sizes one re-arm only:
+--                        on an open qualifying supply the window keeps refilling after it.
 -- A sequence that fits inside a single block is armed exactly as it was before the window existed, byte
 -- for byte, and registers no window entry.
 --
@@ -1702,7 +1730,8 @@ end
 -- stops at the end of its path). For a windowed AI that is a FAILURE signal: reaching the end of a block
 -- means the seamless extension did not take, and pathExtend is silent when its joint does not line up --
 -- exactly the failure that looks like "the NPC just stopped". Re-arm the rest of its route and say so.
--- No-op for a car with no window, one that is already done (its race really is over), or a held one.
+-- No-op for a car with no window, one that is already done (its race really is over), or a held one. A
+-- qualifying car re-armed out of its open supply is not done, so a later stop is healed the same way.
 function M.route_done(cars, store, held, veh_id)
     if type(cars) ~= "table" or type(store) ~= "table" then
         return

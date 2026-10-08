@@ -237,8 +237,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
 -- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
--- camera, partlock (the forced-car part lock) and confirmhint (the setup panel's stale-grid hint) are new
--- since then, and recoverground (the recover assist's placement) is new in this build.
+-- camera, partlock (the forced-car part lock), confirmhint (the setup panel's stale-grid hint) and
+-- recoverground (the recover assist's placement) are new since then, and qualilaps (the circuit-quali AI
+-- lap supply) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -250,8 +251,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- one logging confirmhint-r1 also has the setup panel point at Confirm & Build Grid when the settings
 -- differ from the staged grid, and shows Start Race only while a race is staging; one logging
 -- recoverground-r1 also has the recover assist set the car's box bottom on the surface the way the grid
--- does and measure the slope with the grid's window.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1/2026-10-07"
+-- does and measure the slope with the grid's window; one logging qualilaps-r1 also has the circuit-quali
+-- AI keep lapping until the quali clock ends, and names the path in its arming, park and grace lines.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1/2026-10-07"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -1523,7 +1525,8 @@ end
 -- the qualifying session that reuses the same machinery on its unbounded plan (ADR-0041). `plan` is the
 -- traversal plan to score against (the real race plan, or the quali plan); the host's AI drive the route
 -- for `ai_laps` laps (the race lap count, or the quali plan's lap count so they keep lapping the session).
--- The caller has already confirmed we are in this race.
+-- The caller has already confirmed we are in this race. Returns the ai.drive summary and the back_laps the
+-- AI were armed with -- both nil when no AI were armed -- for the qualifying arming line (quali.note_arming).
 local function begin_driving(plan, ai_laps)
     -- Countdown over: show GO! on the server-authoritative release, play the cue, stop the local count, and
     -- release the start lock so the car can drive.
@@ -1540,6 +1543,7 @@ local function begin_driving(plan, ai_laps)
     -- is measured against it (reported during racing by f1_step_reactions). The return says whether an F1
     -- light start actually ran (false for a normal start and the quali out-lap), gating the AI release.
     local f1_start = f1_arm_reactions()
+    local ai_route, back_laps = nil, nil
     -- Arm checkpoint detection on the plan: it walks the traversal plan (sprint/circuit, ADR-0013), testing
     -- the local car against the planned-next checkpoint each frame while driving (ADR-0010).
     if plan then
@@ -1569,13 +1573,15 @@ local function begin_driving(plan, ai_laps)
         local ai_params = ai.resolve_params(M.state.ai_config, M.state.race.aiDefaults)
         -- Rolling route window: the AI get at most one block of drive targets now and are topped up per
         -- car from the client tick (step_ai_window), so a qualifying session can be lapped for its whole
-        -- length without arming laps x targets up front. `backLaps` is the RACE lap count -- the cap the
-        -- window's give-up fallback uses so a degraded car cannot re-create that runaway.
+        -- length without arming laps x targets up front. `backLaps` is the RACE lap count -- the cap on each
+        -- re-arm of the window's give-up fallback, so a degraded car cannot re-create that runaway (in a
+        -- qualifying session the window keeps refilling after such a re-arm).
         M.state.ai_window = {}
-        local ai_route = ai.drive(M.state.ai_cars,
+        back_laps = M.state.race.laps
+        ai_route = ai.drive(M.state.ai_cars,
             M.state.race.routePoints or M.state.race.checkpoints, ai_laps or M.state.race.laps, ai_params,
             M.state.race.mode == "circuit",
-            {store = M.state.ai_window, backLaps = M.state.race.laps})
+            {store = M.state.ai_window, backLaps = back_laps})
         M.state.ai_custom_map = ai_route and ai_route.customMap or nil
         if ai_route then
             send_to_server("aiRouteNotice", ai_route)
@@ -1614,6 +1620,7 @@ local function begin_driving(plan, ai_laps)
     M.state.provisional_open = true
     -- Auto-show the HUD app for the phase (ADR-0012); removed again on lobby. The show dedups.
     hud.show()
+    return ai_route, back_laps
 end
 
 -- ===== the qualifying hold (bug quali-hold-reset-and-repaint-leak) =======================
@@ -1796,7 +1803,11 @@ local function handle_race_phase(payload)
         -- the phase duration so the HUD shows time remaining; at 0 the finish-your-lap grace runs
         -- server-side.
         local quali_state = M.state.race and M.state.race.quali
-        M.state.qualifying = {remaining = tonumber(payload.duration) or 0}
+        local quali_seconds = tonumber(payload.duration) or 0
+        -- `remaining` is the HUD clock (ticked by dtReal); `total` + `anchor` are the same clock on the wall
+        -- (os.clockhp), which the arming/park/grace diagnostics read so a frame hitch cannot fake a
+        -- "clock left" warning (quali.clock_left).
+        M.state.qualifying = {remaining = quali_seconds, total = quali_seconds, anchor = os.clockhp()}
         -- Fresh session: nobody has finished their graced lap yet (ADR-0041 amendment).
         M.state.quali_lap_done = false
         if quali_state and quali_state.staged then
@@ -1850,8 +1861,9 @@ local function handle_race_phase(payload)
             -- The AI drive the quali plan's own lap count, not the race's: that is what makes them lap the
             -- session instead of parking after the race distance. The plan is sized so the clock runs out
             -- first (race/start.lua quali_for), and the rolling window keeps the armed part constant.
-            begin_driving(quali_state and quali_state.plan,
+            local ai_route, back_laps = begin_driving(quali_state and quali_state.plan,
                 (quali_state and quali_state.laps) or (M.state.race and M.state.race.laps))
+            quali.note_arming(quali_state, ai_route, back_laps)
             -- Arm the live sector-delta tracker (feature: quali-live-sector-delta): a circuit quali laps the
             -- unbounded plan, so each scored crossing closes a per-checkpoint sector the HUD diffs against the
             -- chosen reference. cps == #checkpoints (ADR-0013 circuit plan). Sprint quali has no repeated laps
@@ -2494,6 +2506,93 @@ function quali.hold_ai(ai_id, stop)
     log("I", RACE_LOG_TAG, string.format("quali hold: AI '%s' held (%s)", tostring(car.label),
         stop and "stopped in place" or "returned to its holding slot"))
 end
+
+-- ===== circuit quali diagnostics (bug quali-ai-drives-only-one-lap) =======================
+-- Three lines, one per event, so the next live circuit quali names the path by which an AI stops. Each
+-- line states the numbers its hypothesis turns on:
+--   * the arming -- which lap count reached the AI (quali plan vs race), windowed or not, back_laps;
+--   * an AI park -- the lap it closed and how much quali clock was left (parked with clock left = W);
+--   * a finishGrace arriving in qualifying -- its length and the quali clock left (clock left = W).
+-- "Clock left" is read off a wall-clock anchor stamped at the phase entry, not off the dtReal-ticked HUD
+-- clock, so a frame hitch cannot fake one; the HUD value rides along because it is what the player saw.
+
+-- Seconds of quali clock a park or a grace may still find left before it counts as "the session was
+-- still running". Covers the network delay between the server's expiry and the finishGrace landing here.
+quali.CLOCK_SLACK = 2.0
+
+-- The local quali clock still left on the wall (seconds), or nil outside a qualifying session.
+function quali.clock_left()
+    local clock = M.state.qualifying
+    if not clock or not clock.anchor then
+        return nil
+    end
+    return math.max(0, clock.total - (os.clockhp() - clock.anchor))
+end
+
+-- "N s left (HUD M s)" for a log line, plus whether that is more than the slack -- the W condition.
+function quali.clock_text()
+    local left = quali.clock_left()
+    if not left then
+        return "unknown (no quali clock)", false
+    end
+    local hud = M.state.qualifying and M.state.qualifying.remaining or left
+    return string.format("%.1f s left (HUD %.1f s)", left, hud), left > quali.CLOCK_SLACK
+end
+
+-- The circuit quali just armed (or failed to arm) the host's AI. `ai_route` / `back_laps` are what
+-- begin_driving armed them with, both nil when nothing was armed. Host only: a client without AI says
+-- nothing. W whenever the AI cannot lap the whole session from this arming alone: no plan reached them,
+-- they were given fewer laps than the quali plan, or a car carries no rolling window.
+function quali.note_arming(quali_state, ai_route, back_laps)
+    local cars = M.state.ai_cars
+    if not cars or #cars == 0 then
+        return
+    end
+    local race_laps = M.state.race and M.state.race.laps
+    local plan_laps = quali_state and quali_state.laps
+    if not ai_route then
+        log("W", RACE_LOG_TAG, string.format(
+            "circuit quali AI arming: %d AI NOT armed -- no quali plan reached begin_driving (quali plan "
+            .. "%s, race %s lap(s)); they stay on the grid", #cars, tostring(plan_laps), tostring(race_laps)))
+        return
+    end
+    local windowed = 0
+    for _, car in ipairs(cars) do
+        if M.state.ai_window and M.state.ai_window[car.id] then
+            windowed = windowed + 1
+        end
+    end
+    local short = plan_laps == nil or (tonumber(ai_route.laps) or 0) < plan_laps or windowed < #cars
+    log(short and "W" or "I", RACE_LOG_TAG, string.format(
+        "circuit quali AI arming: %d AI given %s lap(s) (quali plan %s, race %s lap(s)), windowed %d of %d, "
+        .. "back_laps %s, route source %s%s", #cars, tostring(ai_route.laps), tostring(plan_laps),
+        tostring(race_laps), windowed, #cars, tostring(back_laps), tostring(ai_route.source),
+        short and " -- the AI cannot lap the whole session from this arming" or ""))
+end
+
+-- One AI closed a lap inside the circuit quali's finish-your-lap grace and is about to be parked for the
+-- session (step_ai_detections). Intended once the clock is out (ADR-0041 amendment); a park with clock
+-- left is the H2 signature and is said loudly.
+function quali.note_ai_park(car, event)
+    local clock, clock_left = quali.clock_text()
+    local grace = M.state.grace and M.state.grace.remaining
+    log(clock_left and "W" or "I", RACE_LOG_TAG, string.format(
+        "circuit quali: AI '%s' parked after lap %s -- it closed a lap inside the finish-your-lap grace "
+        .. "(%s s of grace left); quali clock %s%s", tostring(car.label), tostring(event and event.lap),
+        grace and string.format("%.0f", grace) or "?", clock,
+        clock_left and " -- PARKED WHILE THE SESSION WAS STILL RUNNING" or ""))
+end
+
+-- A finishGrace landed during qualifying (handle_finish_grace). The server sends it when the quali clock
+-- has run out; one that lands with clock left would park every AI at its next lap close.
+function quali.note_grace(duration)
+    local clock, clock_left = quali.clock_text()
+    log(clock_left and "W" or "I", RACE_LOG_TAG, string.format(
+        "finishGrace during qualifying: %.0f s finish-your-lap grace, quali clock %s%s", duration, clock,
+        clock_left and " -- every AI will be parked at its next lap close although the session is running"
+            or ""))
+end
+-- ===== end circuit quali diagnostics ======================================================
 
 -- "You're up" (server qualiStage, ADR-0044/Round4): a player payload -> stage the local car at the ramp; an
 -- aiId (owner only) -> stage that AI. Guarded to a staged qualifying phase.
@@ -3160,6 +3259,11 @@ local function handle_finish_grace(payload)
     end
     M.state.grace = {remaining = duration}
     log("I", RACE_LOG_TAG, string.format("finish grace: %.0fs to finish or DNF", duration))
+    -- In a qualifying session the grace is what parks every AI at its next lap close, so its arrival is
+    -- stamped against the quali clock (bug quali-ai-drives-only-one-lap).
+    if M.state.phase == "qualifying" then
+        quali.note_grace(duration)
+    end
 end
 
 -- True when the local player is out of the running race -- finished (detection done) or DNF'd (their
@@ -6268,7 +6372,8 @@ local function step_ai_detections(dt_sim)
                     -- player -- ai.stop + freeze IN PLACE, no teleport (user decision 2026-08-08) -- and mark
                     -- it held so quali.step_ai_hold keeps it there. quali.hold_ai drops this AI's detector, so
                     -- nothing further is scored or reported for it, mirroring the player's `detection = nil`.
-                    -- It logs the park itself, right after the crossing line above -- no second line here.
+                    -- quali.note_ai_park says WHY and against which clock; quali.hold_ai then logs the hold.
+                    quali.note_ai_park(car, event)
                     quali.hold_ai(car.id, true)
                 end
             end
