@@ -238,8 +238,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
 -- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
 -- camera, partlock (the forced-car part lock), confirmhint (the setup panel's stale-grid hint) and
--- recoverground (the recover assist's placement) and qualilaps (the circuit-quali AI lap supply) are new
--- since then, and hostaitags (the host's own AI tags) is new in this build.
+-- recoverground (the recover assist's placement), qualilaps (the circuit-quali AI lap supply) and
+-- hostaitags (the host's own AI tags) are new since then, and keysdup (the /keys window's duplicate
+-- keys) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -254,8 +255,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- does and measure the slope with the grid's window; one logging qualilaps-r1 also has the circuit-quali
 -- AI keep lapping until the quali clock ends, and names the path in its arming, park and grace lines;
 -- one logging hostaitags-r1 also lets the host see the names over his own AI cars, drawn by BeamComp,
--- and BeamMP's nametag toggles switch them too.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1/2026-10-08"
+-- and BeamMP's nametag toggles switch them too; one logging keysdup-r1 also has the /keys window never
+-- write a key an assist already has, and show each key once.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r1/2026-10-10"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
