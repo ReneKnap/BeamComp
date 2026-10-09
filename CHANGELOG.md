@@ -66,6 +66,7 @@ below rather than hidden.
 - `/keys` opens a window showing which keys his own game has those two on, for every connected device,
   where he can also rebind or remove them. The setup panel can still send the key lines to everyone in
   chat.
+  Picking a key the assist already has adds nothing, and the window says so.
 - **Reset UI layout** -- one button puts every BeamComp window back to the size and position it ships
   with. It sits in the gear menu of the setup panel and of the `/keys` window, so a player who is not
   an admin can reach it too. Worth knowing: a window you have ever moved keeps its own geometry from
