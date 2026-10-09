@@ -18,6 +18,7 @@ below rather than hidden.
   nameless on every screen, not just the ones the host can see.
 - Over the cars, each driver is shown under the name he picked with `/name` -- his guest name if he
   picked none -- and an AI under the same name the standings give it.
+  The host sees the AI names as well, and BeamMP's nametag key switches them with the others.
 
 ### Starting the field
 
