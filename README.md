@@ -63,8 +63,8 @@ the panel is not yours to open, it is left out.
 the last checkpoint -- hold one while standing still -- on every device you have connected. Click a key
 there to bind a different one, or remove it.
 
-**Reset UI layout** in that window -- and in the setup panel's gear menu -- puts every BeamComp window
-back to the size and position it ships with. Once you move or resize a window, it keeps that geometry
+**Reset UI layout** in the setup panel's gear menu puts every BeamComp window back to the size and
+position it ships with. Once you move or resize a window, it keeps that geometry
 for good, so this button is also how a size changed in an update reaches you.
 
 During a race, `/dnf` gives up and `/results` hides or shows your own results card.

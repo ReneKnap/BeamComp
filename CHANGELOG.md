@@ -67,9 +67,8 @@ below rather than hidden.
   where he can also rebind or remove them. The setup panel can still send the key lines to everyone in
   chat.
 - **Reset UI layout** -- one button puts every BeamComp window back to the size and position it ships
-  with. It sits in the setup panel's gear menu and in the `/keys` window, so a player who is not an
-  admin can reach it too. Worth knowing: a window you have ever moved keeps its own geometry from then
-  on, so a size we change in an update only reaches you through this button.
+  with. It sits in the setup panel's gear menu. Worth knowing: a window you have ever moved keeps its
+  own geometry from then on, so a size we change in an update only reaches you through this button.
 
 ### Known issues
 
