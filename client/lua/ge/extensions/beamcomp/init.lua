@@ -238,8 +238,8 @@ local DASH_REFRESH_SETTLE = 0.75
 -- Names every item in this build on purpose. Live checks 10-13 are accepted (2026-10-05); of the items
 -- named here only the list normalisation (lists-r1) is still outstanding, gridcam is the grid editor's
 -- camera, partlock (the forced-car part lock), confirmhint (the setup panel's stale-grid hint) and
--- recoverground (the recover assist's placement) are new since then, and qualilaps (the circuit-quali AI
--- lap supply) is new in this build.
+-- recoverground (the recover assist's placement) and qualilaps (the circuit-quali AI lap supply) are new
+-- since then, and hostaitags (the host's own AI tags) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -252,8 +252,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- differ from the staged grid, and shows Start Race only while a race is staging; one logging
 -- recoverground-r1 also has the recover assist set the car's box bottom on the surface the way the grid
 -- does and measure the slope with the grid's window; one logging qualilaps-r1 also has the circuit-quali
--- AI keep lapping until the quali clock ends, and names the path in its arming, park and grace lines.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1/2026-10-07"
+-- AI keep lapping until the quali clock ends, and names the path in its arming, park and grace lines;
+-- one logging hostaitags-r1 also lets the host see the names over his own AI cars, drawn by BeamComp,
+-- and BeamMP's nametag toggles switch them too.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1/2026-10-08"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -304,7 +306,7 @@ M.state = {
     prop_map_sent = nil,  -- host only: signature of the last propMap that went out, so an unchanged map costs no message
     prop_map_wait = 0,   -- host only: seconds until the next rebuild attempt while prop_map_pending
     prop_map_budget = 0, -- host only: seconds of rebuild attempts left before we stop and WARN about the vehicles that never registered with BeamMP. A silent give-up on an incomplete map is how the old suppression hid a 49%-coverage gap for a year
-    ai_names = nil,      -- non-owner: cross-client BeamMP id -> the AI's standings label, from the relayed aiMap (ADR-0036/0062), or nil
+    ai_names = nil,      -- non-owner: cross-client BeamMP id -> the AI's standings label, from the relayed aiMap (ADR-0036/0062), or nil. The owner ignores its own aiMap, so this stays nil there; the owner's policy derives the same map from its live ai_cars instead (identity.own_ai_names)
     show_driver_names = nil,  -- whether drivers (humans AND AI) carry a name over their car on this server (ADR-0062). nil = not heard yet, and the safe reading of nil is ON: a client that never got the policy behaves exactly like plain BeamMP. Only an explicit false hides them. Props are outside this and silent either way. Connection-scoped: cleared at the session boundary (identity.clear_policy) and nowhere else -- a race end does not touch it (decision 6), and neither does closing the setup panel (bug panel-close-wipes-nametag-policy)
     tag_written = nil,   -- what THIS client changed on BeamMP's nametag entries: {hidden = {}, named = {}} keyed by cross-client id, so a tag is only ever given back or cleared if we took it away or set it (ADR-0062). Lazily created. Connection-scoped like the policy itself and dropped only by identity.clear_policy: a client that forgets this record while its writes still stand can never give those tags back, which is what made a panel close reopen the prop defect
     tag_wait = 0,        -- seconds until the next nametag reconcile sweep; the sweep is what beats a rebuilt MPVehicleGE entry, which comes back tagged (hideNametag/customName are not serialized)
@@ -5682,6 +5684,32 @@ function identity.prop_map_step(dt)
     end
 end
 
+-- HOST ONLY: the AI cars this client spawned, as {[cross-client id] = label} -- the shape the relayed aiMap
+-- gives every other client (ADR-0062 decision 5, which never excluded the host). nil when this client owns
+-- no AI; a car BeamMP has not registered yet is simply absent until the next sweep.
+--
+-- The owner ignores its own aiMap (handle_ai_map), so without this its policy had no AI at all and named
+-- them after himself -- invisible, because BeamMP never draws an own vehicle, until the host draws them.
+--
+-- Derived from the live ai_cars on every call and never remembered: BeamMP hands a freed vehicle id to the
+-- next car spawned, so after the quali despawn and the re-grid the host's own new race car can carry an id
+-- an AI had. A map kept from the broadcast would put an AI's name on the host's own car; one built from
+-- ai_cars cannot contain it.
+function identity.own_ai_names()
+    local cars = M.state.ai_cars
+    if not cars then
+        return nil
+    end
+    local names = nil
+    for _, entry in ipairs(ai.server_map(cars)) do
+        if type(entry.label) == "string" and entry.label ~= "" then
+            names = names or {}
+            names[tostring(entry.serverId)] = entry.label
+        end
+    end
+    return names
+end
+
 -- Everything this client currently knows about who carries a name, in the shape race/nametags.apply
 -- consumes. Rebuilt per call: it is three table reads and a walk over the player list, and a cached copy
 -- would be one more thing to invalidate on every join, leave, rename and race start.
@@ -5699,7 +5727,8 @@ function identity.tag_policy()
     M.state.tag_written = M.state.tag_written or {}
     return {
         props = M.state.prop_ids,
-        ai = M.state.ai_names,
+        -- The owner knows its AI from the cars it spawned, everybody else from the relayed aiMap.
+        ai = identity.own_ai_names() or M.state.ai_names,
         names = names,
         -- Only an explicit false hides drivers: a client that has not heard the policy looks exactly like
         -- plain BeamMP, which is the safe reading of "unknown" for a setting that defaults to on.
@@ -5708,8 +5737,28 @@ function identity.tag_policy()
     }
 end
 
+-- Apply the policy, and keep it for the per-frame draw of the host's own AI tags (identity.draw_tags),
+-- together with the ai_cars table it was built from. The draw reads exactly what was just applied -- never
+-- a second build -- so a frame can never name a car the sweep did not, and per frame nothing is allocated.
 function identity.apply_tags()
-    nametags.apply(identity.tag_policy())
+    local policy = identity.tag_policy()
+    nametags.apply(policy)
+    identity.drawn_policy = policy
+    identity.drawn_cars = M.state.ai_cars
+end
+
+-- HOST ONLY, every frame: draw the names over this client's own AI cars, which BeamMP never draws because
+-- they are local here (ADR-0062 amendment 2026-10-08). Only the owner spawns AI (ADR-0036), so without
+-- ai_cars there is no AI entry BeamMP skips, and the idle path is this one nil test. A policy built from
+-- an earlier ai_cars table -- before the quali despawn, before the re-grid -- is void: BeamMP may have
+-- handed one of its ids to the host's own new car. Nothing is drawn until the next sweep (<= 0.5 s)
+-- builds one from the cars that exist now.
+function identity.draw_tags()
+    local cars = M.state.ai_cars
+    if cars == nil or identity.drawn_policy == nil or identity.drawn_cars ~= cars then
+        return
+    end
+    nametags.draw_local_ai(identity.drawn_policy)
 end
 
 -- Forget what THIS server told this connection about itself. Called at the SESSION boundary and nowhere
@@ -5756,10 +5805,12 @@ end
 -- would ever hear about it. A sweep over an unchanged scene writes nothing at all.
 --
 -- The guard above it is the idle path: a client that knows no props, no AI, no players and no "off"
--- policy has nothing to assert and pays four nil tests.
+-- policy has nothing to assert and pays five nil tests. ai_cars is the owner's half of "knows AI": a host
+-- with AI but no props, no player list and names on would otherwise never sweep, and nothing would name
+-- (or draw) his AI.
 function identity.tag_step(dt)
     if M.state.prop_ids == nil and M.state.ai_names == nil and M.state.player_list == nil
-            and M.state.show_driver_names ~= false then
+            and M.state.show_driver_names ~= false and M.state.ai_cars == nil then
         return
     end
     M.state.tag_wait = (M.state.tag_wait or 0) - (dt or 0)
@@ -5830,6 +5881,14 @@ function M.onExtensionLoaded()
     -- so the closure never holds a stale answer; re-installed here after a GE Lua reload like notify above.
     lock.car_is_forced = function()
         return M.state.race_forced_car == true
+    end
+    -- Listen to BeamMP's two nametag switches (the "Player Nametags" key and hideNicknames), so the AI tags
+    -- the host draws itself go on and off with every other tag (ADR-0062 amendment 2026-10-08). Given back
+    -- in onExtensionUnloaded; a second install unwraps an earlier one instead of stacking on it. Guarded
+    -- like its counterpart there: nothing below in this hook may depend on it.
+    local tags_ok, tags_err = pcall(nametags.install_toggle_mirror)
+    if not tags_ok then
+        log("W", "beamcomp.nametags", "nametag toggles could not be mirrored: " .. tostring(tags_err))
     end
     -- Blank the centred surfaces from the freshly rebuilt (empty) state. onExtensionUnloaded runs WITHOUT
     -- a pcall, so a teardown that threw part way is no guarantee its clearing push went out (ADR-0052) --
@@ -8445,7 +8504,9 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         return
     end
     -- Nothing to draw with no race and no edit session (the common free-roam case): skip before building
-    -- the pcall closure so the idle path stays zero-work.
+    -- the pcall closure so the idle path stays zero-work. This never hides an AI tag: the host's AI cars
+    -- are spawned only after raceStart has set M.state.race and are all gone before anything sets it back
+    -- to nil (teardown, a rejected raceStart) -- checked 2026-10-08, feature host-sees-ai-nametags.
     if not M.state.race and not grideditor.state.active then
         return
     end
@@ -8493,6 +8554,10 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         M.state.marker_warned = true
         log("W", RACE_LOG_TAG, "marker draw failed (debugDrawer API?): " .. tostring(err))
     end
+    -- The names over the host's own AI cars (ADR-0062 amendment 2026-10-08). Outside the marker pcall on
+    -- purpose: it guards itself and warns under its own tag, so a marker failure can never hide the tags
+    -- and a tag failure can never hide the markers.
+    identity.draw_tags()
 end
 
 -- The level is ending -- the player left the BeamMP session or changed level, possibly mid-race.
@@ -8553,6 +8618,12 @@ function M.onExtensionUnloaded()
     -- mid-race never leaves orphaned scenery or a stuck-frozen/locked car (ADR-0017).
     teardown_race_world()
     M.state.phase = nil
+    -- Give BeamMP its nametag switches back. Guarded on its own like the camera above: this hook has no
+    -- pcall around it, and the unwrap must not be the reason the log line below never comes.
+    local tags_ok, tags_err = pcall(nametags.uninstall_toggle_mirror)
+    if not tags_ok then
+        log("W", "beamcomp.nametags", "nametag toggles could not be given back: " .. tostring(tags_err))
+    end
     log("I", LOG_TAG, "unloaded")
 end
 
