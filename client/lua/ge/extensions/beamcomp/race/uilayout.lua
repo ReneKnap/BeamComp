@@ -539,7 +539,7 @@ end
 -- not a wider automatic repair.
 
 -- The apps a reset covers, listed exactly ONCE. Both doors (the setup panel's gear, the controls
--- window) call one GE function which calls this, so neither door can widen or narrow the set.
+-- window's gear) call one GE function which calls this, so neither door can widen or narrow the set.
 local RESET_APPS = {"beamCompSetup", "beamCompGridEditor", "beamCompHud", "beamCompControls"}
 
 -- Put every instance of ONE app in ONE layout back to the geometry its app.json describes. Size and

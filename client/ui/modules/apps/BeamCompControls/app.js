@@ -226,45 +226,112 @@ angular.module('beamng.apps')
   // The two rows from one InputBindingsChanged payload (core/input/bindings.lua:686): one device entry per
   // connected device, each with contents.devicetype and contents.bindings = {{action, control, unused,
   // active}, ...}.
+  function buildRows(data) {
+    var devices = (data && data.bindings) || [];
+    return ASSISTS.map(function (assist) {
+      return {
+        label: assist.label,
+        does: assist.does,
+        action: assist.action,
+        controls: chipsFor(devices, assist.action)
+      };
+    });
+  }
+
+  // One chip per (device, control) pair the action holds -- ONE, however often the pair is stored.
+  // Neither BeamNG's controls store nor its settings page refuses a second identical entry
+  // (ui-vue/src/services/controls.js addNewBinding / updateBinding), so a player can own a duplicate this
+  // window did not write. Showing it twice would offer two x buttons for what is one key; `copies` carries
+  // the real number instead, so the one x can take every entry away (see scope.remove).
   //
   // The skip rule is race/lock.lua binding_for's, verbatim: `unused` marks a binding the engine disabled
   // for the seated vehicle, `active === false` one that is switched off -- showing either would name a key
-  // that does nothing. Unlike binding_for this keeps EVERY device rather than preferring the keyboard:
-  // that preference exists because a chat line can only carry one key, and this window is the surface
-  // where the other devices were the point.
-  function buildRows(data) {
-    var devices = (data && data.bindings) || [];
-    var rows = [];
-    for (var a = 0; a < ASSISTS.length; a++) {
-      var assist = ASSISTS[a];
-      var controls = [];
-      for (var d = 0; d < devices.length; d++) {
-        var device = devices[d] || {};
-        var contents = device.contents || {};
-        var list = contents.bindings || [];
-        for (var b = 0; b < list.length; b++) {
-          var bind = list[b] || {};
-          if (bind.action !== assist.action) { continue; }
-          if (bind.unused === true || bind.active === false) { continue; }
-          if (typeof bind.control !== 'string' || bind.control === '') { continue; }
-          controls.push({
+  // that does nothing. A hidden entry still COUNTS towards `copies`: the x has to leave the pair really
+  // gone. Unlike binding_for this keeps EVERY device rather than preferring the keyboard: that preference
+  // exists because a chat line can only carry one key, and this window is the surface where the other
+  // devices were the point.
+  function chipsFor(devices, action) {
+    var chips = [];
+    var byPair = {};
+    for (var d = 0; d < devices.length; d++) {
+      var device = devices[d] || {};
+      var list = (device.contents || {}).bindings || [];
+      for (var b = 0; b < list.length; b++) {
+        var bind = list[b] || {};
+        if (bind.action !== action) { continue; }
+        if (typeof bind.control !== 'string' || bind.control === '') { continue; }
+        var pair = device.devname + '\0' + bind.control;
+        var chip = byPair[pair];
+        if (!chip) {
+          chip = byPair[pair] = {
             // The devname ('keyboard0', 'xinput0'), not the devicetype: the controls store looks its
             // image pack up by devname (ui-vue/src/services/controls.js:1056) and falls back to the type
             // on its own, so this is the more precise of the two and never the worse one.
             device: device.devname,
             key: bind.control,
-            label: keyLabel(bind.control)
-          });
+            label: keyLabel(bind.control),
+            copies: 0
+          };
+        }
+        chip.copies++;
+        if (bind.unused !== true && bind.active !== false && chips.indexOf(chip) === -1) {
+          chips.push(chip);
         }
       }
-      rows.push({
-        label: assist.label,
-        does: assist.does,
-        action: assist.action,
-        controls: controls
-      });
     }
-    return rows;
+    return chips;
+  }
+
+  // The tripwire for duplicates: every chip that stands for more than one stored entry, with its action,
+  // device, control and count, verbatim. Null when there is none. This window refuses to write one (see
+  // alreadyBound), so a line here names a pair from elsewhere: the game's own settings page, an edited
+  // inputmap file, or this window before it checked.
+  function duplicateNote(rows) {
+    var found = [];
+    for (var r = 0; r < rows.length; r++) {
+      var chips = rows[r].controls;
+      for (var c = 0; c < chips.length; c++) {
+        if (chips[c].copies > 1) {
+          found.push(rows[r].action + ' ' + pairText(chips[c].device, chips[c].key) + ' x' + chips[c].copies);
+        }
+      }
+    }
+    return found.length ? 'duplicate bindings, each shown once: ' + found.join('; ') : null;
+  }
+
+  // A (device, control) pair for the client log, VERBATIM: quoted, so a trailing space, a case difference
+  // or a modifier spelt another way ('lshift insert' vs 'shift insert') is visible instead of being
+  // smoothed over the way the game's glyph rendering smooths it.
+  function pairText(devname, control) {
+    return JSON.stringify(String(devname)) + ' ' + JSON.stringify(String(control));
+  }
+
+  // Every control `action` holds on device `devname`, verbatim and in payload order. Hidden entries
+  // (`unused`, `active === false`) are included on purpose: writing next to a hidden copy is still a
+  // duplicate, and the write log line names this list so a near-miss is readable.
+  function boundControls(data, devname, action) {
+    var devices = (data && data.bindings) || [];
+    var out = [];
+    for (var d = 0; d < devices.length; d++) {
+      var device = devices[d] || {};
+      if (device.devname !== devname) { continue; }
+      var list = (device.contents || {}).bindings || [];
+      for (var b = 0; b < list.length; b++) {
+        var bind = list[b] || {};
+        if (bind.action === action && typeof bind.control === 'string') {
+          out.push(bind.control);
+        }
+      }
+    }
+    return out;
+  }
+
+  // Does `action` already hold exactly this (device, control) pair? The ONE case conflictsFor skips by
+  // design, and the one neither the controls store nor the engine refuses on a write. Exact string
+  // compare, the engine's own notion of "the same binding" (core/input/bindings.lua bindingListToDict
+  // keys on control.."\0"..action). The same control on ANOTHER device is a different pair.
+  function alreadyBound(data, devname, control, action) {
+    return boundControls(data, devname, action).indexOf(control) !== -1;
   }
 
   // Which OTHER actions the captured control already runs, from the same payload the window draws from.
@@ -335,7 +402,7 @@ angular.module('beamng.apps')
     replace: true,
     restrict: 'EA',
     scope: true,
-    link: function (scope) {
+    link: function (scope, element) {
       var unusable = directiveUnusable();
       // Seeded with the legacy rung, which is answerable here and now, and upgraded to the new UI when
       // GE answers. The seed is what makes the in-flight window safe: a click before the answer lands
@@ -349,6 +416,7 @@ angular.module('beamng.apps')
       var capture = null;       // {gen, row, control} while a capture holds the player's input
       var captureGen = 0;       // every started capture takes the next number; see endCapture
       var captureWait = null;   // the CAPTURE_TIMEOUT handle
+      var duplicatesNoted = false;   // the duplicate line is written once per mount; see noteDuplicates
       scope.useDirective = !unusable;
       scope.canEdit = !!rung;
       scope.canBind = !noRebind;
@@ -408,13 +476,44 @@ angular.module('beamng.apps')
         geLua('if beamcomp_init then beamcomp_init.close_controls() end');
       };
 
-      // Put every BeamComp window back to the size and position its app.json describes -- the same GE
-      // function the setup panel's gear menu calls, with no parameter that could make one door reset
-      // more than the other. This window is the reason the second door exists: the panel sits behind the
-      // admin gate, while any player can open this one with /keys.
+      // The gear in the title bar and its one entry, Reset UI layout: the same GE function the setup
+      // panel's gear menu calls, with no parameter that could make one door reset more than the other.
+      // This window is the reason the second door exists: the panel sits behind the admin gate, while any
+      // player can open this one with /keys. A gear rather than a footer button (owner's decision
+      // 2026-10-10), so it looks and works like the panel's.
+      scope.menuOpen = false;
+      scope.toggleMenu = function () {
+        scope.menuOpen = !scope.menuOpen;
+      };
+      // Closes the menu first, as the setup panel does: the reset moves this very window, and a menu left
+      // hanging over its old spot looks like the reset missed.
       scope.resetUiLayout = function () {
+        scope.menuOpen = false;
         geLua('if beamcomp_init then beamcomp_init.reset_ui_layout() end');
       };
+      // A click anywhere but the gear closes the menu -- the setup panel's closeOnOutsideClick, narrowed to
+      // the one menu this window has. The document global, typeof-guarded like bngApi: an injected
+      // $document is a dependency that could fail to resolve and take the whole directive with it.
+      function closeMenuOnOutsideClick(ev) {
+        if (!scope.menuOpen) {
+          return;
+        }
+        var root = element && element[0];
+        var node = ev && ev.target;
+        while (node && node !== document) {
+          if (node.classList && node.classList.contains('bc-ctl-gear') && root && root.contains(node)) {
+            return;
+          }
+          node = node.parentNode;
+        }
+        scope.$evalAsync(function () { scope.menuOpen = false; });
+      }
+      if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('click', closeMenuOnOutsideClick, false);
+        scope.$on('$destroy', function () {
+          document.removeEventListener('click', closeMenuOnOutsideClick, false);
+        });
+      }
 
       // ----- the capture cycle ---------------------------------------------------------------------
       // END A CAPTURE, from wherever. This is the single exit, and everything about the safety promise
@@ -452,6 +551,8 @@ angular.module('beamng.apps')
         var gen = captureGen;
         capture = {gen: gen, row: row, control: control};
         scope.status = null;
+        // The gear is hidden while a capture runs; an open menu would come back with it afterwards.
+        scope.menuOpen = false;
         scope.prompt = control
           ? 'Press a new key for ' + row.label + '. Right-click to cancel.'
           : 'Press a key for ' + row.label + '. Right-click to cancel.';
@@ -504,6 +605,22 @@ angular.module('beamng.apps')
           return;
         }
 
+        // One line per write attempt, whatever its outcome. It names the captured pair VERBATIM next to
+        // what the action already held on that device: if a key ever lands twice again, this line shows
+        // whether the two strings really were equal.
+        var attempt = 'write ' + row.action + ' via ' + (old ? 'updateBinding' : 'addNewBinding')
+          + ', captured ' + pairText(devname, control)
+          + (old ? ', replacing ' + pairText(old.device, old.key) : '')
+          + ', held ' + JSON.stringify(boundControls(payload, devname, row.action));
+
+        // The action already has this key: a second identical entry is all a write could add. Covers the
+        // '+', the [N/A] chip and a chip edit onto its own key or onto a sibling chip's key alike.
+        if (alreadyBound(payload, devname, control, row.action)) {
+          endCapture('Already bound to ' + row.label + '.');
+          geNote(attempt + ': refused, already bound');
+          return;
+        }
+
         var clash = conflictsFor(payload, devname, control, row.action);
         var entry = bindingEntry(payload, devname, control, row.action);
         try {
@@ -516,11 +633,12 @@ angular.module('beamng.apps')
           }
         } catch (e) {
           endCapture('Could not save.');
-          geNote('writing ' + row.action + ' = ' + devname + '/' + control + ' threw: ' + e);
+          geNote(attempt + ': threw ' + e);
           return;
         }
         // Reported, not resolved -- the other binding stays exactly where it was.
         endCapture(clash.length ? ('Also bound to ' + clash.join(', ') + '.') : null);
+        geNote(attempt + ': written' + (clash.length ? ', also bound to ' + clash.join(', ') : ''));
         refreshBindings();
       }
 
@@ -568,6 +686,12 @@ angular.module('beamng.apps')
 
       // The small x on a chip. No confirmation dialog: the row shows the result immediately and the same
       // row can put it straight back, which is a cheaper undo than a prompt nobody reads.
+      //
+      // A chip can stand for several identical entries (see chipsFor), and the x takes ALL of them -- a
+      // key that is still there after its x was pressed would be the same bug the other way round.
+      // deleteBindings splices one match per item and saves once per device, so N copies are N items in
+      // one save. It is optional on purpose and NOT in rebindUnusable's list: a build without it keeps
+      // the whole rebind feature and only loses this, removing one copy per click as before.
       scope.remove = function (row, control, $event) {
         if ($event && $event.stopPropagation) {
           $event.stopPropagation();   // the x sits inside the chip, which would start a capture
@@ -575,17 +699,31 @@ angular.module('beamng.apps')
         if (capture || !scope.canBind) {
           return;
         }
+        var target = {devname: control.device, control: control.key, action: row.action};
+        var copies = control.copies;
+        var store = controlsStore();
+        var attempt = 'remove ' + row.action + ' ' + pairText(control.device, control.key);
+        var outcome;
         try {
-          controlsStore().deleteBinding({
-            devname: control.device,
-            control: control.key,
-            action: row.action
-          });
+          if (copies > 1 && typeof store.deleteBindings === 'function') {
+            var items = [];
+            for (var i = 0; i < copies; i++) {
+              items.push({devname: target.devname, control: target.control, action: target.action});
+            }
+            store.deleteBindings(items);
+            outcome = copies + ' entries via deleteBindings';
+          } else {
+            store.deleteBinding(target);
+            outcome = copies > 1
+              ? '1 of ' + copies + ' entries via deleteBinding (deleteBindings is missing)'
+              : '1 entry via deleteBinding';
+          }
         } catch (e) {
           scope.status = 'Could not remove.';
-          geNote('deleting ' + row.action + ' = ' + control.device + '/' + control.key + ' threw: ' + e);
+          geNote(attempt + ': threw ' + e);
           return;
         }
+        geNote(attempt + ': ' + outcome);
         scope.status = null;
         refreshBindings();
       };
@@ -625,8 +763,22 @@ angular.module('beamng.apps')
           // actions table (the conflict line). One source, so the two can never disagree.
           payload = data || null;
           scope.rows = buildRows(data);
+          noteDuplicates(scope.rows);
         });
       });
+
+      // The duplicate tripwire, ONCE per mount: the engine re-broadcasts after every write and on
+      // unrelated changes, and the same pair would otherwise be reported each time.
+      function noteDuplicates(rows) {
+        if (duplicatesNoted) {
+          return;
+        }
+        var note = duplicateNote(rows);
+        if (note) {
+          duplicatesNoted = true;
+          geNote(note);
+        }
+      }
 
       // Ask for the current bindings right away: a window opened between two changes would otherwise wait
       // for the next one and stay empty. The game's own Keys app asks the same way at link

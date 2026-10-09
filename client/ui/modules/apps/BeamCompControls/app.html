@@ -8,16 +8,27 @@
       background: rgba(20, 22, 26, 0.92); border-radius: 4px; overflow: hidden; }
     .bc-ctl-bar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 5px 8px;
       border-bottom: 1px solid rgba(255,255,255,0.12); }
-    .bc-ctl-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    /* The title takes the free space, so the gear and the X sit at the right edge together -- and the X
+       stays there alone while a capture hides the gear. */
+    .bc-ctl-title { margin-right: auto; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
       font-size: 11px; color: #8fd3ff; }
-    .bc-ctl-x { margin-left: auto; background: #2a2e35; color: #f0f0f0;
+    .bc-ctl-x, .bc-ctl-gear-head { background: #2a2e35; color: #f0f0f0;
       border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 0 7px;
       font-size: 12px; line-height: 18px; cursor: pointer; }
-    .bc-ctl-x:hover { background: #3a4049; }
+    .bc-ctl-x:hover, .bc-ctl-gear-head:hover { background: #3a4049; }
+    /* The gear menu: the setup panel's settings popover (.bc-dd-list + .bc-settings-list there),
+       anchored to the right edge under the gear and sized to its one entry. */
+    .bc-ctl-gear { position: relative; }
+    .bc-ctl-menu { position: absolute; right: 0; top: 100%; z-index: 50; margin-top: 2px; padding: 4px;
+      background: #20242b; border: 1px solid rgba(255,255,255,0.22); border-radius: 3px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+    .bc-ctl-menu-act { display: block; width: 100%; padding: 4px 7px; text-align: left; white-space: nowrap;
+      color: inherit; font-family: inherit; font-size: 12px; background: none; border: none; cursor: pointer; }
+    .bc-ctl-menu-act:hover { background: #2e7d32; }
     .bc-ctl-body { flex: 1 1 auto; overflow-y: auto; padding: 6px 8px; }
     .bc-ctl-wait { color: #9aa3ad; font-size: 12px; }
-    /* Wraps because the row now carries up to two buttons beside the hint and the window may be dragged
-       down to its 260px minimum -- without it the second one would be cut off with nothing to show for it. */
+    /* Wraps because the row carries a button beside the hint and the window may be dragged down to its
+       260px minimum -- without it the button would be cut off with nothing to show for it. */
     .bc-ctl-hint { color: #9aa3ad; font-size: 11px; margin-top: 8px;
       border-top: 1px solid rgba(255,255,255,0.12); padding-top: 5px;
       display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
@@ -58,13 +69,19 @@
       border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; padding: 1px 7px;
       font-size: 11px; cursor: pointer; white-space: nowrap; }
     .bc-ctl-settings:hover { background: #3a4049; }
-    /* Only the FIRST button takes the free space, so the two group at the right edge instead of drifting
-       apart -- and whichever one is present alone still gets pushed there. */
-    .bc-ctl-settings + .bc-ctl-settings { margin-left: 0; }
   </style>
 
   <div class="bc-ctl-bar">
     <span class="bc-ctl-title">BeamComp assist keys</span>
+    <!-- The gear, like the setup panel's, with Reset UI layout as its only entry -- the way a player
+         without admin access reaches the reset. Hidden while a capture runs: a left click on it would be
+         recorded as the new key. -->
+    <div class="bc-ctl-gear" ng-if="!prompt">
+      <button class="bc-ctl-gear-head" ng-click="toggleMenu()">&#x2699;</button>
+      <div class="bc-ctl-menu" ng-if="menuOpen">
+        <button class="bc-ctl-menu-act" ng-click="resetUiLayout()">Reset UI layout</button>
+      </div>
+    </div>
     <button class="bc-ctl-x" ng-click="close()">&#10005;</button>
   </div>
 
@@ -116,17 +133,17 @@
     <!-- The outcome of the last action, one line, cleared by the next one. -->
     <div class="bc-ctl-status" ng-if="status && !prompt">{{status}}</div>
 
-    <!-- The row no longer hangs on canBind || canEdit. Both are false when neither the controls store nor
-         an options route answers, and the reset has nothing to do with key bindings -- it has to be here
-         on exactly that build too. Every line that DOES depend on the engine surface now carries its own
-         condition, so a player who cannot open the settings page is not told to click a key to open it.
-         `prompt` still hides the whole row: while a capture runs, its instruction is the only thing that
-         may stand here (see the prompt above). -->
-    <div class="bc-ctl-hint" ng-if="!prompt">
+    <!-- Everything in this row depends on the engine surface, so the row hangs on canBind || canEdit: on a
+         build where neither the controls store nor an options route answers there is nothing to say here.
+         Each line still carries its own condition, so a player who cannot open the settings page is not
+         told to click a key to open it. `prompt` hides the whole row: while a capture runs, its instruction
+         is the only thing that may stand here (see the prompt above).
+         Reset UI layout used to sit here too and needed none of that surface; it moved into the gear in
+         the title bar (owner's decision 2026-10-10). -->
+    <div class="bc-ctl-hint" ng-if="!prompt && (canBind || canEdit)">
       <span ng-if="canBind">Click a key to change it, + to add one.</span>
       <span ng-if="!canBind && canEdit">Click a key to open BeamNG's controls settings.</span>
       <button class="bc-ctl-settings" ng-if="canEdit" ng-click="openSettings(null, null)">Game settings</button>
-      <button class="bc-ctl-settings" ng-click="resetUiLayout()">Reset UI layout</button>
     </div>
   </div>
 </div>
