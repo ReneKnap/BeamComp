@@ -256,9 +256,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- AI keep lapping until the quali clock ends, and names the path in its arming, park and grace lines;
 -- one logging hostaitags-r1 also lets the host see the names over his own AI cars, drawn by BeamComp,
 -- and BeamMP's nametag toggles switch them too; one logging keysdup-r1 also has the /keys window never
--- write a key an assist already has, and show each key once; one logging keysdup-r2 also has no Reset
--- UI layout button in the /keys window any more (the setup panel's gear menu keeps it).
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r2/2026-10-10"
+-- write a key an assist already has, and show each key once; one logging keysdup-r3 also has Reset UI
+-- layout in a gear menu in the /keys window's title bar instead of its footer (keysdup-r2 was a test
+-- build with no reset in that window at all).
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3/2026-10-10"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -4825,11 +4826,11 @@ function M.open_controls_bindings()
 end
 
 -- ===== reset the BeamComp windows (feature ui-reset-to-default-size) ==============================
--- ONE function, reached from the setup panel's gear menu. It had a second door in the controls window
--- (/keys) so that a player without admin access could reach it too; the owner took that button out on
--- 2026-10-10, so a plain player has no reset any more. Should a second door come back, it calls this
--- same function -- there is only this one action, with no parameter that could make one door reset more
--- or less than the other.
+-- ONE function, reached from both doors: the setup panel's gear menu and the controls window's gear
+-- menu (a footer button until 2026-10-10). The setup panel sits behind the admin gate while a plain
+-- player's BeamComp windows are the HUD and the controls window, so neither door alone would reach
+-- everybody -- but there is only this one action, with no parameter that could make one door reset
+-- more or less than the other.
 --
 -- The whole reset lives in race/uilayout.lua (RESET_APPS + derive_placement); this says nothing about
 -- geometry and nothing about which apps exist. It turns the seam's status into the one line the player

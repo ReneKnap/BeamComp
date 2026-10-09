@@ -402,7 +402,7 @@ angular.module('beamng.apps')
     replace: true,
     restrict: 'EA',
     scope: true,
-    link: function (scope) {
+    link: function (scope, element) {
       var unusable = directiveUnusable();
       // Seeded with the legacy rung, which is answerable here and now, and upgraded to the new UI when
       // GE answers. The seed is what makes the in-flight window safe: a click before the answer lands
@@ -476,6 +476,45 @@ angular.module('beamng.apps')
         geLua('if beamcomp_init then beamcomp_init.close_controls() end');
       };
 
+      // The gear in the title bar and its one entry, Reset UI layout: the same GE function the setup
+      // panel's gear menu calls, with no parameter that could make one door reset more than the other.
+      // This window is the reason the second door exists: the panel sits behind the admin gate, while any
+      // player can open this one with /keys. A gear rather than a footer button (owner's decision
+      // 2026-10-10), so it looks and works like the panel's.
+      scope.menuOpen = false;
+      scope.toggleMenu = function () {
+        scope.menuOpen = !scope.menuOpen;
+      };
+      // Closes the menu first, as the setup panel does: the reset moves this very window, and a menu left
+      // hanging over its old spot looks like the reset missed.
+      scope.resetUiLayout = function () {
+        scope.menuOpen = false;
+        geLua('if beamcomp_init then beamcomp_init.reset_ui_layout() end');
+      };
+      // A click anywhere but the gear closes the menu -- the setup panel's closeOnOutsideClick, narrowed to
+      // the one menu this window has. The document global, typeof-guarded like bngApi: an injected
+      // $document is a dependency that could fail to resolve and take the whole directive with it.
+      function closeMenuOnOutsideClick(ev) {
+        if (!scope.menuOpen) {
+          return;
+        }
+        var root = element && element[0];
+        var node = ev && ev.target;
+        while (node && node !== document) {
+          if (node.classList && node.classList.contains('bc-ctl-gear') && root && root.contains(node)) {
+            return;
+          }
+          node = node.parentNode;
+        }
+        scope.$evalAsync(function () { scope.menuOpen = false; });
+      }
+      if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('click', closeMenuOnOutsideClick, false);
+        scope.$on('$destroy', function () {
+          document.removeEventListener('click', closeMenuOnOutsideClick, false);
+        });
+      }
+
       // ----- the capture cycle ---------------------------------------------------------------------
       // END A CAPTURE, from wherever. This is the single exit, and everything about the safety promise
       // hangs on two lines of it: `capture = null` before anything else, and the generation number.
@@ -512,6 +551,8 @@ angular.module('beamng.apps')
         var gen = captureGen;
         capture = {gen: gen, row: row, control: control};
         scope.status = null;
+        // The gear is hidden while a capture runs; an open menu would come back with it afterwards.
+        scope.menuOpen = false;
         scope.prompt = control
           ? 'Press a new key for ' + row.label + '. Right-click to cancel.'
           : 'Press a key for ' + row.label + '. Right-click to cancel.';
