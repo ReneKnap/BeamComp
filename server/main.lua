@@ -8780,13 +8780,69 @@ local function player_name_of(player_id)
     return MP.GetPlayers()[player_id]
 end
 
--- Send a map's saved grids to one client (ADR-0023 amendment 2026-07-27): {grids = {{name, race,
--- isDefault}, ...}, target = <the requester's routing string>}, sorted by race then name. The whole map
--- travels in ONE reply so all three consumers can filter locally -- the setup panel narrows it to the
--- selected race, the grid editor splits it into "this race" plus the rest of the map, and the GE console
--- groups it for its toast -- and so switching race in a panel stays a local, synchronous operation
--- instead of a new round-trip. Shared by the list request and by all three write echoes, so a panel
--- always sees the post-change truth.
+-- Who hears about a write to the grid or preset store (ADR-0023 amendment 2026-10-10). `outcome` is what
+-- the write did. "changed" reaches EVERY connected player, so another admin's open panel follows the
+-- store the moment it moves -- before this, the echo went to the writer alone and everybody else kept the
+-- old list until a reopen. "no-op" (nothing to delete, a default that already was one) and "write failed"
+-- reach the writer alone: his own panel still needs its answer -- the delete echo un-arms the row he
+-- clicked -- while nobody else has anything to learn.
+--
+-- The writer is on the list exactly ONCE either way. The broadcast includes him, so nothing is sent to
+-- him on top of it; he passed the admin gate a moment ago, which reads this same players table, so the
+-- fallback below only covers a table that has not caught up.
+function grid_store.audience(writer_id, outcome)
+    if outcome ~= "changed" then
+        return {writer_id}
+    end
+    local recipients = {}
+    local has_writer = false
+    for player_id in pairs(MP.GetPlayers() or {}) do
+        recipients[#recipients + 1] = player_id
+        has_writer = has_writer or player_id == writer_id
+    end
+    if not has_writer then
+        recipients[#recipients + 1] = writer_id
+    end
+    return recipients
+end
+
+-- Send one list payload to every id in `recipients`, then log it ONCE: what it was, who got it and why
+-- (ADR-0023 amendment 2026-10-10). This line is the server half of the trail that tells a live session
+-- where a list went missing -- a request names its target, an echo names its write and outcome, and a
+-- send BeamMP refused is logged by send_event right above it.
+function grid_store.deliver(tag, message_type, payload, recipients, summary)
+    local ids = {}
+    for i, player_id in ipairs(recipients) do
+        send_event(player_id, message_type, payload)
+        ids[i] = tostring(player_id)
+    end
+    log_info(tag, summary .. " -> id(s) " .. table.concat(ids, ", "))
+end
+
+-- A map key as the list log lines print it: quoted, or "(none)" when a request named no map.
+function grid_store.map_text(map)
+    if map == nil then
+        return "(none)"
+    end
+    return "'" .. tostring(map) .. "'"
+end
+
+-- Echo a map's list after a write through `send_list` (send_grid_list or send_preset_list), to the
+-- audience the write's `outcome` earns. Untargeted on purpose: on every client an echo serves both
+-- panels, and a guihooks.trigger at a panel that is not on screen is a no-op, so the server needs to know
+-- nothing about who has what open.
+function grid_store.echo_write(send_list, writer_id, map, write, outcome)
+    send_list(grid_store.audience(writer_id, outcome), map,
+        string.format("echo after %s by id %s (%s)", write, tostring(writer_id), outcome))
+end
+
+-- Send a map's saved grids to `recipients`, a list of player ids (ADR-0023 amendment 2026-07-27):
+-- {grids = {{name, race, isDefault}, ...}, map = <the map>, target = <the requester's routing string>},
+-- sorted by race then name. The whole map travels in ONE reply so all three consumers can filter locally
+-- -- the setup panel narrows it to the selected race, the grid editor splits it into "this race" plus the
+-- rest of the map, and the GE console groups it for its toast -- and so switching race in a panel stays a
+-- local, synchronous operation instead of a new round-trip. Shared by the list request and by all three
+-- write echoes, so a panel always sees the post-change truth.
 --
 -- `target` is the requester's own opaque routing string, relayed back verbatim and never read here
 -- (race-blind, ADR-0005) -- the same shape as gridData echoing the request's race. It is what lets a
@@ -8794,13 +8850,14 @@ end
 -- can no longer steal a reply's destination (ADR-0023 amendment 2026-09-25). An UNSOLICITED echo passes
 -- none, which the client reads as "serve both panels".
 --
--- UNICAST, to the one player who asked or wrote. Another admin with a panel open still sees this grid
--- only when he reopens it -- a deliberate limit, not an oversight: a broadcast would push a list at every
--- connection over a write only one of them made.
+-- A request reply goes to the one player who asked, with his target. A write echo goes to the audience
+-- grid_store.audience picks -- everybody when the store changed -- and that is why the list names its
+-- `map` (ADR-0023 amendment 2026-10-10): a client still loading a map, or on another one, drops it.
+-- `reason` names why the list was sent, for its log line.
 --
 -- Lives here rather than with the other grid_store helpers because it captures send_event/MSG_GRID_LIST,
 -- which are declared further up the chunk than those.
-function grid_store.send_grid_list(player_id, map, target)
+function grid_store.send_grid_list(recipients, map, reason, target)
     ensure_grids_loaded()
     local entries = {}
     local map_grids = type(map) == "string" and grid_store.grids[map] or nil
@@ -8825,7 +8882,10 @@ function grid_store.send_grid_list(player_id, map, target)
         end
         return a.name < b.name
     end)
-    send_event(player_id, MSG_GRID_LIST, {grids = entries, target = target})
+    local list_map = type(map) == "string" and map or nil
+    grid_store.deliver("beamcomp.grid", MSG_GRID_LIST, {grids = entries, map = list_map, target = target},
+        recipients, string.format("grid list of map %s (%d grid(s)), %s",
+            grid_store.map_text(list_map), #entries, reason))
 end
 
 -- Store a named grid sent by the in-game editor (ADR-0023). Admin-gated like /race (ADR-0016): only a
@@ -8869,10 +8929,11 @@ local function handle_grid_save(player_id, payload)
         log_info("beamcomp.grid", string.format("saved grid '%s' for race '%s' on map '%s' (%s) by %s",
             payload.name, payload.race, payload.map, tostring(path), player_name))
         -- Echo the updated list so the grid it was just saved in appears in both panels without a reopen
-        -- (ADR-0023 amendment 2026-09-25) -- they are open at the same time in the normal flow. On the
-        -- SUCCESS path only: send_grid_list reads the in-memory store, and save_grid updates that before
-        -- the file, so echoing after a failed write would state a list the file has not got.
-        grid_store.send_grid_list(player_id, payload.map)
+        -- (ADR-0023 amendment 2026-09-25) -- they are open at the same time in the normal flow -- and in
+        -- every other player's too (amendment 2026-10-10). On the SUCCESS path only: send_grid_list
+        -- reads the in-memory store, and save_grid updates that before the file, so echoing after a
+        -- failed write would state a list the file has not got.
+        grid_store.echo_write(grid_store.send_grid_list, player_id, payload.map, "grid save", "changed")
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
@@ -8901,6 +8962,9 @@ local function handle_grid_assign(player_id, payload)
         return
     end
 
+    -- Re-assigning the standing default writes the file but moves nothing, so only the writer hears back.
+    local map_defaults = grid_store.defaults[payload.map]
+    local was_default = type(map_defaults) == "table" and map_defaults[payload.race] == payload.name
     local ok = assign_default(payload.map, payload.race, payload.name)
     if ok then
         MP.SendChatMessage(player_id, string.format("BeamComp: '%s' is now the default grid for %s",
@@ -8908,8 +8972,10 @@ local function handle_grid_assign(player_id, payload)
         log_info("beamcomp.grid", string.format("assigned grid '%s' as default for race '%s' on map '%s' by %s",
             payload.name, payload.race, payload.map, player_name))
         -- Echo the updated list so the (default) marker moves in both panels, not just after a reopen
-        -- (ADR-0023 amendment 2026-09-25). Success path only, for the same reason as the save above.
-        grid_store.send_grid_list(player_id, payload.map)
+        -- (ADR-0023 amendment 2026-09-25), and in every other player's (amendment 2026-10-10). Success
+        -- path only, for the same reason as the save above.
+        grid_store.echo_write(grid_store.send_grid_list, player_id, payload.map, "grid assign",
+            was_default and "no-op" or "changed")
     else
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
@@ -8932,7 +8998,9 @@ local function handle_grid_delete(player_id, payload)
     end
 
     local existed, ok, promoted = delete_grid(payload.map, payload.race, payload.name)
+    local outcome = "changed"
     if not existed then
+        outcome = "no-op"
         MP.SendChatMessage(player_id, "BeamComp: no grid '" .. payload.name .. "' saved for " .. payload.race)
     elseif ok then
         local message = "BeamComp: deleted grid '" .. payload.name .. "' for " .. payload.race
@@ -8945,15 +9013,17 @@ local function handle_grid_delete(player_id, payload)
         log_info("beamcomp.grid", string.format("deleted grid '%s' for race '%s' on map '%s' by %s",
             payload.name, payload.race, payload.map, player_name))
     else
+        outcome = "write failed"
         MP.SendChatMessage(player_id, "BeamComp: could not write grids file")
     end
 
     -- Always echo the current list so both panels reflect the post-delete state: the editor's dropdown
     -- and, since the echo names no target (ADR-0023 amendment 2026-09-25), the setup panel's -- which
-    -- would otherwise keep offering a grid that is gone. UNCONDITIONAL, unlike the save and assign
-    -- echoes: a delete that removed nothing must still un-arm the row the admin clicked, and that
-    -- un-arming is owned by the arriving list (BeamCompGridEditor/app.js rebuildGridOpts).
-    grid_store.send_grid_list(player_id, payload.map)
+    -- would otherwise keep offering a grid that is gone. UNCONDITIONAL for the writer, unlike the save
+    -- and assign echoes: a delete that removed nothing must still un-arm the row the admin clicked, and
+    -- that un-arming is owned by the arriving list (BeamCompGridEditor/app.js rebuildGridOpts). Everybody
+    -- else hears only of a delete that went through (amendment 2026-10-10).
+    grid_store.echo_write(grid_store.send_grid_list, player_id, payload.map, "grid delete", outcome)
 end
 
 -- Return a saved grid's data so the editor can reopen it (ADR-0023). Read-only, so ungated like
@@ -8992,19 +9062,23 @@ end
 -- that is not a string is dropped, so only a client that actually named a destination gets routed to one.
 local function handle_grid_list_request(player_id, payload)
     if type(payload) ~= "table" then
-        grid_store.send_grid_list(player_id, nil)
+        grid_store.send_grid_list({player_id}, nil, "request without a payload")
         return
     end
     local target = type(payload.target) == "string" and payload.target or nil
-    grid_store.send_grid_list(player_id, payload.map, target)
+    grid_store.send_grid_list({player_id}, payload.map, "request, target " .. (target or "none"), target)
 end
 
 -- Preset handlers (ADR-0037 amendment). Attached to grid_store, not top-level locals (200/200 ceiling);
 -- structured like the grid handlers above -- admin gate on the mutations, opaque form blob throughout.
 
--- Send a map's saved preset names (sorted) to one client. Shared by save/delete (echo the post-change
--- list) and the list request, so the panel's dropdown is always server-authoritative, not local state.
-function grid_store.send_preset_list(player_id, map)
+-- Send a map's saved preset names (sorted) to `recipients`, a list of player ids: {names, map}. Shared by
+-- save/delete (echo the post-change list) and the list request, so the panel's dropdown is always
+-- server-authoritative, not local state. Addressed exactly like send_grid_list -- the asker for a
+-- request, grid_store.audience for a write echo, so another admin's open panel follows a save too -- and
+-- it names its `map` for the same reason (ADR-0023 amendment 2026-10-10). No target: the setup panel is
+-- the one consumer.
+function grid_store.send_preset_list(recipients, map, reason)
     grid_store.ensure_presets_loaded()
     local names = {}
     local map_presets = type(map) == "string" and grid_store.presets[map] or nil
@@ -9014,11 +9088,15 @@ function grid_store.send_preset_list(player_id, map)
         end
         table.sort(names)
     end
-    send_event(player_id, grid_store.MSG_PRESET_LIST, {names = names})
+    local list_map = type(map) == "string" and map or nil
+    grid_store.deliver("beamcomp.preset", grid_store.MSG_PRESET_LIST, {names = names, map = list_map},
+        recipients, string.format("preset list of map %s (%d preset(s)), %s",
+            grid_store.map_text(list_map), #names, reason))
 end
 
 -- Save a named race-setup preset for a map, sent by the panel. Admin-gated like gridSave. The form is an
--- opaque JSON string stored verbatim (race-blind, ADR-0005). Echoes the updated name list. Payload:
+-- opaque JSON string stored verbatim (race-blind, ADR-0005). Echoes the updated name list -- to the
+-- writer whatever the file write did, to everybody else only when it went through. Payload:
 -- {map, name, form}.
 function grid_store.handle_preset_save(player_id, payload)
     local player_name = player_name_of(player_id)
@@ -9049,11 +9127,13 @@ function grid_store.handle_preset_save(player_id, payload)
         MP.SendChatMessage(player_id, "BeamComp: could not write presets file")
     end
 
-    grid_store.send_preset_list(player_id, payload.map)
+    grid_store.echo_write(grid_store.send_preset_list, player_id, payload.map, "preset save",
+        ok and "changed" or "write failed")
 end
 
 -- Delete a saved preset for a map, sent by the panel. Admin-gated. Echoes the updated name list so the
--- dropdown refreshes. Payload: {map, name}.
+-- dropdown refreshes -- the writer's always, everybody else's only after a delete that went through.
+-- Payload: {map, name}.
 function grid_store.handle_preset_delete(player_id, payload)
     local player_name = player_name_of(player_id)
     if not player_name or not is_race_admin(player_name, player_id) then
@@ -9068,7 +9148,9 @@ function grid_store.handle_preset_delete(player_id, payload)
 
     grid_store.ensure_presets_loaded()
     local map_presets = grid_store.presets[payload.map]
+    local outcome = "changed"
     if type(map_presets) ~= "table" or map_presets[payload.name] == nil then
+        outcome = "no-op"
         MP.SendChatMessage(player_id, "BeamComp: no preset '" .. payload.name .. "' saved for " .. payload.map)
     else
         map_presets[payload.name] = nil
@@ -9077,11 +9159,12 @@ function grid_store.handle_preset_delete(player_id, payload)
             log_info("beamcomp.preset", string.format("deleted preset '%s' for map '%s' by %s",
                 payload.name, payload.map, player_name))
         else
+            outcome = "write failed"
             MP.SendChatMessage(player_id, "BeamComp: could not write presets file")
         end
     end
 
-    grid_store.send_preset_list(player_id, payload.map)
+    grid_store.echo_write(grid_store.send_preset_list, player_id, payload.map, "preset delete", outcome)
 end
 
 -- Return a saved preset's opaque form blob so the panel can load it. Read-only, ungated like the grid
@@ -9108,7 +9191,7 @@ end
 -- Return the saved preset names for a map. Read-only, sorted for a stable listing. Payload: {map}.
 function grid_store.handle_preset_list_request(player_id, payload)
     local map = type(payload) == "table" and payload.map or nil
-    grid_store.send_preset_list(player_id, map)
+    grid_store.send_preset_list({player_id}, map, "request")
 end
 
 -- Coerce the settings UI's decoded overrides into the shape begin_race_request/start_race expect (the
