@@ -103,8 +103,10 @@ M.gridcam = require("beamcomp/race/gridcam")
 -- setup -- the race-setup panel's GE-side presence: the session open-state set by the admin-gated
 --          /raceui open, the one-shot watchdog that re-adds the app when a UI reload drops it
 --          (bug setup-panel-settings-survive-ui-reload), the panel's AI-roster car re-resolve
---          (ADR-0047 live amendment), and the record of which panel request the staged grid was
---          built from (feature setup-confirm-grid-stale-hint).
+--          (ADR-0047 live amendment), the record of which panel request the staged grid was
+--          built from (feature setup-confirm-grid-stale-hint), and the request/arrival trail of the
+--          saved grid and preset lists with the check that drops a list for another map (bug
+--          raceui-misses-other-admins-presets-and-grids).
 -- stall -- the client half of the driver-liveness predicate (feature
 --          stall-detection-client-measured-movement): measure whether each car THIS client owns has
 --          actually covered ground, and report the verdict to the race-blind server while a finish
@@ -3750,6 +3752,48 @@ local function handle_grid_data(payload)
     end
 end
 
+-- ===== the saved grid and preset lists: request, arrival, map check (ADR-0023 amendment 2026-10-10) =====
+-- Another admin's save, assign or delete reaches EVERY connected player now, not just the writer (bug
+-- raceui-misses-other-admins-presets-and-grids). Two things ride on that. A list can land on a client
+-- that is still loading a map or is already on another one, so each list names its map and is dropped
+-- here when that is not this client's. And whether a list reached a panel is a question only a live
+-- two-machine session can answer, so every request and every arrival leaves one line, beside the
+-- server's line for every list it sends. None of it is per frame: an open, a refresh or a write.
+
+-- A map key as these lines print it: quoted, or "(none)" when there is none.
+function setup.map_text(map)
+    if map == nil then
+        return "(none)"
+    end
+    return "'" .. tostring(map) .. "'"
+end
+
+-- Ask the server for the current map's saved grids (gridListReq) or presets (presetListReq), and say
+-- so. `target` is the gridList routing string (see handle_grid_list); a preset request names none.
+function setup.request_list(message_type, map, target)
+    log("I", LOG_TAG, string.format("requesting %s: map %s, target %s",
+        message_type, setup.map_text(map), tostring(target or "none")))
+    send_to_server(message_type, {map = map, target = target})
+end
+
+-- Whether an arrived gridList / presetList is for the map this client is on, logging the arrival either
+-- way. A list that names a map other than this client's is dropped -- an unknown current map included,
+-- which is a client mid-load. A list that names NO map comes from a server older than this check and is
+-- taken as it always was. `count` is read by the caller from the list it has already normalised.
+function setup.accept_list(message_type, payload, count)
+    local list_map = type(payload) == "table" and payload.map or nil
+    local target = type(payload) == "table" and payload.target or nil
+    local summary = string.format("%s of map %s, %d entr%s, target %s", message_type,
+        setup.map_text(list_map), count, count == 1 and "y" or "ies", tostring(target or "none"))
+    local here = maps.current()
+    if list_map ~= nil and list_map ~= here then
+        log("W", LOG_TAG, summary .. ": DROPPED, this client is on map " .. setup.map_text(here))
+        return false
+    end
+    log("I", LOG_TAG, summary .. ": received")
+    return true
+end
+
 -- Post the current map's saved grids from a gridList reply (ADR-0023). The reply carries the WHOLE map as
 -- {name, race, isDefault} entries sorted by race then name (ADR-0023 amendment 2026-07-27), so each
 -- consumer filters/groups it locally instead of asking again per race.
@@ -3762,15 +3806,20 @@ end
 --   "setup"   -> the race-setup panel's grid dropdown (ADR-0037)
 --   "gridui"  -> the grid-editor panel's saved-grid dropdown (ADR-0037 amendment)
 --   "console" -> the grid-editor console command's toast (beamcomp_grid_list), grouped by race
---   absent    -> nobody named one: an unsolicited echo after a save/assign/delete, or a server too old
---                to relay the field. Serve BOTH panel hooks -- they are open at the same time in the
---                normal flow ("Edit..." leaves the setup panel standing), and a guihooks.trigger at a
---                panel that is not on screen is a no-op, so this needs to know nothing about what is up.
+--   absent    -> nobody named one: an unsolicited echo after a save/assign/delete -- this client's own
+--                or another admin's (ADR-0023 amendment 2026-10-10) -- or a server too old to relay the
+--                field. Serve BOTH panel hooks -- they are open at the same time in the normal flow
+--                ("Edit..." leaves the setup panel standing), and a guihooks.trigger at a panel that is
+--                not on screen is a no-op, so this needs to know nothing about what is up.
 -- The console toast is reachable ONLY on the literal "console", which only that one command sends, so a
--- save can never surface as a toast whatever else is in flight.
+-- save can never surface as a toast whatever else is in flight. A list for another map goes nowhere
+-- (setup.accept_list).
 local function handle_grid_list(payload)
     local grids = type(payload) == "table" and type(payload.grids) == "table" and payload.grids or {}
     local target = type(payload) == "table" and payload.target or nil
+    if not setup.accept_list("gridList", payload, #grids) then
+        return
+    end
     if target == "setup" then
         guihooks.trigger("BeamCompSetupGrids", {grids = grids})
         return
@@ -3809,8 +3858,13 @@ end
 
 -- Push the current map's saved preset names to the race-setup panel (ADR-0037 amendment). The panel is
 -- the sole consumer (unlike gridList's three), so no routing target is needed -- always to the panel.
+-- The list arrives after this client's own save or delete, after another admin's (ADR-0023 amendment
+-- 2026-10-10), and on request; a list for another map goes nowhere (setup.accept_list).
 local function handle_preset_list(payload)
     local names = type(payload) == "table" and type(payload.names) == "table" and payload.names or {}
+    if not setup.accept_list("presetList", payload, #names) then
+        return
+    end
     guihooks.trigger("BeamCompSetupPresets", {names = names})
 end
 
@@ -3870,9 +3924,9 @@ local function push_setup_data(include_deprecated)
     -- driver file (the single pool source), so it is complete on the first push with no server round-trip.
     -- The panel picks names from this instead of free typing.
     guihooks.trigger("BeamCompAiPool", {names = ai.pool_names()})
-    send_to_server("gridListReq", {map = map, target = "setup"})
+    setup.request_list("gridListReq", map, "setup")
     -- Fetch the map's saved presets too (ADR-0037 amendment), routed back to the panel by handle_preset_list.
-    send_to_server("presetListReq", {map = map})
+    setup.request_list("presetListReq", map)
 end
 
 -- Open the race-setup panel on the relayed setupOpen (ADR-0037): push the current dataset (refreshes an
@@ -4212,7 +4266,7 @@ function M.request_presets()
     if not map then
         return
     end
-    send_to_server("presetListReq", {map = map})
+    setup.request_list("presetListReq", map)
 end
 
 -- Re-resolve the CARS of an existing roster (the "cars" mode of roll_ai_roster, ADR-0047 live amendment):
@@ -4389,7 +4443,7 @@ local function push_grid_data()
         races = racelist.options(map, true),
         seedRace = M.state.grid_seed_race,
     })
-    send_to_server("gridListReq", {map = map, target = "gridui"})
+    setup.request_list("gridListReq", map, "gridui")
     -- Reflect the live edit session too, so a reopened panel (its Angular scope is fresh) restores the
     -- active grid's knobs, direction and overwrite/assign target rather than showing a blank form.
     push_grid_state()
@@ -8705,7 +8759,7 @@ function beamcomp_grid_list()
         editor_feedback("no map loaded", "warning")
         return
     end
-    send_to_server("gridListReq", {map = map, target = "console"})
+    setup.request_list("gridListReq", map, "console")
 end
 
 -- GE console command (intentionally global)
