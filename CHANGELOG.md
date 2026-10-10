@@ -47,6 +47,7 @@ below rather than hidden.
 
 - A setup panel (`/raceui`) with every option and an explanation on every field, and saved setups
   that can be reloaded.
+  A setup or grid one admin saves or deletes shows up in every other admin's open panel straight away.
 - The results screen offers a **Race setup** button to anyone who may open the panel, so the next race
   can be set up without typing `/raceui` again.
 - Change a setting after **Confirm & Build Grid** and the setup panel says so and lights the button up:
