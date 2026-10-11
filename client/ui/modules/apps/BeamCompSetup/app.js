@@ -521,6 +521,18 @@ angular.module('beamng.apps')
     bngApi.engineLua('beamcomp_init.' + fn + "('" + escaped + "')");
   }
 
+  // Run a GE command with N string arguments, each single-quoted + escaped like geLuaArg's one. A copy of
+  // the grid editor's helper of the same name: the panels share no module space (see asArray).
+  function geLuaArgs(fn) {
+    if (typeof bngApi === 'undefined' || !bngApi.engineLua) {
+      return;
+    }
+    var args = Array.prototype.slice.call(arguments, 1).map(function (a) {
+      return "'" + String(a).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+    });
+    bngApi.engineLua('beamcomp_init.' + fn + '(' + args.join(', ') + ')');
+  }
+
   // Call a no-argument GE function, same typeof guard as geLuaArg.
   function geCall(fn) {
     if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
@@ -1327,10 +1339,14 @@ angular.module('beamng.apps')
       };
 
       // Open the grid editor for the currently selected race (ADR-0037 amendment). This panel stays open;
-      // GE opens BeamCompGridEditor client-side with the race carried over.
+      // GE opens BeamCompGridEditor client-side with the race carried over -- and the direction this
+      // panel runs it in, so a New or Load on that race starts there and the editor says when it is on
+      // the other one (ADR-0037 amendment 2026-10-11). Read at the press: changing Reverse afterwards
+      // reaches the editor only with the next Edit….
       scope.editGrid = function () {
         if (scope.form.race) {
-          geLuaArg('open_grid_editor_with_race', scope.form.race);
+          var direction = scope.form.reverse ? 'reverse' : 'forward';
+          geLuaArgs('open_grid_editor_with_race', scope.form.race, direction);
         }
       };
 
