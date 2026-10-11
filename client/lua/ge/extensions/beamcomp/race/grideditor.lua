@@ -10,9 +10,11 @@
 -- Authoring side of named parametric grids (ADR-0023). The admin enters edit mode against a race on the
 -- current map; the editor anchors a preview-count-sized grid to that race's real start line (via
 -- race/start.anchor) and recomputes the preview poses with race/grid as the knobs are tuned over the GE
--- console or the panel. Separate forward/reverse blocks are accumulated; reverse is only authored if the
--- admin switches to it. M.snapshot() hands the blocks -- plus the authored preview count, part of the grid
--- since the ADR-0023 amendment 2026-08-02 -- to init.lua, which ships them to the server (gridSave).
+-- console or the panel. Separate forward/reverse blocks are accumulated; reverse is only authored once the
+-- session switches to it -- the admin's Reverse, or a panel session start that follows the direction the
+-- race setup carried (init.lua setup.apply_carried_direction). M.snapshot() hands the blocks -- plus the
+-- authored preview count, part of the grid since the ADR-0023 amendment 2026-08-02 -- to init.lua, which
+-- ships them to the server (gridSave).
 --
 -- Segmented grids (ADR-0023 amendment): each direction is modelled as an ORDERED SEGMENT LIST -- segment 0
 -- is the base param set, and a breakpoint at a chosen slot adds a further segment (seeded from the covering
@@ -281,7 +283,11 @@ end
 
 -- Switch the knobs to the forward or reverse block. Reverse anchors to the reversed start line lazily;
 -- it seeds a default reverse block only if one was not already loaded/edited, so an opened grid's saved
--- reverse params survive the switch. A race with no reverse geometry returns nil + a reason.
+-- reverse params survive the switch. Returns nil + a reason only when start.anchor cannot anchor the race
+-- at all (it does not resolve or parse, or has no start position). A race WITHOUT its own reverse route
+-- is not refused, whatever this comment used to say: start.anchor falls back to the default start with
+-- the checkpoints reversed, which is exactly where a forced reverse race lines up (ADR-0019) -- so a
+-- reverse block authored there is the one that race starts on.
 function M.set_direction(direction)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"

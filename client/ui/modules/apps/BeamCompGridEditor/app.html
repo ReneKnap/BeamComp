@@ -212,7 +212,10 @@
            (directionNote in app.js; GE sends nothing to compare otherwise). Not a toast: it stays until the
            directions agree again. -->
       <div class="bc-dir-note" ng-if="directionNote()">{{directionNote()}}</div>
-      <div class="bc-hint">Reverse is only saved if you edit it; a race with no reverse geometry is rejected.</div>
+      <!-- Replaced 2026-10-11, both halves of the old text were false: a switch alone seeds a reverse layout
+           that Save then writes, and no race refuses Reverse here -- one without its own reverse route
+           anchors where a forced reverse race lines up (race/grideditor.lua set_direction). -->
+      <div class="bc-hint">Races run in reverse start on the Reverse layout.</div>
       <!-- Next to Forward/Reverse because both are about where on the map the grid is. Needs no ng-disabled:
            this whole section only exists while a session runs, and GE refuses (and says so) during a race. -->
       <div class="bc-row bc-grid-actions">
