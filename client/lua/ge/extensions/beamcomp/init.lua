@@ -104,9 +104,10 @@ M.gridcam = require("beamcomp/race/gridcam")
 --          /raceui open, the one-shot watchdog that re-adds the app when a UI reload drops it
 --          (bug setup-panel-settings-survive-ui-reload), the panel's AI-roster car re-resolve
 --          (ADR-0047 live amendment), the record of which panel request the staged grid was
---          built from (feature setup-confirm-grid-stale-hint), and the request/arrival trail of the
+--          built from (feature setup-confirm-grid-stale-hint), the request/arrival trail of the
 --          saved grid and preset lists with the check that drops a list for another map (bug
---          raceui-misses-other-admins-presets-and-grids).
+--          raceui-misses-other-admins-presets-and-grids), and the direction its Edit... button
+--          carries into the grid editor (feature grideditor-follows-race-direction).
 -- stall -- the client half of the driver-liveness predicate (feature
 --          stall-detection-client-measured-movement): measure whether each car THIS client owns has
 --          actually covered ground, and report the verdict to the race-blind server while a finish
@@ -372,6 +373,7 @@ M.state = {
     hud_reshow_interval = HUD_RESHOW_EVERY,  -- current re-show cadence: starts at HUD_RESHOW_EVERY on each healthy heartbeat, doubles per silent re-show up to HUD_RESHOW_MAX (menu-hidden silence then costs one layout check per 15s)
     idle_info_shown = false,  -- whether the between-races series info box (ADR-0042) currently holds the HUD app up (lobby/free-roam, no race), so it is shown once and taken down when the series ends
     grid_seed_race = nil,     -- a race to pre-select when the grid-editor panel opens (carried from /raceui's "Grid bearbeiten" cross-open); consumed by push_grid_data
+    grid_seed_direction = nil,  -- the direction the race setup runs the carried race in, from the same Edit... press: {race = <canonical id>, direction = "forward"|"reverse"}, or nil (ADR-0037 amendment 2026-10-11). A panel New or Load on THAT race starts in it, and the editor shows a line while its own direction differs. Set by setup.carry_direction, cleared wherever grid_seed_race is (the /gridui open, Close) and nowhere else. Does NOT survive a GE Lua reload (ADR-0052) and need not: the reload also ends the edit session, and nil means "nothing carried" -- Forward and no line, exactly the editor before this field existed
     grid_active_name = nil,   -- the saved name of the grid currently being edited (set on save/load, nil for a fresh unsaved grid); reflected to the panel so a reopen restores the overwrite/assign target
     grid_load_anchor = nil,   -- the race to re-anchor a saved grid onto when loading it (the panel's selected race); grid params are relative to a start line, so a grid can be edited against any race
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
@@ -3647,6 +3649,69 @@ local function editor_feedback(msg, kind)
     log("I", RACE_LOG_TAG, "grid editor: " .. msg)
 end
 
+-- ===== the direction the race setup's Edit... carries (ADR-0037 amendment 2026-10-11) =====
+-- The setup panel's Edit... hands over the direction it runs the race in, together with the race. A panel
+-- session start (New, Load) on that race begins in it, and the editor shows a line while its own direction
+-- is the other one. ONLY Edit... carries it: a /gridui typed directly clears it, and so does Close. The
+-- record names its race, because the direction belongs to that race and to no other (feature
+-- grideditor-follows-race-direction).
+
+-- The grid editor's own tag (race/grideditor.lua, race/gridcam.lua), so these lines sit beside theirs.
+setup.GRID_LOG_TAG = "beamcomp.grid"
+
+-- Remember what this Edit... press carried, replacing whatever the last one did. The race is resolved to
+-- its canonical id HERE, once: discovery logs every resolve, so doing it on each state push would put a
+-- line in the log per knob tick. A direction the panel did not send (a panel from before this) or a race
+-- that does not resolve carries nothing, which is the editor as it was: Forward and no line.
+function setup.carry_direction(race, direction)
+    M.state.grid_seed_direction = nil
+    if race == nil then
+        return
+    end
+    if direction ~= "forward" and direction ~= "reverse" then
+        log("I", setup.GRID_LOG_TAG, "Edit... carried no direction for race '" .. race
+            .. "': the editor starts forward")
+        return
+    end
+    local race_id, reason = race_start.resolve_id(race)
+    if not race_id then
+        log("W", setup.GRID_LOG_TAG, "Edit... carried '" .. direction .. "' for race '" .. race
+            .. "', which does not resolve here (" .. tostring(reason) .. "): nothing carried")
+        return
+    end
+    M.state.grid_seed_direction = {race = race_id, direction = direction}
+    log("I", setup.GRID_LOG_TAG, "Edit... carries '" .. direction .. "' for race '" .. race_id .. "'")
+end
+
+-- Called right after a session started from the panel (M.grid_open_new, handle_grid_data) and before
+-- its first push, so the panel never shows a Forward frame of a session that starts in reverse.
+-- Deliberately NOT hooked into grideditor.enter, which the console commands reach outside any Edit...
+-- visit. A refused switch says nothing on screen -- the admin pressed nothing in the editor -- and the
+-- line then shows by itself, because the session is still Forward.
+function setup.apply_carried_direction()
+    local carried = M.state.grid_seed_direction
+    local editor = grideditor.state
+    if not carried or not editor.active then
+        return
+    end
+    if editor.race ~= carried.race then
+        log("I", setup.GRID_LOG_TAG, "carried direction '" .. carried.direction .. "' not applied: this "
+            .. "session edits '" .. tostring(editor.race) .. "', it was carried for '" .. carried.race .. "'")
+        return
+    end
+    if carried.direction ~= "reverse" then
+        return
+    end
+    local ok, reason = grideditor.set_direction("reverse")
+    if ok then
+        log("I", setup.GRID_LOG_TAG, "session for '" .. editor.race
+            .. "' starts in reverse, the direction the race setup carried")
+    else
+        log("W", setup.GRID_LOG_TAG, "session for '" .. editor.race .. "' stays forward: the switch to the "
+            .. "carried reverse was refused (" .. tostring(reason) .. ")")
+    end
+end
+
 -- Reflect the live grid-editor session back to the grid-editor panel (ADR-0037 amendment): the editor
 -- (race/grideditor.lua) is the source of truth, the panel only displays this state and calls the knob
 -- setters. Pushed after every mutating bridge call. knobs is the active direction's block (or nil when no
@@ -3747,6 +3812,9 @@ local function handle_grid_data(payload)
         -- retyping, and so a panel reopen restores that target.
         M.state.grid_active_name = type(payload.name) == "string" and payload.name or nil
         editor_feedback("editing saved grid '" .. tostring(payload.name) .. "' for " .. tostring(result))
+        -- The panel's Load lands here, and so does beamcomp_grid_edit -- which therefore follows the
+        -- carried direction too, but only inside an Edit... visit: outside one nothing is carried.
+        setup.apply_carried_direction()
         refresh_grid_edit_scene()
         push_grid_state()
     else
@@ -4456,6 +4524,8 @@ end
 -- push, so the panel also pulls on link via request_grid_data -- together they cover every timing.
 local function handle_grid_setup_open(_payload)
     M.state.grid_seed_race = nil
+    -- Only the setup panel's Edit... carries a direction, so a /gridui typed directly carries none.
+    M.state.grid_seed_direction = nil
     push_grid_data()
     -- Re-spawn the reference scene if a session is still active on open (e.g. one started from the GE
     -- console) -- its props are otherwise only spawned when the session begins.
@@ -4475,8 +4545,12 @@ end
 -- the admin still picks New / Load. The seed persists across the panel's on-link pull; the panel applies it
 -- only while its race choice is still empty, so a later push never overrides a manual pick. Public as
 -- beamcomp_init.open_grid_editor_with_race.
-function M.open_grid_editor_with_race(race)
+-- `direction` is the one the race setup runs `race` in (setup.carry_direction). It applies at the NEXT
+-- session start on that race; a session already running is not switched, only the push below lets its
+-- line follow the new reference.
+function M.open_grid_editor_with_race(race, direction)
     M.state.grid_seed_race = (type(race) == "string" and race ~= "") and race or nil
+    setup.carry_direction(M.state.grid_seed_race, direction)
     push_grid_data()
     refresh_grid_edit_scene()
     M.uilayout.ensure_visible("beamCompGridEditor")
@@ -4495,6 +4569,8 @@ function M.grid_open_new(race)
     end
     -- A fresh grid has no saved name yet -- it must be Saved before it can be overwritten or assigned.
     M.state.grid_active_name = nil
+    -- Before the scene and the push: a session that starts in reverse draws the reverse scene only.
+    setup.apply_carried_direction()
     refresh_grid_edit_scene()
     push_grid_state()
 end
@@ -4650,6 +4726,7 @@ end
 -- button's teardown into Close/New/Load.)
 function M.close_grid_editor()
     M.state.grid_seed_race = nil
+    M.state.grid_seed_direction = nil
     -- Reuse the full teardown primitive (session + name + props + checkpoint + reflect); no duplication.
     M.clear_grid_editor()
     -- The end of the visit: the camera goes back to where it was before the first jump (ADR-0063).
