@@ -13,6 +13,7 @@ below rather than hidden.
 - Checkpoints, live position, live times, and a standings board that updates while you drive.
 - A results screen on finish, and a free-roam window afterwards before everything is cleaned up.
 - Laps, direction and sprint-or-circuit can be overridden per race.
+  A point-to-point race forced into reverse lines up behind its finish, facing back along the route.
 - `/dnf` to give up, `/results` to hide or show your own results card.
 - **The race's props carry no name.** Every cone, hay bale, barrel and barrier the race spawns is
   nameless on every screen, not just the ones the host can see.
