@@ -243,8 +243,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- camera, partlock (the forced-car part lock), confirmhint (the setup panel's stale-grid hint) and
 -- recoverground (the recover assist's placement), qualilaps (the circuit-quali AI lap supply),
 -- hostaitags (the host's own AI tags), keysdup (the /keys window's duplicate keys) and adminlists
--- (another admin's saved presets and grids) are new since then, and griddir (the grid editor following
--- the race setup's direction) is new in this build.
+-- (another admin's saved presets and grids) and griddir (the grid editor following the race setup's
+-- direction) are new since then, and revsprint (the reverse start of a sprint without its own) is new in
+-- this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -267,8 +268,10 @@ local DASH_REFRESH_SETTLE = 0.75
 -- reopen, drops a list for a map it is not on, and logs every list it asks for and every list it gets;
 -- one logging griddir-r1 also has a New or Load in a grid editor opened with the race setup's Edit...
 -- start in the direction the setup runs that race, and a line under Forward/Reverse while it is on the
--- other one.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1/2026-10-11"
+-- other one; one logging revsprint-r1 also lines a reverse sprint without its own reverse start up
+-- behind the forward finish, in the grid editor and at a forced race start, instead of at the forward
+-- start.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1/2026-10-11"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
