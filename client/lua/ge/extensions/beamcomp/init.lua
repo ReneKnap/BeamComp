@@ -3712,6 +3712,18 @@ function setup.apply_carried_direction()
     end
 end
 
+-- The carried direction, for the editor's line -- but only while it is about the session on screen: one
+-- is running, and on the race it was carried for. Anything else is nil, and the panel draws no line for
+-- a nil: it compares this with its own direction and keeps nothing from an earlier push.
+function setup.carried_direction_here()
+    local carried = M.state.grid_seed_direction
+    local editor = grideditor.state
+    if carried and editor.active and editor.race == carried.race then
+        return carried.direction
+    end
+    return nil
+end
+
 -- Reflect the live grid-editor session back to the grid-editor panel (ADR-0037 amendment): the editor
 -- (race/grideditor.lua) is the source of truth, the panel only displays this state and calls the knob
 -- setters. Pushed after every mutating bridge call. knobs is the active direction's block (or nil when no
@@ -3729,6 +3741,9 @@ local function push_grid_state()
         race = editor.race,
         name = M.state.grid_active_name,
         direction = editor.direction,
+        -- The direction the race setup runs this race in, when its Edit... carried one for THIS race;
+        -- absent otherwise. The panel shows its line while this differs from `direction` above.
+        setupDirection = setup.carried_direction_here(),
         hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
         previewCount = grideditor.preview_count(),
         -- The ordered breakpoint boundaries, the active segment index (1-based) and its start slot, so the

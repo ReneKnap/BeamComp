@@ -406,7 +406,8 @@ angular.module('beamng.apps')
       // `activeStartSlot` that segment's start slot (ADR-0023 amendment). Every slot in here is a GE SLOT
       // (0-based) -- this payload is GE's, unchanged; only what is rendered from it is 1-based.
       // `knobDefaults` are the layout defaults GE falls back to for a knob a loaded block omits -- shown as
-      // that field's placeholder (see scope.knobHint).
+      // that field's placeholder (see scope.knobHint). `setupDirection` is deliberately not seeded: absent
+      // means no direction line (see scope.directionNote).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
         knobDefaults: null };
@@ -810,6 +811,25 @@ angular.module('beamng.apps')
 
       scope.setDirection = function (direction) {
         geLuaArg('grid_set_direction', direction);
+      };
+
+      // The line under Forward/Reverse while the race setup runs this race the other way round (ADR-0037
+      // amendment 2026-10-11). GE decides whether there is anything to compare: it sends setupDirection
+      // only while the running session edits the race the setup panel's Edit… carried, so an absent field
+      // is no line. Nothing is kept from an earlier push (the state handler replaces scope.state whole) and
+      // nothing is inferred here -- the same rule as the setup panel's serverDefaults.
+      scope.directionNote = function () {
+        var carried = scope.state.setupDirection;
+        if (!scope.state.active || !carried || carried === scope.state.direction) {
+          return '';
+        }
+        if (carried === 'reverse') {
+          return 'The race setup runs this race in reverse.';
+        }
+        if (carried === 'forward') {
+          return 'The race setup runs this race forward.';
+        }
+        return '';
       };
 
       // Put the camera back above P1 of the grid being edited (ADR-0063). The camera already jumps on

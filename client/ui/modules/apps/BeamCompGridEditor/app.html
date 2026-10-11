@@ -116,6 +116,10 @@
       border-radius: 3px; background: #2a2e35; color: #cdd; cursor: pointer; font-weight: 700; }
     .bc-seg button.on { background: #1565c0; color: #fff; border-color: #1565c0; }
     .bc-seg button[disabled] { color: #777; cursor: default; }
+    /* The race setup runs this race the other way round (ADR-0037 amendment 2026-10-11). Amber like the
+       setup panel's stale-grid note: nothing is broken and nothing is refused, the admin is just not
+       editing the layout that race will start on. */
+    .bc-dir-note { font-size: 12px; color: #e8c07a; margin: 4px 0 2px; }
     .bc-mini { background: #355; color: #cde; border: none; border-radius: 3px; padding: 3px 10px;
       font-weight: 700; cursor: pointer; flex: 0 0 auto; }
     .bc-mini[disabled] { background: #3a3a3a; color: #888; cursor: default; }
@@ -204,6 +208,10 @@
         <button ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
         <button ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
       </div>
+      <!-- Stands while this session's direction is not the one the race setup's Edit… carried for this race
+           (directionNote in app.js; GE sends nothing to compare otherwise). Not a toast: it stays until the
+           directions agree again. -->
+      <div class="bc-dir-note" ng-if="directionNote()">{{directionNote()}}</div>
       <div class="bc-hint">Reverse is only saved if you edit it; a race with no reverse geometry is rejected.</div>
       <!-- Next to Forward/Reverse because both are about where on the map the grid is. Needs no ng-disabled:
            this whole section only exists while a session runs, and GE refuses (and says so) during a race. -->
