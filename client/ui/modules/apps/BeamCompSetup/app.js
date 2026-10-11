@@ -168,8 +168,9 @@ angular.module('beamng.apps')
     // ("3 (default)", scope.lapsHint), and this sentence says where it comes from. Two texts for one fact
     // is how they drift apart.
     laps: 'Leave it empty and the track\'s own lap count applies.',
-    // Forced reverse keeps the FORWARD grid anchor (ADR-0019: the default start selector is used when the
-    // track has no reverse one), so the cars line up facing the wrong way. That is what Force costs here.
+    // A forced reverse on a track with no reverse start of its own lines up where the reversed race starts
+    // (ADR-0019 amendment 2026-10-11): on the forward start line turned around for a circuit, behind the
+    // forward finish for a sprint. Nothing here costs the player anything, so the tip does not mention it.
     reverse: 'Drive the route backwards. A track without its own reverse route refuses this, Force starts it '
       + 'anyway.',
     // --- Vehicles ---

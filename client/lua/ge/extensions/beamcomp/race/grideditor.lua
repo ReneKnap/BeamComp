@@ -285,9 +285,10 @@ end
 -- it seeds a default reverse block only if one was not already loaded/edited, so an opened grid's saved
 -- reverse params survive the switch. Returns nil + a reason only when start.anchor cannot anchor the race
 -- at all (it does not resolve or parse, or has no start position). A race WITHOUT its own reverse route
--- is not refused, whatever this comment used to say: start.anchor falls back to the default start with
--- the checkpoints reversed, which is exactly where a forced reverse race lines up (ADR-0019) -- so a
--- reverse block authored there is the one that race starts on.
+-- is not refused, whatever this comment used to say: start.anchor gives it the anchor a forced reverse
+-- race lines up on -- the forward start line turned around on a circuit, behind the forward finish on an
+-- open route (ADR-0019 and its amendment 2026-10-11) -- so a reverse block authored there is the one that
+-- race starts on.
 function M.set_direction(direction)
     if not M.state.active then
         return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
