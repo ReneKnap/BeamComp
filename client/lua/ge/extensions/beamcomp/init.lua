@@ -436,6 +436,12 @@ M.state = {
     -- stall.step drops the whole table whenever the finish timer is not running, which is also what makes
     -- every car start its 15 s from zero the instant the timer arms. nil the rest of the time
     stall_track = nil,
+    -- The kind ("recover"/"repair") of the assist key whose press stopped the own car's standstill clock,
+    -- while that key is still down and its assist has not fired (ADR-0014 amendment 2026-10-13). Set ONLY by
+    -- stall.on_assist_press; cleared by the key-up, the fire, every site that drops assist_held for a lost
+    -- key-up, and every early return of stall.step -- so like stall_track it never outlives the finish timer
+    -- it was set in. nil after a GE Lua reload (ADR-0052), which is the safe direction: the clock runs again
+    stall_pause = nil,
     -- The three centred message surfaces (feature race-toast-cleanup-and-checkpoint-readout, extended by
     -- standings-afk-cutoff-counter), owned by the `notice` namespace: the message line
     -- {text, kind, remaining}, the checkpoint readout {label, time, remaining} and the standing driver's
@@ -749,6 +755,7 @@ local function handle_race_start(payload)
         M.state.stall_cutoff = nil
         M.state.assist_armed = false
         M.state.assist_held = nil
+        M.state.stall_pause = nil
         M.state.assist_arming = nil
         M.state.assist_notice = nil
         M.state.freeze_hold_armed = false
@@ -852,6 +859,7 @@ local function handle_race_start(payload)
     M.state.hud_reshow_interval = HUD_RESHOW_EVERY
     M.state.assist_armed = false
     M.state.assist_held = nil
+    M.state.stall_pause = nil
     M.state.assist_arming = nil
     M.state.assist_notice = nil
     -- Re-arm the EV freeze clamp for this race: cleared here so push_freeze_hold fires again in staging
@@ -1312,6 +1320,7 @@ local function teardown_race_world()
     M.state.hud_reshow_interval = HUD_RESHOW_EVERY
     M.state.assist_armed = false
     M.state.assist_held = nil
+    M.state.stall_pause = nil
     M.state.assist_arming = nil
     M.state.assist_notice = nil
     M.state.freeze_hold_armed = false
@@ -2864,6 +2873,12 @@ stall.HINT = "move now, or you stop holding the finish timer open"
 -- the local player car and to each of the host AI alike. If you are stopped enough to hit recover, you are
 -- stopped enough to count as AFK -- which is also the rule that is easiest to explain in-game.
 --
+-- What it does NOT make AFK is pressing that key. A recover or repair press is the one thing a stuck driver
+-- does to get going again, so it counts as presence: it resets the own car's clock and stops it while the
+-- key is down (stall.on_assist_press). Without that, the shared predicate counted a driver out in the
+-- middle of his own recover -- and for the last driver out there a report ends the race before the recover
+-- can fire (ADR-0014 amendment 2026-10-13).
+--
 -- Body velocity is the right read here BECAUSE it is the recover criterion. The earlier displacement
 -- measure went with the server-side crossing-gap heuristic (ADR-0014, 2026-09-03).
 -- An unreadable car answers `false`, i.e. MOVING. Both callers want that: a recover hold must not start
@@ -2958,6 +2973,35 @@ function stall.step_clocks(dt)
     end
 end
 
+-- Drop one owned car's standstill episode: THE statement of "this car is active again". Movement says it
+-- (stall.check) and so does a recover/repair key on the own car (stall.on_assist_press /
+-- stall.on_assist_fired), and all of them say it here, so the withdrawal exists once.
+--
+-- A claim we made about the episode -- a due time or a verdict -- is taken back: left standing, it would
+-- keep a countdown on everybody's card, or keep a driver discounted, for a car that is not standing any
+-- more. The own car's count goes with it. Safe without a running timer (no table, nothing to drop).
+--
+-- Returns the dropped entry (nil when no episode was running) and whether a withdrawal was sent, so each
+-- caller says in its own words what happened -- or says nothing.
+function stall.release(car)
+    local ai_id = car and car.id
+    local key = ai_id or "self"
+    local seen = M.state.stall_track
+    local entry = seen and seen[key]
+    local withdrawn = false
+    if entry then
+        if entry.reported or entry.announced then
+            send_to_server(stall.MSG, {aiId = ai_id, stalled = false})
+            withdrawn = true
+        end
+        seen[key] = nil
+    end
+    if not ai_id then
+        stall.clear_countdown()
+    end
+    return entry, withdrawn
+end
+
 -- Run one owned car's standstill clock and report the AFK / MOVING-AGAIN edges, once each.
 --
 -- `car` is nil for the local player's own car and the AI's entry when the host proxies one -- so an AI
@@ -2967,8 +3011,8 @@ end
 -- standstill DURING the timer and nothing else -- a driver who was already parked when it started still
 -- gets the full WINDOW.
 --
--- Moving clears the whole episode: the reversal is reported if we had said anything about this car at
--- all, and the entry is dropped, so a later standstill counts again from scratch.
+-- Moving clears the whole episode (stall.release): the reversal is reported if we had said anything about
+-- this car at all, and the entry is dropped, so a later standstill counts again from scratch.
 --
 -- Three edges, not two, since the cutoff counter (feature standings-afk-cutoff-counter): at WARN_AT the
 -- server is told WHEN this car is due to be counted out, at WINDOW that it now is, and on movement that
@@ -2981,18 +3025,10 @@ function stall.check(veh, t, car)
     local entry = seen[key]
 
     if not stall.is_stopped(veh) then
-        if entry then
-            -- `announced` and not just `reported`: a due time we sent is a claim about this car too, and
-            -- leaving it standing would keep a countdown on everybody's card for a car that is driving.
-            if entry.reported or entry.announced then
-                send_to_server(stall.MSG, {aiId = ai_id, stalled = false})
-                log("I", RACE_LOG_TAG, string.format(
-                    "stall: %s is moving again -- reported as still running", stall.who(car)))
-            end
-            seen[key] = nil
-        end
-        if not ai_id then
-            stall.clear_countdown()
+        local _, withdrawn = stall.release(car)
+        if withdrawn then
+            log("I", RACE_LOG_TAG, string.format(
+                "stall: %s is moving again -- reported as still running", stall.who(car)))
         end
         return
     end
@@ -3036,6 +3072,41 @@ function stall.check(veh, t, car)
     end
 end
 
+-- A recover or repair key went down on the own car: the driver is present (ADR-0014 amendment
+-- 2026-10-13). The clock goes back to 0 exactly as if the car had moved, a claim already sent is
+-- withdrawn, and nothing counts until the key comes up or its assist fires (stall_pause, read by
+-- stall.step). Every press counts -- an assist disabled in this race and a press while rolling included.
+-- Only the own car: the AI press no keys.
+function stall.on_assist_press(kind)
+    M.state.stall_pause = kind
+    stall.reset_own(kind, "pressed")
+end
+
+-- The held recover/repair has fired: the pause ends even if the key is still down, and the next
+-- stationary frame counts from 0 again. Normally the press has already dropped the episode and there is
+-- nothing left here. A hold that began before the finish timer armed was never a pause, though (a press
+-- before the timer does nothing extra), and this is what still restarts that driver's clock at the fire.
+function stall.on_assist_fired(kind)
+    M.state.stall_pause = nil
+    stall.reset_own(kind, "fired")
+end
+
+-- Drop the own car's episode for an assist key, and say so once -- only when an episode was running, so
+-- a press with nothing to reset, and a tap repeated every second, write nothing.
+function stall.reset_own(kind, cause)
+    local entry, withdrawn = stall.release(nil)
+    if not entry then
+        return
+    end
+    local claim = "nothing had been sent"
+    if withdrawn then
+        claim = entry.reported and "AFK verdict withdrawn" or "due time withdrawn"
+    end
+    log("I", RACE_LOG_TAG, string.format(
+        "stall: own car's clock reset after %.1f s standing (%s %s) -- %s",
+        os.clockhp() - entry.since, tostring(kind), cause, claim))
+end
+
 -- Per-frame liveness step, from onUpdate in the racing and qualifying phases.
 --
 -- Only cars that can still finish are measured, and `detection` is this file's own truth for that: it is
@@ -3046,9 +3117,16 @@ end
 --
 -- Host only for the AI: M.state.ai_cars is nil on every other client (ADR-0036), so a non-host does no AI
 -- work at all. Nobody ever reports for a car they do not own.
+--
+-- An assist key that is down (stall_pause) keeps the own car out of the measurement: its episode was
+-- dropped at the press, and none starts until the key comes up or the assist fires. Both early returns
+-- below drop the pause with the clocks. A key-up can be lost -- the input filter swallows it once a quali
+-- hold engages, a VE reload can drop it -- and this is what keeps a lost one from carrying a pause into
+-- a later finish timer. The price is that a key already down when the timer arms does not pause it.
 function stall.step()
     local phase = M.state.phase
     if not M.state.race or (phase ~= "racing" and phase ~= "qualifying") then
+        M.state.stall_pause = nil
         stall.clear_countdown()
         return
     end
@@ -3057,6 +3135,7 @@ function stall.step()
     -- means 15 s of the timer -- and it keeps a normal race completely free of both work and traffic.
     if not M.state.grace then
         M.state.stall_track = nil
+        M.state.stall_pause = nil
         stall.clear_countdown()
         return
     end
@@ -3069,7 +3148,7 @@ function stall.step()
 
     local measured_own = false
     local detection = M.state.detection
-    if detection and not detection.done and not hold.is_held() then
+    if detection and not detection.done and not hold.is_held() and not M.state.stall_pause then
         -- The car the detector scores checkpoints with, not M.state.race_car_id: if a switch ever gets
         -- past the in-race lock, the stall verdict must follow the car actually being scored, or we would
         -- report a stall for a car the player is no longer in.
@@ -3081,7 +3160,7 @@ function stall.step()
     end
     if not measured_own then
         -- The driver's count is the face of a measurement, so a frame that does not measure this car has
-        -- nothing to show: finished, held, or momentarily unresolved, the count goes. Cheaper than
+        -- nothing to show: finished, held, paused, or momentarily unresolved, the count goes. Cheaper than
         -- arguing that every one of those transitions has to pass through a moving frame first.
         stall.clear_countdown()
     end
@@ -7861,7 +7940,8 @@ end
 
 -- A recover/repair key went down (forwarded from the VE, ADR-0017): record which assist is held so
 -- the per-frame stepper can run the hold. Racing + qualifying (ADR-0041), enabled assists only -- a
--- disabled assist's key is inert (blocked). The actual countdown starts in step_assist once stationary.
+-- disabled assist's key is inert (blocked), though its press still counts as presence for the AFK clock.
+-- The actual countdown starts in step_assist once stationary.
 function M.on_assist_key_down(kind)
     -- Pre-race staging: a single Insert (repair) press repairs the own car on its grid slot (ADR-0017
     -- staging-allow-repair). Instant -- no hold -- since the car is frozen, so there is no driving exploit
@@ -7888,6 +7968,10 @@ function M.on_assist_key_down(kind)
         hold.notify_blocked()
         return
     end
+    -- From here on a press counts as presence for the AFK clock, whatever it goes on to do -- a requeue, a
+    -- refusal because the assist is disabled, or a hold (ADR-0014 amendment 2026-10-13). A held driver
+    -- above is not measured, so his press has no clock to reset.
+    stall.on_assist_press(kind)
     -- Staged sprint quali (ADR-0044/Round4): the RECOVER key starts a new attempt -- requeue the running
     -- driver to the back of the queue. ONLY recover (not repair): repair falls through to the normal in-place
     -- repair below, which does NOT end the run (ADR-0017). Available regardless of the assist enable (a
@@ -7915,6 +7999,7 @@ function M.on_assist_key_up()
     local was_arming = M.state.assist_arming ~= nil
     local kind = M.state.assist_held
     M.state.assist_held = nil
+    M.state.stall_pause = nil
     clear_assist_arming()
     M.state.assist_notice = nil
     if was_arming and kind then
@@ -7941,9 +8026,11 @@ local function step_assist(dt_real)
     -- input filter swallows the key-UP as well, so on_assist_key_up never fires and assist_held stays
     -- latched. Its countdown only requires a stationary car -- and a frozen car IS stationary -- so it would
     -- run to completion and fire the assist, breaking the very hold we just engaged. Drop the latched hold
-    -- the moment the driver is held (bug quali-hold-reset-and-repaint-leak).
+    -- the moment the driver is held (bug quali-hold-reset-and-repaint-leak). The AFK pause goes with it, for
+    -- the same lost key-up.
     if hold.is_held() then
         M.state.assist_held = nil
+        M.state.stall_pause = nil
         M.state.assist_notice = nil
         clear_assist_arming()
         return
@@ -7976,6 +8063,7 @@ local function step_assist(dt_real)
         local kind = arming.kind
         clear_assist_arming()
         M.state.assist_held = nil
+        stall.on_assist_fired(kind)
         perform_assist(kind)
         return
     end
