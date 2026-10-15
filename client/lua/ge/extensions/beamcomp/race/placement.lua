@@ -516,6 +516,24 @@ function M.ground_all(poses)
     return grounded
 end
 
+-- The surface height under each of a run of `points` ({x, y} tables), searched the way the grid's slots
+-- are (ground_all): each point from the surface the point before it found, through the same narrow
+-- CHAIN_UP_MARGIN window, and a point whose cast finds nothing keeps the last height measured. `hint_z`
+-- seeds the first search and is the fallback until anything answers, so the list never holds a nil.
+-- Draw-only: the grid editor lays its part boundary lines on these (ADR-0023 amendment 2026-10-16).
+function M.ground_heights(points, hint_z)
+    local heights = {}
+    local chain_z = hint_z
+    for index, point in ipairs(points) do
+        local surface = M.ground_z(point.x, point.y, chain_z, CHAIN_UP_MARGIN)
+        if surface then
+            chain_z = surface
+        end
+        heights[index] = chain_z
+    end
+    return heights
+end
+
 -- A copy of `pose` grounded and, if it sits in a wall, nudged along +forward (down-track) until clear --
 -- re-grounding each step, up to MAX_NUDGES. Gives up gracefully (logged) on the last position rather
 -- than looping forever. Recover-only since the grid spawn went height-only (ADR-0034 amendment): a
