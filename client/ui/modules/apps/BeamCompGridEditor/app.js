@@ -17,10 +17,12 @@
 // GE owns the live edit session (race/grideditor.lua) -- this panel is render + input only. It reflects
 // BeamCompGridState (the authoritative, clamped knob values) and calls the knob setters back via
 // beamcomp_init.* . bngApi is referenced as the core UI global (NOT injected -- a DI miss takes the whole
-// late-loaded directive down) and typeof-guarded so a miss is inert. Dropdowns are custom (button + div
-// list, ng-click): native <select> does not open in the BeamNG CEF overlay.
+// late-loaded directive down) and typeof-guarded so a miss is inert. $timeout IS injected (the typing
+// pause): it is AngularJS core and cannot be missing, the way every sibling panel's main directive and this
+// file's bcGridHold inject it. Dropdowns are custom (button + div list, ng-click): native <select> does not
+// open in the BeamNG CEF overlay.
 angular.module('beamng.apps')
-.directive('beamCompGridEditor', [function () {
+.directive('beamCompGridEditor', ['$timeout', function ($timeout) {
   // A list pushed from GE, as a JavaScript array. Lua cannot tell an empty list from an empty map, so
   // every encoder sends an empty table as {} -- which is truthy and carries no .length. That defeats BOTH
   // shapes of guard this code uses: `x || []` keeps the {} (it is truthy), and `x.length <= n` lets it
@@ -119,6 +121,9 @@ angular.module('beamng.apps')
   // Every numeric knob, for the helpers that do not care which section a knob renders in (the edit-field
   // sync and the hold accumulator). One list so a knob can never be tuned but not synced.
   var KNOBS = LAYOUT_KNOBS.concat(HEIGHT_KNOBS);
+
+  // Every scope.edit field the state push writes: the knobs, the preview count and the breakpoint field.
+  var EDIT_FIELDS = KNOBS.map(function (k) { return k.key; }).concat(['previewCount', 'breakpointDisplay']);
 
   // The switch params, rendered as an Off/On pair each. They are named after what they SWITCH ON, so
   // nothing between this panel and the stored value has to invert anything: "Disable downcast: On"
@@ -223,6 +228,24 @@ angular.module('beamng.apps')
   // repeat rate while GE hears about it ~10x/s (plus the guaranteed final one, see scope.endHold).
   var SEND_INTERVAL = 100;
 
+  // How long after the last keystroke a typed number applies on its own (ms). Enter and blur still apply
+  // at once; this bounds how long a number that is simply left standing waits. It also has to outlast the
+  // gap between two digits: typing 12 passes through 1, and every send is a full recompute() on GE's side.
+  var TYPE_DELAY = 750;
+
+  // A field value as a number, or undefined when it cannot be read as one. AngularJS hands a number input's
+  // model over as null when the field is empty and as undefined when the browser or a validator rejects the
+  // text ("-", "1.", or 40 against max="32"); the input's own text is "" whenever the browser cannot read
+  // it. All of these mean "nothing to apply". The same shape as the setup panel's num(); one copy per app,
+  // for the reason asArray above gives.
+  function readNumber(value) {
+    if (value === '' || value === null || value === undefined) {
+      return undefined;
+    }
+    var n = Number(value);
+    return isFinite(n) ? n : undefined;
+  }
+
   // Clamp one accumulator tick exactly the way grideditor.set would clamp the same value (its KNOBS
   // table plus M.set): integer knobs floor, `min` and `max` mirror the Lua constraints of the same name,
   // and continuous knobs round to 2 decimals so 0.05 steps do not accumulate float noise at 25 steps/s.
@@ -240,6 +263,13 @@ angular.module('beamng.apps')
       next = knob.max;
     }
     return next;
+  }
+
+  // The preview count's clamp, mirroring grideditor.set_preview_count: floor, then [PREVIEW_MIN,
+  // PREVIEW_MAX]. One function for the held stepper and the typed field, so a 40 typed and confirmed lands
+  // exactly where holding + would have parked.
+  function clampPreview(value) {
+    return Math.max(PREVIEW_MIN, Math.min(PREVIEW_MAX, Math.floor(value)));
   }
 
   // ---- The panel's two slot NUMBER SPACES (ADR-0023 amendment 2026-08-01) ------------------------
@@ -512,14 +542,27 @@ angular.module('beamng.apps')
       // opens -- a repeat tick allocates nothing -- and yields the seed value, the per-tick clamp and the
       // GE send (null for a field GE never sees). Stepping a different field finishes the previous hold
       // properly first, so no accumulator is ever left open behind another one.
+      //
+      // A field the admin has just typed into is committed first -- the same settle Enter runs -- and the
+      // hold counts on from the typed number, clamped as a tick is: 3, type 5, press + and the field and GE
+      // both end at 6. The number is read BEFORE the settle, which may put the echo back into the field. An
+      // unreadable one (blank, "-", a preview count the input's validator refused) leaves the seed to
+      // makeHold, the authority, as before. This runs on the stepper's mousedown, which comes before the
+      // input's blur, so that blur finds nothing left to commit. Typing in ANOTHER field is left to that
+      // field's own blur, the one place its text can still be read.
       function holdFor(field, makeHold, arg) {
         if (isHeld(field)) {
           return hold;
         }
         scope.endHold();
+        var typed;
+        if (isTyping(field)) {
+          typed = readNumber(scope.edit[field]);
+          settleTyping();
+        }
         var opened = makeHold(arg);
-        hold = { field: field, value: opened.base, clamp: opened.clamp, send: opened.send,
-          sentValue: null, sentAt: 0 };
+        hold = { field: field, value: typed === undefined ? opened.base : opened.clamp(typed),
+          clamp: opened.clamp, send: opened.send, sentValue: null, sentAt: 0 };
         return hold;
       }
 
@@ -559,33 +602,165 @@ angular.module('beamng.apps')
         }
       };
 
-      // Sync the editable number fields from the authoritative state, so the inputs show GE's clamped values
-      // (and `columns` shows blank when auto/derived). The fields commit on blur, not per keystroke, so a
-      // state push never lands mid-type to fight the cursor.
+      // ---- Typing: a typed number applies on Enter, on blur, or after TYPE_DELAY without a keystroke ----
+      // (ADR-0023 amendment 2026-10-15.) One record at a time, like the hold -- there is one keyboard. The
+      // field's ng-change opens it, and it carries that field's own send, so a typed number can only ever
+      // reach the knob it was typed for, whichever field the admin moves on to.
       //
-      // A field with a hold open on it is skipped: its accumulator is ahead of the throttled echo, so
-      // writing an older value here would visibly yank the number backwards mid-hold. Every other part of
-      // the push still applies -- scope.state stays the authority for everything except that one field,
-      // and only until the button comes back up.
+      // While a record is open, its field shows what the admin typed, not the echo (see syncEditFromState).
+      // Enter and blur end it and hand the field back to GE's value (see settleTyping).
+      var typing = null;
+
+      function isTyping(field) {
+        return typing !== null && typing.field === field;
+      }
+
+      // What a typed number is ABOUT: the session's race, its direction and the active segment's start. A
+      // push that moves any of them under an open record drops the record, because its number belongs to
+      // the old target. Every control in this panel blurs the field before it acts, so this only catches
+      // a change made from outside (a console command).
+      function editTarget() {
+        return [scope.state.race, scope.state.direction, scope.state.activeStartSlot].join('|');
+      }
+
+      // Open (or keep) the record on `field`. `makeTyping(arg)` runs only when one opens and yields the
+      // field's clamp and its GE send. A record still open on another field is settled first -- a backstop,
+      // since that field's own blur has normally settled it already.
+      function typingFor(field, makeTyping, arg) {
+        if (isTyping(field)) {
+          return typing;
+        }
+        settleTyping();
+        var opened = makeTyping(arg);
+        typing = { field: field, clamp: opened.clamp, send: opened.send, timer: null, sentValue: null,
+          target: editTarget() };
+        return typing;
+      }
+
+      function cancelPause(entry) {
+        if (entry.timer !== null) {
+          $timeout.cancel(entry.timer);
+          entry.timer = null;
+        }
+      }
+
+      // (Re)start the pause, so only the number the admin stopped on is sent. It reads the MODEL only:
+      // while the admin is typing, a number the browser or the input's own validator refused is not a
+      // number he asked for. invokeApply false: the send writes nothing this panel renders, and the echo
+      // brings its own digest.
+      function armPause(entry) {
+        cancelPause(entry);
+        entry.timer = $timeout(function () {
+          entry.timer = null;
+          sendTyped(entry, readNumber(scope.edit[entry.field]));
+        }, TYPE_DELAY, false);
+      }
+
+      // Send a typed number through its record and answer whether it went. Nothing goes without a session
+      // (as before) or for a number this record already sent: a pause send followed by Enter costs GE one
+      // recompute(), not two -- the pause's echo already carries GE's answer.
+      function sendTyped(entry, value) {
+        if (value === undefined || !scope.state.active) {
+          return false;
+        }
+        var clamped = entry.clamp(value);
+        if (clamped === entry.sentValue) {
+          return false;
+        }
+        entry.sentValue = clamped;
+        entry.send(clamped);
+        return true;
+      }
+
+      // Enter / blur: end the record and apply what it holds. The value is the model, else the input's own
+      // text -- the one way to reach a preview count the max="32" validator blanked, which is clamped here
+      // and never while typing. When that sends, the echo of the send settles the field. When it does not
+      // (unreadable, no session, or the number the pause already sent), the field is put back from
+      // scope.state right here: a blanked field reads its value again, a 50 in Rows reads the 32 GE made of
+      // it. Either way the field cannot go on showing a number GE does not hold.
+      function settleTyping(rawText) {
+        var entry = typing;
+        if (entry === null) {
+          return;
+        }
+        typing = null;
+        cancelPause(entry);
+        var value = readNumber(scope.edit[entry.field]);
+        if (value === undefined) {
+          value = readNumber(rawText);
+        }
+        if (!sendTyped(entry, value)) {
+          scope.edit[entry.field] = echoOf(entry.field);
+        }
+      }
+
+      // End the record WITHOUT sending: New, Load, the session ending, a moved target, the panel's
+      // $destroy. Its number belongs to something that is going away, and the next push writes the field.
+      function dropTyping() {
+        if (typing === null) {
+          return;
+        }
+        cancelPause(typing);
+        typing = null;
+      }
+
+      scope.$on('$destroy', dropTyping);
+
+      // ng-keydown on a typed field. Enter commits, and nothing here moves the focus, so the admin can type
+      // straight on. Every other key restarts an open record's pause, because ng-change only hears a key
+      // that changed the number: 5.0 -> 5.00, or "-" -> "-.", is still typing.
+      scope.typingKey = function (field, ev) {
+        if (ev.keyCode === 13) {
+          scope.commitTyped(field, ev);
+          return;
+        }
+        if (isTyping(field)) {
+          armPause(typing);
+        }
+      };
+
+      // ng-blur, and Enter: settle THIS field's record, with this input's own text at hand.
+      scope.commitTyped = function (field, ev) {
+        if (!isTyping(field)) {
+          return;
+        }
+        settleTyping(ev && ev.target ? ev.target.value : undefined);
+      };
+
+      // The value the GE echo puts into one edit field: the knob's own value, blank for the unpinned width
+      // axis ("auto") or a knob the block omits; the preview count; and for the breakpoint field the active
+      // segment's start slot, which the admin retypes to add or select another breakpoint. That one is a GE
+      // SLOT while the field is a DISPLAY number, so this is one of the two places that seed the field from
+      // a slot (the other is breakpointHold's fallback).
+      function echoOf(field) {
+        if (field === 'previewCount') {
+          return scope.state.previewCount;
+        }
+        if (field === 'breakpointDisplay') {
+          return slotToDisplay(scope.state.activeStartSlot);
+        }
+        var value = (scope.state.knobs || {})[field];
+        return (value === undefined || value === null) ? '' : value;
+      }
+
+      // Sync the editable number fields from the authoritative state, so the inputs show GE's clamped values
+      // (and `columns` shows blank when auto/derived). Two kinds of field are skipped, each only while the
+      // admin is working in it -- ADR-0023's two narrow exceptions to "the panel shows the echo":
+      //
+      //   * a field with a hold open on it: its accumulator is ahead of the throttled echo, so writing an
+      //     older value here would visibly yank the number backwards mid-hold. Ends when the button comes up.
+      //   * a field with typing open on it. The fields used to commit on blur only, so a push could never
+      //     land mid-type; the pause sends mid-type now, and its echo (a clamped value, or rows set and the
+      //     columns gone to auto) would rewrite the digits under the cursor. Ends at Enter or blur, which put
+      //     GE's value back themselves when they send nothing -- so it restores itself.
+      //
+      // Every other part of the push still applies: scope.state stays the authority for every other field.
       function syncEditFromState() {
-        var knobs = scope.state.knobs || {};
-        KNOBS.forEach(function (k) {
-          if (isHeld(k.key)) {
-            return;
+        EDIT_FIELDS.forEach(function (field) {
+          if (!isHeld(field) && !isTyping(field)) {
+            scope.edit[field] = echoOf(field);
           }
-          var value = knobs[k.key];
-          scope.edit[k.key] = (value === undefined || value === null) ? '' : value;
         });
-        if (!isHeld('previewCount')) {
-          scope.edit.previewCount = scope.state.previewCount;
-        }
-        // The breakpoint field baselines on the active segment's start slot (a state push resets it, like
-        // the knob fields); the admin retypes it to add/select a different breakpoint. state.activeStartSlot
-        // is a GE SLOT and the field is a DISPLAY number, so this is one of the two places that seed the
-        // field from a slot (the other is breakpointHold's fallback).
-        if (!isHeld('breakpointDisplay')) {
-          scope.edit.breakpointDisplay = slotToDisplay(scope.state.activeStartSlot);
-        }
       }
 
       scope.$on('BeamCompGridData', function (event, payload) {
@@ -636,6 +811,11 @@ angular.module('beamng.apps')
           // overwrite the field once the real list arrives. The admin gets one from the next New grid.
           if (!scope.form.saveName && scope.state.name) {
             scope.form.saveName = scope.state.name;
+          }
+          // A typed number belongs to the session and the segment it was typed for. The push that ends the
+          // session is also the one whose ng-if removes the field, so the record cannot outlive its input.
+          if (typing !== null && (!scope.state.active || typing.target !== editTarget())) {
+            dropTyping();
           }
           syncEditFromState();
         });
@@ -708,8 +888,8 @@ angular.module('beamng.apps')
         }
       });
 
-      // Close any open dropdown on a click outside it (standard dropdown UX). No DI here: injected
-      // services fail to resolve for this late-loaded mod directive, so use the document global. A click
+      // Close any open dropdown on a click outside it (standard dropdown UX). The document global, not an
+      // injected $document -- the same choice the setup panel makes (see the header on DI). A click
       // on this app's own .bc-dd (head or list) is left to toggle()/pick(); anything else closes it.
       function closeOnOutsideClick(ev) {
         if (scope.open === null) { return; }
@@ -751,10 +931,13 @@ angular.module('beamng.apps')
       // Closing the saved-grid list is part of the action: the button sits INSIDE the .bc-dd wrapper, so the
       // outside-click handler exempts it, and an absolutely positioned list would otherwise hang over the
       // Direction/Layout sections this very click just revealed.
+      // A number still being typed belongs to the session this replaces, so it goes unsent (the click that
+      // got here has normally blurred and settled it already).
       scope.newGrid = function () {
         if (!scope.form.race) {
           return;
         }
+        dropTyping();
         scope.open = null;
         scope.savedName = null;
         scope.form.saveName = suggestGridName(scope.data.grids, scope.form.race);
@@ -771,12 +954,14 @@ angular.module('beamng.apps')
       // addresses the grid by its OWN race; saving it afterwards writes it to the ANCHORED race, which is
       // how a layout is copied from one track to another. Pre-fill its name so a later Save overwrites it
       // without retyping. Its only caller is pickGrid (the row click) -- there is no separate
-      // Load-the-selection button any more (ADR-0023 amendment 2026-07-30).
+      // Load-the-selection button any more (ADR-0023 amendment 2026-07-30). A number still being typed is
+      // dropped unsent, as in newGrid.
       scope.loadGrid = function () {
         var grid = selectedGrid();
         if (!grid) {
           return;
         }
+        dropTyping();
         scope.savedName = grid.name;
         scope.form.saveName = grid.name;
         geLuaArgs('grid_open_saved', grid.race, grid.name, scope.form.race || '');
@@ -841,6 +1026,9 @@ angular.module('beamng.apps')
       // Where a knob's hold starts: the current authoritative value (auto/blank starts at 0) -- the GE
       // echo, deliberately NOT scope.edit. A number typed into the field but never committed must not
       // become the base a stepper counts from, which is the source the single click always used too.
+      // A number typed and still open DOES become the base, but only through holdFor, which commits it
+      // first (the settle Enter runs) and only then seeds from it -- so the rule still holds: a stepper
+      // never counts from anything uncommitted.
       function knobHold(knob) {
         var current = scope.state.knobs ? scope.state.knobs[knob.key] : undefined;
         return {
@@ -883,27 +1071,28 @@ angular.module('beamng.apps')
         return (typeof value === 'number' && isFinite(value)) ? value + ' (default)' : '-';
       };
 
-      // Number-field commit: send the typed value to GE (which clamps and reflects it back).
-      scope.commitKnob = function (knob) {
-        if (!scope.state.active) {
-          return;
-        }
-        var value = scope.edit[knob.key];
-        if (value === '' || value === null || value === undefined) {
-          return;
-        }
-        geSetKnob(knob.key, value);
+      // How a knob field's typed number goes out: as typed, the way the old blur commit sent it -- GE
+      // clamps it and the echo says so (5.123 is not rounded on the way).
+      function knobTyping(knob) {
+        return {
+          clamp: function (value) { return value; },
+          send: function (value) { geSetKnob(knob.key, value); },
+        };
+      }
+
+      // ng-change on a knob field: a keystroke that changed the number (re)starts the pause.
+      scope.knobTyped = function (knob) {
+        armPause(typingFor(knob.key, knobTyping, knob));
       };
 
-      // Where the preview count's hold starts, and how a tick is clamped: [PREVIEW_MIN, PREVIEW_MAX]
-      // after flooring, mirroring grideditor.set_preview_count. Clamping per tick is what makes a long
-      // hold park at 32 instead of running the accumulator to 900 and taking three seconds to come back.
+      // Where the preview count's hold starts, and how a tick is clamped (clampPreview). Clamping per tick
+      // is what makes a long hold park at 32 instead of running the accumulator to 900 and taking three
+      // seconds to come back. The authority, as for knobHold, and for the same reason: a typed count
+      // becomes the base only after holdFor has committed it.
       function previewHold() {
         return {
           base: Number(scope.state.previewCount || PREVIEW_MIN),
-          clamp: function (value) {
-            return Math.max(PREVIEW_MIN, Math.min(PREVIEW_MAX, Math.floor(value)));
-          },
+          clamp: clampPreview,
           send: function (value) { geLuaNum('grid_set_preview', value); },
         };
       }
@@ -914,11 +1103,18 @@ angular.module('beamng.apps')
         }
         advanceHold(holdFor('previewCount', previewHold), direction);
       };
-      scope.commitPreview = function () {
-        if (!scope.state.active || scope.edit.previewCount === '' || scope.edit.previewCount === null) {
-          return;
-        }
-        geLuaNum('grid_set_preview', scope.edit.previewCount);
+
+      // How a typed preview count goes out: clamped like a held tick, so 40 confirmed with Enter lands on
+      // 32, and the pause's send and the Enter that follows it compare like with like.
+      function previewTyping() {
+        return {
+          clamp: clampPreview,
+          send: function (value) { geLuaNum('grid_set_preview', value); },
+        };
+      }
+
+      scope.previewTyped = function () {
+        armPause(typingFor('previewCount', previewTyping));
       };
 
       // Breakpoint / segment editing (ADR-0023 amendment). The GE session owns the segment list; the
@@ -963,7 +1159,10 @@ angular.module('beamng.apps')
       // once, and handed on in GE space. Two entry points rather than one shared function is the whole
       // point: feeding one function from two number spaces is precisely how an off-by-one ships.
       //
-      // An unusable field does nothing at all, like commitKnob and commitPreview above. The guard is not
+      // Add breakpoint and Enter in the field both land here. There is no pause: stopping at "1" on the
+      // way to "12" must not create a segment.
+      //
+      // An unusable field does nothing at all, like an unreadable knob or count above. The guard is not
       // decoration: AngularJS's number parser turns an EMPTY input into `null`, not undefined, and
       // Number(null) is 0 -- so an unguarded conversion would quietly hand GE the slot -1. It is also
       // where "there is no P0" lives in JS rather than only in the input's min attribute; a value below

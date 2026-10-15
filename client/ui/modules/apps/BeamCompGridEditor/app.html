@@ -240,7 +240,9 @@
         <span>Breakpoint at P</span>
         <div class="bc-step">
           <button bc-grid-hold="stepBreakpoint(-1)" bc-grid-hold-end="endHold()">&minus;</button>
-          <input type="number" min="1" ng-model="edit.breakpointDisplay">
+          <!-- Enter is Add breakpoint; there is deliberately no pause commit here (see selectTypedSegment). -->
+          <input type="number" min="1" ng-model="edit.breakpointDisplay"
+            ng-keydown="$event.keyCode === 13 && selectTypedSegment()">
           <button bc-grid-hold="stepBreakpoint(1)" bc-grid-hold-end="endHold()">+</button>
         </div>
       </div>
@@ -271,12 +273,16 @@
           <button ng-class="{on: !!state.knobs[k.key]}" ng-click="setFlag(k, true)">On</button>
         </div>
       </div>
+      <!-- A typed number applies on Enter, on blur, and after a short pause in typing (ADR-0023 amendment
+           2026-10-15): ng-change starts the pause, ng-keydown carries Enter, ng-blur settles. The same three
+           attributes sit on the height knobs and the preview count. -->
       <div class="bc-row bc-knob" ng-repeat="k in layoutKnobs" bc-grid-tip="k.tip">
         <span>{{k.label}}</span>
         <div class="bc-step">
           <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()">&minus;1</button>
           <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, -0.05)" bc-grid-hold-end="endHold()">&minus;</button>
-          <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
+          <input type="number" ng-model="edit[k.key]" ng-change="knobTyped(k)"
+            ng-keydown="typingKey(k.key, $event)" ng-blur="commitTyped(k.key, $event)"
             placeholder="{{k.auto ? 'auto' : knobHint(k)}}">
           <button ng-if="!k.integer" bc-grid-hold="stepKnob(k, 0.05)" bc-grid-hold-end="endHold()">+</button>
           <button class="bc-coarse" bc-grid-hold="stepKnob(k, 1)" bc-grid-hold-end="endHold()">+1</button>
@@ -289,7 +295,8 @@
         <span>Preview / warn above</span>
         <div class="bc-step">
           <button bc-grid-hold="stepPreview(-1)" bc-grid-hold-end="endHold()">&minus;</button>
-          <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-blur="commitPreview()">
+          <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-change="previewTyped()"
+            ng-keydown="typingKey('previewCount', $event)" ng-blur="commitTyped('previewCount', $event)">
           <button bc-grid-hold="stepPreview(1)" bc-grid-hold-end="endHold()">+</button>
         </div>
       </div>
@@ -316,7 +323,8 @@
           <div class="bc-step">
             <button class="bc-coarse" bc-grid-hold="stepKnob(k, -1)" bc-grid-hold-end="endHold()">&minus;1</button>
             <button bc-grid-hold="stepKnob(k, -0.05)" bc-grid-hold-end="endHold()">&minus;</button>
-            <input type="number" ng-model="edit[k.key]" ng-blur="commitKnob(k)"
+            <input type="number" ng-model="edit[k.key]" ng-change="knobTyped(k)"
+              ng-keydown="typingKey(k.key, $event)" ng-blur="commitTyped(k.key, $event)"
               placeholder="{{knobHint(k)}}">
             <button bc-grid-hold="stepKnob(k, 0.05)" bc-grid-hold-end="endHold()">+</button>
             <button class="bc-coarse" bc-grid-hold="stepKnob(k, 1)" bc-grid-hold-end="endHold()">+1</button>
