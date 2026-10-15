@@ -29,6 +29,7 @@ below rather than hidden.
   game with a live preview and saved by name.
   Opened from the setup panel, the grid editor starts in the direction the race is set to run, and
   says when you switch to the other one.
+  A number typed into the grid editor applies on Enter, or by itself a moment after you stop typing.
 - A grid can be set as the default for a race, so that race always starts on it.
 - Large vehicles get the room they need; the field is placed on the ground it actually stands on.
 - A synchronised countdown that holds every car, or an F1-style light sequence where the car is free
