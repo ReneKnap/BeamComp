@@ -293,9 +293,10 @@ local function make_frame(base_pos, base_rot, gate_normal)
     }
 end
 
--- Lay `count` cars out for one param set anchored on `frame`, and return (poses, next_frame) -- the frame the
--- FOLLOWING segment starts from (a kinematic chain). `poses` is a list of { pos, rot, forward, faceDir } in
--- slot order. Within the segment: its own headingDeg rotates the layout about the frame origin (the pivot);
+-- Lay `count` cars out for one param set anchored on `frame`, and return (poses, next_frame, layout) -- the
+-- frame the FOLLOWING segment starts from (a kinematic chain), and the frame this one was laid out in.
+-- `poses` is a list of { pos, rot, forward, faceDir } in slot order.
+-- Within the segment: its own headingDeg rotates the layout about the frame origin (the pivot);
 -- each slot is placed as right * lateral + (-forward) * setback, so offsetForward is a gap along the frame
 -- forward and offsetLateral a shift along the frame right; the column stagger (row_gap / columns) spreads the
 -- columns across one row's depth; mirror negates only the column-derived lateral. `next_frame` advances the
@@ -303,6 +304,11 @@ end
 -- offsetLateral shift, and rotates forward/facing/rot by this segment's headingDeg -- so a rotated or
 -- laterally shifted segment carries the whole tail behind it and headings compose cumulatively down the
 -- chain. `params`: the ADR-0023 param set (offsets/heading/gaps + a rows-or-columns width pin; nil -> default).
+--
+-- `layout` hands out what this function computes anyway and changes none of it (ADR-0023 amendment
+-- 2026-10-16): the pivot `origin`, the `frame_forward` the segment received, its own heading-rotated
+-- `forward` and `right`, and the resolved `columns`. The grid editor draws its part boundaries and its plan
+-- from them; the poses and next_frame are exactly what they were. The tables are shared, so read-only.
 local function compute_segment(frame, count, params)
     local p = resolved_params(params)
     local heading_rad = math.rad(p.heading_deg)
@@ -402,7 +408,14 @@ local function compute_segment(frame, count, params)
         facing = facing,
         rot = rot,
     }
-    return poses, next_frame
+    local layout = {
+        origin = origin,
+        frame_forward = frame.forward,
+        forward = forward,
+        right = right,
+        columns = columns,
+    }
+    return poses, next_frame, layout
 end
 
 -- Grid poses for `count` players behind base_pos/base_rot for a single param set (ADR-0023). Thin wrapper
@@ -449,27 +462,50 @@ end
 -- breakpoint off a column boundary restarts that segment's columns (its lateral pattern begins fresh at
 -- column 0). Every pose is tagged with its 1-based `segment` index (for the editor's active highlight). A
 -- single-segment list reproduces M.poses (today's layout) bit-for-bit.
-function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
+--
+-- Returns (poses, layouts): `layouts` lists, in slot order, every segment that laid out at least one pose
+-- as compute_segment's layout plus its `segment` index, `startSlot` and pose `count`. A segment that starts
+-- at or past `count` has no poses and no entry.
+local function stack_segments(base_pos, base_rot, count, segments, gate_normal)
     local list = normalize_segments(segments)
     -- The running frame: starts at segment 0's anchor and is threaded from each segment to the next, so
     -- every segment stacks relative to the previous segment's end (its rotation and lateral shift included).
     local frame = make_frame(base_pos, base_rot, gate_normal)
 
     local all_poses = {}
+    local layouts = {}
     for index = 1, #list do
         local seg = list[index]
         local next_start = list[index + 1] and list[index + 1].startSlot or count
         local seg_count = math.min(next_start, count) - seg.startSlot
         if seg_count > 0 then
-            local seg_poses, next_frame = compute_segment(frame, seg_count, seg.params)
+            local seg_poses, next_frame, layout = compute_segment(frame, seg_count, seg.params)
             for _, pose in ipairs(seg_poses) do
                 pose.segment = index
                 all_poses[#all_poses + 1] = pose
             end
+            layout.segment = index
+            layout.startSlot = seg.startSlot
+            layout.count = seg_count
+            layouts[#layouts + 1] = layout
             frame = next_frame
         end
     end
-    return all_poses
+    return all_poses, layouts
+end
+
+-- The pose list alone, for the race start. Deliberately ONE return value: start.lua calls this in the last
+-- argument position of placement.ground_all, where a second return would be passed on as an argument.
+function M.poses_segmented(base_pos, base_rot, count, segments, gate_normal)
+    local poses = stack_segments(base_pos, base_rot, count, segments, gate_normal)
+    return poses
+end
+
+-- The same poses plus the frame every segment was laid out in (see stack_segments), for the grid editor's
+-- part boundaries and plan (ADR-0023 amendment 2026-10-16). Same function underneath, so the editor can
+-- never draw a line for a layout the spawn does not produce.
+function M.poses_segmented_with_frames(base_pos, base_rot, count, segments, gate_normal)
+    return stack_segments(base_pos, base_rot, count, segments, gate_normal)
 end
 
 -- Drop the retired height anchor from a param set as it is loaded (ADR-0023 amendment 2026-09-01). Every
