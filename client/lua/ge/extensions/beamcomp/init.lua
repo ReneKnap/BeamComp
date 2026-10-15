@@ -245,8 +245,9 @@ local DASH_REFRESH_SETTLE = 0.75
 -- hostaitags (the host's own AI tags), keysdup (the /keys window's duplicate keys) and adminlists
 -- (another admin's saved presets and grids) and griddir (the grid editor following the race setup's
 -- direction) and revsprint (the reverse start of a sprint without its own) and afkassist (a recover or
--- repair press resetting the AFK count) are new since then, and gridenter (a number typed into the grid
--- editor applying on Enter and after a typing pause) is new in this build.
+-- repair press resetting the AFK count) and gridenter (a number typed into the grid editor applying on
+-- Enter and after a typing pause) are new since then, and gridplan (the grid editor's part colors, part
+-- lines and plan) is new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -274,8 +275,11 @@ local DASH_REFRESH_SETTLE = 0.75
 -- start; one logging afkassist-r1 also has a recover or repair press during the finish timer take the AFK
 -- count back to 0 and stop it while the key is down; one logging gridenter-r1 also has a number typed into
 -- the grid editor apply on Enter and after 750 ms without a keystroke, not only when the field loses focus,
--- with Enter in "Breakpoint at P" adding the breakpoint and +/- counting on from a number just typed.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1/2026-10-15"
+-- with Enter in "Breakpoint at P" adding the breakpoint and +/- counting on from a number just typed; one
+-- logging gridplan-r1 also draws each part of a grid being edited in its own color, with a magenta line
+-- labelled "Part <n> from P<m>" across the field where each part begins, and shows the grid as a plan in
+-- the editor panel that can be dragged sideways and draws a typed breakpoint as a dashed line.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1-gridplan-r1/2026-10-16"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
