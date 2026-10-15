@@ -179,9 +179,12 @@ angular.module('beamng.apps')
     direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
     cameraToGrid: 'Move the camera above P1 of this grid. Not during a race.',
 
-    breakpoint: 'The starting position where a new part of the grid begins.',
+    breakpoint: 'The position where a new part of the grid begins. While you type, the plan shows it as a '
+      + 'dashed line.',
     addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
-      + 'own layout.',
+      + 'own layout. A line on the ground and in the plan marks where the new part begins.',
+    plan: 'The grid seen from above, P1 at the start line on the left. Drag to look along it, click a '
+      + 'position to edit its part.',
     removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
       + 'one to edit it with the settings below.',
@@ -303,6 +306,67 @@ angular.module('beamng.apps')
   // The breakpoint field's floor. Slot 0 is the base segment, so the smallest number the admin can dial
   // is its label -- expressed through the conversion rather than hard-coded, so the two cannot drift.
   var SLOT_DISPLAY_MIN = slotToDisplay(0);
+
+  // ---- The plan: the grid seen from above (ADR-0023 amendment 2026-10-16) ----------------------------
+  // Display constants only. Every position, line and color in the plan comes from GE
+  // (BeamCompGridState.plan); this panel lays nothing out and holds no grid constant.
+  //
+  // The scale is fixed, so a dot keeps its size whatever the field: at the default 4 m column stagger a
+  // diagonal neighbour is 34 px away and a same-column one 48 px, and a ~600 px strip shows ~100 m, the
+  // whole default 16-car field. A longer field is dragged.
+  var PLAN_SCALE = 6;             // px per meter
+  var PLAN_HEIGHT = 104;          // px
+  var PLAN_DOT_RADIUS = 10;       // px; the P<n> label sits inside the dot
+  var PLAN_NOSE = 6;              // px the facing tick reaches past the dot
+  var PLAN_PAD = 18;              // px of room before the start line and after the last position
+  var PLAN_LEAD = 0.25;           // share of the window that shows the part before the edited one
+  var PLAN_FALLBACK_WIDTH = 560;  // px, until the strip has been laid out and measured
+  var PLAN_START_SQUARE = 4;      // px, the start line's checkered mark
+  var PLAN_START_ROWS = 10;
+  // The panel background (.bc-grid), to decide whether a dot's label is dark or light.
+  var PANEL_RGB = [20 / 255, 22 / 255, 26 / 255];
+
+  // A GE color {r, g, b, a} (0..1) as CSS.
+  function cssColor(color, alpha) {
+    var a = alpha === undefined ? color.a : alpha;
+    return 'rgba(' + Math.round(color.r * 255) + ',' + Math.round(color.g * 255) + ','
+      + Math.round(color.b * 255) + ',' + a + ')';
+  }
+
+  // Dark text on a light dot, white on a dark one, judged on the dot as it shows over the panel.
+  function labelColorOn(color) {
+    var shown = [color.r, color.g, color.b].map(function (c, i) {
+      return c * color.a + PANEL_RGB[i] * (1 - color.a);
+    });
+    var light = 0.2126 * shown[0] + 0.7152 * shown[1] + 0.0722 * shown[2];
+    return light > 0.5 ? '#10131a' : '#ffffff';
+  }
+
+  // GE's plan with every list normalised (see asArray), or null when GE sent none.
+  function planOf(plan) {
+    if (!plan) {
+      return null;
+    }
+    return { poses: asArray(plan.poses), boundaries: asArray(plan.boundaries), parts: asArray(plan.parts) };
+  }
+
+  // The checkered start-line mark at x = 0, centred on the start pose: two columns of small squares.
+  function startMark() {
+    var squares = [];
+    var top = -(PLAN_START_ROWS * PLAN_START_SQUARE) / 2;
+    for (var row = 0; row < PLAN_START_ROWS; row++) {
+      for (var col = 0; col < 2; col++) {
+        squares.push({ x: (col - 1) * PLAN_START_SQUARE, y: top + row * PLAN_START_SQUARE,
+          size: PLAN_START_SQUARE, fill: (row + col) % 2 === 0 ? '#f0f0f0' : '#10131a' });
+      }
+    }
+    return squares;
+  }
+
+  function emptyPlan() {
+    return { height: PLAN_HEIGHT, tx: 0, ty: PLAN_HEIGHT / 2, left: 0, right: 0, fits: true, middle: 0,
+      dots: [], lines: [], dashed: null, start: startMark() };
+  }
 
   // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
   // every further one "<EXTRA_GRID_PREFIX><n>". Both are prefills only -- the field stays freely editable,
@@ -437,10 +501,11 @@ angular.module('beamng.apps')
       // (0-based) -- this payload is GE's, unchanged; only what is rendered from it is 1-based.
       // `knobDefaults` are the layout defaults GE falls back to for a knob a loaded block omits -- shown as
       // that field's placeholder (see scope.knobHint). `setupDirection` is deliberately not seeded: absent
-      // means no direction line (see scope.directionNote).
+      // means no direction line (see scope.directionNote). `plan` is the field as GE lays it out, for the
+      // plan strip (see planOf; ADR-0023 amendment 2026-10-16).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
-        knobDefaults: null };
+        knobDefaults: null, plan: null };
       // Editable mirror of the number fields, synced from state on each push. The knob entries hold GE's own
       // values; `breakpointDisplay` alone is in DISPLAY space (see slotToDisplay above) -- which is why it
       // is not called breakpointSlot.
@@ -790,9 +855,11 @@ angular.module('beamng.apps')
           scope.state = payload || scope.state;
           // The breakpoint boundaries are a list, and GE.segment_bounds() returns an EMPTY one whenever
           // no edit session is running -- the case that crosses the bridge as {}. The template reads
-          // state.segments.length, which would then be undefined: "Editing segment 1 of " with nothing
-          // after it. Normalised here, so the field matches the [] this scope was seeded with.
+          // state.segments.length, which would then be undefined: "Part 1 of " with nothing after it.
+          // Normalised here, so the field matches the [] this scope was seeded with.
           scope.state.segments = asArray(scope.state.segments);
+          // The plan's three lists, the same way: a one-part grid sends its boundaries as {}.
+          scope.state.plan = planOf(scope.state.plan);
           // savedName tracks the active grid's persisted name (gates the default button, marks the
           // overwrite target).
           scope.savedName = scope.state.name || null;
@@ -818,6 +885,7 @@ angular.module('beamng.apps')
             dropTyping();
           }
           syncEditFromState();
+          planAfterPush();
         });
       });
 
@@ -938,6 +1006,7 @@ angular.module('beamng.apps')
           return;
         }
         dropTyping();
+        planNewSession();
         scope.open = null;
         scope.savedName = null;
         scope.form.saveName = suggestGridName(scope.data.grids, scope.form.race);
@@ -962,6 +1031,7 @@ angular.module('beamng.apps')
           return;
         }
         dropTyping();
+        planNewSession();
         scope.savedName = grid.name;
         scope.form.saveName = grid.name;
         geLuaArgs('grid_open_saved', grid.race, grid.name, scope.form.race || '');
@@ -1143,6 +1213,7 @@ angular.module('beamng.apps')
       // model on any smaller value, so an unclamped hold would empty the field instead of stopping in it.
       scope.stepBreakpoint = function (delta) {
         advanceHold(holdFor('breakpointDisplay', breakpointHold), delta);
+        planDraftChanged('stepped');
       };
 
       // Select the segment starting at `slot`, or create one there seeded from the covering segment.
@@ -1167,7 +1238,10 @@ angular.module('beamng.apps')
       // Number(null) is 0 -- so an unguarded conversion would quietly hand GE the slot -1. It is also
       // where "there is no P0" lives in JS rather than only in the input's min attribute; a value below
       // the floor is invalid there too and arrives here as undefined.
+      //
+      // Either way the number is settled now, so the plan's dashed line goes (planSettleDraft).
       scope.selectTypedSegment = function () {
+        planSettleDraft();
         var display = Number(scope.edit.breakpointDisplay);
         if (!isFinite(display) || display < SLOT_DISPLAY_MIN) {
           return;
@@ -1188,6 +1262,316 @@ angular.module('beamng.apps')
           return;
         }
         geCall('grid_remove_segment');
+      };
+
+      // The hint above the plan: which part the settings below edit, and which positions that is. The
+      // admin reads segments as parts. Ranges come from GE's plan (the last PREVIEWED slot of a part), so
+      // the last part ends at the preview count, and a part starting past the preview says so.
+      scope.partHint = function () {
+        var plan = scope.state.plan;
+        var index = scope.state.activeSegment;
+        var part = plan && plan.parts[index - 1];
+        if (!part) {
+          return '';
+        }
+        var head = 'Part ' + index + ' of ' + plan.parts.length;
+        var first = scope.slotLabel(part.startSlot);
+        if (part.lastSlot === undefined || part.lastSlot === null) {
+          return head + ' starts at ' + first + ', which is not in the preview. '
+            + 'The settings below change only its positions.';
+        }
+        if (part.lastSlot === part.startSlot) {
+          return head + ': ' + first + '. The settings below change only this position.';
+        }
+        var range = head + ': ' + first + ' to ' + scope.slotLabel(part.lastSlot) + '.';
+        if (plan.parts.length === 1) {
+          return range + ' The settings below change every position.';
+        }
+        return range + ' The settings below change only these positions.';
+      };
+
+      // A part's color as GE draws it right now (bright for the edited part), for its chip.
+      scope.partSwatch = function (index) {
+        var part = scope.state.plan && scope.state.plan.parts[index];
+        return part ? cssColor(part.color, 1) : 'transparent';
+      };
+
+      // ---- The plan strip (ADR-0023 amendment 2026-10-16) -------------------------------------------
+      // Renders GE's plan (scope.state.plan) and nothing else: one dot per preview position, a line where
+      // each part begins, a checkered start-line mark at x = 0. Plan meters x (behind the start line) and
+      // y (right of travel) map to the strip as x -> right, y -> up, so P1 is on the left and the cars face
+      // left, towards the mark -- a true top view, pole-left at the bottom.
+      //
+      // The strip is a WINDOW onto the field, moved by dragging (bcGridDrag) and by two triggers:
+      //   * the edited part changes (editTarget(): race, direction, the part's start): the window jumps to
+      //     that part's start, with the part before it in its first quarter, and FOLLOWS that start on
+      //     every push from then on (a knob that moves the part moves the window with it);
+      //   * the typed breakpoint moves the dashed line: the window centres on it and stops following.
+      // A drag stops following too, and a push then never moves the window; only the clamp to the field
+      // can, when the field itself got shorter.
+      //
+      // The dashed line is a DRAFT: the number in Breakpoint at P while it is the admin's own, typed
+      // (`ng-change`) or stepped (its ± buttons) and not yet applied. The plan reads that field and never
+      // writes it, and nothing of the draft reaches GE before Enter or Add breakpoint.
+      scope.plan = emptyPlan();
+      var planView = { pan: 0, follow: true, partKey: null, dashedSlot: null, width: 0, dragFrom: 0 };
+      var planDraft = null;   // null (the field shows GE's echo), 'typed' or 'stepped'
+
+      function planWidth() {
+        return planView.width || PLAN_FALLBACK_WIDTH;
+      }
+
+      function planPoseAt(slot) {
+        var poses = scope.state.plan ? scope.state.plan.poses : [];
+        for (var i = 0; i < poses.length; i++) {
+          if (poses[i].slot === slot) {
+            return poses[i];
+          }
+        }
+        return null;
+      }
+
+      // The part covering a GE slot, from GE's ranges.
+      function planPartCovering(slot) {
+        var parts = scope.state.plan ? scope.state.plan.parts : [];
+        var covering = null;
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i].startSlot <= slot) {
+            covering = parts[i];
+          }
+        }
+        return covering;
+      }
+
+      // The GE slot the dashed line stands in front of, or null. Only for a draft that reads as a number,
+      // is not already where a part begins (P1 included: slot 0 is part 1's start) and has a position in
+      // the preview to draw against. Floored like GE floors the number it is sent.
+      function planDashedSlot() {
+        if (planDraft === null || !scope.state.plan) {
+          return null;
+        }
+        var display = readNumber(scope.edit.breakpointDisplay);
+        if (display === undefined) {
+          return null;
+        }
+        var slot = displayToSlot(Math.floor(display));
+        var parts = scope.state.plan.parts;
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i].startSlot === slot) {
+            return null;
+          }
+        }
+        return planPoseAt(slot) && planPoseAt(slot - 1) ? slot : null;
+      }
+
+      // The dashed line: halfway between the last position that would stay in the earlier part and the
+      // first one of the new part, square to that position's facing, as tall as the strip.
+      function planDashedLine(slot) {
+        var before = planPoseAt(slot - 1);
+        var after = planPoseAt(slot);
+        var midX = (before.x + after.x) / 2 * PLAN_SCALE;
+        var midY = -(before.y + after.y) / 2 * PLAN_SCALE;
+        var acrossX = after.fy;
+        var acrossY = after.fx;
+        return { x: midX, x1: midX - acrossX * PLAN_HEIGHT, y1: midY - acrossY * PLAN_HEIGHT,
+          x2: midX + acrossX * PLAN_HEIGHT, y2: midY + acrossY * PLAN_HEIGHT };
+      }
+
+      // Rebuild what the strip draws from GE's plan and the draft. The window position is placePlan's.
+      function buildPlan() {
+        var source = scope.state.plan;
+        var built = emptyPlan();
+        if (!source || !source.poses.length) {
+          scope.plan = built;
+          return;
+        }
+        var dashedSlot = planDashedSlot();
+        var draftPart = dashedSlot === null ? null : planPartCovering(dashedSlot);
+        var minX = 0;
+        var maxX = 0;
+        var minY = Infinity;
+        var maxY = -Infinity;
+        built.dots = source.poses.map(function (pose) {
+          var part = source.parts[pose.part - 1];
+          var color = part ? part.color : { r: 1, g: 1, b: 1, a: 1 };
+          var isDraft = draftPart !== null && pose.slot >= dashedSlot && pose.slot <= draftPart.lastSlot;
+          var isEdited = pose.part === scope.state.activeSegment;
+          minX = Math.min(minX, pose.x);
+          maxX = Math.max(maxX, pose.x);
+          minY = Math.min(minY, pose.y);
+          maxY = Math.max(maxY, pose.y);
+          return {
+            slot: pose.slot,
+            start: part ? part.startSlot : 0,
+            label: scope.slotLabel(pose.slot),
+            cx: pose.x * PLAN_SCALE,
+            cy: -pose.y * PLAN_SCALE,
+            r: PLAN_DOT_RADIUS,
+            nx: pose.fx * (PLAN_DOT_RADIUS + PLAN_NOSE),
+            ny: -pose.fy * (PLAN_DOT_RADIUS + PLAN_NOSE),
+            fill: isDraft ? 'rgba(20,22,26,0.6)' : cssColor(color),
+            nose: cssColor(color),
+            stroke: isDraft ? cssColor(color, 1) : (isEdited ? '#ffffff' : 'none'),
+            dash: isDraft ? '3 2' : 'none',
+            text: isDraft ? cssColor(color, 1) : labelColorOn(color),
+          };
+        });
+        built.lines = source.boundaries.map(function (boundary) {
+          minX = Math.min(minX, boundary.a.x, boundary.b.x);
+          maxX = Math.max(maxX, boundary.a.x, boundary.b.x);
+          return { part: boundary.part, x1: boundary.a.x * PLAN_SCALE, y1: -boundary.a.y * PLAN_SCALE,
+            x2: boundary.b.x * PLAN_SCALE, y2: -boundary.b.y * PLAN_SCALE, color: cssColor(boundary.color) };
+        });
+        built.dashed = dashedSlot === null ? null : planDashedLine(dashedSlot);
+        built.left = minX * PLAN_SCALE - PLAN_PAD;
+        built.right = maxX * PLAN_SCALE + PLAN_PAD;
+        built.middle = (minY + maxY) / 2;
+        built.fits = (maxY - minY) * PLAN_SCALE + 2 * PLAN_DOT_RADIUS <= PLAN_HEIGHT - 8;
+        scope.plan = built;
+      }
+
+      function clampPan(pan) {
+        var max = Math.max(scope.plan.left, scope.plan.right - planWidth());
+        return Math.min(Math.max(pan, scope.plan.left), max);
+      }
+
+      // The lateral middle the strip is centred on: the whole field's when it fits the strip's height,
+      // else the middle of the positions inside the window, so a strong bend stays in view as it is dragged.
+      function planMiddle() {
+        if (scope.plan.fits) {
+          return scope.plan.middle;
+        }
+        var from = planView.pan;
+        var to = planView.pan + planWidth();
+        var minY = Infinity;
+        var maxY = -Infinity;
+        scope.plan.dots.forEach(function (dot) {
+          if (dot.cx >= from && dot.cx <= to) {
+            minY = Math.min(minY, -dot.cy / PLAN_SCALE);
+            maxY = Math.max(maxY, -dot.cy / PLAN_SCALE);
+          }
+        });
+        return minY === Infinity ? scope.plan.middle : (minY + maxY) / 2;
+      }
+
+      // Put the window where planView.pan says, clamped to the field.
+      function placePlan() {
+        planView.pan = clampPan(planView.pan);
+        scope.plan.tx = -planView.pan;
+        scope.plan.ty = PLAN_HEIGHT / 2 + planMiddle() * PLAN_SCALE;
+      }
+
+      // Where the window shows the edited part's start: the start line for part 1, otherwise the line
+      // where the part begins a quarter of the way in. A part past the preview has no line: the end of the
+      // field, where it would begin.
+      function partStartPan() {
+        var index = scope.state.activeSegment;
+        if (index <= 1) {
+          return scope.plan.left;
+        }
+        for (var i = 0; i < scope.plan.lines.length; i++) {
+          var line = scope.plan.lines[i];
+          if (line.part === index) {
+            return (line.x1 + line.x2) / 2 - planWidth() * PLAN_LEAD;
+          }
+        }
+        return scope.plan.right - planWidth();
+      }
+
+      // Every push: the echo settles a draft (it has just rewritten the field), a changed edit target sends
+      // the window back to following, and a following window goes to the edited part's start.
+      function planAfterPush() {
+        if (!isHeld('breakpointDisplay')) {
+          planDraft = null;
+          planView.dashedSlot = null;
+        }
+        if (!scope.state.active) {
+          planView.partKey = null;
+        }
+        var key = editTarget();
+        if (scope.state.active && key !== planView.partKey) {
+          planView.partKey = key;
+          planView.follow = true;
+        }
+        buildPlan();
+        if (planView.follow) {
+          planView.pan = partStartPan();
+        }
+        placePlan();
+      }
+
+      // New and Load start a field of their own, even on the same race, direction and part.
+      function planNewSession() {
+        planView.partKey = null;
+        planDraft = null;
+        planView.dashedSlot = null;
+      }
+
+      // The draft changed: redraw, and when the dashed line moved to a new place, centre the window on it.
+      function planDraftChanged(source) {
+        planDraft = source;
+        buildPlan();
+        var slot = planDashedSlot();
+        if (slot !== null && slot !== planView.dashedSlot) {
+          planView.pan = scope.plan.dashed.x - planWidth() / 2;
+          planView.follow = false;
+        }
+        planView.dashedSlot = slot;
+        placePlan();
+      }
+
+      // Enter / Add breakpoint: the number is settled, so the dashed line goes. The window stays.
+      function planSettleDraft() {
+        planDraft = null;
+        planView.dashedSlot = null;
+        buildPlan();
+        placePlan();
+      }
+
+      // ng-change on Breakpoint at P. It only draws: there is no pause commit on this field.
+      scope.planBreakpointTyped = function () {
+        planDraftChanged('typed');
+      };
+
+      // ng-blur on Breakpoint at P settles a TYPED draft. A stepped one stays: a ± press blurs the field
+      // AFTER its mousedown has stepped, and the step is exactly what the admin is looking at.
+      scope.planBreakpointBlurred = function () {
+        if (planDraft === 'typed') {
+          planSettleDraft();
+        }
+      };
+
+      // bcGridDrag: a press remembers where the window was, a drag moves it from there.
+      scope.planPress = function () {
+        planView.dragFrom = planView.pan;
+      };
+
+      scope.planDrag = function (dx) {
+        planView.follow = false;
+        planView.pan = planView.dragFrom - dx;
+        placePlan();
+      };
+
+      // A click on a dot selects that dot's part, exactly like its chip: the part's start is a GE slot and
+      // goes through selectSegment untouched. A click anywhere else in the strip does nothing.
+      scope.planClick = function (start) {
+        var slot = Number(start);
+        if (start === null || start === undefined || start === '' || !isFinite(slot)) {
+          return;
+        }
+        scope.selectSegment(slot);
+      };
+
+      // bcGridDrag reports the strip's real width once it is laid out (and when it changes).
+      scope.planMeasure = function (width) {
+        if (!(width > 0) || width === planView.width) {
+          return;
+        }
+        planView.width = width;
+        if (planView.follow) {
+          planView.pan = partStartPan();
+        }
+        placePlan();
       };
 
       // Reveal (or cancel) the Save name row. It deliberately does NOT touch form.saveName -- the opposite
@@ -1499,6 +1883,147 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
       // listener are ours to clear, and the final GE send still goes out through endGesture.
       scope.$on('$destroy', function () {
         release();
+      });
+    },
+  };
+}]);
+
+// Drag-to-pan for the plan strip (ADR-0023 amendment 2026-10-16): the gesture and nothing else, the way
+// bcGridHold is the hold and nothing else. The panel above owns the window position and what a click means.
+//
+//   bc-grid-drag-start="planPress()"        a left press on the strip
+//   bc-grid-drag="planDrag($dx)"            every move once the press has moved past CLICK_SLOP; $dx is
+//                                           the horizontal distance from the press, in px
+//   bc-grid-drag-click="planClick($start)"  a release that never got past CLICK_SLOP; $start is the
+//                                           data-start of the dot under the press (null off the dots)
+//   bc-grid-drag-width="planMeasure($width)" the strip's laid-out width, after link and on every resize
+//
+// The press is preventDefault-ed: the strip must neither take the focus from a field being typed in (its
+// draft is what the admin is looking at) nor start a text selection across the SVG labels.
+//
+// Every release path ends the drag, the set bcGridHold owns: mouseup anywhere, the pointer leaving the
+// strip, the window losing focus, and $destroy. Only the mouseup can be a click. The document and window
+// listeners exist only while a press is open. App-unique name for the reason bcGridFit's is.
+angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', function ($parse, $timeout) {
+  var CLICK_SLOP = 4;   // px a press may move and still count as a click
+
+  return {
+    restrict: 'A',
+    link: function (scope, element, attrs) {
+      var onStart = $parse(attrs.bcGridDragStart);
+      var onDrag = $parse(attrs.bcGridDrag);
+      var onClick = $parse(attrs.bcGridDragClick);
+      var onWidth = $parse(attrs.bcGridDragWidth);
+      var press = null;   // {x, y, moved, start} while the button is down
+      var resizeObserver = null;
+
+      // The same phase check as bcGridHold's: a blur can arrive from inside a digest.
+      function applyHandler(fn) {
+        if (scope.$root && scope.$root.$$phase) {
+          fn();
+        } else {
+          scope.$apply(fn);
+        }
+      }
+
+      // The data-start of the dot the press landed on, or null.
+      function startUnder(node) {
+        while (node && node !== element[0]) {
+          if (node.getAttribute && node.getAttribute('data-start') !== null) {
+            return node.getAttribute('data-start');
+          }
+          node = node.parentNode;
+        }
+        return null;
+      }
+
+      function reportWidth() {
+        var width = element[0].getBoundingClientRect().width;
+        if (width > 0) {
+          applyHandler(function () {
+            onWidth(scope, { $width: width });
+          });
+        }
+      }
+
+      function stopListening() {
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('mouseup', onUp, true);
+        window.removeEventListener('blur', onCancel, false);
+      }
+
+      // End the press. Idempotent; a click only when the release is a mouseup and the press never moved.
+      function release(isMouseUp) {
+        if (press === null) {
+          return;
+        }
+        var ended = press;
+        press = null;
+        stopListening();
+        if (isMouseUp && !ended.moved) {
+          onClick(scope, { $start: ended.start });
+        }
+      }
+
+      function onMove(ev) {
+        if (press === null) {
+          return;
+        }
+        var dx = ev.clientX - press.x;
+        var dy = ev.clientY - press.y;
+        if (!press.moved && Math.sqrt(dx * dx + dy * dy) <= CLICK_SLOP) {
+          return;
+        }
+        press.moved = true;
+        applyHandler(function () {
+          onDrag(scope, { $dx: dx });
+        });
+      }
+
+      function onUp() {
+        applyHandler(function () {
+          release(true);
+        });
+      }
+
+      function onCancel() {
+        applyHandler(function () {
+          release(false);
+        });
+      }
+
+      function onDown(ev) {
+        if (ev.button !== 0 || press !== null) {
+          return;
+        }
+        ev.preventDefault();
+        press = { x: ev.clientX, y: ev.clientY, moved: false, start: startUnder(ev.target) };
+        document.addEventListener('mousemove', onMove, true);
+        document.addEventListener('mouseup', onUp, true);
+        window.addEventListener('blur', onCancel, false);
+        reportWidth();
+        applyHandler(function () {
+          onStart(scope);
+        });
+      }
+
+      element.on('mousedown', onDown);
+      element.on('mouseleave', onCancel);
+
+      // After the first layout, and whenever the panel is resized. invokeApply false: reportWidth applies.
+      var firstLayout = $timeout(reportWidth, 0, false);
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(reportWidth);
+        resizeObserver.observe(element[0]);
+      }
+
+      // Already inside a digest, so release runs directly; jqLite drops the element's own listeners.
+      scope.$on('$destroy', function () {
+        release(false);
+        $timeout.cancel(firstLayout);
+        if (resizeObserver) {
+          resizeObserver.disconnect();
+        }
       });
     },
   };
