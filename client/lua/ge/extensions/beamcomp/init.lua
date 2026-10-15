@@ -3863,6 +3863,10 @@ local function push_grid_state()
         -- placeholder instead of a bare "-". Constant, but sent with the knobs it annotates so the panel
         -- always has both together.
         knobDefaults = grideditor.knob_defaults(),
+        -- The field as the panel's plan draws it (ADR-0023 amendment 2026-10-16): every preview pose and
+        -- every part boundary in plan metres, and each part's range and color as the 3D preview draws it.
+        -- The panel's only geometry source; it never lays a pose out itself. Nil when not editing.
+        plan = grideditor.plan(),
     })
 end
 
@@ -5382,11 +5386,13 @@ local function on_server_event(data)
     handler(payload)
 end
 
--- Draw the grid editor's live preview poses as cyan pillars with P-position labels, each with a red
--- orientation line in the slot's facing (drive-up) direction (ADR-0023 + amendment). The active
--- segment's pillars read bright and the rest are dimmed, so it is clear which slots the current knobs
--- affect. Immediate-mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false)
--- removes them with no scene objects to clean up.
+-- Draw the grid editor's live preview poses as pillars with P-position labels, each with a red
+-- orientation line in the slot's facing (drive-up) direction (ADR-0023 + amendment). Every part has its
+-- own color (grideditor.part_color): the active part's pillars read bright and the rest muted, so it is
+-- clear which slots the current knobs affect, and a magenta line across the field, labelled
+-- "Part <n> from P<m>", marks where each part begins (ADR-0023 amendment 2026-10-16). Immediate-mode:
+-- redrawn each frame from grideditor.state, so leaving edit mode (active = false) removes them with no
+-- scene objects to clean up.
 --
 -- Pillar and line follow the slot's MEASURED ground slope, and the four points that slope was measured
 -- at get a blob each (ADR-0034 amendment 2026-08-30). Both read the normal race/placement put on the
@@ -5398,8 +5404,8 @@ local function draw_editor_grid()
         return
     end
     local active_segment = grideditor.active_segment()
-    local active_color = ColorF(0.35, 0.95, 1.0, 0.95)
-    local inactive_color = ColorF(0.16, 0.55, 0.72, 0.6)
+    -- One ColorF per part per frame: a part is either the active one or not for the whole frame.
+    local part_colors = {}
     local orient_color = ColorF(1.0, 0.15, 0.15, 0.9)
     local sample_color = ColorF(1.0, 0.78, 0.2, 0.85)
     local label_fg = ColorF(1, 1, 1, 1)
@@ -5411,7 +5417,12 @@ local function draw_editor_grid()
         -- No normal (flat ground answered, or nothing measured) -> world up, i.e. upright as before.
         local up = pose.up and vec3(pose.up.x, pose.up.y, pose.up.z) or vec3(0, 0, 1)
         local top = base + up * GRID_COLUMN_HEIGHT
-        local color = (pose.segment == active_segment) and active_color or inactive_color
+        local color = part_colors[pose.segment]
+        if not color then
+            local c = grideditor.part_color(pose.segment, pose.segment == active_segment)
+            color = ColorF(c.r, c.g, c.b, c.a)
+            part_colors[pose.segment] = color
+        end
         debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, color)
         -- The label is in DISPLAY space (ADR-0023 amendment 2026-08-01): the admin reads grid positions
         -- 1-based, so the front pillar is "P1", like every other P in this mod (the race HUD's P<pos>).
@@ -5442,6 +5453,29 @@ local function draw_editor_grid()
                     grideditor.SAMPLE_BLOB_RADIUS, sample_color)
             end
         end
+    end
+    -- Where each part begins: a line across the whole field, already grounded point by point
+    -- (grideditor's project, once per change), drawn piece by piece so it follows the surface, and labelled
+    -- at its right end, black on the line's own magenta.
+    local boundary_lines = grideditor.state.boundary_lines
+    if not boundary_lines or #boundary_lines == 0 then
+        return
+    end
+    local rgba = grideditor.BOUNDARY_COLOR
+    local line_color = ColorF(rgba.r, rgba.g, rgba.b, rgba.a)
+    local line_label_fg = ColorF(0, 0, 0, 1)
+    local line_label_bg = ColorI(math.floor(rgba.r * 255), math.floor(rgba.g * 255), math.floor(rgba.b * 255),
+        255)
+    for _, line in ipairs(boundary_lines) do
+        local points = line.points
+        for i = 2, #points do
+            local from, to = points[i - 1], points[i]
+            debugDrawer:drawCylinder(vec3(from.x, from.y, from.z), vec3(to.x, to.y, to.z),
+                grideditor.BOUNDARY_LINE_RADIUS, line_color)
+        end
+        local at = line.label_pos
+        debugDrawer:drawTextAdvanced(vec3(at.x, at.y, at.z), line.label, line_label_fg, true, false,
+            line_label_bg)
     end
 end
 
