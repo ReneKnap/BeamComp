@@ -350,6 +350,34 @@ angular.module('beamng.apps')
     return light > 0.5 ? '#10131a' : '#ffffff';
   }
 
+  // Say something into the client log (UI -> GE) under beamcomp.grid, through the one GE function for it
+  // (note_grid_plan), so the tag lives on the Lua side and this panel cannot inject Lua. Line breaks are
+  // STRIPPED, not escaped, as in BeamCompControls' geNote: Lua refuses a line break inside a single-quoted
+  // string, and the whole chunk would fail exactly where the diagnostic is needed.
+  function geNote(msg) {
+    geLuaArg('note_grid_plan', String(msg).replace(/[\r\n]+/g, ' '));
+  }
+
+  // The one log line a press on the plan writes when it ends (bcGridDrag's report, `moved` the window's
+  // change in px since the press). It names the broken link if a drag does nothing in game: no line at all
+  // means the press never reached the strip; 0 moves, that the moves never did; an end other than the
+  // release, what cut it short; moves without the window moving, that the pan itself failed. Example:
+  //   press via pointer: 23 moves (button reported held), 182 px from the press, ended by pointerup,
+  //   the window moved -182,0 px
+  function pressLine(report, moved) {
+    var outcome = 'the window did not move';
+    if (report.click) {
+      outcome = (report.start === null || report.start === undefined) ? 'a click beside the dots'
+        : 'a click on a dot of the part from P' + slotToDisplay(report.start);
+    } else if (moved[0] || moved[1]) {
+      outcome = 'the window moved ' + moved[0] + ',' + moved[1] + ' px';
+    }
+    var wheels = report.wheels ? ', ' + report.wheels + ' wheel turn' + (report.wheels === 1 ? '' : 's') : '';
+    return 'press via ' + report.path + ': ' + report.moves + ' move' + (report.moves === 1 ? '' : 's')
+      + ' (button ' + (report.buttonsSeen ? 'reported held' : 'never reported held') + '), '
+      + report.farthest + ' px from the press, ended by ' + report.ended + ', ' + outcome + wheels;
+  }
+
   // GE's plan with every list normalised (see asArray), or null when GE sent none. `start` is not a list
   // and passes as it is: the start line's direction, upright when GE sends none.
   function planOf(plan) {
@@ -1343,7 +1371,7 @@ angular.module('beamng.apps')
       // writes it, and nothing of the draft reaches GE before Enter or Add breakpoint.
       scope.plan = emptyPlan();
       var planView = { left: 0, mid: 0, scale: PLAN_SCALE, follow: true, partKey: null, dashedSlot: null,
-        width: 0, dragFrom: null };
+        width: 0, dragFrom: null, pressFrom: null };
       var planDraft = null;   // null (the field shows GE's echo), 'typed' or 'stepped'
 
       // The window's size in plan meters.
@@ -1599,6 +1627,25 @@ angular.module('beamng.apps')
       // field is taller than the strip.
       scope.planPress = function () {
         planView.dragFrom = { left: planView.left, mid: planView.mid };
+        // Where the window stood when the press began, for its log line. A wheel turn mid-press calls this
+        // again to rebase the drag, and must not move the line's reference.
+        if (planView.pressFrom === null) {
+          planView.pressFrom = { tx: scope.plan.tx, ty: scope.plan.ty };
+        }
+      };
+
+      // bcGridDrag, once per press, however it ended: the press's one log line (pressLine).
+      scope.planPressEnded = function (report) {
+        var from = planView.pressFrom || { tx: scope.plan.tx, ty: scope.plan.ty };
+        planView.pressFrom = null;
+        geNote(pressLine(report, [toPx(scope.plan.tx - from.tx), toPx(scope.plan.ty - from.ty)]));
+      };
+
+      // bcGridDrag, once at link: which input path this runtime offers, for the log.
+      scope.planLinked = function (path) {
+        geNote('strip linked, input path ' + path + (path === 'pointer'
+          ? ' (window.PointerEvent present; a press that arrives as a bare mousedown rides on mouse events)'
+          : ' (no window.PointerEvent: mouse events)'));
       };
 
       scope.planDrag = function (dx, dy) {
@@ -1974,21 +2021,48 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
 //                                           are the distance from the press, in px
 //   bc-grid-drag-click="planClick($start)"  a release that never got past CLICK_SLOP; $start is the
 //                                           data-start of the dot under the press (null off the dots)
+//   bc-grid-drag-end="planPressEnded($report)"  every press, however it ended: its path, moves, distance,
+//                                           what ended it and whether it was a click (see release)
 //   bc-grid-drag-wheel="planZoom($delta, $x, $y)"  a wheel turn over the strip: $delta in px (line and page
 //                                           modes converted, capped per event), $x, $y the cursor in px
 //                                           from the strip's top left
 //   bc-grid-drag-width="planMeasure($width)" the strip's laid-out width, after link and on every resize
+//   bc-grid-drag-linked="planLinked($path)"  once, at link: the input path this runtime offers
 //
-// The press is preventDefault-ed: the strip must neither take the focus from a field being typed in (its
-// draft is what the admin is looking at) nor start a text selection across the SVG labels. The wheel is
-// too, from a listener registered NON-passive (a passive one cannot cancel): over the strip it zooms and the
-// panel must not scroll; beside it the panel scrolls as it always did.
+// THE PRESS RIDES ON POINTER EVENTS, the way the game's own drag service does it (ui-vue/src/services/
+// drag.js, startPointerDrag): `pointerdown` with the left button on the strip, `setPointerCapture` in a try,
+// and the moves and the release from `pointermove` / `pointerup` / `pointercancel` on the WINDOW. Window
+// listeners because they hear the press with or without the capture -- a captured event is retargeted to
+// the strip and still bubbles up to the window, and if the capture was refused the pointer's own events
+// still reach the window wherever it is in the panel. The capture is what lets the admin drag past the
+// strip's edge, out of the app, and keep panning.
 //
-// Every release path ends the drag, the set bcGridHold owns: mouseup anywhere, the pointer leaving the
-// strip, the window losing focus, and $destroy. Only the mouseup can be a click, and a wheel turn is never
-// one: a press that sees a wheel turn is no click any more, and pans on from where the zoom left it. The
-// document and window listeners exist only while a press is open. App-unique name for the reason
-// bcGridFit's is.
+// A press that arrives as a bare `mousedown` with no `pointerdown` before it rides on mouse events instead
+// (`mousemove` / `mouseup` on the document). That is the runtime with no window.PointerEvent, and also one
+// that has the constructor but never delivers the events: 0.40's resources.js loads polyfills "for
+// Ultralight", so a defined PointerEvent is not proof the engine sends pointer events. Each press belongs to
+// the path that started it and is never handled twice -- the compat `mousedown` that follows a `pointerdown`
+// finds the press already open and is ignored.
+//
+// The `mousedown` is preventDefault-ed on both paths: the strip must neither take the focus from a field
+// being typed in (its draft is what the admin is looking at) nor start a text selection. The `pointerdown`
+// is not, so its compat mousedown still comes and is what that preventDefault acts on.
+//
+// HOW A PRESS ENDS -- every way, and none of them a guess about where the pointer is:
+//   * pointerup / mouseup                 the release; the only one that can be a click
+//   * pointercancel                       the engine took the pointer away
+//   * lostpointercapture                  the strip lost its capture before the release
+//   * a move with the left button up      `(buttons & 1) === 0` after a move that HAS reported it held, so a
+//                                         release that never arrived cannot latch the drag. Armed only by
+//                                         such a move: no game code reads `buttons`, and a runtime that
+//                                         never reports it on moves must not end every drag at its first
+//   * $destroy                            the strip went away mid-press
+// Leaving the strip and the window losing focus no longer end it (they did until 2026-10-23): with the
+// capture a drag may leave the strip, and nothing in BeamNG's UI showed either to be reliable mid-drag.
+//
+// A wheel turn is never a click: a press that sees one is no click any more, and pans on from where the
+// zoom left it. The window and document listeners exist only while a press is open. App-unique name for the
+// reason bcGridFit's is.
 angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', function ($parse, $timeout) {
   var CLICK_SLOP = 4;     // px a press may move and still count as a click
   var WHEEL_LINE = 33;    // px per wheel line (deltaMode 1): three lines are one 100 px notch
@@ -2001,12 +2075,18 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
       var onStart = $parse(attrs.bcGridDragStart);
       var onDrag = $parse(attrs.bcGridDrag);
       var onClick = $parse(attrs.bcGridDragClick);
-      var onWidth = $parse(attrs.bcGridDragWidth);
+      var onEnded = $parse(attrs.bcGridDragEnd);
       var onWheelTurn = $parse(attrs.bcGridDragWheel);
-      var press = null;   // {x, y, moved, start} while the button is down
+      var onWidth = $parse(attrs.bcGridDragWidth);
+      var onLinked = $parse(attrs.bcGridDragLinked);
+      var strip = element[0];
+      var hasPointerEvents = typeof window.PointerEvent === 'function';
+      // The open press, or null: {path, id, x, y, originX, originY, moved, start, moves, farthest,
+      // buttonsSeen, wheels}. x / y is where pans count from (a wheel turn moves it), origin where it began.
+      var press = null;
       var resizeObserver = null;
 
-      // The same phase check as bcGridHold's: a blur can arrive from inside a digest.
+      // The same phase check as bcGridHold's: an event can arrive from inside a digest.
       function applyHandler(fn) {
         if (scope.$root && scope.$root.$$phase) {
           fn();
@@ -2017,7 +2097,7 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
 
       // The data-start of the dot the press landed on, or null.
       function startUnder(node) {
-        while (node && node !== element[0]) {
+        while (node && node !== strip) {
           if (node.getAttribute && node.getAttribute('data-start') !== null) {
             return node.getAttribute('data-start');
           }
@@ -2027,7 +2107,7 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
       }
 
       function reportWidth() {
-        var width = element[0].getBoundingClientRect().width;
+        var width = strip.getBoundingClientRect().width;
         if (width > 0) {
           applyHandler(function () {
             onWidth(scope, { $width: width });
@@ -2035,29 +2115,65 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         }
       }
 
-      function stopListening() {
-        document.removeEventListener('mousemove', onMove, true);
-        document.removeEventListener('mouseup', onUp, true);
-        window.removeEventListener('blur', onCancel, false);
+      // Hear (or stop hearing) the open press's moves and its end, on the path it started on.
+      function listen(path, on) {
+        var method = on ? 'addEventListener' : 'removeEventListener';
+        if (path === 'pointer') {
+          window[method]('pointermove', onMove, false);
+          window[method]('pointerup', onUp, false);
+          window[method]('pointercancel', onPointerCancel, false);
+          strip[method]('lostpointercapture', onLostCapture, false);
+        } else {
+          document[method]('mousemove', onMove, true);
+          document[method]('mouseup', onUp, true);
+        }
       }
 
-      // End the press. Idempotent; a click only when the release is a mouseup and the press never moved.
-      function release(isMouseUp) {
+      // End the press, however it ends (see the header). Idempotent. Only a release can be a click, and
+      // every press is reported, once, when it ends.
+      function release(how, isRelease) {
         if (press === null) {
           return;
         }
         var ended = press;
         press = null;
-        stopListening();
-        if (isMouseUp && !ended.moved) {
+        listen(ended.path, false);
+        if (ended.path === 'pointer') {
+          try {
+            strip.releasePointerCapture(ended.id);
+          } catch (e) {
+            // Not captured, or already released: nothing to give back.
+          }
+        }
+        var isClick = isRelease && !ended.moved;
+        if (isClick) {
           onClick(scope, { $start: ended.start });
         }
+        onEnded(scope, { $report: { path: ended.path, moves: ended.moves, farthest: Math.round(ended.farthest),
+          ended: how, click: isClick, start: ended.start, buttonsSeen: ended.buttonsSeen,
+          wheels: ended.wheels } });
+      }
+
+      // Is this event about the open press? A pointer press answers only to its own pointer.
+      function isPress(ev) {
+        return press !== null && (press.path !== 'pointer' || ev.pointerId === press.id);
       }
 
       function onMove(ev) {
-        if (press === null) {
+        if (!isPress(ev)) {
           return;
         }
+        if ((ev.buttons & 1) === 1) {
+          press.buttonsSeen = true;
+        } else if (press.buttonsSeen) {
+          applyHandler(function () {
+            release('a move with the button up', false);
+          });
+          return;
+        }
+        press.moves += 1;
+        press.farthest = Math.max(press.farthest,
+          Math.sqrt(Math.pow(ev.clientX - press.originX, 2) + Math.pow(ev.clientY - press.originY, 2)));
         var dx = ev.clientX - press.x;
         var dy = ev.clientY - press.y;
         if (!press.moved && Math.sqrt(dx * dx + dy * dy) <= CLICK_SLOP) {
@@ -2069,31 +2185,62 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         });
       }
 
-      function onUp() {
-        applyHandler(function () {
-          release(true);
-        });
-      }
-
-      function onCancel() {
-        applyHandler(function () {
-          release(false);
-        });
-      }
-
-      function onDown(ev) {
-        if (ev.button !== 0 || press !== null) {
+      function onUp(ev) {
+        if (!isPress(ev)) {
           return;
         }
-        ev.preventDefault();
-        press = { x: ev.clientX, y: ev.clientY, moved: false, start: startUnder(ev.target) };
-        document.addEventListener('mousemove', onMove, true);
-        document.addEventListener('mouseup', onUp, true);
-        window.addEventListener('blur', onCancel, false);
+        var how = press.path === 'pointer' ? 'pointerup' : 'mouseup';
+        applyHandler(function () {
+          release(how, true);
+        });
+      }
+
+      function onPointerCancel(ev) {
+        if (!isPress(ev)) {
+          return;
+        }
+        applyHandler(function () {
+          release('pointercancel', false);
+        });
+      }
+
+      function onLostCapture(ev) {
+        if (!isPress(ev)) {
+          return;
+        }
+        applyHandler(function () {
+          release('lostpointercapture', false);
+        });
+      }
+
+      function begin(path, id, ev) {
+        press = { path: path, id: id, x: ev.clientX, y: ev.clientY, originX: ev.clientX, originY: ev.clientY,
+          moved: false, start: startUnder(ev.target), moves: 0, farthest: 0, buttonsSeen: false, wheels: 0 };
+        listen(path, true);
         reportWidth();
         applyHandler(function () {
           onStart(scope);
         });
+      }
+
+      function onPointerDown(ev) {
+        if (ev.button !== 0 || press !== null) {
+          return;
+        }
+        begin('pointer', ev.pointerId, ev);
+        try {
+          strip.setPointerCapture(ev.pointerId);
+        } catch (e) {
+          // Refused or unsupported: the window listeners still hear the press inside the panel.
+        }
+      }
+
+      function onMouseDown(ev) {
+        ev.preventDefault();
+        if (ev.button !== 0 || press !== null) {
+          return;
+        }
+        begin('mouse', null, ev);
       }
 
       function onWheel(ev) {
@@ -2103,13 +2250,14 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         if (!delta) {
           return;
         }
-        var box = element[0].getBoundingClientRect();
-        var x = ev.clientX - box.left - element[0].clientLeft;
-        var y = ev.clientY - box.top - element[0].clientTop;
+        var box = strip.getBoundingClientRect();
+        var x = ev.clientX - box.left - strip.clientLeft;
+        var y = ev.clientY - box.top - strip.clientTop;
         applyHandler(function () {
           onWheelTurn(scope, { $delta: delta, $x: x, $y: y });
           if (press !== null) {
             press.moved = true;
+            press.wheels += 1;
             press.x = ev.clientX;
             press.y = ev.clientY;
             onStart(scope);
@@ -2117,21 +2265,26 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         });
       }
 
-      element.on('mousedown', onDown);
-      element.on('mouseleave', onCancel);
-      element[0].addEventListener('wheel', onWheel, { passive: false });
+      if (hasPointerEvents) {
+        strip.addEventListener('pointerdown', onPointerDown, false);
+      }
+      strip.addEventListener('mousedown', onMouseDown, false);
+      strip.addEventListener('wheel', onWheel, { passive: false });
+      onLinked(scope, { $path: hasPointerEvents ? 'pointer' : 'mouse' });
 
       // After the first layout, and whenever the panel is resized. invokeApply false: reportWidth applies.
       var firstLayout = $timeout(reportWidth, 0, false);
       if (typeof ResizeObserver !== 'undefined') {
         resizeObserver = new ResizeObserver(reportWidth);
-        resizeObserver.observe(element[0]);
+        resizeObserver.observe(strip);
       }
 
-      // Already inside a digest, so release runs directly; jqLite drops the element's own listeners.
+      // Already inside a digest, so release runs directly.
       scope.$on('$destroy', function () {
-        release(false);
-        element[0].removeEventListener('wheel', onWheel, { passive: false });
+        release('$destroy', false);
+        strip.removeEventListener('pointerdown', onPointerDown, false);
+        strip.removeEventListener('mousedown', onMouseDown, false);
+        strip.removeEventListener('wheel', onWheel, { passive: false });
         $timeout.cancel(firstLayout);
         if (resizeObserver) {
           resizeObserver.disconnect();

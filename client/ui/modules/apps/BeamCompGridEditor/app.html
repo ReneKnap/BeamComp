@@ -122,10 +122,10 @@
     .bc-dir-note { font-size: 12px; color: #e8c07a; margin: 4px 0 2px; }
     /* The plan strip (ADR-0023 amendments 2026-10-16, 2026-10-23): the grid seen from above, dragged and
        zoomed with the wheel. Its height is PLAN_HEIGHT in app.js (bound on the svg); the width is the
-       section's. No text selection and a grab cursor, because a press here is a drag. The svg clips what
-       lies outside the window. */
+       section's. No text selection, no touch panning and a grab cursor, because a press here is a drag. The
+       svg clips what lies outside the window. */
     .bc-plan { margin: 4px 0 6px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 3px; cursor: grab; user-select: none; -webkit-user-select: none; }
+      border-radius: 3px; cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
     .bc-plan:active { cursor: grabbing; }
     .bc-plan-svg { display: block; width: 100%; overflow: hidden; }
     .bc-plan-svg text { font-size: 8.5px; font-weight: 700; pointer-events: none; }
@@ -253,7 +253,8 @@
            start slot for the click. -->
       <div class="bc-plan" bc-grid-tip="tip('plan')" bc-grid-drag="planDrag($dx, $dy)"
         bc-grid-drag-start="planPress()" bc-grid-drag-click="planClick($start)"
-        bc-grid-drag-wheel="planZoom($delta, $x, $y)" bc-grid-drag-width="planMeasure($width)">
+        bc-grid-drag-wheel="planZoom($delta, $x, $y)" bc-grid-drag-width="planMeasure($width)"
+        bc-grid-drag-end="planPressEnded($report)" bc-grid-drag-linked="planLinked($path)">
         <svg class="bc-plan-svg" ng-attr-height="{{plan.height}}">
           <g ng-attr-transform="translate({{plan.tx}},{{plan.ty}})">
             <g class="bc-plan-start" ng-attr-transform="rotate({{plan.startAngle}})">

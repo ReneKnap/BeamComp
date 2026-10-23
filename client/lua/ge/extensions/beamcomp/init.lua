@@ -4763,6 +4763,15 @@ function M.grid_camera_to_grid()
     end
 end
 
+-- The grid editor plan's own diagnostic (UI -> GE, ADR-0023 amendment 2026-10-23): one line when its strip
+-- links, naming the input path, and one when a press on it ends -- how it started, how many moves arrived,
+-- how far it went, what ended it and whether the window moved. Never per move: the client log stops
+-- recording after ~15k lines. A named function, like note_controls, so the tag lives here and the panel
+-- cannot inject Lua.
+function M.note_grid_plan(msg)
+    log("I", setup.GRID_LOG_TAG, "plan " .. tostring(msg))
+end
+
 -- Set how many slots the preview shows (UI -> GE) and reflect.
 function M.grid_set_preview(count)
     local ok, reason = grideditor.set_preview_count(count)
