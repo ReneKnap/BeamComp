@@ -30,6 +30,9 @@ below rather than hidden.
   Opened from the setup panel, the grid editor starts in the direction the race is set to run, and
   says when you switch to the other one.
   A number typed into the grid editor applies on Enter, or by itself a moment after you stop typing.
+  Each part of a grid has its own color in the editor and a line on the ground where it begins. A plan of the
+  field seen from above can be dragged and zoomed with the mouse wheel; clicking a position in it edits that
+  position's part and puts its number into **Breakpoint at P**.
 - A grid can be set as the default for a race, so that race always starts on it.
 - Large vehicles get the room they need; the field is placed on the ground it actually stands on.
 - A synchronised countdown that holds every car, or an F1-style light sequence where the car is free
