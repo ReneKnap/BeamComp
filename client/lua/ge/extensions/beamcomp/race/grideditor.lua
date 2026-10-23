@@ -24,6 +24,11 @@
 -- it used to auto-seed existed only to re-centre the grounding window at a segment boundary, and the
 -- height CHAIN (placement.ground_all, ADR-0034 amendment 2026-09-01) now does that continuously, per slot.
 -- A grid with only segment 0 is exactly today's single-block behaviour.
+--
+-- The admin reads segments as PARTS (ADR-0023 amendment 2026-10-16): every part has its own color, a line
+-- across the field marks where each begins, and the panel draws the field as a plan. All three come out
+-- of recompute() (see project) and M.plan(), from the very layout grid.lua hands the spawn, so the panel
+-- never re-derives a pose and the plan and the 3D preview cannot disagree.
 
 local M = {}
 
@@ -153,6 +158,41 @@ M.ROUTE_CHECKPOINT_STYLE = {
     post = {r = 0.62, g = 0.64, b = 0.68, a = 0.7},
 }
 
+-- ---- Parts: their colors, the line where each begins, and the panel's plan ---------------------------
+-- (ADR-0023 amendment 2026-10-16.) init.lua draws the pillars and the lines with these, and the panel gets
+-- the colors it draws with from M.plan(), so the plan and the 3D preview cannot disagree on a color.
+--
+-- Every part has its own color, wrapping after the last entry; neighbouring parts never share one. Part 1
+-- keeps the cyan the preview has always had. Picked against tarmac, grass, sand and dirt for both the
+-- bright and the muted rule below (a CIEDE2000 estimate, feature grid-editor-breakpoint-lines).
+M.PART_PALETTE = {
+    {r = 0.35, g = 0.95, b = 1.0},  -- cyan
+    {r = 0.6, g = 1.0, b = 0.3},    -- lime
+    {r = 0.3, g = 0.45, b = 1.0},   -- blue
+}
+
+-- The part being edited is drawn bright, every other part muted, each in its own color.
+M.PART_BRIGHT = {scale = 1.0, alpha = 0.95}
+M.PART_MUTED = {scale = 0.65, alpha = 0.7}
+
+-- The line across the field where a part begins: one color for every such line, magenta because it must
+-- read against the cyan pillars, the red orientation lines and the yellow sample blobs alike (red, the
+-- color of the owner's sketch, would be taken for an orientation line). Carried on every boundary of the
+-- plan too, so the panel draws a boundary in the color GE gives it.
+M.BOUNDARY_COLOR = {r = 1.0, g = 0.2, b = 0.9, a = 0.95}
+M.BOUNDARY_LINE_RADIUS = 0.08
+-- How far above the line's end its "Part <n> from P<m>" label floats (m).
+M.BOUNDARY_LABEL_HEIGHT = 0.6
+
+-- How far the line reaches past the outermost car on either side (m): half a car's width plus room.
+local BOUNDARY_SIDE_MARGIN = 1.5
+-- The line is grounded at a point every BOUNDARY_SAMPLE_STEP metres (in at most BOUNDARY_MAX_SAMPLES
+-- pieces), so it follows a crowned road or a kerb instead of cutting through it.
+local BOUNDARY_SAMPLE_STEP = 1.0
+local BOUNDARY_MAX_SAMPLES = 24
+-- How far above the measured surface the line lies (m): on the ground, never in it.
+local BOUNDARY_LINE_LIFT = 0.1
+
 -- Editor session. active = false when not editing; everything else is meaningful only while active.
 M.state = {
     active = false,
@@ -163,6 +203,11 @@ M.state = {
     segment = 1,       -- 1-based index of the active segment (the one the knobs edit) in the active direction
     anchors = nil,     -- cached {forward = {base_pose, gate_normal}, reverse = ...} per direction
     poses = nil,       -- current preview poses for the active direction (drawn by init.lua)
+    -- The preview projected for the panel ({poses, boundaries, start}, plan metres) and the grounded 3D
+    -- lines where each part begins ({points, label, label_pos} each, drawn by init.lua). Both rebuilt by
+    -- every recompute, so neither needs its own previous value (ADR-0052).
+    plan = nil,
+    boundary_lines = nil,
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
     -- Bumped by every session start (enter, under both start_fresh and open) and never reset, not even
     -- by clear: race/gridcam.lua watches it to jump the camera on EVERY session start, whoever started it.
@@ -177,13 +222,196 @@ local function active_segments()
     return M.state.blocks[M.state.direction]
 end
 
+-- The color part `part` is drawn in, {r, g, b, a}: its palette entry, wrapping, under the bright or the
+-- muted rule. The one place that rule is applied.
+function M.part_color(part, is_bright)
+    local index = math.max(1, math.floor(tonumber(part) or 1))
+    local base = M.PART_PALETTE[(index - 1) % #M.PART_PALETTE + 1]
+    local rule = is_bright and M.PART_BRIGHT or M.PART_MUTED
+    return {r = base.r * rule.scale, g = base.g * rule.scale, b = base.b * rule.scale, a = rule.alpha}
+end
+
+-- `value` rounded to 1 / `per_unit`. The plan is rounded to the centimetre and its facings to a
+-- thousandth: plenty for a drawing, and it keeps the push small.
+local function rounded(value, per_unit)
+    return math.floor(value * per_unit + 0.5) / per_unit
+end
+
+-- The plan's frame: the one part 1 is laid out in, AFTER its own Rotate grid (ADR-0023 amendment
+-- 2026-10-23) -- origin on the start pose (part 1's pivot), axes part 1's own. So part 1's rows are always
+-- level, P1 on the left and its cars facing left, and only a later part that turns against part 1 shows
+-- as a bend. Part 1's shift and mirror act on the positions inside this frame as they do in the world;
+-- they do not move or flip the frame, which would turn the top view into a mirror image.
+--
+-- Round 1 used the frame BEFORE part 1's heading, the start line's own. A grid turned 196 degrees to fit
+-- its track then lay diagonally across the strip and ran off both its edges.
+local function plan_frame(first_layout)
+    return {origin = first_layout.origin, forward = first_layout.forward, right = first_layout.right}
+end
+
+-- A world point in plan metres: x behind the start line, y to the right of the direction of travel.
+local function to_plan(frame, point)
+    local dx, dy = point.x - frame.origin.x, point.y - frame.origin.y
+    return {
+        x = rounded(-(dx * frame.forward.x + dy * frame.forward.y), 100),
+        y = rounded(dx * frame.right.x + dy * frame.right.y, 100),
+    }
+end
+
+-- A world direction in plan axes, rounded to a thousandth: (-1, 0) points at the start line.
+local function plan_direction(frame, v)
+    return rounded(-(v.x * frame.forward.x + v.y * frame.forward.y), 1000),
+        rounded(v.x * frame.right.x + v.y * frame.right.y, 1000)
+end
+
+-- Which way the start line runs in the plan, {dx, dy}. It passes through the plan's origin (the start
+-- pose) square to its own normal, the frame part 1 received, so it slants by part 1's heading: upright at
+-- 0 degrees, 16 degrees off at 196. Turned to dy >= 0: a line has no direction, and one answer keeps the
+-- push stable.
+local function start_line_direction(frame, first_layout)
+    local normal = first_layout.frame_forward
+    local dx, dy = plan_direction(frame, {x = normal.y, y = -normal.x})
+    if dy < 0 or (dy == 0 and dx < 0) then
+        dx, dy = -dx, -dy
+    end
+    -- 0 rather than -0: the number crosses into JSON.
+    return {dx = dx + 0, dy = dy + 0}
+end
+
+-- A world point in a part's own laid-out axes: metres along its forward and across to its right, from
+-- its pivot.
+local function part_coords(layout, point)
+    local dx, dy = point.x - layout.origin.x, point.y - layout.origin.y
+    return dx * layout.forward.x + dy * layout.forward.y, dx * layout.right.x + dy * layout.right.y
+end
+
+-- The first and last slot of a part's LAST row and of its FIRST row. Each part begins its own row 0
+-- (grid.lua), so a part split off mid-row has a short last row, and both come from the part's own columns.
+local function last_row(layout)
+    local last = layout.count - 1
+    return layout.startSlot + math.floor(last / layout.columns) * layout.columns, layout.startSlot + last
+end
+
+local function first_row(layout)
+    return layout.startSlot, layout.startSlot + math.min(layout.columns, layout.count) - 1
+end
+
+-- How far the slots first..last reach along and across `layout`'s axes.
+local function extent_in(layout, poses, first, last)
+    local reach = {
+        along_min = math.huge,
+        along_max = -math.huge,
+        across_min = math.huge,
+        across_max = -math.huge,
+    }
+    for slot = first, last do
+        local along, across = part_coords(layout, poses[slot + 1].pos)
+        reach.along_min = math.min(reach.along_min, along)
+        reach.along_max = math.max(reach.along_max, along)
+        reach.across_min = math.min(reach.across_min, across)
+        reach.across_max = math.max(reach.across_max, across)
+    end
+    return reach
+end
+
+-- The two end points ({x, y}) of the line where `layout`'s part begins. Measured in that part's own axes,
+-- so the line turns with the part: halfway between the rearmost car of the previous part's last row and
+-- the frontmost car of this part's first row -- between the two rows, never through a pillar -- and as
+-- wide as both rows plus BOUNDARY_SIDE_MARGIN on each side.
+local function boundary_ends(poses, previous, layout)
+    local before = extent_in(layout, poses, last_row(previous))
+    local after = extent_in(layout, poses, first_row(layout))
+    local along = (before.along_min + after.along_max) / 2
+    local function at(across)
+        return {
+            x = layout.origin.x + layout.forward.x * along + layout.right.x * across,
+            y = layout.origin.y + layout.forward.y * along + layout.right.y * across,
+        }
+    end
+    return at(math.min(before.across_min, after.across_min) - BOUNDARY_SIDE_MARGIN),
+        at(math.max(before.across_max, after.across_max) + BOUNDARY_SIDE_MARGIN)
+end
+
+-- The line from `a` to `b` as points on the ground, one every BOUNDARY_SAMPLE_STEP metres. Grounded
+-- through the grid's own chain (placement.ground_heights), seeded at `seed_z`.
+local function grounded_line(a, b, seed_z)
+    local length = math.sqrt((b.x - a.x) ^ 2 + (b.y - a.y) ^ 2)
+    local steps = math.max(1, math.min(BOUNDARY_MAX_SAMPLES, math.ceil(length / BOUNDARY_SAMPLE_STEP)))
+    local points = {}
+    for step = 0, steps do
+        local t = step / steps
+        points[#points + 1] = {x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t}
+    end
+    local heights = placement.ground_heights(points, seed_z)
+    for index, point in ipairs(points) do
+        point.z = heights[index] + BOUNDARY_LINE_LIFT
+    end
+    return points
+end
+
+-- Project the grounded preview for its two readers: the panel's plan ({poses, boundaries, start}, plan
+-- metres) and the 3D lines init.lua draws. A boundary exists for every part that has a pose, from the
+-- second laid-out part on; a part starting past the preview has neither poses nor a line. `layouts` is
+-- grid.poses_segmented_with_frames' second return, so every number here comes from the layout the spawn
+-- uses -- the panel re-derives nothing.
+local function project(poses, layouts)
+    if not layouts[1] then
+        return nil, nil
+    end
+    local frame = plan_frame(layouts[1])
+    local plan_poses = {}
+    for index, pose in ipairs(poses) do
+        local at = to_plan(frame, pose.pos)
+        -- The way the car faces, in plan axes: (-1, 0) for every car of part 1.
+        local fx, fy = plan_direction(frame, pose.faceDir)
+        plan_poses[index] = {
+            slot = index - 1,
+            part = pose.segment,
+            x = at.x,
+            y = at.y,
+            fx = fx,
+            fy = fy,
+        }
+    end
+
+    local plan_boundaries, lines = {}, {}
+    for index = 2, #layouts do
+        local layout = layouts[index]
+        local a, b = boundary_ends(poses, layouts[index - 1], layout)
+        plan_boundaries[#plan_boundaries + 1] = {
+            part = layout.segment,
+            startSlot = layout.startSlot,
+            a = to_plan(frame, a),
+            b = to_plan(frame, b),
+            color = M.BOUNDARY_COLOR,
+        }
+        -- Seeded at the surface under the part's first car (its grounded height without its lift).
+        local first = poses[layout.startSlot + 1]
+        local points = grounded_line(a, b, first.pos.z - (tonumber(first.lift) or 0))
+        local label_at = points[#points]
+        lines[#lines + 1] = {
+            points = points,
+            -- Display space, like the pillars' P labels: slot 0 is P1.
+            label = "Part " .. layout.segment .. " from P" .. (layout.startSlot + 1),
+            label_pos = {x = label_at.x, y = label_at.y, z = label_at.z + M.BOUNDARY_LABEL_HEIGHT},
+        }
+    end
+    local plan = {
+        poses = plan_poses,
+        boundaries = plan_boundaries,
+        start = start_line_direction(frame, layouts[1]),
+    }
+    return plan, lines
+end
+
 -- Recompute the preview poses for the active direction from its segment list + cached anchor.
 local function recompute()
     local anchor = M.state.anchors[M.state.direction]
     local segments = M.state.blocks[M.state.direction]
     -- poses_segmented stacks the segments (ADR-0023 amendment) and tags each pose with its segment index
-    -- and faceDir, which init.lua reads to highlight the active segment and draw the orientation line.
-    local poses = grid.poses_segmented(anchor.base_pose.pos, anchor.base_pose.rot,
+    -- and faceDir, which init.lua reads to highlight the active segment and draw the orientation line. The
+    -- _with_frames form is the same layout plus the frame each segment was laid out in, for project().
+    local poses, layouts = grid.poses_segmented_with_frames(anchor.base_pose.pos, anchor.base_pose.rot,
         M.state.preview_count, segments, anchor.gate_normal)
     -- Ground the preview through the very function the spawn grounds with (placement.ground_all): the
     -- height-only drop, the height CHAIN across the slots (ADR-0034 amendment 2026-09-01) and the
@@ -205,6 +433,8 @@ local function recompute()
         pose.samples = grounded[index].samples
     end
     M.state.poses = poses
+    -- After the grounding: the boundary lines seed their own ground search at the grounded height.
+    M.state.plan, M.state.boundary_lines = project(poses, layouts)
 end
 
 -- Anchor the forward grid for `race_name_or_id` on the current map, install the given STORED blocks
@@ -485,6 +715,45 @@ function M.segment_bounds()
     return bounds
 end
 
+-- The last previewed slot of part `part`, or nil when the part starts past the preview.
+local function last_previewed_slot(plan_poses, part)
+    local last = nil
+    for _, entry in ipairs(plan_poses) do
+        if entry.part == part then
+            last = entry.slot
+        end
+    end
+    return last
+end
+
+-- The plan the panel draws (ADR-0023 amendment 2026-10-16), or nil when not editing. `poses` and
+-- `boundaries` are the last recompute's projection, in plan metres (x behind the start line, y to the
+-- right, in part 1's frame -- see plan_frame), and `start` the start line's direction through the plan's
+-- origin. `parts` lists every part of the active direction, one starting past the preview included, with
+-- its start slot, its last previewed slot (absent when it has none) and the color it is drawn in right
+-- now -- bright for the edited part, muted for the rest, exactly as init.lua draws the pillars. Every slot
+-- in here is a GE slot (0-based).
+function M.plan()
+    if not M.state.active or not M.state.plan then
+        return nil
+    end
+    local parts = {}
+    for index, seg in ipairs(active_segments()) do
+        parts[index] = {
+            part = index,
+            startSlot = seg.startSlot,
+            lastSlot = last_previewed_slot(M.state.plan.poses, index),
+            color = M.part_color(index, index == M.state.segment),
+        }
+    end
+    return {
+        poses = M.state.plan.poses,
+        boundaries = M.state.plan.boundaries,
+        start = M.state.plan.start,
+        parts = parts,
+    }
+end
+
 -- Set the authored field size: how many grid slots the preview shows, and (once saved) the size above
 -- which the race start warns the issuer. It never feeds the layout -- that stays count-independent
 -- (ADR-0023). `count` is coerced to an integer and clamped to [MIN, MAX]. Returns true + the applied
@@ -559,6 +828,8 @@ function M.clear()
     M.state.segment = 1
     M.state.anchors = nil
     M.state.poses = nil
+    M.state.plan = nil
+    M.state.boundary_lines = nil
     M.state.preview_count = DEFAULT_PREVIEW_COUNT
 end
 

@@ -120,6 +120,19 @@
        setup panel's stale-grid note: nothing is broken and nothing is refused, the admin is just not
        editing the layout that race will start on. */
     .bc-dir-note { font-size: 12px; color: #e8c07a; margin: 4px 0 2px; }
+    /* The plan strip (ADR-0023 amendments 2026-10-16, 2026-10-23): the grid seen from above, dragged and
+       zoomed with the wheel. Its height is PLAN_HEIGHT in app.js (bound on the svg); the width is the
+       section's. No text selection, no touch panning and a grab cursor, because a press here is a drag. The
+       svg clips what lies outside the window. */
+    .bc-plan { margin: 4px 0 6px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 3px; cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
+    .bc-plan:active { cursor: grabbing; }
+    .bc-plan-svg { display: block; width: 100%; overflow: hidden; }
+    .bc-plan-svg text { font-size: 8.5px; font-weight: 700; pointer-events: none; }
+    .bc-plan-dot { cursor: pointer; }
+    /* A part's color on its chip. */
+    .bc-part-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px;
+      vertical-align: middle; }
     .bc-mini { background: #355; color: #cde; border: none; border-radius: 3px; padding: 3px 10px;
       font-weight: 700; cursor: pointer; flex: 0 0 auto; }
     .bc-mini[disabled] { background: #3a3a3a; color: #888; cursor: default; }
@@ -223,26 +236,58 @@
       </div>
     </div>
 
-    <!-- Segment / breakpoint. Every slot number in this section is written the way the admin reads it on
+    <!-- Parts / breakpoint. The admin reads segments as PARTS (ADR-0023 amendment 2026-10-16); the code and
+         the ADR keep "segment". Every slot number in this section is written the way the admin reads it on
          the preview pillars -- 1-based, P-prefixed, front slot = P1 (ADR-0023 amendment 2026-08-01). The
          numbers underneath (state.activeStartSlot, s.startSlot, and everything GE stores) stay 0-based;
          app.js's slotToDisplay/displayToSlot pair is the only place the two spaces meet, and slotLabel is
-         the only formatter this template may use for a slot. "Editing segment N of M" is NOT part of that
-         -- state.activeSegment has always been 1-based. -->
+         the only formatter this template may use for a slot. "Part N of M" is NOT part of that --
+         state.activeSegment has always been 1-based. -->
     <div class="bc-section" ng-if="state.active">
-      <div class="bc-section-title">Segment</div>
-      <!-- Deliberately names no Layout label: it used to end "with its Offset forward as the gap",
-           which meant this line had to be kept in step with LAYOUT_KNOBS in app.js. It no longer
-           quotes a label, so do not reintroduce one here. -->
-      <div class="bc-hint">Editing segment {{state.activeSegment}} of {{state.segments.length}}. The
-        Layout settings below apply to this segment; it stacks behind the previous one.</div>
+      <div class="bc-section-title">Parts</div>
+      <!-- Deliberately names no Layout label, so it never has to be kept in step with LAYOUT_KNOBS in
+           app.js. Its numbers are GE's ranges (partHint). -->
+      <div class="bc-hint">{{partHint()}}</div>
+      <!-- The plan: the grid from above in part 1's frame, a window onto it that is dragged and zoomed with
+           the mouse wheel (app.js "The plan strip"). Everything in it is GE's plan; dots carry their part's
+           start slot and their own slot for the click, which selects the part and fills Breakpoint at P. -->
+      <div class="bc-plan" bc-grid-tip="tip('plan')" bc-grid-drag="planDrag($dx, $dy)"
+        bc-grid-drag-start="planPress()" bc-grid-drag-click="planClick($start, $slot)"
+        bc-grid-drag-wheel="planZoom($delta, $x, $y)" bc-grid-drag-width="planMeasure($width)"
+        bc-grid-drag-end="planPressEnded($report)">
+        <svg class="bc-plan-svg" ng-attr-height="{{plan.height}}">
+          <g ng-attr-transform="translate({{plan.tx}},{{plan.ty}})">
+            <g class="bc-plan-start" ng-attr-transform="rotate({{plan.startAngle}})">
+              <rect ng-repeat="q in plan.start track by $index" ng-attr-x="{{q.x}}" ng-attr-y="{{q.y}}"
+                ng-attr-width="{{q.size}}" ng-attr-height="{{q.size}}" ng-attr-fill="{{q.fill}}"></rect>
+            </g>
+            <line class="bc-plan-line" ng-repeat="b in plan.lines track by $index" ng-attr-x1="{{b.x1}}"
+              ng-attr-y1="{{b.y1}}" ng-attr-x2="{{b.x2}}" ng-attr-y2="{{b.y2}}" ng-attr-stroke="{{b.color}}"
+              stroke-width="3" stroke-linecap="round"></line>
+            <line class="bc-plan-dashed" ng-if="plan.dashed" ng-attr-x1="{{plan.dashed.x1}}"
+              ng-attr-y1="{{plan.dashed.y1}}" ng-attr-x2="{{plan.dashed.x2}}" ng-attr-y2="{{plan.dashed.y2}}"
+              stroke="#ffffff" stroke-width="2" stroke-dasharray="6 4"></line>
+            <g class="bc-plan-dot" ng-repeat="d in plan.dots track by d.slot" ng-attr-data-start="{{d.start}}"
+              ng-attr-data-slot="{{d.slot}}"
+              ng-attr-transform="translate({{d.cx}},{{d.cy}})">
+              <line x1="0" y1="0" ng-attr-x2="{{d.nx}}" ng-attr-y2="{{d.ny}}" ng-attr-stroke="{{d.nose}}"
+                stroke-width="3" stroke-linecap="round"></line>
+              <circle ng-attr-r="{{d.r}}" ng-attr-fill="{{d.fill}}" ng-attr-stroke="{{d.stroke}}"
+                stroke-width="2" ng-attr-stroke-dasharray="{{d.dash}}"></circle>
+              <text text-anchor="middle" dy="3" ng-attr-fill="{{d.text}}">{{d.label}}</text>
+            </g>
+          </g>
+        </svg>
+      </div>
       <div class="bc-row" bc-grid-tip="tip('breakpoint')">
         <span>Breakpoint at P</span>
         <div class="bc-step">
           <button bc-grid-hold="stepBreakpoint(-1)" bc-grid-hold-end="endHold()">&minus;</button>
-          <!-- Enter is Add breakpoint; there is deliberately no pause commit here (see selectTypedSegment). -->
+          <!-- Enter is Add breakpoint; there is deliberately no pause commit here (see selectTypedSegment).
+               ng-change and ng-blur only draw the plan's dashed line: they send nothing. -->
           <input type="number" min="1" ng-model="edit.breakpointDisplay"
-            ng-keydown="$event.keyCode === 13 && selectTypedSegment()">
+            ng-keydown="$event.keyCode === 13 && selectTypedSegment()"
+            ng-change="planBreakpointTyped()" ng-blur="planBreakpointBlurred()">
           <button bc-grid-hold="stepBreakpoint(1)" bc-grid-hold-end="endHold()">+</button>
         </div>
       </div>
@@ -255,10 +300,11 @@
           ng-click="removeSegment()" bc-grid-tip="tip('removeSegment')">Remove</button>
       </div>
       <div class="bc-row" ng-if="state.segments.length > 1">
-        <span bc-grid-tip="tip('segmentChips')">Breakpoints</span>
+        <span bc-grid-tip="tip('segmentChips')">Parts</span>
         <div class="bc-seg" bc-grid-tip="tip('segmentChips')">
           <button ng-repeat="s in state.segments" ng-class="{on: ($index + 1) === state.activeSegment}"
-            ng-click="selectSegment(s.startSlot)">{{slotLabel(s.startSlot)}}</button>
+            ng-click="selectSegment(s.startSlot)"><span class="bc-part-swatch"
+            ng-style="{'background-color': partSwatch($index)}"></span>{{slotLabel(s.startSlot)}}</button>
         </div>
       </div>
     </div>
@@ -317,7 +363,7 @@
       </div>
       <div ng-show="heightOpen">
         <div class="bc-hint">Every car is dropped onto the ground starting from the height the car in
-          front of it landed on. These four settings change that drop, for this segment only.</div>
+          front of it landed on. These four settings change that drop, for this part only.</div>
         <div class="bc-row bc-knob" ng-repeat="k in heightKnobs" bc-grid-tip="k.tip">
           <span>{{k.label}}</span>
           <div class="bc-step">

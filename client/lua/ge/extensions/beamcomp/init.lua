@@ -245,8 +245,11 @@ local DASH_REFRESH_SETTLE = 0.75
 -- hostaitags (the host's own AI tags), keysdup (the /keys window's duplicate keys) and adminlists
 -- (another admin's saved presets and grids) and griddir (the grid editor following the race setup's
 -- direction) and revsprint (the reverse start of a sprint without its own) and afkassist (a recover or
--- repair press resetting the AFK count) are new since then, and gridenter (a number typed into the grid
--- editor applying on Enter and after a typing pause) is new in this build.
+-- repair press resetting the AFK count) and gridenter (a number typed into the grid editor applying on
+-- Enter and after a typing pause) are new since then, and gridplan (the grid editor's part colors, part
+-- lines and plan; r2 aligns the plan to part 1 and zooms it with the mouse wheel, r3 drags it on pointer
+-- events and logs every press on it, r4 pans it to its last dot and fills the breakpoint on a dot click) is
+-- new in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -274,8 +277,19 @@ local DASH_REFRESH_SETTLE = 0.75
 -- start; one logging afkassist-r1 also has a recover or repair press during the finish timer take the AFK
 -- count back to 0 and stop it while the key is down; one logging gridenter-r1 also has a number typed into
 -- the grid editor apply on Enter and after 750 ms without a keystroke, not only when the field loses focus,
--- with Enter in "Breakpoint at P" adding the breakpoint and +/- counting on from a number just typed.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1/2026-10-15"
+-- with Enter in "Breakpoint at P" adding the breakpoint and +/- counting on from a number just typed; one
+-- logging gridplan-r1 also draws each part of a grid being edited in its own color, with a magenta line
+-- labelled "Part <n> from P<m>" across the field where each part begins, and shows the grid as a plan in
+-- the editor panel that can be dragged sideways and draws a typed breakpoint as a dashed line; one logging
+-- gridplan-r2 also lays that plan out in part 1's own frame, so part 1 is level however it is turned and
+-- the start-line mark slants instead, and zooms it with the mouse wheel around the cursor, dragged both
+-- ways when zoomed in; one logging gridplan-r3 also drags that plan on pointer events with the pointer
+-- captured, so a drag goes on past the strip's edge, and writes one beamcomp.grid line per press on it
+-- ("plan press via <path>: ...") and one when it links ("plan strip linked, input path ..."); one logging
+-- gridplan-r4 also lets that plan be dragged, both ways and at every zoom, until only its first or last
+-- position is left at the strip's edge, has a click on a dot put its number into "Breakpoint at P" with the
+-- cursor there, and logs a press only when it ends the way a defect would (no strip-linked line any more).
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1-gridplan-r4/2026-10-23"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -3863,6 +3877,10 @@ local function push_grid_state()
         -- placeholder instead of a bare "-". Constant, but sent with the knobs it annotates so the panel
         -- always has both together.
         knobDefaults = grideditor.knob_defaults(),
+        -- The field as the panel's plan draws it (ADR-0023 amendment 2026-10-16): every preview pose and
+        -- every part boundary in plan metres, and each part's range and color as the 3D preview draws it.
+        -- The panel's only geometry source; it never lays a pose out itself. Nil when not editing.
+        plan = grideditor.plan(),
     })
 end
 
@@ -4752,6 +4770,15 @@ function M.grid_camera_to_grid()
     end
 end
 
+-- The grid editor plan's own diagnostic (UI -> GE, ADR-0023 amendment 2026-10-23): one line when its strip
+-- links, naming the input path, and one when a press on it ends -- how it started, how many moves arrived,
+-- how far it went, what ended it and whether the window moved. Never per move: the client log stops
+-- recording after ~15k lines. A named function, like note_controls, so the tag lives here and the panel
+-- cannot inject Lua.
+function M.note_grid_plan(msg)
+    log("I", setup.GRID_LOG_TAG, "plan " .. tostring(msg))
+end
+
 -- Set how many slots the preview shows (UI -> GE) and reflect.
 function M.grid_set_preview(count)
     local ok, reason = grideditor.set_preview_count(count)
@@ -5382,11 +5409,13 @@ local function on_server_event(data)
     handler(payload)
 end
 
--- Draw the grid editor's live preview poses as cyan pillars with P-position labels, each with a red
--- orientation line in the slot's facing (drive-up) direction (ADR-0023 + amendment). The active
--- segment's pillars read bright and the rest are dimmed, so it is clear which slots the current knobs
--- affect. Immediate-mode: redrawn each frame from grideditor.state, so leaving edit mode (active = false)
--- removes them with no scene objects to clean up.
+-- Draw the grid editor's live preview poses as pillars with P-position labels, each with a red
+-- orientation line in the slot's facing (drive-up) direction (ADR-0023 + amendment). Every part has its
+-- own color (grideditor.part_color): the active part's pillars read bright and the rest muted, so it is
+-- clear which slots the current knobs affect, and a magenta line across the field, labelled
+-- "Part <n> from P<m>", marks where each part begins (ADR-0023 amendment 2026-10-16). Immediate-mode:
+-- redrawn each frame from grideditor.state, so leaving edit mode (active = false) removes them with no
+-- scene objects to clean up.
 --
 -- Pillar and line follow the slot's MEASURED ground slope, and the four points that slope was measured
 -- at get a blob each (ADR-0034 amendment 2026-08-30). Both read the normal race/placement put on the
@@ -5398,8 +5427,8 @@ local function draw_editor_grid()
         return
     end
     local active_segment = grideditor.active_segment()
-    local active_color = ColorF(0.35, 0.95, 1.0, 0.95)
-    local inactive_color = ColorF(0.16, 0.55, 0.72, 0.6)
+    -- One ColorF per part per frame: a part is either the active one or not for the whole frame.
+    local part_colors = {}
     local orient_color = ColorF(1.0, 0.15, 0.15, 0.9)
     local sample_color = ColorF(1.0, 0.78, 0.2, 0.85)
     local label_fg = ColorF(1, 1, 1, 1)
@@ -5411,7 +5440,12 @@ local function draw_editor_grid()
         -- No normal (flat ground answered, or nothing measured) -> world up, i.e. upright as before.
         local up = pose.up and vec3(pose.up.x, pose.up.y, pose.up.z) or vec3(0, 0, 1)
         local top = base + up * GRID_COLUMN_HEIGHT
-        local color = (pose.segment == active_segment) and active_color or inactive_color
+        local color = part_colors[pose.segment]
+        if not color then
+            local c = grideditor.part_color(pose.segment, pose.segment == active_segment)
+            color = ColorF(c.r, c.g, c.b, c.a)
+            part_colors[pose.segment] = color
+        end
         debugDrawer:drawCylinder(base, top, GRID_COLUMN_RADIUS, color)
         -- The label is in DISPLAY space (ADR-0023 amendment 2026-08-01): the admin reads grid positions
         -- 1-based, so the front pillar is "P1", like every other P in this mod (the race HUD's P<pos>).
@@ -5442,6 +5476,29 @@ local function draw_editor_grid()
                     grideditor.SAMPLE_BLOB_RADIUS, sample_color)
             end
         end
+    end
+    -- Where each part begins: a line across the whole field, already grounded point by point
+    -- (grideditor's project, once per change), drawn piece by piece so it follows the surface, and labelled
+    -- at its right end, black on the line's own magenta.
+    local boundary_lines = grideditor.state.boundary_lines
+    if not boundary_lines or #boundary_lines == 0 then
+        return
+    end
+    local rgba = grideditor.BOUNDARY_COLOR
+    local line_color = ColorF(rgba.r, rgba.g, rgba.b, rgba.a)
+    local line_label_fg = ColorF(0, 0, 0, 1)
+    local line_label_bg = ColorI(math.floor(rgba.r * 255), math.floor(rgba.g * 255), math.floor(rgba.b * 255),
+        255)
+    for _, line in ipairs(boundary_lines) do
+        local points = line.points
+        for i = 2, #points do
+            local from, to = points[i - 1], points[i]
+            debugDrawer:drawCylinder(vec3(from.x, from.y, from.z), vec3(to.x, to.y, to.z),
+                grideditor.BOUNDARY_LINE_RADIUS, line_color)
+        end
+        local at = line.label_pos
+        debugDrawer:drawTextAdvanced(vec3(at.x, at.y, at.z), line.label, line_label_fg, true, false,
+            line_label_bg)
     end
 end
 

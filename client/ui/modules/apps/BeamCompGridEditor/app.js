@@ -179,9 +179,12 @@ angular.module('beamng.apps')
     direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
     cameraToGrid: 'Move the camera above P1 of this grid. Not during a race.',
 
-    breakpoint: 'The starting position where a new part of the grid begins.',
+    breakpoint: 'The position where a new part of the grid begins. While you type, the plan shows it as a '
+      + 'dashed line.',
     addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
-      + 'own layout.',
+      + 'own layout. A line on the ground and in the plan marks where the new part begins.',
+    plan: 'The grid seen from above, P1 on the left. Drag to look along it, turn the mouse wheel to zoom, '
+      + 'click a position to edit its part and put its number into Breakpoint at P.',
     removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
       + 'one to edit it with the settings below.',
@@ -303,6 +306,120 @@ angular.module('beamng.apps')
   // The breakpoint field's floor. Slot 0 is the base segment, so the smallest number the admin can dial
   // is its label -- expressed through the conversion rather than hard-coded, so the two cannot drift.
   var SLOT_DISPLAY_MIN = slotToDisplay(0);
+
+  // ---- The plan: the grid seen from above (ADR-0023 amendment 2026-10-16) ----------------------------
+  // Display constants only. Every position, line and color in the plan comes from GE
+  // (BeamCompGridState.plan); this panel lays nothing out and holds no grid constant.
+  //
+  // The default zoom (ADR-0023 amendment 2026-10-23): at the default 4 m column stagger a diagonal
+  // neighbour is 34 px away and a same-column one 48 px, and a ~600 px strip shows ~100 m, the whole default
+  // 16-car field. The mouse wheel zooms between the two bounds; New and Load go back to the default.
+  var PLAN_SCALE = 6;             // px per meter, the default
+  var PLAN_SCALE_MIN = 2;         // fully out: ~300 m across a 618 px strip, a whole 32-position field
+  var PLAN_SCALE_MAX = 24;        // fully in: a two-wide row 4 m apart is 96 px across
+  var PLAN_ZOOM_RATE = 0.0015;    // zoom factor exp(-deltaY * rate): one 100 px wheel notch is about x0.86
+  var PLAN_HEIGHT = 104;          // px
+  // A dot keeps its size from the default zoom up; below it, it shrinks with the zoom to a floor, and a dot
+  // too small for its P<n> shows none. Overlapping dots fully zoomed out are accepted.
+  var PLAN_DOT_RADIUS = 10;       // px at the default zoom and above
+  var PLAN_DOT_MIN = 4;           // px
+  var PLAN_LABEL_MIN = 7;         // px of radius a dot needs to show its label (from ~4.2 px per meter)
+  var PLAN_NOSE = 0.6;            // the facing tick reaches this share of a radius past the dot
+  var PLAN_PAD = 18;              // px of room before the start line and after the last position
+  var PLAN_EDGE_INSET = 4;        // px the outermost dot's rim stays inside the edge at the drag's end
+  var PLAN_LEAD = 0.25;           // share of the window that shows the part before the edited one
+  var PLAN_FALLBACK_WIDTH = 560;  // px, until the strip has been laid out and measured
+  var PLAN_START_SQUARE = 4;      // px, the start line's checkered mark
+  var PLAN_START_ROWS = 10;
+  // The panel background (.bc-grid), to decide whether a dot's label is dark or light.
+  var PANEL_RGB = [20 / 255, 22 / 255, 26 / 255];
+
+  // A GE color {r, g, b, a} (0..1) as CSS.
+  function cssColor(color, alpha) {
+    var a = alpha === undefined ? color.a : alpha;
+    return 'rgba(' + Math.round(color.r * 255) + ',' + Math.round(color.g * 255) + ','
+      + Math.round(color.b * 255) + ',' + a + ')';
+  }
+
+  // Dark text on a light dot, white on a dark one, judged on the dot as it shows over the panel.
+  function labelColorOn(color) {
+    var shown = [color.r, color.g, color.b].map(function (c, i) {
+      return c * color.a + PANEL_RGB[i] * (1 - color.a);
+    });
+    var light = 0.2126 * shown[0] + 0.7152 * shown[1] + 0.0722 * shown[2];
+    return light > 0.5 ? '#10131a' : '#ffffff';
+  }
+
+  // Say something into the client log (UI -> GE) under beamcomp.grid, through the one GE function for it
+  // (note_grid_plan), so the tag lives on the Lua side and this panel cannot inject Lua. Line breaks are
+  // STRIPPED, not escaped, as in BeamCompControls' geNote: Lua refuses a line break inside a single-quoted
+  // string, and the whole chunk would fail exactly where the diagnostic is needed.
+  function geNote(msg) {
+    geLuaArg('note_grid_plan', String(msg).replace(/[\r\n]+/g, ' '));
+  }
+
+  // The log line of a press on the plan that ended the way a defect would (bcGridDrag's report, `moved` the
+  // window's change in px since the press; planPressEnded decides when). It names what cut the press
+  // short -- anything but its pointerup -- or that a drag moved and the window did not. An ordinary click
+  // or drag writes none, so an empty log says nothing about whether a press arrived. Example:
+  //   press via pointer: 20 moves (button reported held), 300 px from the press, ended by pointerup,
+  //   the window did not move
+  function pressLine(report, moved) {
+    var outcome = 'the window did not move';
+    if (report.click) {
+      outcome = (report.start === null || report.start === undefined) ? 'a click beside the dots'
+        : 'a click on a dot of the part from P' + slotToDisplay(report.start);
+    } else if (moved[0] || moved[1]) {
+      outcome = 'the window moved ' + moved[0] + ',' + moved[1] + ' px';
+    }
+    var wheels = report.wheels ? ', ' + report.wheels + ' wheel turn' + (report.wheels === 1 ? '' : 's') : '';
+    return 'press via ' + report.path + ': ' + report.moves + ' move' + (report.moves === 1 ? '' : 's')
+      + ' (button ' + (report.buttonsSeen ? 'reported held' : 'never reported held') + '), '
+      + report.farthest + ' px from the press, ended by ' + report.ended + ', ' + outcome + wheels;
+  }
+
+  // GE's plan with every list normalised (see asArray), or null when GE sent none. `start` is not a list
+  // and passes as it is: the start line's direction, upright when GE sends none.
+  function planOf(plan) {
+    if (!plan) {
+      return null;
+    }
+    return { poses: asArray(plan.poses), boundaries: asArray(plan.boundaries), parts: asArray(plan.parts),
+      start: plan.start || { dx: 0, dy: 1 } };
+  }
+
+  // A drawn coordinate, rounded to a hundredth of a px (meters times a zoom is not always a short number).
+  function toPx(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  // A dot's radius at `scale` px per meter: full size from the default zoom up, then shrinking to the floor.
+  function dotRadiusAt(scale) {
+    return Math.max(PLAN_DOT_MIN, PLAN_DOT_RADIUS * Math.min(1, scale / PLAN_SCALE));
+  }
+
+  // The checkered start-line mark, centred on the start pose: two columns of small squares, upright, turned
+  // to the start line's real angle by the transform it is drawn under. A screen size, not a length.
+  function startMark() {
+    var squares = [];
+    var top = -(PLAN_START_ROWS * PLAN_START_SQUARE) / 2;
+    for (var row = 0; row < PLAN_START_ROWS; row++) {
+      for (var col = 0; col < 2; col++) {
+        squares.push({ x: (col - 1) * PLAN_START_SQUARE, y: top + row * PLAN_START_SQUARE,
+          size: PLAN_START_SQUARE, fill: (row + col) % 2 === 0 ? '#f0f0f0' : '#10131a' });
+      }
+    }
+    return squares;
+  }
+
+  // What the strip draws, in px at the current zoom, plus, in plan meters for the window: the field's
+  // extent with the start line and the part lines (xMin..yMax), the dots' own extent (dotXMin..dotYMax,
+  // what the drag stops at) and the edited part's lateral middle (editedMid, null when it has no position).
+  function emptyPlan() {
+    return { height: PLAN_HEIGHT, tx: 0, ty: PLAN_HEIGHT / 2, xMin: 0, xMax: 0, yMin: 0, yMax: 0,
+      dotXMin: 0, dotXMax: 0, dotYMin: 0, dotYMax: 0, radius: PLAN_DOT_RADIUS, editedMid: null, dots: [],
+      lines: [], dashed: null, start: startMark(), startAngle: 0 };
+  }
 
   // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
   // every further one "<EXTRA_GRID_PREFIX><n>". Both are prefills only -- the field stays freely editable,
@@ -437,10 +554,11 @@ angular.module('beamng.apps')
       // (0-based) -- this payload is GE's, unchanged; only what is rendered from it is 1-based.
       // `knobDefaults` are the layout defaults GE falls back to for a knob a loaded block omits -- shown as
       // that field's placeholder (see scope.knobHint). `setupDirection` is deliberately not seeded: absent
-      // means no direction line (see scope.directionNote).
+      // means no direction line (see scope.directionNote). `plan` is the field as GE lays it out, for the
+      // plan strip (see planOf; ADR-0023 amendment 2026-10-16).
       scope.state = { active: false, race: null, direction: 'forward', hasReverse: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
-        knobDefaults: null };
+        knobDefaults: null, plan: null };
       // Editable mirror of the number fields, synced from state on each push. The knob entries hold GE's own
       // values; `breakpointDisplay` alone is in DISPLAY space (see slotToDisplay above) -- which is why it
       // is not called breakpointSlot.
@@ -790,9 +908,11 @@ angular.module('beamng.apps')
           scope.state = payload || scope.state;
           // The breakpoint boundaries are a list, and GE.segment_bounds() returns an EMPTY one whenever
           // no edit session is running -- the case that crosses the bridge as {}. The template reads
-          // state.segments.length, which would then be undefined: "Editing segment 1 of " with nothing
-          // after it. Normalised here, so the field matches the [] this scope was seeded with.
+          // state.segments.length, which would then be undefined: "Part 1 of " with nothing after it.
+          // Normalised here, so the field matches the [] this scope was seeded with.
           scope.state.segments = asArray(scope.state.segments);
+          // The plan's three lists, the same way: a one-part grid sends its boundaries as {}.
+          scope.state.plan = planOf(scope.state.plan);
           // savedName tracks the active grid's persisted name (gates the default button, marks the
           // overwrite target).
           scope.savedName = scope.state.name || null;
@@ -818,6 +938,7 @@ angular.module('beamng.apps')
             dropTyping();
           }
           syncEditFromState();
+          planAfterPush();
         });
       });
 
@@ -938,6 +1059,7 @@ angular.module('beamng.apps')
           return;
         }
         dropTyping();
+        planNewSession();
         scope.open = null;
         scope.savedName = null;
         scope.form.saveName = suggestGridName(scope.data.grids, scope.form.race);
@@ -962,6 +1084,7 @@ angular.module('beamng.apps')
           return;
         }
         dropTyping();
+        planNewSession();
         scope.savedName = grid.name;
         scope.form.saveName = grid.name;
         geLuaArgs('grid_open_saved', grid.race, grid.name, scope.form.race || '');
@@ -1143,6 +1266,7 @@ angular.module('beamng.apps')
       // model on any smaller value, so an unclamped hold would empty the field instead of stopping in it.
       scope.stepBreakpoint = function (delta) {
         advanceHold(holdFor('breakpointDisplay', breakpointHold), delta);
+        planDraftChanged('stepped');
       };
 
       // Select the segment starting at `slot`, or create one there seeded from the covering segment.
@@ -1167,7 +1291,10 @@ angular.module('beamng.apps')
       // Number(null) is 0 -- so an unguarded conversion would quietly hand GE the slot -1. It is also
       // where "there is no P0" lives in JS rather than only in the input's min attribute; a value below
       // the floor is invalid there too and arrives here as undefined.
+      //
+      // Either way the number is settled now, so the plan's dashed line goes (planSettleDraft).
       scope.selectTypedSegment = function () {
+        planSettleDraft();
         var display = Number(scope.edit.breakpointDisplay);
         if (!isFinite(display) || display < SLOT_DISPLAY_MIN) {
           return;
@@ -1188,6 +1315,444 @@ angular.module('beamng.apps')
           return;
         }
         geCall('grid_remove_segment');
+      };
+
+      // The hint above the plan: which part the settings below edit, and which positions that is. The
+      // admin reads segments as parts. Ranges come from GE's plan (the last PREVIEWED slot of a part), so
+      // the last part ends at the preview count, and a part starting past the preview says so.
+      scope.partHint = function () {
+        var plan = scope.state.plan;
+        var index = scope.state.activeSegment;
+        var part = plan && plan.parts[index - 1];
+        if (!part) {
+          return '';
+        }
+        var head = 'Part ' + index + ' of ' + plan.parts.length;
+        var first = scope.slotLabel(part.startSlot);
+        if (part.lastSlot === undefined || part.lastSlot === null) {
+          return head + ' starts at ' + first + ', which is not in the preview. '
+            + 'The settings below change only its positions.';
+        }
+        if (part.lastSlot === part.startSlot) {
+          return head + ': ' + first + '. The settings below change only this position.';
+        }
+        var range = head + ': ' + first + ' to ' + scope.slotLabel(part.lastSlot) + '.';
+        if (plan.parts.length === 1) {
+          return range + ' The settings below change every position.';
+        }
+        return range + ' The settings below change only these positions.';
+      };
+
+      // A part's color as GE draws it right now (bright for the edited part), for its chip.
+      scope.partSwatch = function (index) {
+        var part = scope.state.plan && scope.state.plan.parts[index];
+        return part ? cssColor(part.color, 1) : 'transparent';
+      };
+
+      // ---- The plan strip (ADR-0023 amendments 2026-10-16 and 2026-10-23) ----------------------------
+      // Renders GE's plan (scope.state.plan) and nothing else: one dot per preview position, a line where
+      // each part begins, a checkered start-line mark at its real angle. Plan meters x (behind the start
+      // line) and y (right of travel), in part 1's own frame, map to the strip as x -> right, y -> up, so
+      // P1 is on the left, part 1's rows are level and the cars face left -- a true top view.
+      //
+      // The strip is a WINDOW onto the field: `left` is the plan x at its left edge, `mid` the plan y at its
+      // vertical centre, `scale` its zoom in px per meter. It is moved by dragging (bcGridDrag, both ways,
+      // until only the outermost dot is left at the edge -- see planLeftRange), zoomed by the mouse wheel
+      // around the cursor, and moved -- never zoomed -- by two triggers:
+      //   * the edited part changes (editTarget(): race, direction, the part's start): the window jumps to
+      //     that part's start, with the part before it in its first quarter (the start line at the left
+      //     while the whole field fits), centres on the part vertically, and FOLLOWS that start on every
+      //     push from then on;
+      //   * the typed breakpoint moves the dashed line: the window centres on it and stops following.
+      // A drag, a wheel zoom or a click on a dot stops following too, and a push then never moves the
+      // window; only the clamp can, when the field itself changed. The zoom stays through pushes, part
+      // switches and typed breakpoints; New and Load go back to the default.
+      //
+      // The dashed line is a DRAFT: the number in Breakpoint at P while it is the admin's own -- typed
+      // (`ng-change`), stepped (its ± buttons) or clicked (a dot, which writes it) -- and not yet applied.
+      // Apart from that click the plan reads the field and never writes it, and nothing of the draft
+      // reaches GE before Enter or Add breakpoint.
+      scope.plan = emptyPlan();
+      var planView = { left: 0, mid: 0, scale: PLAN_SCALE, follow: true, partKey: null, dashedSlot: null,
+        width: 0, dragFrom: null, pressFrom: null, clicked: null };
+      var planDraft = null;   // null (the field shows GE's echo), 'typed', 'stepped' or 'clicked'
+
+      // The window's size in plan meters.
+      function planWindowWidth() {
+        return (planView.width || PLAN_FALLBACK_WIDTH) / planView.scale;
+      }
+
+      function planWindowHeight() {
+        return PLAN_HEIGHT / planView.scale;
+      }
+
+      function planPoseAt(slot) {
+        var poses = scope.state.plan ? scope.state.plan.poses : [];
+        for (var i = 0; i < poses.length; i++) {
+          if (poses[i].slot === slot) {
+            return poses[i];
+          }
+        }
+        return null;
+      }
+
+      // The part covering a GE slot, from GE's ranges.
+      function planPartCovering(slot) {
+        var parts = scope.state.plan ? scope.state.plan.parts : [];
+        var covering = null;
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i].startSlot <= slot) {
+            covering = parts[i];
+          }
+        }
+        return covering;
+      }
+
+      // The GE slot the dashed line stands in front of, or null. Only for a draft that reads as a number,
+      // is not already where a part begins (P1 included: slot 0 is part 1's start) and has a position in
+      // the preview to draw against. Floored like GE floors the number it is sent.
+      function planDashedSlot() {
+        if (planDraft === null || !scope.state.plan) {
+          return null;
+        }
+        var display = readNumber(scope.edit.breakpointDisplay);
+        if (display === undefined) {
+          return null;
+        }
+        var slot = displayToSlot(Math.floor(display));
+        var parts = scope.state.plan.parts;
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i].startSlot === slot) {
+            return null;
+          }
+        }
+        return planPoseAt(slot) && planPoseAt(slot - 1) ? slot : null;
+      }
+
+      // The dashed line: halfway between the last position that would stay in the earlier part and the
+      // first one of the new part, square to that position's facing, taller than the strip. `x`, `y` are its
+      // middle in plan meters, for centring the window on it.
+      function planDashedLine(slot, scale) {
+        var before = planPoseAt(slot - 1);
+        var after = planPoseAt(slot);
+        var x = (before.x + after.x) / 2;
+        var y = (before.y + after.y) / 2;
+        var acrossX = after.fy * PLAN_HEIGHT;
+        var acrossY = after.fx * PLAN_HEIGHT;
+        return { x: x, y: y, x1: toPx(x * scale - acrossX), y1: toPx(-y * scale - acrossY),
+          x2: toPx(x * scale + acrossX), y2: toPx(-y * scale + acrossY) };
+      }
+
+      // Rebuild what the strip draws from GE's plan, the draft and the zoom. The window is placePlan's.
+      function buildPlan() {
+        var source = scope.state.plan;
+        var built = emptyPlan();
+        if (!source || !source.poses.length) {
+          scope.plan = built;
+          return;
+        }
+        var scale = planView.scale;
+        var radius = dotRadiusAt(scale);
+        var showLabels = radius >= PLAN_LABEL_MIN;
+        var dashedSlot = planDashedSlot();
+        var draftPart = dashedSlot === null ? null : planPartCovering(dashedSlot);
+        var extent = { xMin: 0, xMax: 0, yMin: Infinity, yMax: -Infinity };
+        var dotsAt = { xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity };
+        var edited = { yMin: Infinity, yMax: -Infinity };
+        function reach(x, y) {
+          extent.xMin = Math.min(extent.xMin, x);
+          extent.xMax = Math.max(extent.xMax, x);
+          extent.yMin = Math.min(extent.yMin, y);
+          extent.yMax = Math.max(extent.yMax, y);
+        }
+        built.dots = source.poses.map(function (pose) {
+          var part = source.parts[pose.part - 1];
+          var color = part ? part.color : { r: 1, g: 1, b: 1, a: 1 };
+          var isDraft = draftPart !== null && pose.slot >= dashedSlot && pose.slot <= draftPart.lastSlot;
+          var isEdited = pose.part === scope.state.activeSegment;
+          reach(pose.x, pose.y);
+          dotsAt.xMin = Math.min(dotsAt.xMin, pose.x);
+          dotsAt.xMax = Math.max(dotsAt.xMax, pose.x);
+          dotsAt.yMin = Math.min(dotsAt.yMin, pose.y);
+          dotsAt.yMax = Math.max(dotsAt.yMax, pose.y);
+          if (isEdited) {
+            edited.yMin = Math.min(edited.yMin, pose.y);
+            edited.yMax = Math.max(edited.yMax, pose.y);
+          }
+          return {
+            slot: pose.slot,
+            start: part ? part.startSlot : 0,
+            label: showLabels ? scope.slotLabel(pose.slot) : '',
+            cx: toPx(pose.x * scale),
+            cy: toPx(-pose.y * scale),
+            r: toPx(radius),
+            nx: toPx(pose.fx * radius * (1 + PLAN_NOSE)),
+            ny: toPx(-pose.fy * radius * (1 + PLAN_NOSE)),
+            fill: isDraft ? 'rgba(20,22,26,0.6)' : cssColor(color),
+            nose: cssColor(color),
+            stroke: isDraft ? cssColor(color, 1) : (isEdited ? '#ffffff' : 'none'),
+            dash: isDraft ? '3 2' : 'none',
+            text: isDraft ? cssColor(color, 1) : labelColorOn(color),
+          };
+        });
+        built.lines = source.boundaries.map(function (boundary) {
+          reach(boundary.a.x, boundary.a.y);
+          reach(boundary.b.x, boundary.b.y);
+          return { part: boundary.part, x: (boundary.a.x + boundary.b.x) / 2, x1: toPx(boundary.a.x * scale),
+            y1: toPx(-boundary.a.y * scale), x2: toPx(boundary.b.x * scale), y2: toPx(-boundary.b.y * scale),
+            color: cssColor(boundary.color) };
+        });
+        built.dashed = dashedSlot === null ? null : planDashedLine(dashedSlot, scale);
+        built.xMin = extent.xMin;
+        built.xMax = extent.xMax;
+        built.yMin = extent.yMin;
+        built.yMax = extent.yMax;
+        built.dotXMin = dotsAt.xMin;
+        built.dotXMax = dotsAt.xMax;
+        built.dotYMin = dotsAt.yMin;
+        built.dotYMax = dotsAt.yMax;
+        built.radius = radius;
+        built.editedMid = edited.yMin === Infinity ? null : (edited.yMin + edited.yMax) / 2;
+        // SVG rotate turns clockwise on screen, and the mark stands along plan +y: atan2(dx, dy).
+        built.startAngle = Math.atan2(source.start.dx, source.start.dy) * 180 / Math.PI;
+        scope.plan = built;
+      }
+
+      // How far the window may go (ADR-0023 amendment 2026-10-23, round 4): until only the field's outermost
+      // position is left at the strip's edge, its dot whole and PLAN_EDGE_INSET inside -- in both axes, at
+      // every zoom, and whether or not the field fits the strip, so nothing is ever pinned. The start mark
+      // and the part lines may leave the view. `keep` is how far inside the edge that last dot's centre stays.
+      function planEdgeKeep() {
+        return (scope.plan.radius + PLAN_EDGE_INSET) / planView.scale;
+      }
+
+      // The window's left edge: from the first dot whole at the right edge to the last one at the left.
+      function planLeftRange() {
+        return [scope.plan.dotXMin - planWindowWidth() + planEdgeKeep(), scope.plan.dotXMax - planEdgeKeep()];
+      }
+
+      // The window's vertical centre: from the topmost dot whole at the bottom edge to the lowest at the top.
+      function planMidRange() {
+        var half = planWindowHeight() / 2;
+        return [scope.plan.dotYMin - half + planEdgeKeep(), scope.plan.dotYMax + half - planEdgeKeep()];
+      }
+
+      function clampTo(value, range) {
+        return Math.min(Math.max(value, range[0]), range[1]);
+      }
+
+      // Put the window where planView says, clamped to the field.
+      function placePlan() {
+        planView.left = clampTo(planView.left, planLeftRange());
+        planView.mid = clampTo(planView.mid, planMidRange());
+        scope.plan.tx = toPx(-planView.left * planView.scale);
+        scope.plan.ty = toPx(PLAN_HEIGHT / 2 + planView.mid * planView.scale);
+      }
+
+      // The edited part's start: the start line at the left edge for part 1 -- and for every part while the
+      // whole field fits the window, which then shows all of it -- otherwise the line where the part begins
+      // a quarter of the way in, and the part centred vertically. A part past the preview has no line and
+      // no position: the end of the field, centred on the whole field.
+      function planToPartStart() {
+        var index = scope.state.activeSegment;
+        var pad = PLAN_PAD / planView.scale;
+        var atStart = Math.min(0, scope.plan.xMin) - pad;
+        var fieldEnd = scope.plan.xMax + pad;
+        var left = fieldEnd - planWindowWidth();
+        if (index <= 1 || fieldEnd - atStart <= planWindowWidth()) {
+          left = atStart;
+        } else {
+          scope.plan.lines.forEach(function (line) {
+            if (line.part === index) {
+              left = line.x - planWindowWidth() * PLAN_LEAD;
+            }
+          });
+        }
+        planView.left = left;
+        planView.mid = scope.plan.editedMid === null ? (scope.plan.yMin + scope.plan.yMax) / 2
+          : scope.plan.editedMid;
+      }
+
+      // Every push: the echo settles a draft (it has just rewritten the field), a changed edit target sends
+      // the window back to following, and a following window goes to the edited part's start.
+      //
+      // Except a CLICKED draft: a dot click selects a part, and the echo of that selection -- and of any
+      // other push before the field is settled -- has just written that part's start into the field. The
+      // clicked number is put back, so it stands until Enter, Add breakpoint, the field's blur, a typed or
+      // stepped number or the session's end replaces it.
+      function planAfterPush() {
+        if (!scope.state.active) {
+          planView.partKey = null;
+          planDraft = null;
+          planView.dashedSlot = null;
+        } else if (planDraft === 'clicked') {
+          scope.edit.breakpointDisplay = planView.clicked;
+        } else if (!isHeld('breakpointDisplay')) {
+          planDraft = null;
+          planView.dashedSlot = null;
+        }
+        var key = editTarget();
+        if (scope.state.active && key !== planView.partKey) {
+          planView.partKey = key;
+          planView.follow = true;
+        }
+        buildPlan();
+        if (planView.follow) {
+          planToPartStart();
+        }
+        placePlan();
+      }
+
+      // New and Load start a field of their own, even on the same race, direction and part, and at the
+      // default zoom.
+      function planNewSession() {
+        planView.partKey = null;
+        planView.scale = PLAN_SCALE;
+        planDraft = null;
+        planView.dashedSlot = null;
+      }
+
+      // The draft changed: redraw, and when the dashed line moved to a new place, centre the window on it.
+      function planDraftChanged(source) {
+        planDraft = source;
+        buildPlan();
+        var slot = planDashedSlot();
+        if (slot !== null && slot !== planView.dashedSlot) {
+          planView.left = scope.plan.dashed.x - planWindowWidth() / 2;
+          planView.mid = scope.plan.dashed.y;
+          planView.follow = false;
+        }
+        planView.dashedSlot = slot;
+        placePlan();
+      }
+
+      // Enter / Add breakpoint: the number is settled, so the dashed line goes. The window stays.
+      function planSettleDraft() {
+        planDraft = null;
+        planView.dashedSlot = null;
+        buildPlan();
+        placePlan();
+      }
+
+      // ng-change on Breakpoint at P. It only draws: there is no pause commit on this field.
+      scope.planBreakpointTyped = function () {
+        planDraftChanged('typed');
+      };
+
+      // ng-blur on Breakpoint at P settles a TYPED or a CLICKED draft (the admin left the field). A stepped
+      // one stays: a ± press blurs the field AFTER its mousedown has stepped, and the step is exactly what
+      // the admin is looking at.
+      scope.planBreakpointBlurred = function () {
+        if (planDraft === 'typed' || planDraft === 'clicked') {
+          planSettleDraft();
+        }
+      };
+
+      // bcGridDrag: a press remembers where the window was, a drag moves it from there, both ways, as far as
+      // the clamp lets it (planLeftRange, planMidRange).
+      scope.planPress = function () {
+        planView.dragFrom = { left: planView.left, mid: planView.mid };
+        // Where the window stood when the press began, for its log line. A wheel turn mid-press calls this
+        // again to rebase the drag, and must not move the line's reference.
+        if (planView.pressFrom === null) {
+          planView.pressFrom = { tx: scope.plan.tx, ty: scope.plan.ty };
+        }
+      };
+
+      // bcGridDrag, once per press, however it ended. The press's log line (pressLine) is written only for
+      // the cases that point at a defect, now that the pointer path is proven in game (round 4): a drag that
+      // moved past the slop and did not move the window, or a press ended by anything but its pointerup.
+      // An ordinary click or drag stays silent.
+      scope.planPressEnded = function (report) {
+        var from = planView.pressFrom || { tx: scope.plan.tx, ty: scope.plan.ty };
+        planView.pressFrom = null;
+        var moved = [toPx(scope.plan.tx - from.tx), toPx(scope.plan.ty - from.ty)];
+        var stuck = report.dragged && moved[0] === 0 && moved[1] === 0;
+        if (report.ended === 'pointerup' && !stuck) {
+          return;
+        }
+        geNote(pressLine(report, moved));
+      };
+
+      scope.planDrag = function (dx, dy) {
+        planView.follow = false;
+        planView.left = planView.dragFrom.left - dx / planView.scale;
+        planView.mid = planView.dragFrom.mid + dy / planView.scale;
+        placePlan();
+      };
+
+      // The mouse wheel over the strip: zoom by exp(-delta * rate) between the two bounds, around the point
+      // under the cursor (x, y in px from the strip's top left), which stays where it is unless the clamp
+      // to the field has to move it. A manual view change, like a drag.
+      scope.planZoom = function (delta, x, y) {
+        var scale = Math.min(PLAN_SCALE_MAX, Math.max(PLAN_SCALE_MIN,
+          planView.scale * Math.exp(-delta * PLAN_ZOOM_RATE)));
+        if (scale === planView.scale) {
+          return;
+        }
+        var underX = planView.left + x / planView.scale;
+        var underY = planView.mid + (PLAN_HEIGHT / 2 - y) / planView.scale;
+        planView.scale = scale;
+        planView.left = underX - x / scale;
+        planView.mid = underY - (PLAN_HEIGHT / 2 - y) / scale;
+        planView.follow = false;
+        buildPlan();
+        placePlan();
+      };
+
+      // A click on a dot (ADR-0023 amendment 2026-10-23, round 4) selects that dot's part exactly like its
+      // chip -- the part's start is a GE slot and goes through selectSegment untouched -- and writes the
+      // dot's number into Breakpoint at P as a CLICKED draft, with the focus in that field and its text
+      // selected: typing replaces it, Enter adds the break there. A click beside the dots does nothing.
+      //
+      // The view does not move: the dot is where the admin is looking. So the click stops the window
+      // following, names in advance the edit target its selection's echo will carry (so the part switch
+      // does not jump), and takes the dashed line's position as known (so it does not centre either). A
+      // number typed or stepped afterwards moves it as before.
+      //
+      // A number still typed into another field goes to GE FIRST, through that field's own blur commit:
+      // GE applies a knob to whichever part is selected when it arrives, so after this selection it would
+      // land on the wrong part. The real blur, when the focus moves, then finds nothing left to send.
+      scope.planClick = function (start, slot) {
+        var partStart = Number(start);
+        var dotSlot = Number(slot);
+        var isDot = start !== null && start !== undefined && start !== '';
+        if (!isDot || !isFinite(partStart) || !isFinite(dotSlot)) {
+          return;
+        }
+        if (typing !== null) {
+          scope.commitTyped(typing.field, { target: document.activeElement });
+        }
+        planView.follow = false;
+        planView.partKey = [scope.state.race, scope.state.direction, partStart].join('|');
+        scope.selectSegment(partStart);
+        planView.clicked = slotToDisplay(dotSlot);
+        scope.edit.breakpointDisplay = planView.clicked;
+        planDraft = 'clicked';
+        buildPlan();
+        planView.dashedSlot = planDashedSlot();
+        placePlan();
+        // After the digest that writes the number into the input: select() before it would select the old
+        // text. invokeApply false: focusing changes nothing this panel renders.
+        $timeout(function () {
+          var input = element[0].querySelector('input[ng-model="edit.breakpointDisplay"]');
+          if (input) {
+            input.focus();
+            input.select();
+          }
+        }, 0, false);
+      };
+
+      // bcGridDrag reports the strip's real width once it is laid out (and when it changes).
+      scope.planMeasure = function (width) {
+        if (!(width > 0) || width === planView.width) {
+          return;
+        }
+        planView.width = width;
+        if (planView.follow) {
+          planToPartStart();
+        }
+        placePlan();
       };
 
       // Reveal (or cancel) the Save name row. It deliberately does NOT touch form.saveName -- the opposite
@@ -1499,6 +2064,292 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
       // listener are ours to clear, and the final GE send still goes out through endGesture.
       scope.$on('$destroy', function () {
         release();
+      });
+    },
+  };
+}]);
+
+// Drag-to-pan and wheel-to-zoom for the plan strip (ADR-0023 amendments 2026-10-16 and 2026-10-23): the
+// gestures and nothing else, the way bcGridHold is the hold and nothing else. The panel above owns the
+// window, the zoom and what a click means.
+//
+//   bc-grid-drag-start="planPress()"        a left press on the strip
+//   bc-grid-drag="planDrag($dx, $dy)"       every move once the press has moved past CLICK_SLOP; $dx, $dy
+//                                           are the distance from the press, in px
+//   bc-grid-drag-click="planClick($start, $slot)"  a release that never got past CLICK_SLOP; $start and
+//                                           $slot are the data-start and data-slot of the dot under the press
+//                                           (both null off the dots)
+//   bc-grid-drag-end="planPressEnded($report)"  every press, however it ended: its path, moves, distance,
+//                                           what ended it, whether it dragged and whether it was a click
+//   bc-grid-drag-wheel="planZoom($delta, $x, $y)"  a wheel turn over the strip: $delta in px (line and page
+//                                           modes converted, capped per event), $x, $y the cursor in px
+//                                           from the strip's top left
+//   bc-grid-drag-width="planMeasure($width)" the strip's laid-out width, after link and on every resize
+//
+// THE PRESS RIDES ON POINTER EVENTS, the way the game's own drag service does it (ui-vue/src/services/
+// drag.js, startPointerDrag): `pointerdown` with the left button on the strip, `setPointerCapture` in a try,
+// and the moves and the release from `pointermove` / `pointerup` / `pointercancel` on the WINDOW. Window
+// listeners because they hear the press with or without the capture -- a captured event is retargeted to
+// the strip and still bubbles up to the window, and if the capture was refused the pointer's own events
+// still reach the window wherever it is in the panel. The capture is what lets the admin drag past the
+// strip's edge, out of the app, and keep panning.
+//
+// A press that arrives as a bare `mousedown` with no `pointerdown` before it rides on mouse events instead
+// (`mousemove` / `mouseup` on the document). That is the runtime with no window.PointerEvent, and also one
+// that has the constructor but never delivers the events: 0.40's resources.js loads polyfills "for
+// Ultralight", so a defined PointerEvent is not proof the engine sends pointer events. Each press belongs to
+// the path that started it and is never handled twice -- the compat `mousedown` that follows a `pointerdown`
+// finds the press already open and is ignored.
+//
+// The `mousedown` is preventDefault-ed on both paths: the strip must neither take the focus from a field
+// being typed in (its draft is what the admin is looking at) nor start a text selection. The `pointerdown`
+// is not, so its compat mousedown still comes and is what that preventDefault acts on.
+//
+// HOW A PRESS ENDS -- every way, and none of them a guess about where the pointer is:
+//   * pointerup / mouseup                 the release; the only one that can be a click
+//   * pointercancel                       the engine took the pointer away
+//   * lostpointercapture                  the strip lost its capture before the release
+//   * a move with the left button up      `(buttons & 1) === 0` after a move that HAS reported it held, so a
+//                                         release that never arrived cannot latch the drag. Armed only by
+//                                         such a move: no game code reads `buttons`, and a runtime that
+//                                         never reports it on moves must not end every drag at its first
+//   * $destroy                            the strip went away mid-press
+// Leaving the strip and the window losing focus no longer end it (they did until 2026-10-23): with the
+// capture a drag may leave the strip, and nothing in BeamNG's UI showed either to be reliable mid-drag.
+//
+// A wheel turn is never a click: a press that sees one is no click any more, and pans on from where the
+// zoom left it. The window and document listeners exist only while a press is open. App-unique name for the
+// reason bcGridFit's is.
+angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', function ($parse, $timeout) {
+  var CLICK_SLOP = 4;     // px a press may move and still count as a click
+  var WHEEL_LINE = 33;    // px per wheel line (deltaMode 1): three lines are one 100 px notch
+  var WHEEL_PAGE = 400;   // px per wheel page (deltaMode 2)
+  var WHEEL_CAP = 300;    // px one wheel event may zoom by, so a flung trackpad cannot jump the range
+
+  return {
+    restrict: 'A',
+    link: function (scope, element, attrs) {
+      var onStart = $parse(attrs.bcGridDragStart);
+      var onDrag = $parse(attrs.bcGridDrag);
+      var onClick = $parse(attrs.bcGridDragClick);
+      var onEnded = $parse(attrs.bcGridDragEnd);
+      var onWheelTurn = $parse(attrs.bcGridDragWheel);
+      var onWidth = $parse(attrs.bcGridDragWidth);
+      var strip = element[0];
+      var hasPointerEvents = typeof window.PointerEvent === 'function';
+      // The open press, or null: {path, id, x, y, originX, originY, moved, dragged, dot, moves, farthest,
+      // buttonsSeen, wheels}. x / y is where pans count from (a wheel turn moves it), origin where it began.
+      // `moved` rules the click out (a move past the slop or a wheel turn); `dragged` is the move alone.
+      var press = null;
+      var resizeObserver = null;
+
+      // The same phase check as bcGridHold's: an event can arrive from inside a digest.
+      function applyHandler(fn) {
+        if (scope.$root && scope.$root.$$phase) {
+          fn();
+        } else {
+          scope.$apply(fn);
+        }
+      }
+
+      // The dot the press landed on, {start, slot} from its data-start / data-slot, or null.
+      function dotUnder(node) {
+        while (node && node !== strip) {
+          if (node.getAttribute && node.getAttribute('data-start') !== null) {
+            return { start: node.getAttribute('data-start'), slot: node.getAttribute('data-slot') };
+          }
+          node = node.parentNode;
+        }
+        return null;
+      }
+
+      // The width the plan is drawn in: inside the strip's border, which is what the window's edges and the
+      // drag's stop (the last dot whole at the edge) are measured against.
+      function reportWidth() {
+        var width = strip.clientWidth;
+        if (width > 0) {
+          applyHandler(function () {
+            onWidth(scope, { $width: width });
+          });
+        }
+      }
+
+      // Hear (or stop hearing) the open press's moves and its end, on the path it started on.
+      function listen(path, on) {
+        var method = on ? 'addEventListener' : 'removeEventListener';
+        if (path === 'pointer') {
+          window[method]('pointermove', onMove, false);
+          window[method]('pointerup', onUp, false);
+          window[method]('pointercancel', onPointerCancel, false);
+          strip[method]('lostpointercapture', onLostCapture, false);
+        } else {
+          document[method]('mousemove', onMove, true);
+          document[method]('mouseup', onUp, true);
+        }
+      }
+
+      // End the press, however it ends (see the header). Idempotent. Only a release can be a click, and
+      // every press is reported, once, when it ends.
+      function release(how, isRelease) {
+        if (press === null) {
+          return;
+        }
+        var ended = press;
+        press = null;
+        listen(ended.path, false);
+        if (ended.path === 'pointer') {
+          try {
+            strip.releasePointerCapture(ended.id);
+          } catch (e) {
+            // Not captured, or already released: nothing to give back.
+          }
+        }
+        var isClick = isRelease && !ended.moved;
+        var start = ended.dot ? ended.dot.start : null;
+        if (isClick) {
+          onClick(scope, { $start: start, $slot: ended.dot ? ended.dot.slot : null });
+        }
+        onEnded(scope, { $report: { path: ended.path, moves: ended.moves, farthest: Math.round(ended.farthest),
+          ended: how, click: isClick, dragged: ended.dragged, start: start, buttonsSeen: ended.buttonsSeen,
+          wheels: ended.wheels } });
+      }
+
+      // Is this event about the open press? A pointer press answers only to its own pointer.
+      function isPress(ev) {
+        return press !== null && (press.path !== 'pointer' || ev.pointerId === press.id);
+      }
+
+      function onMove(ev) {
+        if (!isPress(ev)) {
+          return;
+        }
+        if ((ev.buttons & 1) === 1) {
+          press.buttonsSeen = true;
+        } else if (press.buttonsSeen) {
+          applyHandler(function () {
+            release('a move with the button up', false);
+          });
+          return;
+        }
+        press.moves += 1;
+        press.farthest = Math.max(press.farthest,
+          Math.sqrt(Math.pow(ev.clientX - press.originX, 2) + Math.pow(ev.clientY - press.originY, 2)));
+        var dx = ev.clientX - press.x;
+        var dy = ev.clientY - press.y;
+        if (!press.moved && Math.sqrt(dx * dx + dy * dy) <= CLICK_SLOP) {
+          return;
+        }
+        press.moved = true;
+        press.dragged = true;
+        applyHandler(function () {
+          onDrag(scope, { $dx: dx, $dy: dy });
+        });
+      }
+
+      function onUp(ev) {
+        if (!isPress(ev)) {
+          return;
+        }
+        var how = press.path === 'pointer' ? 'pointerup' : 'mouseup';
+        applyHandler(function () {
+          release(how, true);
+        });
+      }
+
+      function onPointerCancel(ev) {
+        if (!isPress(ev)) {
+          return;
+        }
+        applyHandler(function () {
+          release('pointercancel', false);
+        });
+      }
+
+      function onLostCapture(ev) {
+        if (!isPress(ev)) {
+          return;
+        }
+        applyHandler(function () {
+          release('lostpointercapture', false);
+        });
+      }
+
+      function begin(path, id, ev) {
+        press = { path: path, id: id, x: ev.clientX, y: ev.clientY, originX: ev.clientX, originY: ev.clientY,
+          moved: false, dragged: false, dot: dotUnder(ev.target), moves: 0, farthest: 0, buttonsSeen: false,
+          wheels: 0 };
+        listen(path, true);
+        reportWidth();
+        applyHandler(function () {
+          onStart(scope);
+        });
+      }
+
+      function onPointerDown(ev) {
+        if (ev.button !== 0 || press !== null) {
+          return;
+        }
+        begin('pointer', ev.pointerId, ev);
+        try {
+          strip.setPointerCapture(ev.pointerId);
+        } catch (e) {
+          // Refused or unsupported: the window listeners still hear the press inside the panel.
+        }
+      }
+
+      function onMouseDown(ev) {
+        ev.preventDefault();
+        if (ev.button !== 0 || press !== null) {
+          return;
+        }
+        begin('mouse', null, ev);
+      }
+
+      function onWheel(ev) {
+        ev.preventDefault();
+        var scale = ev.deltaMode === 1 ? WHEEL_LINE : (ev.deltaMode === 2 ? WHEEL_PAGE : 1);
+        var delta = Math.max(-WHEEL_CAP, Math.min(WHEEL_CAP, ev.deltaY * scale));
+        if (!delta) {
+          return;
+        }
+        var box = strip.getBoundingClientRect();
+        var x = ev.clientX - box.left - strip.clientLeft;
+        var y = ev.clientY - box.top - strip.clientTop;
+        applyHandler(function () {
+          onWheelTurn(scope, { $delta: delta, $x: x, $y: y });
+          if (press !== null) {
+            press.moved = true;
+            press.wheels += 1;
+            press.x = ev.clientX;
+            press.y = ev.clientY;
+            onStart(scope);
+          }
+        });
+      }
+
+      if (hasPointerEvents) {
+        strip.addEventListener('pointerdown', onPointerDown, false);
+      }
+      strip.addEventListener('mousedown', onMouseDown, false);
+      strip.addEventListener('wheel', onWheel, { passive: false });
+
+      // After the first layout, and whenever the panel is resized. invokeApply false: reportWidth applies.
+      var firstLayout = $timeout(reportWidth, 0, false);
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(reportWidth);
+        resizeObserver.observe(strip);
+      }
+
+      // Already inside a digest, so release runs directly.
+      scope.$on('$destroy', function () {
+        release('$destroy', false);
+        strip.removeEventListener('pointerdown', onPointerDown, false);
+        strip.removeEventListener('mousedown', onMouseDown, false);
+        strip.removeEventListener('wheel', onWheel, { passive: false });
+        $timeout.cancel(firstLayout);
+        if (resizeObserver) {
+          resizeObserver.disconnect();
+        }
       });
     },
   };
