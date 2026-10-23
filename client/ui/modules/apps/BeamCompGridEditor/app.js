@@ -183,8 +183,8 @@ angular.module('beamng.apps')
       + 'dashed line.',
     addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
       + 'own layout. A line on the ground and in the plan marks where the new part begins.',
-    plan: 'The grid seen from above, P1 at the start line on the left. Drag to look along it, click a '
-      + 'position to edit its part.',
+    plan: 'The grid seen from above, P1 on the left. Drag to look along it, turn the mouse wheel to zoom, '
+      + 'click a position to edit its part.',
     removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
       + 'one to edit it with the settings below.',
@@ -311,14 +311,22 @@ angular.module('beamng.apps')
   // Display constants only. Every position, line and color in the plan comes from GE
   // (BeamCompGridState.plan); this panel lays nothing out and holds no grid constant.
   //
-  // The scale is fixed, so a dot keeps its size whatever the field: at the default 4 m column stagger a
-  // diagonal neighbour is 34 px away and a same-column one 48 px, and a ~600 px strip shows ~100 m, the
-  // whole default 16-car field. A longer field is dragged.
-  var PLAN_SCALE = 6;             // px per meter
+  // The default zoom (ADR-0023 amendment 2026-10-23): at the default 4 m column stagger a diagonal
+  // neighbour is 34 px away and a same-column one 48 px, and a ~600 px strip shows ~100 m, the whole default
+  // 16-car field. The mouse wheel zooms between the two bounds; New and Load go back to the default.
+  var PLAN_SCALE = 6;             // px per meter, the default
+  var PLAN_SCALE_MIN = 2;         // fully out: ~300 m across a 618 px strip, a whole 32-position field
+  var PLAN_SCALE_MAX = 24;        // fully in: a two-wide row 4 m apart is 96 px across
+  var PLAN_ZOOM_RATE = 0.0015;    // zoom factor exp(-deltaY * rate): one 100 px wheel notch is about x0.86
   var PLAN_HEIGHT = 104;          // px
-  var PLAN_DOT_RADIUS = 10;       // px; the P<n> label sits inside the dot
-  var PLAN_NOSE = 6;              // px the facing tick reaches past the dot
+  // A dot keeps its size from the default zoom up; below it, it shrinks with the zoom to a floor, and a dot
+  // too small for its P<n> shows none. Overlapping dots fully zoomed out are accepted.
+  var PLAN_DOT_RADIUS = 10;       // px at the default zoom and above
+  var PLAN_DOT_MIN = 4;           // px
+  var PLAN_LABEL_MIN = 7;         // px of radius a dot needs to show its label (from ~4.2 px per meter)
+  var PLAN_NOSE = 0.6;            // the facing tick reaches this share of a radius past the dot
   var PLAN_PAD = 18;              // px of room before the start line and after the last position
+  var PLAN_MARGIN = 6;            // px of room above the topmost and below the lowest dot
   var PLAN_LEAD = 0.25;           // share of the window that shows the part before the edited one
   var PLAN_FALLBACK_WIDTH = 560;  // px, until the strip has been laid out and measured
   var PLAN_START_SQUARE = 4;      // px, the start line's checkered mark
@@ -342,15 +350,28 @@ angular.module('beamng.apps')
     return light > 0.5 ? '#10131a' : '#ffffff';
   }
 
-  // GE's plan with every list normalised (see asArray), or null when GE sent none.
+  // GE's plan with every list normalised (see asArray), or null when GE sent none. `start` is not a list
+  // and passes as it is: the start line's direction, upright when GE sends none.
   function planOf(plan) {
     if (!plan) {
       return null;
     }
-    return { poses: asArray(plan.poses), boundaries: asArray(plan.boundaries), parts: asArray(plan.parts) };
+    return { poses: asArray(plan.poses), boundaries: asArray(plan.boundaries), parts: asArray(plan.parts),
+      start: plan.start || { dx: 0, dy: 1 } };
   }
 
-  // The checkered start-line mark at x = 0, centred on the start pose: two columns of small squares.
+  // A drawn coordinate, rounded to a hundredth of a px (meters times a zoom is not always a short number).
+  function toPx(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  // A dot's radius at `scale` px per meter: full size from the default zoom up, then shrinking to the floor.
+  function dotRadiusAt(scale) {
+    return Math.max(PLAN_DOT_MIN, PLAN_DOT_RADIUS * Math.min(1, scale / PLAN_SCALE));
+  }
+
+  // The checkered start-line mark, centred on the start pose: two columns of small squares, upright, turned
+  // to the start line's real angle by the transform it is drawn under. A screen size, not a length.
   function startMark() {
     var squares = [];
     var top = -(PLAN_START_ROWS * PLAN_START_SQUARE) / 2;
@@ -363,9 +384,12 @@ angular.module('beamng.apps')
     return squares;
   }
 
+  // What the strip draws, in px at the current zoom, plus the field's extent in plan meters (xMin..yMax)
+  // and the edited part's lateral middle (editedMid, null when it has no position), for the window.
   function emptyPlan() {
-    return { height: PLAN_HEIGHT, tx: 0, ty: PLAN_HEIGHT / 2, left: 0, right: 0, fits: true, middle: 0,
-      dots: [], lines: [], dashed: null, start: startMark() };
+    return { height: PLAN_HEIGHT, tx: 0, ty: PLAN_HEIGHT / 2, xMin: 0, xMax: 0, yMin: 0, yMax: 0,
+      radius: PLAN_DOT_RADIUS, editedMid: null, dots: [], lines: [], dashed: null, start: startMark(),
+      startAngle: 0 };
   }
 
   // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
@@ -1296,29 +1320,39 @@ angular.module('beamng.apps')
         return part ? cssColor(part.color, 1) : 'transparent';
       };
 
-      // ---- The plan strip (ADR-0023 amendment 2026-10-16) -------------------------------------------
+      // ---- The plan strip (ADR-0023 amendments 2026-10-16 and 2026-10-23) ----------------------------
       // Renders GE's plan (scope.state.plan) and nothing else: one dot per preview position, a line where
-      // each part begins, a checkered start-line mark at x = 0. Plan meters x (behind the start line) and
-      // y (right of travel) map to the strip as x -> right, y -> up, so P1 is on the left and the cars face
-      // left, towards the mark -- a true top view, pole-left at the bottom.
+      // each part begins, a checkered start-line mark at its real angle. Plan meters x (behind the start
+      // line) and y (right of travel), in part 1's own frame, map to the strip as x -> right, y -> up, so
+      // P1 is on the left, part 1's rows are level and the cars face left -- a true top view.
       //
-      // The strip is a WINDOW onto the field, moved by dragging (bcGridDrag) and by two triggers:
+      // The strip is a WINDOW onto the field: `left` is the plan x at its left edge, `mid` the plan y at its
+      // vertical centre, `scale` its zoom in px per meter. It is moved by dragging (bcGridDrag, both ways
+      // wherever the field is larger than the strip), zoomed by the mouse wheel around the cursor, and
+      // moved -- never zoomed -- by two triggers:
       //   * the edited part changes (editTarget(): race, direction, the part's start): the window jumps to
-      //     that part's start, with the part before it in its first quarter, and FOLLOWS that start on
-      //     every push from then on (a knob that moves the part moves the window with it);
+      //     that part's start, with the part before it in its first quarter, centres on the part
+      //     vertically, and FOLLOWS that start on every push from then on;
       //   * the typed breakpoint moves the dashed line: the window centres on it and stops following.
-      // A drag stops following too, and a push then never moves the window; only the clamp to the field
-      // can, when the field itself got shorter.
+      // A drag or a wheel zoom stops following too, and a push then never moves the window; only the clamp
+      // to the field can, when the field itself changed. The zoom stays through pushes, part switches and
+      // typed breakpoints; New and Load go back to the default.
       //
       // The dashed line is a DRAFT: the number in Breakpoint at P while it is the admin's own, typed
       // (`ng-change`) or stepped (its ± buttons) and not yet applied. The plan reads that field and never
       // writes it, and nothing of the draft reaches GE before Enter or Add breakpoint.
       scope.plan = emptyPlan();
-      var planView = { pan: 0, follow: true, partKey: null, dashedSlot: null, width: 0, dragFrom: 0 };
+      var planView = { left: 0, mid: 0, scale: PLAN_SCALE, follow: true, partKey: null, dashedSlot: null,
+        width: 0, dragFrom: null };
       var planDraft = null;   // null (the field shows GE's echo), 'typed' or 'stepped'
 
-      function planWidth() {
-        return planView.width || PLAN_FALLBACK_WIDTH;
+      // The window's size in plan meters.
+      function planWindowWidth() {
+        return (planView.width || PLAN_FALLBACK_WIDTH) / planView.scale;
+      }
+
+      function planWindowHeight() {
+        return PLAN_HEIGHT / planView.scale;
       }
 
       function planPoseAt(slot) {
@@ -1365,19 +1399,20 @@ angular.module('beamng.apps')
       }
 
       // The dashed line: halfway between the last position that would stay in the earlier part and the
-      // first one of the new part, square to that position's facing, as tall as the strip.
-      function planDashedLine(slot) {
+      // first one of the new part, square to that position's facing, taller than the strip. `x`, `y` are its
+      // middle in plan meters, for centring the window on it.
+      function planDashedLine(slot, scale) {
         var before = planPoseAt(slot - 1);
         var after = planPoseAt(slot);
-        var midX = (before.x + after.x) / 2 * PLAN_SCALE;
-        var midY = -(before.y + after.y) / 2 * PLAN_SCALE;
-        var acrossX = after.fy;
-        var acrossY = after.fx;
-        return { x: midX, x1: midX - acrossX * PLAN_HEIGHT, y1: midY - acrossY * PLAN_HEIGHT,
-          x2: midX + acrossX * PLAN_HEIGHT, y2: midY + acrossY * PLAN_HEIGHT };
+        var x = (before.x + after.x) / 2;
+        var y = (before.y + after.y) / 2;
+        var acrossX = after.fy * PLAN_HEIGHT;
+        var acrossY = after.fx * PLAN_HEIGHT;
+        return { x: x, y: y, x1: toPx(x * scale - acrossX), y1: toPx(-y * scale - acrossY),
+          x2: toPx(x * scale + acrossX), y2: toPx(-y * scale + acrossY) };
       }
 
-      // Rebuild what the strip draws from GE's plan and the draft. The window position is placePlan's.
+      // Rebuild what the strip draws from GE's plan, the draft and the zoom. The window is placePlan's.
       function buildPlan() {
         var source = scope.state.plan;
         var built = emptyPlan();
@@ -1385,30 +1420,38 @@ angular.module('beamng.apps')
           scope.plan = built;
           return;
         }
+        var scale = planView.scale;
+        var radius = dotRadiusAt(scale);
+        var showLabels = radius >= PLAN_LABEL_MIN;
         var dashedSlot = planDashedSlot();
         var draftPart = dashedSlot === null ? null : planPartCovering(dashedSlot);
-        var minX = 0;
-        var maxX = 0;
-        var minY = Infinity;
-        var maxY = -Infinity;
+        var extent = { xMin: 0, xMax: 0, yMin: Infinity, yMax: -Infinity };
+        var edited = { yMin: Infinity, yMax: -Infinity };
+        function reach(x, y) {
+          extent.xMin = Math.min(extent.xMin, x);
+          extent.xMax = Math.max(extent.xMax, x);
+          extent.yMin = Math.min(extent.yMin, y);
+          extent.yMax = Math.max(extent.yMax, y);
+        }
         built.dots = source.poses.map(function (pose) {
           var part = source.parts[pose.part - 1];
           var color = part ? part.color : { r: 1, g: 1, b: 1, a: 1 };
           var isDraft = draftPart !== null && pose.slot >= dashedSlot && pose.slot <= draftPart.lastSlot;
           var isEdited = pose.part === scope.state.activeSegment;
-          minX = Math.min(minX, pose.x);
-          maxX = Math.max(maxX, pose.x);
-          minY = Math.min(minY, pose.y);
-          maxY = Math.max(maxY, pose.y);
+          reach(pose.x, pose.y);
+          if (isEdited) {
+            edited.yMin = Math.min(edited.yMin, pose.y);
+            edited.yMax = Math.max(edited.yMax, pose.y);
+          }
           return {
             slot: pose.slot,
             start: part ? part.startSlot : 0,
-            label: scope.slotLabel(pose.slot),
-            cx: pose.x * PLAN_SCALE,
-            cy: -pose.y * PLAN_SCALE,
-            r: PLAN_DOT_RADIUS,
-            nx: pose.fx * (PLAN_DOT_RADIUS + PLAN_NOSE),
-            ny: -pose.fy * (PLAN_DOT_RADIUS + PLAN_NOSE),
+            label: showLabels ? scope.slotLabel(pose.slot) : '',
+            cx: toPx(pose.x * scale),
+            cy: toPx(-pose.y * scale),
+            r: toPx(radius),
+            nx: toPx(pose.fx * radius * (1 + PLAN_NOSE)),
+            ny: toPx(-pose.fy * radius * (1 + PLAN_NOSE)),
             fill: isDraft ? 'rgba(20,22,26,0.6)' : cssColor(color),
             nose: cssColor(color),
             stroke: isDraft ? cssColor(color, 1) : (isEdited ? '#ffffff' : 'none'),
@@ -1417,65 +1460,72 @@ angular.module('beamng.apps')
           };
         });
         built.lines = source.boundaries.map(function (boundary) {
-          minX = Math.min(minX, boundary.a.x, boundary.b.x);
-          maxX = Math.max(maxX, boundary.a.x, boundary.b.x);
-          return { part: boundary.part, x1: boundary.a.x * PLAN_SCALE, y1: -boundary.a.y * PLAN_SCALE,
-            x2: boundary.b.x * PLAN_SCALE, y2: -boundary.b.y * PLAN_SCALE, color: cssColor(boundary.color) };
+          reach(boundary.a.x, boundary.a.y);
+          reach(boundary.b.x, boundary.b.y);
+          return { part: boundary.part, x: (boundary.a.x + boundary.b.x) / 2, x1: toPx(boundary.a.x * scale),
+            y1: toPx(-boundary.a.y * scale), x2: toPx(boundary.b.x * scale), y2: toPx(-boundary.b.y * scale),
+            color: cssColor(boundary.color) };
         });
-        built.dashed = dashedSlot === null ? null : planDashedLine(dashedSlot);
-        built.left = minX * PLAN_SCALE - PLAN_PAD;
-        built.right = maxX * PLAN_SCALE + PLAN_PAD;
-        built.middle = (minY + maxY) / 2;
-        built.fits = (maxY - minY) * PLAN_SCALE + 2 * PLAN_DOT_RADIUS <= PLAN_HEIGHT - 8;
+        built.dashed = dashedSlot === null ? null : planDashedLine(dashedSlot, scale);
+        built.xMin = extent.xMin;
+        built.xMax = extent.xMax;
+        built.yMin = extent.yMin;
+        built.yMax = extent.yMax;
+        built.radius = radius;
+        built.editedMid = edited.yMin === Infinity ? null : (edited.yMin + edited.yMax) / 2;
+        // SVG rotate turns clockwise on screen, and the mark stands along plan +y: atan2(dx, dy).
+        built.startAngle = Math.atan2(source.start.dx, source.start.dy) * 180 / Math.PI;
         scope.plan = built;
       }
 
-      function clampPan(pan) {
-        var max = Math.max(scope.plan.left, scope.plan.right - planWidth());
-        return Math.min(Math.max(pan, scope.plan.left), max);
+      // The range the window's left edge may take: a field narrower than the window sits at the start line,
+      // a wider one keeps the window inside it (plus the pad).
+      function planLeftRange() {
+        var pad = PLAN_PAD / planView.scale;
+        var low = scope.plan.xMin - pad;
+        return [low, Math.max(low, scope.plan.xMax + pad - planWindowWidth())];
       }
 
-      // The lateral middle the strip is centred on: the whole field's when it fits the strip's height,
-      // else the middle of the positions inside the window, so a strong bend stays in view as it is dragged.
-      function planMiddle() {
-        if (scope.plan.fits) {
-          return scope.plan.middle;
+      // The range the window's vertical centre may take, and whether the field (plus the margin, which
+      // clears the dots) is taller than the strip: a taller field keeps the strip inside it, a shorter one
+      // stays wholly inside the strip.
+      function planMidLimits() {
+        var margin = (scope.plan.radius + PLAN_MARGIN) / planView.scale;
+        var half = planWindowHeight() / 2;
+        var lowest = scope.plan.yMin - margin + half;
+        var highest = scope.plan.yMax + margin - half;
+        return { range: [Math.min(lowest, highest), Math.max(lowest, highest)], taller: highest > lowest };
+      }
+
+      function clampTo(value, range) {
+        return Math.min(Math.max(value, range[0]), range[1]);
+      }
+
+      // Put the window where planView says, clamped to the field.
+      function placePlan() {
+        planView.left = clampTo(planView.left, planLeftRange());
+        planView.mid = clampTo(planView.mid, planMidLimits().range);
+        scope.plan.tx = toPx(-planView.left * planView.scale);
+        scope.plan.ty = toPx(PLAN_HEIGHT / 2 + planView.mid * planView.scale);
+      }
+
+      // The edited part's start: the start line for part 1, otherwise the line where the part begins a
+      // quarter of the way in, and the part centred vertically. A part past the preview has no line and
+      // no position: the end of the field, centred on the whole field.
+      function planToPartStart() {
+        var index = scope.state.activeSegment;
+        var left = scope.plan.xMax - planWindowWidth();
+        if (index <= 1) {
+          left = planLeftRange()[0];
         }
-        var from = planView.pan;
-        var to = planView.pan + planWidth();
-        var minY = Infinity;
-        var maxY = -Infinity;
-        scope.plan.dots.forEach(function (dot) {
-          if (dot.cx >= from && dot.cx <= to) {
-            minY = Math.min(minY, -dot.cy / PLAN_SCALE);
-            maxY = Math.max(maxY, -dot.cy / PLAN_SCALE);
+        scope.plan.lines.forEach(function (line) {
+          if (line.part === index) {
+            left = line.x - planWindowWidth() * PLAN_LEAD;
           }
         });
-        return minY === Infinity ? scope.plan.middle : (minY + maxY) / 2;
-      }
-
-      // Put the window where planView.pan says, clamped to the field.
-      function placePlan() {
-        planView.pan = clampPan(planView.pan);
-        scope.plan.tx = -planView.pan;
-        scope.plan.ty = PLAN_HEIGHT / 2 + planMiddle() * PLAN_SCALE;
-      }
-
-      // Where the window shows the edited part's start: the start line for part 1, otherwise the line
-      // where the part begins a quarter of the way in. A part past the preview has no line: the end of the
-      // field, where it would begin.
-      function partStartPan() {
-        var index = scope.state.activeSegment;
-        if (index <= 1) {
-          return scope.plan.left;
-        }
-        for (var i = 0; i < scope.plan.lines.length; i++) {
-          var line = scope.plan.lines[i];
-          if (line.part === index) {
-            return (line.x1 + line.x2) / 2 - planWidth() * PLAN_LEAD;
-          }
-        }
-        return scope.plan.right - planWidth();
+        planView.left = left;
+        planView.mid = scope.plan.editedMid === null ? (scope.plan.yMin + scope.plan.yMax) / 2
+          : scope.plan.editedMid;
       }
 
       // Every push: the echo settles a draft (it has just rewritten the field), a changed edit target sends
@@ -1495,14 +1545,16 @@ angular.module('beamng.apps')
         }
         buildPlan();
         if (planView.follow) {
-          planView.pan = partStartPan();
+          planToPartStart();
         }
         placePlan();
       }
 
-      // New and Load start a field of their own, even on the same race, direction and part.
+      // New and Load start a field of their own, even on the same race, direction and part, and at the
+      // default zoom.
       function planNewSession() {
         planView.partKey = null;
+        planView.scale = PLAN_SCALE;
         planDraft = null;
         planView.dashedSlot = null;
       }
@@ -1513,7 +1565,8 @@ angular.module('beamng.apps')
         buildPlan();
         var slot = planDashedSlot();
         if (slot !== null && slot !== planView.dashedSlot) {
-          planView.pan = scope.plan.dashed.x - planWidth() / 2;
+          planView.left = scope.plan.dashed.x - planWindowWidth() / 2;
+          planView.mid = scope.plan.dashed.y;
           planView.follow = false;
         }
         planView.dashedSlot = slot;
@@ -1541,14 +1594,38 @@ angular.module('beamng.apps')
         }
       };
 
-      // bcGridDrag: a press remembers where the window was, a drag moves it from there.
+      // bcGridDrag: a press remembers where the window was, a drag moves it from there -- sideways always
+      // (the clamp holds a field narrower than the strip at the start line), up and down only while the
+      // field is taller than the strip.
       scope.planPress = function () {
-        planView.dragFrom = planView.pan;
+        planView.dragFrom = { left: planView.left, mid: planView.mid };
       };
 
-      scope.planDrag = function (dx) {
+      scope.planDrag = function (dx, dy) {
         planView.follow = false;
-        planView.pan = planView.dragFrom - dx;
+        planView.left = planView.dragFrom.left - dx / planView.scale;
+        if (planMidLimits().taller) {
+          planView.mid = planView.dragFrom.mid + dy / planView.scale;
+        }
+        placePlan();
+      };
+
+      // The mouse wheel over the strip: zoom by exp(-delta * rate) between the two bounds, around the point
+      // under the cursor (x, y in px from the strip's top left), which stays where it is unless the clamp
+      // to the field has to move it. A manual view change, like a drag.
+      scope.planZoom = function (delta, x, y) {
+        var scale = Math.min(PLAN_SCALE_MAX, Math.max(PLAN_SCALE_MIN,
+          planView.scale * Math.exp(-delta * PLAN_ZOOM_RATE)));
+        if (scale === planView.scale) {
+          return;
+        }
+        var underX = planView.left + x / planView.scale;
+        var underY = planView.mid + (PLAN_HEIGHT / 2 - y) / planView.scale;
+        planView.scale = scale;
+        planView.left = underX - x / scale;
+        planView.mid = underY - (PLAN_HEIGHT / 2 - y) / scale;
+        planView.follow = false;
+        buildPlan();
         placePlan();
       };
 
@@ -1569,7 +1646,7 @@ angular.module('beamng.apps')
         }
         planView.width = width;
         if (planView.follow) {
-          planView.pan = partStartPan();
+          planToPartStart();
         }
         placePlan();
       };
@@ -1888,24 +1965,35 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
   };
 }]);
 
-// Drag-to-pan for the plan strip (ADR-0023 amendment 2026-10-16): the gesture and nothing else, the way
-// bcGridHold is the hold and nothing else. The panel above owns the window position and what a click means.
+// Drag-to-pan and wheel-to-zoom for the plan strip (ADR-0023 amendments 2026-10-16 and 2026-10-23): the
+// gestures and nothing else, the way bcGridHold is the hold and nothing else. The panel above owns the
+// window, the zoom and what a click means.
 //
 //   bc-grid-drag-start="planPress()"        a left press on the strip
-//   bc-grid-drag="planDrag($dx)"            every move once the press has moved past CLICK_SLOP; $dx is
-//                                           the horizontal distance from the press, in px
+//   bc-grid-drag="planDrag($dx, $dy)"       every move once the press has moved past CLICK_SLOP; $dx, $dy
+//                                           are the distance from the press, in px
 //   bc-grid-drag-click="planClick($start)"  a release that never got past CLICK_SLOP; $start is the
 //                                           data-start of the dot under the press (null off the dots)
+//   bc-grid-drag-wheel="planZoom($delta, $x, $y)"  a wheel turn over the strip: $delta in px (line and page
+//                                           modes converted, capped per event), $x, $y the cursor in px
+//                                           from the strip's top left
 //   bc-grid-drag-width="planMeasure($width)" the strip's laid-out width, after link and on every resize
 //
 // The press is preventDefault-ed: the strip must neither take the focus from a field being typed in (its
-// draft is what the admin is looking at) nor start a text selection across the SVG labels.
+// draft is what the admin is looking at) nor start a text selection across the SVG labels. The wheel is
+// too, from a listener registered NON-passive (a passive one cannot cancel): over the strip it zooms and the
+// panel must not scroll; beside it the panel scrolls as it always did.
 //
 // Every release path ends the drag, the set bcGridHold owns: mouseup anywhere, the pointer leaving the
-// strip, the window losing focus, and $destroy. Only the mouseup can be a click. The document and window
-// listeners exist only while a press is open. App-unique name for the reason bcGridFit's is.
+// strip, the window losing focus, and $destroy. Only the mouseup can be a click, and a wheel turn is never
+// one: a press that sees a wheel turn is no click any more, and pans on from where the zoom left it. The
+// document and window listeners exist only while a press is open. App-unique name for the reason
+// bcGridFit's is.
 angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', function ($parse, $timeout) {
-  var CLICK_SLOP = 4;   // px a press may move and still count as a click
+  var CLICK_SLOP = 4;     // px a press may move and still count as a click
+  var WHEEL_LINE = 33;    // px per wheel line (deltaMode 1): three lines are one 100 px notch
+  var WHEEL_PAGE = 400;   // px per wheel page (deltaMode 2)
+  var WHEEL_CAP = 300;    // px one wheel event may zoom by, so a flung trackpad cannot jump the range
 
   return {
     restrict: 'A',
@@ -1914,6 +2002,7 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
       var onDrag = $parse(attrs.bcGridDrag);
       var onClick = $parse(attrs.bcGridDragClick);
       var onWidth = $parse(attrs.bcGridDragWidth);
+      var onWheelTurn = $parse(attrs.bcGridDragWheel);
       var press = null;   // {x, y, moved, start} while the button is down
       var resizeObserver = null;
 
@@ -1976,7 +2065,7 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         }
         press.moved = true;
         applyHandler(function () {
-          onDrag(scope, { $dx: dx });
+          onDrag(scope, { $dx: dx, $dy: dy });
         });
       }
 
@@ -2007,8 +2096,30 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         });
       }
 
+      function onWheel(ev) {
+        ev.preventDefault();
+        var scale = ev.deltaMode === 1 ? WHEEL_LINE : (ev.deltaMode === 2 ? WHEEL_PAGE : 1);
+        var delta = Math.max(-WHEEL_CAP, Math.min(WHEEL_CAP, ev.deltaY * scale));
+        if (!delta) {
+          return;
+        }
+        var box = element[0].getBoundingClientRect();
+        var x = ev.clientX - box.left - element[0].clientLeft;
+        var y = ev.clientY - box.top - element[0].clientTop;
+        applyHandler(function () {
+          onWheelTurn(scope, { $delta: delta, $x: x, $y: y });
+          if (press !== null) {
+            press.moved = true;
+            press.x = ev.clientX;
+            press.y = ev.clientY;
+            onStart(scope);
+          }
+        });
+      }
+
       element.on('mousedown', onDown);
       element.on('mouseleave', onCancel);
+      element[0].addEventListener('wheel', onWheel, { passive: false });
 
       // After the first layout, and whenever the panel is resized. invokeApply false: reportWidth applies.
       var firstLayout = $timeout(reportWidth, 0, false);
@@ -2020,6 +2131,7 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
       // Already inside a digest, so release runs directly; jqLite drops the element's own listeners.
       scope.$on('$destroy', function () {
         release(false);
+        element[0].removeEventListener('wheel', onWheel, { passive: false });
         $timeout.cancel(firstLayout);
         if (resizeObserver) {
           resizeObserver.disconnect();

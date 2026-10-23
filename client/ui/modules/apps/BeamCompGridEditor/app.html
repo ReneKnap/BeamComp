@@ -120,9 +120,10 @@
        setup panel's stale-grid note: nothing is broken and nothing is refused, the admin is just not
        editing the layout that race will start on. */
     .bc-dir-note { font-size: 12px; color: #e8c07a; margin: 4px 0 2px; }
-    /* The plan strip (ADR-0023 amendment 2026-10-16): the grid seen from above, dragged sideways. Its
-       height is PLAN_HEIGHT in app.js (bound on the svg); the width is the section's. No text selection and
-       a grab cursor, because a press here is a drag. The svg clips what lies outside the window. */
+    /* The plan strip (ADR-0023 amendments 2026-10-16, 2026-10-23): the grid seen from above, dragged and
+       zoomed with the wheel. Its height is PLAN_HEIGHT in app.js (bound on the svg); the width is the
+       section's. No text selection and a grab cursor, because a press here is a drag. The svg clips what
+       lies outside the window. */
     .bc-plan { margin: 4px 0 6px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
       border-radius: 3px; cursor: grab; user-select: none; -webkit-user-select: none; }
     .bc-plan:active { cursor: grabbing; }
@@ -247,15 +248,18 @@
       <!-- Deliberately names no Layout label, so it never has to be kept in step with LAYOUT_KNOBS in
            app.js. Its numbers are GE's ranges (partHint). -->
       <div class="bc-hint">{{partHint()}}</div>
-      <!-- The plan: the grid from above, a window onto it that is dragged sideways (app.js "The plan
-           strip"). Everything in it is GE's plan; dots carry their part's start slot for the click. -->
-      <div class="bc-plan" bc-grid-tip="tip('plan')" bc-grid-drag="planDrag($dx)"
+      <!-- The plan: the grid from above in part 1's frame, a window onto it that is dragged and zoomed with
+           the mouse wheel (app.js "The plan strip"). Everything in it is GE's plan; dots carry their part's
+           start slot for the click. -->
+      <div class="bc-plan" bc-grid-tip="tip('plan')" bc-grid-drag="planDrag($dx, $dy)"
         bc-grid-drag-start="planPress()" bc-grid-drag-click="planClick($start)"
-        bc-grid-drag-width="planMeasure($width)">
+        bc-grid-drag-wheel="planZoom($delta, $x, $y)" bc-grid-drag-width="planMeasure($width)">
         <svg class="bc-plan-svg" ng-attr-height="{{plan.height}}">
           <g ng-attr-transform="translate({{plan.tx}},{{plan.ty}})">
-            <rect ng-repeat="q in plan.start track by $index" ng-attr-x="{{q.x}}" ng-attr-y="{{q.y}}"
-              ng-attr-width="{{q.size}}" ng-attr-height="{{q.size}}" ng-attr-fill="{{q.fill}}"></rect>
+            <g class="bc-plan-start" ng-attr-transform="rotate({{plan.startAngle}})">
+              <rect ng-repeat="q in plan.start track by $index" ng-attr-x="{{q.x}}" ng-attr-y="{{q.y}}"
+                ng-attr-width="{{q.size}}" ng-attr-height="{{q.size}}" ng-attr-fill="{{q.fill}}"></rect>
+            </g>
             <line class="bc-plan-line" ng-repeat="b in plan.lines track by $index" ng-attr-x1="{{b.x1}}"
               ng-attr-y1="{{b.y1}}" ng-attr-x2="{{b.x2}}" ng-attr-y2="{{b.y2}}" ng-attr-stroke="{{b.color}}"
               stroke-width="3" stroke-linecap="round"></line>
