@@ -203,9 +203,9 @@ M.state = {
     segment = 1,       -- 1-based index of the active segment (the one the knobs edit) in the active direction
     anchors = nil,     -- cached {forward = {base_pose, gate_normal}, reverse = ...} per direction
     poses = nil,       -- current preview poses for the active direction (drawn by init.lua)
-    -- The preview projected for the panel ({poses, boundaries}, plan metres) and the grounded 3D lines
-    -- where each part begins ({points, label, label_pos} each, drawn by init.lua). Both rebuilt by every
-    -- recompute, so neither needs its own previous value (ADR-0052).
+    -- The preview projected for the panel ({poses, boundaries, start}, plan metres) and the grounded 3D
+    -- lines where each part begins ({points, label, label_pos} each, drawn by init.lua). Both rebuilt by
+    -- every recompute, so neither needs its own previous value (ADR-0052).
     plan = nil,
     boundary_lines = nil,
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
@@ -237,12 +237,16 @@ local function rounded(value, per_unit)
     return math.floor(value * per_unit + 0.5) / per_unit
 end
 
--- The plan's frame: the one part 1 is laid out IN -- origin on the start pose, axis along the start line's
--- normal -- before part 1's own heading turns it. So the start line is x = 0 exactly, and a heading on any
--- part, the first one included, shows as a bend against it.
+-- The plan's frame: the one part 1 is laid out in, AFTER its own Rotate grid (ADR-0023 amendment
+-- 2026-10-23) -- origin on the start pose (part 1's pivot), axes part 1's own. So part 1's rows are always
+-- level, P1 on the left and its cars facing left, and only a later part that turns against part 1 shows
+-- as a bend. Part 1's shift and mirror act on the positions inside this frame as they do in the world;
+-- they do not move or flip the frame, which would turn the top view into a mirror image.
+--
+-- Round 1 used the frame BEFORE part 1's heading, the start line's own. A grid turned 196 degrees to fit
+-- its track then lay diagonally across the strip and ran off both its edges.
 local function plan_frame(first_layout)
-    local forward = first_layout.frame_forward
-    return {origin = first_layout.origin, forward = forward, right = {x = forward.y, y = -forward.x}}
+    return {origin = first_layout.origin, forward = first_layout.forward, right = first_layout.right}
 end
 
 -- A world point in plan metres: x behind the start line, y to the right of the direction of travel.
@@ -252,6 +256,26 @@ local function to_plan(frame, point)
         x = rounded(-(dx * frame.forward.x + dy * frame.forward.y), 100),
         y = rounded(dx * frame.right.x + dy * frame.right.y, 100),
     }
+end
+
+-- A world direction in plan axes, rounded to a thousandth: (-1, 0) points at the start line.
+local function plan_direction(frame, v)
+    return rounded(-(v.x * frame.forward.x + v.y * frame.forward.y), 1000),
+        rounded(v.x * frame.right.x + v.y * frame.right.y, 1000)
+end
+
+-- Which way the start line runs in the plan, {dx, dy}. It passes through the plan's origin (the start
+-- pose) square to its own normal, the frame part 1 received, so it slants by part 1's heading: upright at
+-- 0 degrees, 16 degrees off at 196. Turned to dy >= 0: a line has no direction, and one answer keeps the
+-- push stable.
+local function start_line_direction(frame, first_layout)
+    local normal = first_layout.frame_forward
+    local dx, dy = plan_direction(frame, {x = normal.y, y = -normal.x})
+    if dy < 0 or (dy == 0 and dx < 0) then
+        dx, dy = -dx, -dy
+    end
+    -- 0 rather than -0: the number crosses into JSON.
+    return {dx = dx + 0, dy = dy + 0}
 end
 
 -- A world point in a part's own laid-out axes: metres along its forward and across to its right, from
@@ -325,9 +349,9 @@ local function grounded_line(a, b, seed_z)
     return points
 end
 
--- Project the grounded preview for its two readers: the panel's plan ({poses, boundaries}, plan metres)
--- and the 3D lines init.lua draws. A boundary exists for every part that has a pose, from the second
--- laid-out part on; a part starting past the preview has neither poses nor a line. `layouts` is
+-- Project the grounded preview for its two readers: the panel's plan ({poses, boundaries, start}, plan
+-- metres) and the 3D lines init.lua draws. A boundary exists for every part that has a pose, from the
+-- second laid-out part on; a part starting past the preview has neither poses nor a line. `layouts` is
 -- grid.poses_segmented_with_frames' second return, so every number here comes from the layout the spawn
 -- uses -- the panel re-derives nothing.
 local function project(poses, layouts)
@@ -338,15 +362,15 @@ local function project(poses, layouts)
     local plan_poses = {}
     for index, pose in ipairs(poses) do
         local at = to_plan(frame, pose.pos)
-        local face = pose.faceDir
+        -- The way the car faces, in plan axes: (-1, 0) for every car of part 1.
+        local fx, fy = plan_direction(frame, pose.faceDir)
         plan_poses[index] = {
             slot = index - 1,
             part = pose.segment,
             x = at.x,
             y = at.y,
-            -- The way the car faces, in plan axes (-1, 0 = towards the start line).
-            fx = rounded(-(face.x * frame.forward.x + face.y * frame.forward.y), 1000),
-            fy = rounded(face.x * frame.right.x + face.y * frame.right.y, 1000),
+            fx = fx,
+            fy = fy,
         }
     end
 
@@ -372,7 +396,12 @@ local function project(poses, layouts)
             label_pos = {x = label_at.x, y = label_at.y, z = label_at.z + M.BOUNDARY_LABEL_HEIGHT},
         }
     end
-    return {poses = plan_poses, boundaries = plan_boundaries}, lines
+    local plan = {
+        poses = plan_poses,
+        boundaries = plan_boundaries,
+        start = start_line_direction(frame, layouts[1]),
+    }
+    return plan, lines
 end
 
 -- Recompute the preview poses for the active direction from its segment list + cached anchor.
@@ -699,7 +728,8 @@ end
 
 -- The plan the panel draws (ADR-0023 amendment 2026-10-16), or nil when not editing. `poses` and
 -- `boundaries` are the last recompute's projection, in plan metres (x behind the start line, y to the
--- right). `parts` lists every part of the active direction, one starting past the preview included, with
+-- right, in part 1's frame -- see plan_frame), and `start` the start line's direction through the plan's
+-- origin. `parts` lists every part of the active direction, one starting past the preview included, with
 -- its start slot, its last previewed slot (absent when it has none) and the color it is drawn in right
 -- now -- bright for the edited part, muted for the rest, exactly as init.lua draws the pillars. Every slot
 -- in here is a GE slot (0-based).
@@ -716,7 +746,12 @@ function M.plan()
             color = M.part_color(index, index == M.state.segment),
         }
     end
-    return {poses = M.state.plan.poses, boundaries = M.state.plan.boundaries, parts = parts}
+    return {
+        poses = M.state.plan.poses,
+        boundaries = M.state.plan.boundaries,
+        start = M.state.plan.start,
+        parts = parts,
+    }
 end
 
 -- Set the authored field size: how many grid slots the preview shows, and (once saved) the size above
