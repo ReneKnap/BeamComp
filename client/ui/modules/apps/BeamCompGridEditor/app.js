@@ -184,7 +184,7 @@ angular.module('beamng.apps')
     addBreakpoint: 'Split the grid at the position on the left, so everything from there back gets its '
       + 'own layout. A line on the ground and in the plan marks where the new part begins.',
     plan: 'The grid seen from above, P1 on the left. Drag to look along it, turn the mouse wheel to zoom, '
-      + 'click a position to edit its part.',
+      + 'click a position to edit its part and put its number into Breakpoint at P.',
     removeSegment: 'Merge this part back into the one in front of it. The first part cannot be removed.',
     segmentChips: 'The parts this grid is split into, each labelled with the position it starts at. Click '
       + 'one to edit it with the settings below.',
@@ -326,7 +326,7 @@ angular.module('beamng.apps')
   var PLAN_LABEL_MIN = 7;         // px of radius a dot needs to show its label (from ~4.2 px per meter)
   var PLAN_NOSE = 0.6;            // the facing tick reaches this share of a radius past the dot
   var PLAN_PAD = 18;              // px of room before the start line and after the last position
-  var PLAN_MARGIN = 6;            // px of room above the topmost and below the lowest dot
+  var PLAN_EDGE_INSET = 4;        // px the outermost dot's rim stays inside the edge at the drag's end
   var PLAN_LEAD = 0.25;           // share of the window that shows the part before the edited one
   var PLAN_FALLBACK_WIDTH = 560;  // px, until the strip has been laid out and measured
   var PLAN_START_SQUARE = 4;      // px, the start line's checkered mark
@@ -358,12 +358,12 @@ angular.module('beamng.apps')
     geLuaArg('note_grid_plan', String(msg).replace(/[\r\n]+/g, ' '));
   }
 
-  // The one log line a press on the plan writes when it ends (bcGridDrag's report, `moved` the window's
-  // change in px since the press). It names the broken link if a drag does nothing in game: no line at all
-  // means the press never reached the strip; 0 moves, that the moves never did; an end other than the
-  // release, what cut it short; moves without the window moving, that the pan itself failed. Example:
-  //   press via pointer: 23 moves (button reported held), 182 px from the press, ended by pointerup,
-  //   the window moved -182,0 px
+  // The log line of a press on the plan that ended the way a defect would (bcGridDrag's report, `moved` the
+  // window's change in px since the press; planPressEnded decides when). It names what cut the press
+  // short -- anything but its pointerup -- or that a drag moved and the window did not. An ordinary click
+  // or drag writes none, so an empty log says nothing about whether a press arrived. Example:
+  //   press via pointer: 20 moves (button reported held), 300 px from the press, ended by pointerup,
+  //   the window did not move
   function pressLine(report, moved) {
     var outcome = 'the window did not move';
     if (report.click) {
@@ -412,12 +412,13 @@ angular.module('beamng.apps')
     return squares;
   }
 
-  // What the strip draws, in px at the current zoom, plus the field's extent in plan meters (xMin..yMax)
-  // and the edited part's lateral middle (editedMid, null when it has no position), for the window.
+  // What the strip draws, in px at the current zoom, plus, in plan meters for the window: the field's
+  // extent with the start line and the part lines (xMin..yMax), the dots' own extent (dotXMin..dotYMax,
+  // what the drag stops at) and the edited part's lateral middle (editedMid, null when it has no position).
   function emptyPlan() {
     return { height: PLAN_HEIGHT, tx: 0, ty: PLAN_HEIGHT / 2, xMin: 0, xMax: 0, yMin: 0, yMax: 0,
-      radius: PLAN_DOT_RADIUS, editedMid: null, dots: [], lines: [], dashed: null, start: startMark(),
-      startAngle: 0 };
+      dotXMin: 0, dotXMax: 0, dotYMin: 0, dotYMax: 0, radius: PLAN_DOT_RADIUS, editedMid: null, dots: [],
+      lines: [], dashed: null, start: startMark(), startAngle: 0 };
   }
 
   // Save-name suggestions for a freshly started grid: the first grid of a race gets MAIN_GRID_NAME,
@@ -1355,24 +1356,26 @@ angular.module('beamng.apps')
       // P1 is on the left, part 1's rows are level and the cars face left -- a true top view.
       //
       // The strip is a WINDOW onto the field: `left` is the plan x at its left edge, `mid` the plan y at its
-      // vertical centre, `scale` its zoom in px per meter. It is moved by dragging (bcGridDrag, both ways
-      // wherever the field is larger than the strip), zoomed by the mouse wheel around the cursor, and
-      // moved -- never zoomed -- by two triggers:
+      // vertical centre, `scale` its zoom in px per meter. It is moved by dragging (bcGridDrag, both ways,
+      // until only the outermost dot is left at the edge -- see planLeftRange), zoomed by the mouse wheel
+      // around the cursor, and moved -- never zoomed -- by two triggers:
       //   * the edited part changes (editTarget(): race, direction, the part's start): the window jumps to
-      //     that part's start, with the part before it in its first quarter, centres on the part
-      //     vertically, and FOLLOWS that start on every push from then on;
+      //     that part's start, with the part before it in its first quarter (the start line at the left
+      //     while the whole field fits), centres on the part vertically, and FOLLOWS that start on every
+      //     push from then on;
       //   * the typed breakpoint moves the dashed line: the window centres on it and stops following.
-      // A drag or a wheel zoom stops following too, and a push then never moves the window; only the clamp
-      // to the field can, when the field itself changed. The zoom stays through pushes, part switches and
-      // typed breakpoints; New and Load go back to the default.
+      // A drag, a wheel zoom or a click on a dot stops following too, and a push then never moves the
+      // window; only the clamp can, when the field itself changed. The zoom stays through pushes, part
+      // switches and typed breakpoints; New and Load go back to the default.
       //
-      // The dashed line is a DRAFT: the number in Breakpoint at P while it is the admin's own, typed
-      // (`ng-change`) or stepped (its ± buttons) and not yet applied. The plan reads that field and never
-      // writes it, and nothing of the draft reaches GE before Enter or Add breakpoint.
+      // The dashed line is a DRAFT: the number in Breakpoint at P while it is the admin's own -- typed
+      // (`ng-change`), stepped (its ± buttons) or clicked (a dot, which writes it) -- and not yet applied.
+      // Apart from that click the plan reads the field and never writes it, and nothing of the draft
+      // reaches GE before Enter or Add breakpoint.
       scope.plan = emptyPlan();
       var planView = { left: 0, mid: 0, scale: PLAN_SCALE, follow: true, partKey: null, dashedSlot: null,
-        width: 0, dragFrom: null, pressFrom: null };
-      var planDraft = null;   // null (the field shows GE's echo), 'typed' or 'stepped'
+        width: 0, dragFrom: null, pressFrom: null, clicked: null };
+      var planDraft = null;   // null (the field shows GE's echo), 'typed', 'stepped' or 'clicked'
 
       // The window's size in plan meters.
       function planWindowWidth() {
@@ -1454,6 +1457,7 @@ angular.module('beamng.apps')
         var dashedSlot = planDashedSlot();
         var draftPart = dashedSlot === null ? null : planPartCovering(dashedSlot);
         var extent = { xMin: 0, xMax: 0, yMin: Infinity, yMax: -Infinity };
+        var dotsAt = { xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity };
         var edited = { yMin: Infinity, yMax: -Infinity };
         function reach(x, y) {
           extent.xMin = Math.min(extent.xMin, x);
@@ -1467,6 +1471,10 @@ angular.module('beamng.apps')
           var isDraft = draftPart !== null && pose.slot >= dashedSlot && pose.slot <= draftPart.lastSlot;
           var isEdited = pose.part === scope.state.activeSegment;
           reach(pose.x, pose.y);
+          dotsAt.xMin = Math.min(dotsAt.xMin, pose.x);
+          dotsAt.xMax = Math.max(dotsAt.xMax, pose.x);
+          dotsAt.yMin = Math.min(dotsAt.yMin, pose.y);
+          dotsAt.yMax = Math.max(dotsAt.yMax, pose.y);
           if (isEdited) {
             edited.yMin = Math.min(edited.yMin, pose.y);
             edited.yMax = Math.max(edited.yMax, pose.y);
@@ -1499,6 +1507,10 @@ angular.module('beamng.apps')
         built.xMax = extent.xMax;
         built.yMin = extent.yMin;
         built.yMax = extent.yMax;
+        built.dotXMin = dotsAt.xMin;
+        built.dotXMax = dotsAt.xMax;
+        built.dotYMin = dotsAt.yMin;
+        built.dotYMax = dotsAt.yMax;
         built.radius = radius;
         built.editedMid = edited.yMin === Infinity ? null : (edited.yMin + edited.yMax) / 2;
         // SVG rotate turns clockwise on screen, and the mark stands along plan +y: atan2(dx, dy).
@@ -1506,23 +1518,23 @@ angular.module('beamng.apps')
         scope.plan = built;
       }
 
-      // The range the window's left edge may take: a field narrower than the window sits at the start line,
-      // a wider one keeps the window inside it (plus the pad).
-      function planLeftRange() {
-        var pad = PLAN_PAD / planView.scale;
-        var low = scope.plan.xMin - pad;
-        return [low, Math.max(low, scope.plan.xMax + pad - planWindowWidth())];
+      // How far the window may go (ADR-0023 amendment 2026-10-23, round 4): until only the field's outermost
+      // position is left at the strip's edge, its dot whole and PLAN_EDGE_INSET inside -- in both axes, at
+      // every zoom, and whether or not the field fits the strip, so nothing is ever pinned. The start mark
+      // and the part lines may leave the view. `keep` is how far inside the edge that last dot's centre stays.
+      function planEdgeKeep() {
+        return (scope.plan.radius + PLAN_EDGE_INSET) / planView.scale;
       }
 
-      // The range the window's vertical centre may take, and whether the field (plus the margin, which
-      // clears the dots) is taller than the strip: a taller field keeps the strip inside it, a shorter one
-      // stays wholly inside the strip.
-      function planMidLimits() {
-        var margin = (scope.plan.radius + PLAN_MARGIN) / planView.scale;
+      // The window's left edge: from the first dot whole at the right edge to the last one at the left.
+      function planLeftRange() {
+        return [scope.plan.dotXMin - planWindowWidth() + planEdgeKeep(), scope.plan.dotXMax - planEdgeKeep()];
+      }
+
+      // The window's vertical centre: from the topmost dot whole at the bottom edge to the lowest at the top.
+      function planMidRange() {
         var half = planWindowHeight() / 2;
-        var lowest = scope.plan.yMin - margin + half;
-        var highest = scope.plan.yMax + margin - half;
-        return { range: [Math.min(lowest, highest), Math.max(lowest, highest)], taller: highest > lowest };
+        return [scope.plan.dotYMin - half + planEdgeKeep(), scope.plan.dotYMax + half - planEdgeKeep()];
       }
 
       function clampTo(value, range) {
@@ -1532,25 +1544,30 @@ angular.module('beamng.apps')
       // Put the window where planView says, clamped to the field.
       function placePlan() {
         planView.left = clampTo(planView.left, planLeftRange());
-        planView.mid = clampTo(planView.mid, planMidLimits().range);
+        planView.mid = clampTo(planView.mid, planMidRange());
         scope.plan.tx = toPx(-planView.left * planView.scale);
         scope.plan.ty = toPx(PLAN_HEIGHT / 2 + planView.mid * planView.scale);
       }
 
-      // The edited part's start: the start line for part 1, otherwise the line where the part begins a
-      // quarter of the way in, and the part centred vertically. A part past the preview has no line and
+      // The edited part's start: the start line at the left edge for part 1 -- and for every part while the
+      // whole field fits the window, which then shows all of it -- otherwise the line where the part begins
+      // a quarter of the way in, and the part centred vertically. A part past the preview has no line and
       // no position: the end of the field, centred on the whole field.
       function planToPartStart() {
         var index = scope.state.activeSegment;
-        var left = scope.plan.xMax - planWindowWidth();
-        if (index <= 1) {
-          left = planLeftRange()[0];
+        var pad = PLAN_PAD / planView.scale;
+        var atStart = Math.min(0, scope.plan.xMin) - pad;
+        var fieldEnd = scope.plan.xMax + pad;
+        var left = fieldEnd - planWindowWidth();
+        if (index <= 1 || fieldEnd - atStart <= planWindowWidth()) {
+          left = atStart;
+        } else {
+          scope.plan.lines.forEach(function (line) {
+            if (line.part === index) {
+              left = line.x - planWindowWidth() * PLAN_LEAD;
+            }
+          });
         }
-        scope.plan.lines.forEach(function (line) {
-          if (line.part === index) {
-            left = line.x - planWindowWidth() * PLAN_LEAD;
-          }
-        });
         planView.left = left;
         planView.mid = scope.plan.editedMid === null ? (scope.plan.yMin + scope.plan.yMax) / 2
           : scope.plan.editedMid;
@@ -1558,13 +1575,21 @@ angular.module('beamng.apps')
 
       // Every push: the echo settles a draft (it has just rewritten the field), a changed edit target sends
       // the window back to following, and a following window goes to the edited part's start.
+      //
+      // Except a CLICKED draft: a dot click selects a part, and the echo of that selection -- and of any
+      // other push before the field is settled -- has just written that part's start into the field. The
+      // clicked number is put back, so it stands until Enter, Add breakpoint, the field's blur, a typed or
+      // stepped number or the session's end replaces it.
       function planAfterPush() {
-        if (!isHeld('breakpointDisplay')) {
-          planDraft = null;
-          planView.dashedSlot = null;
-        }
         if (!scope.state.active) {
           planView.partKey = null;
+          planDraft = null;
+          planView.dashedSlot = null;
+        } else if (planDraft === 'clicked') {
+          scope.edit.breakpointDisplay = planView.clicked;
+        } else if (!isHeld('breakpointDisplay')) {
+          planDraft = null;
+          planView.dashedSlot = null;
         }
         var key = editTarget();
         if (scope.state.active && key !== planView.partKey) {
@@ -1614,17 +1639,17 @@ angular.module('beamng.apps')
         planDraftChanged('typed');
       };
 
-      // ng-blur on Breakpoint at P settles a TYPED draft. A stepped one stays: a ± press blurs the field
-      // AFTER its mousedown has stepped, and the step is exactly what the admin is looking at.
+      // ng-blur on Breakpoint at P settles a TYPED or a CLICKED draft (the admin left the field). A stepped
+      // one stays: a ± press blurs the field AFTER its mousedown has stepped, and the step is exactly what
+      // the admin is looking at.
       scope.planBreakpointBlurred = function () {
-        if (planDraft === 'typed') {
+        if (planDraft === 'typed' || planDraft === 'clicked') {
           planSettleDraft();
         }
       };
 
-      // bcGridDrag: a press remembers where the window was, a drag moves it from there -- sideways always
-      // (the clamp holds a field narrower than the strip at the start line), up and down only while the
-      // field is taller than the strip.
+      // bcGridDrag: a press remembers where the window was, a drag moves it from there, both ways, as far as
+      // the clamp lets it (planLeftRange, planMidRange).
       scope.planPress = function () {
         planView.dragFrom = { left: planView.left, mid: planView.mid };
         // Where the window stood when the press began, for its log line. A wheel turn mid-press calls this
@@ -1634,26 +1659,25 @@ angular.module('beamng.apps')
         }
       };
 
-      // bcGridDrag, once per press, however it ended: the press's one log line (pressLine).
+      // bcGridDrag, once per press, however it ended. The press's log line (pressLine) is written only for
+      // the cases that point at a defect, now that the pointer path is proven in game (round 4): a drag that
+      // moved past the slop and did not move the window, or a press ended by anything but its pointerup.
+      // An ordinary click or drag stays silent.
       scope.planPressEnded = function (report) {
         var from = planView.pressFrom || { tx: scope.plan.tx, ty: scope.plan.ty };
         planView.pressFrom = null;
-        geNote(pressLine(report, [toPx(scope.plan.tx - from.tx), toPx(scope.plan.ty - from.ty)]));
-      };
-
-      // bcGridDrag, once at link: which input path this runtime offers, for the log.
-      scope.planLinked = function (path) {
-        geNote('strip linked, input path ' + path + (path === 'pointer'
-          ? ' (window.PointerEvent present; a press that arrives as a bare mousedown rides on mouse events)'
-          : ' (no window.PointerEvent: mouse events)'));
+        var moved = [toPx(scope.plan.tx - from.tx), toPx(scope.plan.ty - from.ty)];
+        var stuck = report.dragged && moved[0] === 0 && moved[1] === 0;
+        if (report.ended === 'pointerup' && !stuck) {
+          return;
+        }
+        geNote(pressLine(report, moved));
       };
 
       scope.planDrag = function (dx, dy) {
         planView.follow = false;
         planView.left = planView.dragFrom.left - dx / planView.scale;
-        if (planMidLimits().taller) {
-          planView.mid = planView.dragFrom.mid + dy / planView.scale;
-        }
+        planView.mid = planView.dragFrom.mid + dy / planView.scale;
         placePlan();
       };
 
@@ -1676,14 +1700,47 @@ angular.module('beamng.apps')
         placePlan();
       };
 
-      // A click on a dot selects that dot's part, exactly like its chip: the part's start is a GE slot and
-      // goes through selectSegment untouched. A click anywhere else in the strip does nothing.
-      scope.planClick = function (start) {
-        var slot = Number(start);
-        if (start === null || start === undefined || start === '' || !isFinite(slot)) {
+      // A click on a dot (ADR-0023 amendment 2026-10-23, round 4) selects that dot's part exactly like its
+      // chip -- the part's start is a GE slot and goes through selectSegment untouched -- and writes the
+      // dot's number into Breakpoint at P as a CLICKED draft, with the focus in that field and its text
+      // selected: typing replaces it, Enter adds the break there. A click beside the dots does nothing.
+      //
+      // The view does not move: the dot is where the admin is looking. So the click stops the window
+      // following, names in advance the edit target its selection's echo will carry (so the part switch
+      // does not jump), and takes the dashed line's position as known (so it does not centre either). A
+      // number typed or stepped afterwards moves it as before.
+      //
+      // A number still typed into another field goes to GE FIRST, through that field's own blur commit:
+      // GE applies a knob to whichever part is selected when it arrives, so after this selection it would
+      // land on the wrong part. The real blur, when the focus moves, then finds nothing left to send.
+      scope.planClick = function (start, slot) {
+        var partStart = Number(start);
+        var dotSlot = Number(slot);
+        var isDot = start !== null && start !== undefined && start !== '';
+        if (!isDot || !isFinite(partStart) || !isFinite(dotSlot)) {
           return;
         }
-        scope.selectSegment(slot);
+        if (typing !== null) {
+          scope.commitTyped(typing.field, { target: document.activeElement });
+        }
+        planView.follow = false;
+        planView.partKey = [scope.state.race, scope.state.direction, partStart].join('|');
+        scope.selectSegment(partStart);
+        planView.clicked = slotToDisplay(dotSlot);
+        scope.edit.breakpointDisplay = planView.clicked;
+        planDraft = 'clicked';
+        buildPlan();
+        planView.dashedSlot = planDashedSlot();
+        placePlan();
+        // After the digest that writes the number into the input: select() before it would select the old
+        // text. invokeApply false: focusing changes nothing this panel renders.
+        $timeout(function () {
+          var input = element[0].querySelector('input[ng-model="edit.breakpointDisplay"]');
+          if (input) {
+            input.focus();
+            input.select();
+          }
+        }, 0, false);
       };
 
       // bcGridDrag reports the strip's real width once it is laid out (and when it changes).
@@ -2019,15 +2076,15 @@ angular.module('beamng.apps').directive('bcGridHold', ['$parse', '$timeout', fun
 //   bc-grid-drag-start="planPress()"        a left press on the strip
 //   bc-grid-drag="planDrag($dx, $dy)"       every move once the press has moved past CLICK_SLOP; $dx, $dy
 //                                           are the distance from the press, in px
-//   bc-grid-drag-click="planClick($start)"  a release that never got past CLICK_SLOP; $start is the
-//                                           data-start of the dot under the press (null off the dots)
+//   bc-grid-drag-click="planClick($start, $slot)"  a release that never got past CLICK_SLOP; $start and
+//                                           $slot are the data-start and data-slot of the dot under the press
+//                                           (both null off the dots)
 //   bc-grid-drag-end="planPressEnded($report)"  every press, however it ended: its path, moves, distance,
-//                                           what ended it and whether it was a click (see release)
+//                                           what ended it, whether it dragged and whether it was a click
 //   bc-grid-drag-wheel="planZoom($delta, $x, $y)"  a wheel turn over the strip: $delta in px (line and page
 //                                           modes converted, capped per event), $x, $y the cursor in px
 //                                           from the strip's top left
 //   bc-grid-drag-width="planMeasure($width)" the strip's laid-out width, after link and on every resize
-//   bc-grid-drag-linked="planLinked($path)"  once, at link: the input path this runtime offers
 //
 // THE PRESS RIDES ON POINTER EVENTS, the way the game's own drag service does it (ui-vue/src/services/
 // drag.js, startPointerDrag): `pointerdown` with the left button on the strip, `setPointerCapture` in a try,
@@ -2078,11 +2135,11 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
       var onEnded = $parse(attrs.bcGridDragEnd);
       var onWheelTurn = $parse(attrs.bcGridDragWheel);
       var onWidth = $parse(attrs.bcGridDragWidth);
-      var onLinked = $parse(attrs.bcGridDragLinked);
       var strip = element[0];
       var hasPointerEvents = typeof window.PointerEvent === 'function';
-      // The open press, or null: {path, id, x, y, originX, originY, moved, start, moves, farthest,
+      // The open press, or null: {path, id, x, y, originX, originY, moved, dragged, dot, moves, farthest,
       // buttonsSeen, wheels}. x / y is where pans count from (a wheel turn moves it), origin where it began.
+      // `moved` rules the click out (a move past the slop or a wheel turn); `dragged` is the move alone.
       var press = null;
       var resizeObserver = null;
 
@@ -2095,19 +2152,21 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
         }
       }
 
-      // The data-start of the dot the press landed on, or null.
-      function startUnder(node) {
+      // The dot the press landed on, {start, slot} from its data-start / data-slot, or null.
+      function dotUnder(node) {
         while (node && node !== strip) {
           if (node.getAttribute && node.getAttribute('data-start') !== null) {
-            return node.getAttribute('data-start');
+            return { start: node.getAttribute('data-start'), slot: node.getAttribute('data-slot') };
           }
           node = node.parentNode;
         }
         return null;
       }
 
+      // The width the plan is drawn in: inside the strip's border, which is what the window's edges and the
+      // drag's stop (the last dot whole at the edge) are measured against.
       function reportWidth() {
-        var width = strip.getBoundingClientRect().width;
+        var width = strip.clientWidth;
         if (width > 0) {
           applyHandler(function () {
             onWidth(scope, { $width: width });
@@ -2146,11 +2205,12 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
           }
         }
         var isClick = isRelease && !ended.moved;
+        var start = ended.dot ? ended.dot.start : null;
         if (isClick) {
-          onClick(scope, { $start: ended.start });
+          onClick(scope, { $start: start, $slot: ended.dot ? ended.dot.slot : null });
         }
         onEnded(scope, { $report: { path: ended.path, moves: ended.moves, farthest: Math.round(ended.farthest),
-          ended: how, click: isClick, start: ended.start, buttonsSeen: ended.buttonsSeen,
+          ended: how, click: isClick, dragged: ended.dragged, start: start, buttonsSeen: ended.buttonsSeen,
           wheels: ended.wheels } });
       }
 
@@ -2180,6 +2240,7 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
           return;
         }
         press.moved = true;
+        press.dragged = true;
         applyHandler(function () {
           onDrag(scope, { $dx: dx, $dy: dy });
         });
@@ -2215,7 +2276,8 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
 
       function begin(path, id, ev) {
         press = { path: path, id: id, x: ev.clientX, y: ev.clientY, originX: ev.clientX, originY: ev.clientY,
-          moved: false, start: startUnder(ev.target), moves: 0, farthest: 0, buttonsSeen: false, wheels: 0 };
+          moved: false, dragged: false, dot: dotUnder(ev.target), moves: 0, farthest: 0, buttonsSeen: false,
+          wheels: 0 };
         listen(path, true);
         reportWidth();
         applyHandler(function () {
@@ -2270,7 +2332,6 @@ angular.module('beamng.apps').directive('bcGridDrag', ['$parse', '$timeout', fun
       }
       strip.addEventListener('mousedown', onMouseDown, false);
       strip.addEventListener('wheel', onWheel, { passive: false });
-      onLinked(scope, { $path: hasPointerEvents ? 'pointer' : 'mouse' });
 
       // After the first layout, and whenever the panel is resized. invokeApply false: reportWidth applies.
       var firstLayout = $timeout(reportWidth, 0, false);

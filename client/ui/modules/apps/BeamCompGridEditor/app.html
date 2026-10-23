@@ -250,11 +250,11 @@
       <div class="bc-hint">{{partHint()}}</div>
       <!-- The plan: the grid from above in part 1's frame, a window onto it that is dragged and zoomed with
            the mouse wheel (app.js "The plan strip"). Everything in it is GE's plan; dots carry their part's
-           start slot for the click. -->
+           start slot and their own slot for the click, which selects the part and fills Breakpoint at P. -->
       <div class="bc-plan" bc-grid-tip="tip('plan')" bc-grid-drag="planDrag($dx, $dy)"
-        bc-grid-drag-start="planPress()" bc-grid-drag-click="planClick($start)"
+        bc-grid-drag-start="planPress()" bc-grid-drag-click="planClick($start, $slot)"
         bc-grid-drag-wheel="planZoom($delta, $x, $y)" bc-grid-drag-width="planMeasure($width)"
-        bc-grid-drag-end="planPressEnded($report)" bc-grid-drag-linked="planLinked($path)">
+        bc-grid-drag-end="planPressEnded($report)">
         <svg class="bc-plan-svg" ng-attr-height="{{plan.height}}">
           <g ng-attr-transform="translate({{plan.tx}},{{plan.ty}})">
             <g class="bc-plan-start" ng-attr-transform="rotate({{plan.startAngle}})">
@@ -268,6 +268,7 @@
               ng-attr-y1="{{plan.dashed.y1}}" ng-attr-x2="{{plan.dashed.x2}}" ng-attr-y2="{{plan.dashed.y2}}"
               stroke="#ffffff" stroke-width="2" stroke-dasharray="6 4"></line>
             <g class="bc-plan-dot" ng-repeat="d in plan.dots track by d.slot" ng-attr-data-start="{{d.start}}"
+              ng-attr-data-slot="{{d.slot}}"
               ng-attr-transform="translate({{d.cx}},{{d.cy}})">
               <line x1="0" y1="0" ng-attr-x2="{{d.nx}}" ng-attr-y2="{{d.ny}}" ng-attr-stroke="{{d.nose}}"
                 stroke-width="3" stroke-linecap="round"></line>
