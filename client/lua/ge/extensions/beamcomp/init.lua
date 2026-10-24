@@ -8832,18 +8832,21 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         -- for "the one after", every other checkpoint grey, no distance limit and no finish colour. Drawn
         -- grey first, then yellow, then red, so the two that matter win where columns overlap. Inline
         -- rather than a helper because a helper here would be a top-level local (200-local ceiling).
-        -- Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil -> full area +
-        -- stored-normal posts).
+        -- Immediate-mode, drawn whenever a session is active (car_pos nil -> full area). A checkpoint with
+        -- a normal stands its posts on it (line angle nil -> gate_edges), one without stands them across
+        -- the route (grideditor.route_post_angle, ADR-0023 amendment 2026-10-24) -- the colour is in the
+        -- posts, so without them CP0 and CP1 were the same pale column as every other checkpoint.
         local route = grideditor.state.active and M.state.grid_edit_checkpoints
         if route then
             for i = #route, 3, -1 do
-                draw_checkpoint_marker(route[i], grideditor.ROUTE_CHECKPOINT_STYLE, nil, nil)
+                draw_checkpoint_marker(route[i], grideditor.ROUTE_CHECKPOINT_STYLE, nil,
+                    grideditor.route_post_angle(route[i]))
             end
             if route[2] then
-                draw_checkpoint_marker(route[2], LOOKAHEAD_STYLE, nil, nil)
+                draw_checkpoint_marker(route[2], LOOKAHEAD_STYLE, nil, grideditor.route_post_angle(route[2]))
             end
             if route[1] then
-                draw_checkpoint_marker(route[1], CHECKPOINT_STYLE, nil, nil)
+                draw_checkpoint_marker(route[1], CHECKPOINT_STYLE, nil, grideditor.route_post_angle(route[1]))
             end
         end
         local race = M.state.race

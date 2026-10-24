@@ -158,6 +158,23 @@ M.ROUTE_CHECKPOINT_STYLE = {
     post = {r = 0.62, g = 0.64, b = 0.68, a = 0.7},
 }
 
+-- The gate-line angle init.lua's draw_checkpoint_marker takes for one checkpoint of the preview's route,
+-- or nil. The colour of CP0 (red) and CP1 (yellow) is in their two POSTS, and without a line angle a
+-- marker draws its posts from its gate normal -- so a checkpoint with no normal showed only the pale
+-- column, the same tint for every role (bug utah-crawls-grid-helpers-and-heading). Such a checkpoint
+-- carries the route's `tangent` (start.anchor), and this turns it into the angle that stands the posts
+-- square to the route: the same convention as init.lua's gate_line_angle, atan2(-x, y) of the direction
+-- the gate faces, so the posts land exactly where gate_edges would put them for a normal along the route.
+-- nil for a checkpoint with a normal (it draws from that, unchanged) or without a tangent (no posts, as
+-- before). A field here, not a helper in init.lua, because init.lua sits at the 200-local ceiling.
+function M.route_post_angle(checkpoint)
+    local tangent = checkpoint.tangent
+    if not tangent then
+        return nil
+    end
+    return math.atan2(-tangent.x, tangent.y)
+end
+
 -- ---- Parts: their colors, the line where each begins, and the panel's plan ---------------------------
 -- (ADR-0023 amendment 2026-10-16.) init.lua draws the pillars and the lines with these, and the panel gets
 -- the colors it draws with from M.plan(), so the plan and the 3D preview cannot disagree on a color.

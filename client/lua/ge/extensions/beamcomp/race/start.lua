@@ -881,12 +881,12 @@ end
 -- editor (race/grideditor) to preview poses against the same geometry a real race start uses. Also returns
 -- the reference scene the editor can spawn/draw alongside the preview (so the grid is positioned against
 -- the real start area): `prefabFiles` -- the track's static-scenery prefabs for this direction (the same
--- set a real start loads) -- and `checkpoints` -- every checkpoint {index, pos, normal, radius} in this
--- direction's traversal order, CP0 (the start line) first. Returns {base_pose = {pos, rot}, gate_normal =
--- {x,y,z}|nil, raceId = string, prefabFiles = {...}, checkpoints = {...}} or nil plus a reason.
--- `gate_normal` is CP0's own normal, nil included -- the grid derives the direction from base_pose when it
--- is nil, exactly as the race start does. raceId is the canonical id the default-grid assignment is keyed
--- on (ADR-0023).
+-- set a real start loads) -- and `checkpoints` -- every checkpoint {index, pos, normal, radius, tangent} in
+-- this direction's traversal order, CP0 (the start line) first; `tangent` only on one without a usable
+-- normal (see below). Returns {base_pose = {pos, rot}, gate_normal = {x,y,z}|nil, raceId = string,
+-- prefabFiles = {...}, checkpoints = {...}} or nil plus a reason. `gate_normal` is CP0's own normal, nil
+-- included -- the grid derives the direction from base_pose when it is nil, exactly as the race start
+-- does. raceId is the canonical id the default-grid assignment is keyed on (ADR-0023).
 function M.anchor(race_name, direction)
     if type(race_name) ~= "string" then
         return nil, "no race name"
@@ -927,6 +927,20 @@ function M.anchor(race_name, direction)
                 normal = checkpoint.normal,
                 radius = checkpoint.radius,
             }
+        end
+    end
+    -- A checkpoint without a usable normal has no line of its own to stand its two posts on, so the
+    -- editor stands them across the ROUTE instead (ADR-0023 amendment 2026-10-24): `tangent` is the
+    -- route's horizontal direction through it -- previous -> next checkpoint, CP0 -> CP1 for the first,
+    -- previous -> last for the last. Draw-only and editor-only (init.lua's route draw, through
+    -- grideditor.route_post_angle); it is NOT a normal, and the parsed checkpoints never see it -- the
+    -- detector stays radius-only for such a gate. A checkpoint that has a normal gets no tangent and draws
+    -- exactly as before.
+    for i, entry in ipairs(route) do
+        if not horizontal_unit(entry.normal) then
+            local previous, following = route[i - 1] or entry, route[i + 1] or entry
+            entry.tangent = horizontal_unit({x = following.pos.x - previous.pos.x,
+                y = following.pos.y - previous.pos.y})
         end
     end
 
