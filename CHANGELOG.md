@@ -35,6 +35,8 @@ below rather than hidden.
   position's part and puts its number into **Breakpoint at P**.
 - A grid can be set as the default for a race, so that race always starts on it.
 - Large vehicles get the room they need; the field is placed on the ground it actually stands on.
+  The Utah crawls Leap, Dried and Around line up facing the way they are driven, in the grid editor and in
+  the race.
 - A synchronised countdown that holds every car, or an F1-style light sequence where the car is free
   and a jump start costs time instead.
 
