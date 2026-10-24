@@ -246,10 +246,11 @@ local DASH_REFRESH_SETTLE = 0.75
 -- (another admin's saved presets and grids) and griddir (the grid editor following the race setup's
 -- direction) and revsprint (the reverse start of a sprint without its own) and afkassist (a recover or
 -- repair press resetting the AFK count) and gridenter (a number typed into the grid editor applying on
--- Enter and after a typing pause) are new since then, and gridplan (the grid editor's part colors, part
--- lines and plan; r2 aligns the plan to part 1 and zooms it with the mouse wheel, r3 drags it on pointer
--- events and logs every press on it, r4 pans it to its last dot and fills the breakpoint on a dot click) is
--- new in this build.
+-- Enter and after a typing pause) and gridplan (the grid editor's part colors, part lines and plan; r2
+-- aligns the plan to part 1 and zooms it with the mouse wheel, r3 drags it on pointer events and logs every
+-- press on it, r4 pans it to its last dot and fills the breakpoint on a dot click) are new since then, and
+-- crawlheading (the grid of a race whose start line has no gate normal -- the Utah crawls 006 to 008) is new
+-- in this build.
 -- A client logging r2 has the nametags but no race-setup button; one logging r3 has both; one
 -- logging aicar-r1 on top of r3 also has the forced-car precedence in the AI roster; one logging
 -- lists-r1 on top of that also normalises an empty list pushed from GE (the preset dropdown and the
@@ -288,8 +289,14 @@ local DASH_REFRESH_SETTLE = 0.75
 -- ("plan press via <path>: ...") and one when it links ("plan strip linked, input path ..."); one logging
 -- gridplan-r4 also lets that plan be dragged, both ways and at every zoom, until only its first or last
 -- position is left at the strip's edge, has a click on a dot put its number into "Breakpoint at P" with the
--- cursor there, and logs a press only when it ends the way a defect would (no strip-linked line any more).
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1-gridplan-r4/2026-10-23"
+-- cursor there, and logs a press only when it ends the way a defect would (no strip-linked line any more);
+-- one logging crawlheading-r1 also lays the grid of a race whose start line has no gate normal out along its
+-- start rotation read the way the engine reads it, with every car facing along the field, its slope
+-- measured (four sample discs per slot in the editor) and Rotate grid turning field and cars together, has
+-- the grid editor stand CP0's and CP1's posts across the route when they have no normal, lines such a race
+-- up behind its forward finish in reverse, and logs "grid direction for '<id>' (<direction>): ..." once per
+-- race start and per editor anchor when it took the start rotation.
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1-gridplan-r4-crawlheading-r1/2026-10-24"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -8832,18 +8839,21 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         -- for "the one after", every other checkpoint grey, no distance limit and no finish colour. Drawn
         -- grey first, then yellow, then red, so the two that matter win where columns overlap. Inline
         -- rather than a helper because a helper here would be a top-level local (200-local ceiling).
-        -- Immediate-mode, drawn whenever a session is active (car_pos/line_angle nil -> full area +
-        -- stored-normal posts).
+        -- Immediate-mode, drawn whenever a session is active (car_pos nil -> full area). A checkpoint with
+        -- a normal stands its posts on it (line angle nil -> gate_edges), one without stands them across
+        -- the route (grideditor.route_post_angle, ADR-0023 amendment 2026-10-24) -- the colour is in the
+        -- posts, so without them CP0 and CP1 were the same pale column as every other checkpoint.
         local route = grideditor.state.active and M.state.grid_edit_checkpoints
         if route then
             for i = #route, 3, -1 do
-                draw_checkpoint_marker(route[i], grideditor.ROUTE_CHECKPOINT_STYLE, nil, nil)
+                draw_checkpoint_marker(route[i], grideditor.ROUTE_CHECKPOINT_STYLE, nil,
+                    grideditor.route_post_angle(route[i]))
             end
             if route[2] then
-                draw_checkpoint_marker(route[2], LOOKAHEAD_STYLE, nil, nil)
+                draw_checkpoint_marker(route[2], LOOKAHEAD_STYLE, nil, grideditor.route_post_angle(route[2]))
             end
             if route[1] then
-                draw_checkpoint_marker(route[1], CHECKPOINT_STYLE, nil, nil)
+                draw_checkpoint_marker(route[1], CHECKPOINT_STYLE, nil, grideditor.route_post_angle(route[1]))
             end
         end
         local race = M.state.race

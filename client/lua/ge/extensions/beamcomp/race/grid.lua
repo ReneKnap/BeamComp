@@ -10,15 +10,13 @@
 -- layout (offset 15 m back, ADR-0022), so a race with no custom grid looks exactly as before. A custom
 -- grid (server-stored, named, relayed in raceStart) just supplies a different param set.
 --
--- Longitudinal axis: the grid's forward direction (the way the field drives off the line) comes
--- from real world geometry, NOT from a guessed quaternion axis. Callers pass the start/finish gate
--- normal (the direction of travel through CP0); the grid lays the field out behind it. When no gate
--- normal exists the grid derives forward from the start pose itself (see forward_from_base_rot).
--- The headingDeg param rotates the whole grid (positions + car headings) about vertical on top of
--- that. Each pose carries the grid's `forward` travel axis (the direction the car should face) when
--- it comes from a gate normal -- the reliable source -- so the placement can orient the car to the
--- grid instead of the authored start quaternion; `forward` is nil when there is no gate normal, in
--- which case the placement keeps the start pose's own heading.
+-- Longitudinal axis: the grid's forward direction (the way the field drives off the line) is ONE
+-- answer, M.travel_axis (ADR-0023 amendment 2026-10-24): the start/finish gate normal callers pass (the
+-- direction of travel through CP0), else -- a start line with no usable normal -- the start pose's own
+-- rotation, read the way BeamNG reads it. The field is laid out behind that axis and every car faces
+-- along it: each pose carries it as `forward`, so the placement orients the car with quatFromDir and the
+-- measured slope whichever source answered. The headingDeg param rotates the whole grid (positions + car
+-- headings) about vertical on top of that, layout and cars by the same angle in the same sense.
 --
 -- Segmented grids (ADR-0023 amendment): a direction's grid can be an ordered list of stacked parametric
 -- segments -- segment 0 is the base param set (today's block) and each further segment starts at a
@@ -84,37 +82,36 @@ M.MAX_AXIS_PIN = MAX_AXIS_PIN
 -- to keep the resolved `rows` a usable number instead of nil.
 local DEFAULT_ROWS = 4
 
--- BeamNG vehicle-forward axis in object space, used only by the no-gate-normal fallback: the grid
--- lays cars out along this once it is rotated into the world by the placement rotation. +Y is the
--- documented default; if a race whose start line has NO gate normal lays its grid out sideways or in
--- front of the line, flip/rotate this. Races with a gate normal (the common case, e.g. closed
--- circuits) never touch this.
-local VEHICLE_FORWARD_LOCAL = {x = 0, y = 1, z = 0}
+-- The way a start rotation drives off, in that rotation's own frame: +Y. BeamNG puts a race car on a
+-- start pose as quat(0,0,1,0) * rot (gameplay/race/startPosition.lua; vehicles.lua places our cars the
+-- same way) and a car's nose is its local -Y, so the flip turns the nose onto +Y and `rot` carries that
+-- out into the world. Authored start rotations follow it: their +Y lies along CP0's gate normal on 306 of
+-- the 325 shipped races that have one, median 1.3 degrees (measured 2026-10-24, the engine's own maths).
+local START_ROT_TRAVEL = {x = 0, y = 1, z = 0}
 
--- 180-degree rotation about Z (vertical) -- the exact flip vehicles.lua applies when it actually
--- places the car (quat(0,0,1,0) * base_rot). We replicate it here so the FALLBACK forward axis
--- matches the heading the car ends up at, not the raw authored start quaternion.
-local Z_FLIP = {x = 0, y = 0, z = 1, w = 0}
+-- The axis of last resort, for a start line with no usable gate normal whose start rotation points its +Y
+-- straight up or down: nothing names a horizontal direction, so the field lies along world X and its
+-- cars face along it too. No shipped race comes near it; start.lua logs it as a W line.
+local WORLD_X = {x = 1, y = 0, z = 0}
 
 local EPSILON = 1e-6
 
--- Rotate a plain {x, y, z} vector by a plain {x, y, z, w} quaternion:
---   v' = v + 2w(q x v) + 2 q x (q x v)
-local function rotate_vector(q, v)
-    local first = {
-        x = q.y * v.z - q.z * v.y,
-        y = q.z * v.x - q.x * v.z,
-        z = q.x * v.y - q.y * v.x,
-    }
-    local second = {
-        x = q.y * first.z - q.z * first.y,
-        y = q.z * first.x - q.x * first.z,
-        z = q.x * first.y - q.y * first.x,
-    }
+-- Rotate a plain {x, y, z} vector by a plain {x, y, z, w} quaternion THE WAY THE ENGINE DOES. BeamNG's
+-- `q * v` (lua/common/mathlib.lua, LuaQuat.__mul) applies the CONJUGATE of the textbook rotation:
+--   t = 2 (q x v),  v' = v - w t + q x t        (the textbook rotation is v + w t + q x t)
+-- i.e. it turns by the opposite angle. Transcribed term for term from LuaQuat.__mul, so it agrees with
+-- `quat(...) * vec3(...)` to the last bit and this module stays engine-free (ADR-0023). Read the textbook
+-- way, a start rotation comes out mirrored across world X -- heading h becomes -h -- which is what this
+-- module's no-gate-normal fallback did until 2026-10-24: the field lay along the mirror image while the
+-- cars, placed by the engine, faced the right way (bug utah-crawls-grid-helpers-and-heading).
+local function engine_rotate(q, v)
+    local tx = 2 * (q.y * v.z - q.z * v.y)
+    local ty = 2 * (q.z * v.x - q.x * v.z)
+    local tz = 2 * (q.x * v.y - q.y * v.x)
     return {
-        x = v.x + 2 * (q.w * first.x + second.x),
-        y = v.y + 2 * (q.w * first.y + second.y),
-        z = v.z + 2 * (q.w * first.z + second.z),
+        x = v.x - q.w * tx + (q.y * tz - q.z * ty),
+        y = v.y - q.w * ty + (q.z * tx - q.x * tz),
+        z = v.z - q.w * tz + (q.x * ty - q.y * tx),
     }
 end
 
@@ -151,28 +148,30 @@ local function horizontal_unit(v)
     return {x = v.x / len, y = v.y / len, z = 0}
 end
 
--- The grid's forward direction (direction of travel off the line) derived from the start pose, for
--- races whose start line has no gate normal. Uses the same placement rotation the car gets
--- (Z_FLIP * base_rot, see vehicles.lua), so the layout can't disagree with the heading. Returns a
--- horizontal unit {x, y, z} or nil if it degenerates.
-local function forward_from_base_rot(base_rot)
-    local placed = quat_mul(Z_FLIP, base_rot)
-    return horizontal_unit(rotate_vector(placed, VEHICLE_FORWARD_LOCAL))
-end
-
--- The forward (travel) unit vector for the grid: prefer the gate normal (direction of travel through
--- CP0, the cleanest source), else derive from the start pose, with a final raw-base_rot last resort so
--- a pose always comes back. Always horizontal so the grid stays level.
-local function resolve_forward(base_rot, gate_normal)
-    if gate_normal then
-        local f = horizontal_unit(gate_normal)
-        if f then
-            return f
-        end
+-- (public) The direction the grid is laid out along and its cars face, as a horizontal unit {x, y, z},
+-- plus which source answered: "gate normal" or "start rotation". nil, nil when neither names a horizontal
+-- direction. THE one answer to that question (ADR-0023 amendment 2026-10-24): make_frame lays every grid
+-- out with it, so the race start and the grid editor's preview take the same direction, and race/start.lua
+-- asks it again only to say in the log which source answered and to measure a reverse start's setback.
+--
+--   gate normal    -- CP0's normal, flattened, whenever it has a horizontal component: the direction of
+--                     travel through the start line, the cleanest source there is.
+--   start rotation -- `base_rot`'s +Y as the engine turns it (engine_rotate), flattened: where the
+--                     engine points a car placed on that pose. Three shipped races need it, the Utah
+--                     crawls 006-Leap, 007-Dried and 008-Around; their start headings lie 6 to 12 degrees
+--                     off CP0 -> CP1. Its pitch and roll are dropped -- the placement measures the slope.
+--
+-- Plain tables in and out; `base_rot` may be nil when the caller has a gate normal.
+function M.travel_axis(base_rot, gate_normal)
+    local axis = gate_normal and horizontal_unit(gate_normal)
+    if axis then
+        return axis, "gate normal"
     end
-    return forward_from_base_rot(base_rot)
-        or horizontal_unit(rotate_vector(base_rot, {x = 0, y = 1, z = 0}))
-        or {x = 1, y = 0, z = 0}
+    axis = base_rot and horizontal_unit(engine_rotate(base_rot, START_ROT_TRAVEL))
+    if axis then
+        return axis, "start rotation"
+    end
+    return nil, nil
 end
 
 -- Fill a (possibly partial, possibly nil) grid param set with defaults. Param keys are camelCase to
@@ -279,16 +278,21 @@ local function slot_setback(local_index, p, columns, column_setback)
 end
 
 -- The starting frame for a grid (segment 0): the moving reference the segmented stacker threads from one
--- segment to the next. `origin` is the segment's base point and the heading pivot; `forward` is the travel
--- axis (the gate normal, else derived from base_rot); `facing` is the gate-normal-based car heading (nil
--- without a gate normal, so placement keeps the authored start quaternion); `rot` is the base quaternion for
--- that no-gate fallback. The right axis is always forward's horizontal perpendicular, so it is derived on
--- demand rather than stored.
+-- segment to the next. `origin` is the segment's base point and the heading pivot; `forward` is the layout
+-- axis and `facing` the way the cars face, BOTH M.travel_axis's answer (two equal tables, never shared, so
+-- no pose can alias the other's); `rot` is the start quaternion, carried along on every pose and not read
+-- for the orientation, since every pose has a `facing` now. The right axis is always forward's horizontal
+-- perpendicular, so it is derived on demand rather than stored.
+--
+-- Until 2026-10-24 a start line without a gate normal left `facing` nil, and with it every pose's
+-- `forward`: no slope was measured, no sample discs were drawn, and the car kept the start quaternion while
+-- the layout took a mirrored copy of it. That case is now a gate normal like any other.
 local function make_frame(base_pos, base_rot, gate_normal)
+    local axis = M.travel_axis(base_rot, gate_normal) or WORLD_X
     return {
         origin = base_pos,
-        forward = resolve_forward(base_rot, gate_normal),
-        facing = gate_normal and horizontal_unit(gate_normal) or nil,
+        forward = {x = axis.x, y = axis.y, z = axis.z},
+        facing = {x = axis.x, y = axis.y, z = axis.z},
         rot = base_rot,
     }
 end
@@ -314,17 +318,20 @@ local function compute_segment(frame, count, params)
     local heading_rad = math.rad(p.heading_deg)
 
     -- Rotate the incoming frame axes by this segment's headingDeg about the origin (the pivot). `forward`
-    -- is the layout/travel axis, `facing` the gate-normal car heading (nil without a gate normal, so
-    -- placement keeps the start quaternion), `rot` the no-gate fallback quaternion -- all rotate together so
-    -- the layout and the car headings stay consistent, and the rotation carries into next_frame (it chains).
+    -- is the layout/travel axis and `facing` the way the cars face: the same direction, turned by the same
+    -- rotate_horizontal, so a turned grid turns its field and its cars by the same angle in the same sense.
+    -- The rotation carries into next_frame (it chains).
+    --
+    -- `rot` is composed too, as z_quat * rot, and that is a TEXTBOOK composition: under the engine's
+    -- convention (engine_rotate) it turns a car by -headingDeg, the opposite way. It is kept exactly as it
+    -- always was so a pose's `rot` field stays bit-identical, and it is harmless only because nothing
+    -- orients a car by it any more -- every pose carries `forward`. Do not start reading it again.
     local forward = frame.forward
     local facing = frame.facing
     local rot = frame.rot
     if p.heading_deg ~= 0 then
         forward = rotate_horizontal(forward, heading_rad)
-        if facing then
-            facing = rotate_horizontal(facing, heading_rad)
-        end
+        facing = rotate_horizontal(facing, heading_rad)
         rot = quat_mul(z_quat(heading_rad), rot)
     end
     -- Right-hand horizontal perpendicular to forward. Which column is left vs right is arbitrary.
@@ -363,12 +370,13 @@ local function compute_segment(frame, count, params)
                 z = base_z,
             },
             rot = {x = rot.x, y = rot.y, z = rot.z, w = rot.w},
-            -- The travel axis the car should face, from the gate normal (+ chained headings); nil when no
-            -- gate normal, so the placement falls back to `rot`. Shared read-only across slots.
+            -- The travel axis the car faces (M.travel_axis + the chained headings): vehicles.lua orients the
+            -- car along it with quatFromDir and the measured slope, and placement.ground_all measures the
+            -- slope only when it is there. Shared read-only across slots.
             forward = facing,
-            -- The always-present heading unit vector (the car's true facing in both the gate-normal and
-            -- the fallback case) -- draw-only, used by the editor's orientation line. Distinct from
-            -- `forward` above, which stays nil without a gate normal to preserve placement semantics.
+            -- The layout axis the slot was placed along -- draw-only, the editor's orientation line and the
+            -- grid camera read it. Equal to `forward` by construction (both start as M.travel_axis and turn
+            -- together); a separate table so a reader of one can never mutate the other.
             faceDir = forward,
             -- The segment's POST-grounding height lift (the offsetHeight knob, ADR-0023 amendment).
             -- Deliberately NOT part of pos.z: the frame chain and the ground-cast hint must not see it.

@@ -82,33 +82,60 @@ local function horizontal_unit(v)
     return {x = v.x / length, y = v.y / length, z = 0}
 end
 
+-- The way a reversed open route leaves its first line when that line has no normal of its own: from
+-- reverse CP0 (the forward finish) toward route[2], the checkpoint before the finish -- the route itself
+-- at the finish, never a normal the finish does not have (ADR-0019 amendment 2026-10-24). Returns the
+-- horizontal unit axis and the checkpoint it points at, or nil when there is no such checkpoint or it
+-- stands on the finish.
+local function route_reverse_axis(route)
+    local finish, before = route[1], route[2]
+    if type(before) ~= "table" or type(before.pos) ~= "table" or type(finish.pos) ~= "table" then
+        return nil
+    end
+    local axis = horizontal_unit({x = before.pos.x - finish.pos.x, y = before.pos.y - finish.pos.y})
+    return axis, axis and before or nil
+end
+
 -- The reverse start of an OPEN route that authored none (ADR-0019 amendment 2026-10-11): behind reverse
 -- CP0 -- the forward finish -- facing back along the route, as far behind that line as the forward start
 -- stands behind its own. `forward_start` is the race's forward start pose, `route` the checkpoints in
 -- reverse order (route[1] is reverse CP0, normal already negated).
 --
---   setback  -- measured along forward CP0's horizontal normal, clamped to [0, MAX_MIRRORED_SETBACK]: a
---               forward start AHEAD of its line would otherwise put the reverse field past the first line
---               it has to cross. The grid's own offsetForward still sets the field back from this pose.
+--   setback  -- measured along the FORWARD axis, clamped to [0, MAX_MIRRORED_SETBACK]: a forward start
+--               AHEAD of its line would otherwise put the reverse field past the first line it has to
+--               cross. The grid's own offsetForward still sets the field back from this pose.
 --   lateral  -- none: centred on the gate. Which side the pole sits on means nothing reversed.
 --   height   -- reverse CP0's own; the ground pass drops every slot onto the surface from there.
---   rotation -- quatFromDir along reverse CP0's horizontal normal, the convention authored start poses
---               follow (the car's +Y is the travel direction).
+--   rotation -- quatFromDir along the REVERSE axis, the convention authored start poses follow (their +Y
+--               is the travel direction). The grid reads it back through grid.travel_axis when reverse CP0
+--               has no normal, so the reversed field faces exactly this way.
 --
--- Returns pose, details ({checkpoint, measured, setback}) or nil plus the reason the pose cannot be built.
+-- The two axes, each from the normal when there is one -- the path of every shipped race that has both,
+-- bit for bit -- and otherwise derived (ADR-0019 amendment 2026-10-24; the Utah crawls 006-Leap, 007-Dried
+-- and 008-Around have neither):
+--   forward axis -- grid.travel_axis on the forward start: forward CP0's normal, else the forward start's
+--                   rotation read the engine's way. The same answer the forward grid is laid out along.
+--   reverse axis -- reverse CP0's normal, else route_reverse_axis: the route at the finish.
+--
+-- Returns pose, details ({checkpoint, measured, setback, forward_source, toward}) -- `toward` is the
+-- checkpoint the reverse axis points at when the route answered, nil when the normal did -- or nil plus
+-- the reason the pose cannot be built.
 local function open_route_reverse_pose(race, forward_start, route)
     local forward_cp0 = type(race.checkpoints) == "table" and race.checkpoints[1] or nil
     local reverse_cp0 = type(route) == "table" and route[1] or nil
     if not forward_cp0 or not reverse_cp0 then
         return nil, "the route has no checkpoints"
     end
-    local forward_axis = horizontal_unit(forward_cp0.normal)
+    local forward_axis, forward_source = grid.travel_axis(forward_start.rot, forward_cp0.normal)
     if not forward_axis then
-        return nil, "forward CP0 has no usable normal"
+        return nil, "neither forward CP0's normal nor the forward start's rotation names a direction"
     end
-    local reverse_axis = horizontal_unit(reverse_cp0.normal)
+    local reverse_axis, toward = horizontal_unit(reverse_cp0.normal), nil
     if not reverse_axis then
-        return nil, "reverse CP0 has no usable normal"
+        reverse_axis, toward = route_reverse_axis(route)
+    end
+    if not reverse_axis then
+        return nil, "reverse CP0 has no usable normal and no checkpoint before it to face"
     end
     if type(forward_start.pos) ~= "table" or type(forward_cp0.pos) ~= "table"
         or type(reverse_cp0.pos) ~= "table" then
@@ -130,7 +157,8 @@ local function open_route_reverse_pose(race, forward_start, route)
         },
         rot = {x = rot.x, y = rot.y, z = rot.z, w = rot.w},
     }
-    return pose, {checkpoint = reverse_cp0, measured = measured, setback = setback}
+    return pose, {checkpoint = reverse_cp0, measured = measured, setback = setback,
+        forward_source = forward_source, toward = toward}
 end
 
 -- How the synthesized setback relates to the measured one, for the anchor's log line: empty when they
@@ -145,6 +173,23 @@ local function setback_note(details)
             details.measured)
     end
     return ""
+end
+
+-- Which sources the synthesized pose's two axes came from, for the same line: empty when both were the
+-- gate normals -- the line every race with both normals has always written -- else both named, so a
+-- reverse start built without a normal says so (ADR-0019 amendment 2026-10-24).
+local function axes_note(details)
+    if details.forward_source == "gate normal" and not details.toward then
+        return ""
+    end
+    local measured_along = details.forward_source == "gate normal" and "forward CP0's normal"
+        or "the forward start's rotation"
+    local facing = "the reverse CP0 normal"
+    if details.toward then
+        facing = string.format("the route toward CP%s '%s'", tostring(details.toward.index),
+            tostring(details.toward.name))
+    end
+    return " -- setback measured along " .. measured_along .. ", facing along " .. facing
 end
 
 -- The pose the grid anchors on for `direction`. `route` is this direction's checkpoint list (CP0 first,
@@ -189,10 +234,38 @@ local function start_pose(race, direction, route, race_label)
     local checkpoint = details.checkpoint
     log("I", LOG_TAG, string.format(
         "reverse start for '%s': open route without a reverse start -- grid anchored %.1f m behind "
-        .. "CP%s '%s' (the forward finish)%s",
+        .. "CP%s '%s' (the forward finish)%s%s",
         label, details.setback, tostring(checkpoint.index), tostring(checkpoint.name),
-        setback_note(details)))
+        setback_note(details), axes_note(details)))
     return pose
+end
+
+-- Say in the log when the grid's direction did NOT come from CP0's gate normal (ADR-0023 amendment
+-- 2026-10-24). The direction itself is grid.travel_axis's answer, and both consumers lay out through it
+-- (grid.lua make_frame) with exactly these inputs -- the anchor's start pose and its direction's CP0 --
+-- so the editor preview IS the spawn. This only asks the same question again to name the source: once per
+-- race start (M.prepare) and once per grid-editor anchor (M.anchor), never per frame, and nothing at all
+-- for a race whose CP0 has a normal. `route` is the direction's checkpoint list, CP0 first.
+--
+-- The line is the tripwire for a start line without a normal, the way `reverse start for '<id>': ...`
+-- is for a reverse without a start position: it names the direction as a vector, so a field that stands
+-- the wrong way shows as a number.
+local function report_travel_axis(route, base_pose, direction, race_label)
+    local cp0 = type(route) == "table" and route[1] or nil
+    local axis, source = grid.travel_axis(base_pose.rot, cp0 and cp0.normal)
+    if source == "gate normal" then
+        return
+    end
+    local label = tostring(race_label)
+    if not axis then
+        log("W", LOG_TAG, string.format("grid direction for '%s' (%s): CP0 has no usable normal and the "
+            .. "start pose's rotation names no horizontal direction -- the field lies along world X",
+            label, direction))
+        return
+    end
+    log("I", LOG_TAG, string.format("grid direction for '%s' (%s): CP0 has no usable gate normal -- the "
+        .. "field and its cars face along the start pose's rotation, (%.3f, %.3f)",
+        label, direction, axis.x, axis.y))
 end
 
 local FORWARD_PREFAB = "forwardPrefab.prefab.json"
@@ -697,10 +770,14 @@ function M.prepare(payload)
 
     -- Lay the grid out behind the line along the travel axis taken from the start/finish gate normal
     -- (CP0 = race_checkpoints[1], already reversed for a reverse race) so the field sits behind the line
-    -- and a circuit's lap-1 clock starts on a real line crossing (ADR-0022). A server-stored custom grid
-    -- relays its params per direction in raceStart.gridParams (ADR-0023): use the matching block, and for
-    -- a reverse race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
+    -- and a circuit's lap-1 clock starts on a real line crossing (ADR-0022). Without a usable normal the
+    -- grid takes the start pose's rotation instead (grid.travel_axis, ADR-0023 amendment 2026-10-24) and
+    -- report_travel_axis says so; the normal itself stays what the checkpoint has, nil included, because
+    -- the detector, the markers and the lap timer read it from there. A server-stored custom grid relays
+    -- its params per direction in raceStart.gridParams (ADR-0023): use the matching block, and for a reverse
+    -- race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
     local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
+    report_travel_axis(race_checkpoints, base_pose, direction, locator.id)
     local grid_params = grid_params_for(payload.gridParams, direction)
     -- Drop every pose onto the real surface before anyone spawns on it (ADR-0034): grid.poses is pure
     -- math at the chain Z, so on undulating tracks the rear rows would bury or float. front-anchoring
@@ -804,10 +881,12 @@ end
 -- editor (race/grideditor) to preview poses against the same geometry a real race start uses. Also returns
 -- the reference scene the editor can spawn/draw alongside the preview (so the grid is positioned against
 -- the real start area): `prefabFiles` -- the track's static-scenery prefabs for this direction (the same
--- set a real start loads) -- and `checkpoints` -- every checkpoint {index, pos, normal, radius} in this
--- direction's traversal order, CP0 (the start line) first. Returns {base_pose = {pos, rot}, gate_normal =
--- {x,y,z}|nil, raceId = string, prefabFiles = {...}, checkpoints = {...}} or nil plus a reason. raceId
--- is the canonical id the default-grid assignment is keyed on (ADR-0023).
+-- set a real start loads) -- and `checkpoints` -- every checkpoint {index, pos, normal, radius, tangent} in
+-- this direction's traversal order, CP0 (the start line) first; `tangent` only on one without a usable
+-- normal (see below). Returns {base_pose = {pos, rot}, gate_normal = {x,y,z}|nil, raceId = string,
+-- prefabFiles = {...}, checkpoints = {...}} or nil plus a reason. `gate_normal` is CP0's own normal, nil
+-- included -- the grid derives the direction from base_pose when it is nil, exactly as the race start
+-- does. raceId is the canonical id the default-grid assignment is keyed on (ADR-0023).
 function M.anchor(race_name, direction)
     if type(race_name) ~= "string" then
         return nil, "no race name"
@@ -827,7 +906,11 @@ function M.anchor(race_name, direction)
     end
 
     local first_checkpoint = race_checkpoints[1]
+    -- The grid editor lays its preview out with exactly this normal and base_pose (grideditor recompute ->
+    -- grid.poses_segmented_with_frames), which is what M.prepare hands the spawn: without a normal both
+    -- take the start pose's rotation through grid.travel_axis, and the line below says so once per anchor.
     local gate_normal = first_checkpoint and first_checkpoint.normal
+    report_travel_axis(race_checkpoints, base_pose, direction, locator.id)
 
     -- The editor draws the whole route (CP0 red, CP1 yellow, the rest grey), so the ordered list travels,
     -- not just its head. Already in this direction's order: the reversed list is the one CP0 came from.
@@ -844,6 +927,20 @@ function M.anchor(race_name, direction)
                 normal = checkpoint.normal,
                 radius = checkpoint.radius,
             }
+        end
+    end
+    -- A checkpoint without a usable normal has no line of its own to stand its two posts on, so the
+    -- editor stands them across the ROUTE instead (ADR-0023 amendment 2026-10-24): `tangent` is the
+    -- route's horizontal direction through it -- previous -> next checkpoint, CP0 -> CP1 for the first,
+    -- previous -> last for the last. Draw-only and editor-only (init.lua's route draw, through
+    -- grideditor.route_post_angle); it is NOT a normal, and the parsed checkpoints never see it -- the
+    -- detector stays radius-only for such a gate. A checkpoint that has a normal gets no tangent and draws
+    -- exactly as before.
+    for i, entry in ipairs(route) do
+        if not horizontal_unit(entry.normal) then
+            local previous, following = route[i - 1] or entry, route[i + 1] or entry
+            entry.tangent = horizontal_unit({x = following.pos.x - previous.pos.x,
+                y = following.pos.y - previous.pos.y})
         end
     end
 
