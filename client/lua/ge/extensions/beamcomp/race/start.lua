@@ -195,6 +195,34 @@ local function start_pose(race, direction, route, race_label)
     return pose
 end
 
+-- Say in the log when the grid's direction did NOT come from CP0's gate normal (ADR-0023 amendment
+-- 2026-10-24). The direction itself is grid.travel_axis's answer, and both consumers lay out through it
+-- (grid.lua make_frame) with exactly these inputs -- the anchor's start pose and its direction's CP0 --
+-- so the editor preview IS the spawn. This only asks the same question again to name the source: once per
+-- race start (M.prepare) and once per grid-editor anchor (M.anchor), never per frame, and nothing at all
+-- for a race whose CP0 has a normal. `route` is the direction's checkpoint list, CP0 first.
+--
+-- The line is the tripwire for a start line without a normal, the way `reverse start for '<id>': ...`
+-- is for a reverse without a start position: it names the direction as a vector, so a field that stands
+-- the wrong way shows as a number.
+local function report_travel_axis(route, base_pose, direction, race_label)
+    local cp0 = type(route) == "table" and route[1] or nil
+    local axis, source = grid.travel_axis(base_pose.rot, cp0 and cp0.normal)
+    if source == "gate normal" then
+        return
+    end
+    local label = tostring(race_label)
+    if not axis then
+        log("W", LOG_TAG, string.format("grid direction for '%s' (%s): CP0 has no usable normal and the "
+            .. "start pose's rotation names no horizontal direction -- the field lies along world X",
+            label, direction))
+        return
+    end
+    log("I", LOG_TAG, string.format("grid direction for '%s' (%s): CP0 has no usable gate normal -- the "
+        .. "field and its cars face along the start pose's rotation, (%.3f, %.3f)",
+        label, direction, axis.x, axis.y))
+end
+
 local FORWARD_PREFAB = "forwardPrefab.prefab.json"
 local REVERSE_PREFAB = "reversePrefab.prefab.json"
 
@@ -697,10 +725,14 @@ function M.prepare(payload)
 
     -- Lay the grid out behind the line along the travel axis taken from the start/finish gate normal
     -- (CP0 = race_checkpoints[1], already reversed for a reverse race) so the field sits behind the line
-    -- and a circuit's lap-1 clock starts on a real line crossing (ADR-0022). A server-stored custom grid
-    -- relays its params per direction in raceStart.gridParams (ADR-0023): use the matching block, and for
-    -- a reverse race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
+    -- and a circuit's lap-1 clock starts on a real line crossing (ADR-0022). Without a usable normal the
+    -- grid takes the start pose's rotation instead (grid.travel_axis, ADR-0023 amendment 2026-10-24) and
+    -- report_travel_axis says so; the normal itself stays what the checkpoint has, nil included, because
+    -- the detector, the markers and the lap timer read it from there. A server-stored custom grid relays
+    -- its params per direction in raceStart.gridParams (ADR-0023): use the matching block, and for a reverse
+    -- race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
     local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
+    report_travel_axis(race_checkpoints, base_pose, direction, locator.id)
     local grid_params = grid_params_for(payload.gridParams, direction)
     -- Drop every pose onto the real surface before anyone spawns on it (ADR-0034): grid.poses is pure
     -- math at the chain Z, so on undulating tracks the rear rows would bury or float. front-anchoring
@@ -806,8 +838,10 @@ end
 -- the real start area): `prefabFiles` -- the track's static-scenery prefabs for this direction (the same
 -- set a real start loads) -- and `checkpoints` -- every checkpoint {index, pos, normal, radius} in this
 -- direction's traversal order, CP0 (the start line) first. Returns {base_pose = {pos, rot}, gate_normal =
--- {x,y,z}|nil, raceId = string, prefabFiles = {...}, checkpoints = {...}} or nil plus a reason. raceId
--- is the canonical id the default-grid assignment is keyed on (ADR-0023).
+-- {x,y,z}|nil, raceId = string, prefabFiles = {...}, checkpoints = {...}} or nil plus a reason.
+-- `gate_normal` is CP0's own normal, nil included -- the grid derives the direction from base_pose when it
+-- is nil, exactly as the race start does. raceId is the canonical id the default-grid assignment is keyed
+-- on (ADR-0023).
 function M.anchor(race_name, direction)
     if type(race_name) ~= "string" then
         return nil, "no race name"
@@ -827,7 +861,11 @@ function M.anchor(race_name, direction)
     end
 
     local first_checkpoint = race_checkpoints[1]
+    -- The grid editor lays its preview out with exactly this normal and base_pose (grideditor recompute ->
+    -- grid.poses_segmented_with_frames), which is what M.prepare hands the spawn: without a normal both
+    -- take the start pose's rotation through grid.travel_axis, and the line below says so once per anchor.
     local gate_normal = first_checkpoint and first_checkpoint.normal
+    report_travel_axis(race_checkpoints, base_pose, direction, locator.id)
 
     -- The editor draws the whole route (CP0 red, CP1 yellow, the rest grey), so the ordered list travels,
     -- not just its head. Already in this direction's order: the reversed list is the one CP0 came from.

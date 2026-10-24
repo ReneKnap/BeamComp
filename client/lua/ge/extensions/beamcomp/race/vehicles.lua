@@ -305,8 +305,12 @@ end
 -- Prefer the pose's `forward` travel axis -- face the car along it via quatFromDir -- so the car is
 -- oriented to the grid (or, on the recover path, to the next checkpoint) rather than to the authored
 -- start quaternion, and tilt it into the measured surface (pose_frame). Fall back to the start rotation
--- (`rot`) when the pose carries no forward (no gate normal); recover_to reaches this only with a
--- forward, so its poses carry no `rot` at all. quatFromDir/vec3/quat are engine globals, kept here
+-- (`rot`) when the pose carries no forward. No caller hands one over today: every grid pose carries
+-- `forward` since 2026-10-24, a start line without a gate normal included (race/grid.lua
+-- M.travel_axis, which reads the start rotation the engine's way), and recover_to reaches this only with
+-- a forward, so its poses carry no `rot` at all. Kept as the defensive path, not a grid case. A grid
+-- pose's `rot` is composed with its heading the textbook way (race/grid.lua compute_segment), so it must
+-- not become the source of a car's heading again. quatFromDir/vec3/quat are engine globals, kept here
 -- rather than in the pure grid module.
 --
 -- The `rot` fallback stays FLAT on purpose (ADR-0034 amendment 2026-08-30). That quaternion is the
@@ -315,8 +319,10 @@ end
 -- measured normal onto it would double-count an authored tilt, and every way of doing so either needs a
 -- second rotation recipe with no verified precedent here or rebuilds the quaternion from a derived
 -- heading, which would throw the authored pitch/roll away even on flat ground. The tilt is therefore
--- applied only where we SYNTHESISE the orientation from a horizontal gate normal and so genuinely hold
--- no tilt information of our own.
+-- applied only where we SYNTHESISE the orientation from a horizontal axis and so genuinely hold no tilt
+-- information of our own. A start line without a gate normal now takes that path too: its axis is the
+-- start rotation's heading, flattened, and the measured slope replaces the authored pitch and roll (owner
+-- decision 2026-10-24, ADR-0034 amendment of that date).
 --
 -- The 180-degree flip composes correctly with a tilted pose and needs no change: `quat(0,0,1,0) * rot`
 -- reads as "flip first, then rot" under BeamNG's quaternion convention (LuaQuat.__mul is the Hamilton
@@ -537,7 +543,8 @@ end
 -- yet -- then the config METADATA box (a real footprint, just not this car's deformed one), and last the
 -- raw pose: the reference point itself on it, which is exactly the behaviour before any anchoring existed.
 -- A pose with no forward axis has no frame to anchor in and gets the raw pose straight away, silently
--- ("no frame") -- for a grid that is the normal case of a pure-radius CP0.
+-- ("no frame"). Grid poses always carry one since 2026-10-24 (race/grid.lua M.travel_axis): a pure-radius
+-- CP0 used to be this case, and its cars stood centre-anchored on the slot.
 local function anchored_target(veh, pose, anchor)
     require_anchor(anchor)
     local base = vec3(pose.pos.x, pose.pos.y, pose.pos.z)
