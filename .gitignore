@@ -1,2 +1,12 @@
 # Local release snapshots (deploy.ps1 outputs)
 releases/
+
+# Workflow notes live beside the repo, never in it
+.claude/
+CLAUDE.md
+
+# Logs, archives and server runtime files
+*.log
+*.zip
+server/beamcomp.runs.jsonl
+server/beamcomp.records.json
