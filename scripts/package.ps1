@@ -8,6 +8,7 @@
   and nothing else:
 
     README.md          what it is, how to install it, every setting explained
+    COMMANDS.md        every chat command, linked from the README
     CHANGELOG.md       what is in this version
     LICENSE            the terms it comes under
     Resources/         drop this into the BeamMP server folder
@@ -65,6 +66,7 @@ $releaseDir = Join-Path $repoRoot 'releases'
 
 $docs = @(
     (Join-Path $repoRoot 'README.md'),
+    (Join-Path $repoRoot 'COMMANDS.md'),
     (Join-Path $repoRoot 'CHANGELOG.md'),
     (Join-Path $repoRoot 'LICENSE')
 )

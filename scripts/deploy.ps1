@@ -9,8 +9,8 @@
   are replaced on each run. The committed client/ and server/ trees are never
   modified -- all duplication happens in a staging directory and the target.
 
-  LICENSE rides along in both halves, and README.md in the server half, so a
-  download carries its own terms and setup instructions.
+  LICENSE rides along in both halves, and README.md and COMMANDS.md in the server
+  half, so a download carries its own terms, setup instructions and command list.
 
   Runtime data the plugin writes into the server folder (named grids, saved
   presets, the per-run records log) is copied out before the folder is wiped and
@@ -87,8 +87,10 @@ $envelope  = Join-Path $repoRoot 'shared\envelope.lua'
 # shipping a build without it.
 $license   = Join-Path $repoRoot 'LICENSE'
 $readme    = Join-Path $repoRoot 'README.md'
+# The README links the command list, so the two travel together.
+$commands  = Join-Path $repoRoot 'COMMANDS.md'
 
-foreach ($p in @($clientDir, $serverDir, $envelope, $license, $readme)) {
+foreach ($p in @($clientDir, $serverDir, $envelope, $license, $readme, $commands)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "Missing repo path: $p" }
 }
 
@@ -198,6 +200,7 @@ try {
     # The operator is the one who has to read both: the terms, and how to set the thing up.
     Copy-Item -LiteralPath $license -Destination (Join-Path $serverOut 'LICENSE') -Force
     Copy-Item -LiteralPath $readme -Destination (Join-Path $serverOut 'README.md') -Force
+    Copy-Item -LiteralPath $commands -Destination (Join-Path $serverOut 'COMMANDS.md') -Force
 
     if ($null -ne $gridsBackup) {
         Copy-Item -LiteralPath $gridsBackup -Destination $gridsTarget -Force
