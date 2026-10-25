@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.0 -- Early Access (2026-09-12)
+## 0.9.0 Early Access (2026-09-12)
 
 The first release. Everything here is new.
 
@@ -17,16 +17,16 @@ below rather than hidden.
 - `/dnf` to give up, `/results` to hide or show your own results card.
 - **The race's props carry no name.** Every cone, hay bale, barrel and barrier the race spawns is
   nameless on every screen, not just the ones the host can see.
-- Over the cars, each driver is shown under the name he picked with `/name` -- his guest name if he
-  picked none -- and an AI under the same name the standings give it.
+- Over the cars, each driver is shown under the name they picked with `/name`, or under their BeamMP
+  name if they picked none, and an AI under the same name the standings give it.
   The host sees the AI names as well, and BeamMP's nametag key switches them with the others.
 
 ### Starting the field
 
-- **Grids for 105 races are included and already assigned** -- Grid Map, Hirochi Raceway, Italy and
+- **Grids for 105 races are included and already assigned**, on Grid Map, Hirochi Raceway, Italy and
   West Coast USA. Every other race starts on a sensible default layout.
-- Parametric starting grids: rows, columns, spacing, distance behind the line, angle -- edited in
-  game with a live preview and saved by name.
+- Parametric starting grids with rows, columns, spacing, distance behind the line and angle, edited
+  in game with a live preview and saved by name.
   Opened from the setup panel, the grid editor starts in the direction the race is set to run, and
   says when you switch to the other one.
   A number typed into the grid editor applies on Enter, or by itself a moment after you stop typing.
@@ -37,17 +37,17 @@ below rather than hidden.
 - Large vehicles get the room they need; the field is placed on the ground it actually stands on.
   The Utah crawls Leap, Dried and Around line up facing the way they are driven, in the grid editor and in
   the race.
-- A synchronised countdown that holds every car, or an F1-style light sequence where the car is free
+- A synchronized countdown that holds every car, or an F1-style light sequence where the car is free
   and a jump start costs time instead.
 
 ### Who you race
 
 - AI opponents, up to 16, with easy / medium / hard presets and their own named drivers.
-- Vehicle rules: everyone in the same car -- one you name, or simply the one you are sitting in when
-  you start -- everyone in a random car, or free choice inside a power and weight limit. A car that
-  does not fit the limit is swapped for one that does.
+- Vehicle rules: everyone in the same car, everyone in a random car, or free choice inside a power and
+  weight limit. The same car can be one you name, or simply the one you are sitting in when you start.
+  A car that does not fit the limit is swapped for one that does.
 - Qualifying, for a grid order that was driven rather than drawn.
-  The AI lap until the qualifying clock runs out and stop as they finish their lap -- on a track
+  The AI lap until the qualifying clock runs out and stop as they finish their lap. On a track
   where one lap takes longer than the session, that is after the first one.
 - Championships across several races, and a class-drop tournament that eliminates the back of the
   field each round.
@@ -62,24 +62,24 @@ below rather than hidden.
 - Change a setting after **Confirm & Build Grid** and the setup panel says so and lights the button up:
   **Start Race** starts the grid as it was built.
 - A grid editor (`/gridui`).
-- Admin access by password or by BeamMP name -- see `beamcomp.config.ini`.
+- Admin access by password or by BeamMP name, set in `beamcomp.config.ini`.
 - `showDriverNames` decides whether names are drawn over the cars at all. It can be switched from the
   setup panel's gear menu while the server runs, and the change is written back into
-  `beamcomp.config.ini` -- the rest of the file, comments and password included, is left untouched.
+  `beamcomp.config.ini`. The rest of the file, comments and password included, is left untouched.
 - Players pick the name everyone sees with `/name`.
 - Recover and repair as a held key during the race, on by default and switchable per race.
   A recovered car stands on its wheels at the checkpoint, following the slope of the road, instead of
   rolled onto its side or sunk into the surface.
   Pressing either key counts as being at the wheel: the "AFK in" count is gone at once and stays away
   while the key is held.
-- On joining, every player gets one message naming the three commands he needs -- `/raceui`, `/name`
-  and `/keys`. The `/raceui` line says how to get in where a password is set, and is left out where he
-  could not get in at all.
-- `/keys` opens a window showing which keys his own game has those two on, for every connected device,
-  where he can also rebind or remove them. The setup panel can still send the key lines to everyone in
+- On joining, every player gets one message naming the three commands they need: `/raceui`, `/name`
+  and `/keys`. The `/raceui` line says how to get in where a password is set, and is left out where
+  they could not get in at all.
+- `/keys` opens a window showing which keys their own game has those two on, for every connected
+  device, where they can also rebind or remove them. The setup panel can still send the key lines to everyone in
   chat.
   Picking a key the assist already has adds nothing, and the window says so.
-- **Reset UI layout** -- one button puts every BeamComp window back to the size and position it ships
+- **Reset UI layout**: one button puts every BeamComp window back to the size and position it ships
   with. It sits in the gear menu of the setup panel and of the `/keys` window, so a player who is not
   an admin can reach it too. Worth knowing: a window you have ever moved keeps its own geometry from
   then on, so a size we change in an update only reaches you through this button.
@@ -93,5 +93,5 @@ below rather than hidden.
 
 ### Not in this release
 
-- Per-race statistics -- best times, track records and the post-race analysis overlay -- are switched
-  off. They will come back once they work the way they should.
+- Per-race statistics are switched off: best times, track records and the post-race analysis
+  overlay. They will come back once they work the way they should.
