@@ -10,8 +10,8 @@
 -- loaders handle oldId remapping, segment ordering, and classification. M.parse dispatches by
 -- locator.format and normalizes the loaded path object into a plain-Lua, engine-handle-free table
 -- (ADR-0005): start positions, ordered visible checkpoints with a stable 0-based index, prefab file
--- references, and meta (a mission's defaultLaps coming from its sibling info.json). The data-model
--- contract lives in .claude/features/race-parser/2-architecture.md.
+-- references, and meta (a mission's defaultLaps coming from its sibling info.json). That table is the
+-- data model the rest of the race code reads.
 
 local M = {}
 

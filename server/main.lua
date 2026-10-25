@@ -2243,7 +2243,7 @@ grid_fit.AXIS_CAPACITY = 32
 
 -- Safety rails.
 --   MAX_ROUNDS -- the allocation WALKS candidate layout sizes (grid_fit.assign) and the walk has to end
---     somewhere. Measured (.claude/tools/grid_fit_probe.py) over 9240 parameter sets -- 15 width pins x
+--     somewhere. Measured over 9240 parameter sets -- 15 width pins x
 --     4 gap sets x 77 fields of cars, buses and semis from 2 to 32 vehicles, each with and without the
 --     ADR-0044 start ramp: every one of them resolves, the worst needing 184 rounds (32 semis on a
 --     rows=4 grid with a 3 m column gap), a field of 12 or fewer 1 to 3. So 192, the worst case plus
@@ -3271,7 +3271,7 @@ end
 -- real qualifying under a driver who was still driving, and the same log showed 90 s between two of their
 -- checkpoints on a normal lap -- no fixed or adaptive threshold can separate that from a wreck. It was
 -- removed rather than retuned (2026-09-03; ADR-0014). If no client ever reports, a grace simply runs its
--- full length, which is the pre-928a938 behaviour and never worse than the bug.
+-- full length, which is the pre-aeb4e2c behaviour and never worse than the bug.
 --
 -- A namespace table rather than a set of top-level locals, because main.lua's main chunk sits near
 -- Lua's 200-local ceiling: a table costs ONE local no matter how many functions it carries.
@@ -3331,7 +3331,7 @@ end
 -- There is exactly ONE input, and it is not the server's. A client report is a MEASUREMENT of a car
 -- standing still; the crossing-gap guess that used to sit beside it was measuring nothing and is gone.
 -- Silence therefore means "still driving", always -- an unreported driver holds their grace open for its
--- full length, which is the safe direction and the pre-928a938 behaviour.
+-- full length, which is the safe direction and the pre-aeb4e2c behaviour.
 function stall.verdict(id)
     if session.stall_reported and session.stall_reported[id] then
         return "reported stalled by its client"
