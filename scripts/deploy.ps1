@@ -81,10 +81,10 @@ $repoRoot  = Split-Path -Parent $PSScriptRoot
 $clientDir = Join-Path $repoRoot 'client'
 $serverDir = Join-Path $repoRoot 'server'
 $envelope  = Join-Path $repoRoot 'shared\envelope.lua'
-# The license has to travel with the payload. BeamComp is handed out as a download and the repository
-# is not public, so a LICENSE that never leaves the source tree reaches nobody who installs it -- and
-# the license is the only enforcement basis there is (the mod ships as readable source by necessity).
-# Both halves get a copy, and a missing file throws below rather than shipping an unlicensed build.
+# The license has to travel with the payload. BeamComp is MIT-licensed, and MIT's one condition is that
+# the copyright notice and the license text go with every copy -- including the server folder an
+# operator copies on its own. Both halves get a copy, and a missing file throws below rather than
+# shipping a build without it.
 $license   = Join-Path $repoRoot 'LICENSE'
 $readme    = Join-Path $repoRoot 'README.md'
 

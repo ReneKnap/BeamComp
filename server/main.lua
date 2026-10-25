@@ -1,8 +1,8 @@
 -- BeamComp -- BeamMP server plugin entry point.
 --
--- Copyright 2026 Rene Knap. Licensed under the PolyForm Strict License 1.0.0 plus an additional
--- permission; the full terms are in the LICENSE file shipped beside this one. Run it, do not
--- redistribute it.
+-- Copyright (c) 2026 Rene Knap. Licensed under the MIT License; the full text is in the LICENSE file
+-- shipped beside this one. Use it, change it and share it as you like -- the notice and the license
+-- text stay with every copy.
 --
 -- Deployed to Resources/Server/BeamComp/. BeamMP loads every .lua file in the
 -- plugin folder alphabetically at server start.

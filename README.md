@@ -14,8 +14,8 @@ Built for small groups on private servers who would rather race than free-roam.
 This is an Early Access release: complete and playable, with a few known rough edges listed in
 [CHANGELOG.md](CHANGELOG.md).
 
-BeamComp lives at **<https://www.patreon.com/c/ReneKnap>**. New versions appear there, and that is
-where to ask anything about it.
+BeamComp is free and open source. If you enjoy it, you can support it on Patreon:
+<https://www.patreon.com/c/ReneKnap>. That is voluntary and buys nothing extra.
 
 ## What you get
 
@@ -244,28 +244,13 @@ version do not reach a server that already has the file; the changelog says when
 
 ## License
 
-BeamComp is **not open source**, and the usual modding assumption does not apply here. The full terms
-are in [LICENSE](LICENSE) -- PolyForm Strict 1.0.0 plus one additional permission. In short:
+BeamComp is open source under the [MIT License](LICENSE). You may use it, change it, share it and build
+on it, for any purpose. Keep the copyright notice and the license text with every copy. It comes with no
+warranty.
 
-- **You may** download it, install it, and run it on your own server, for any purpose, including a
-  commercial one.
-- **You may not** redistribute it -- no mirrors, no re-uploads to mod sites, no bundling it into
-  anything else, no selling it. Link people to the original download instead.
-- **You may not** publish modified versions or new works based on it.
-- It comes with **no warranty**.
-
-The source is readable on purpose, so you can see what runs on your own server and so a problem in the
-field can be diagnosed. That is not an invitation to redistribute it.
-
-**Why it is worth respecting.** BeamComp is free to play with -- the supporters who pay for it are
-buying *early* access to new versions, nothing else. One re-upload and that is gone, and with it the
-reason there are new versions. If someone asks you for it, send them to
-<https://www.patreon.com/c/ReneKnap>.
-
-If you want to do something the license does not allow, ask -- permission can be granted.
+BeamNG's own races, props and maps are not part of BeamComp and keep their own license. BeamComp reads
+them from your game install.
 
 ## Credits
 
 BeamComp is by Rene Knap.
-
-Team Principal supporters are named here, once there are any.

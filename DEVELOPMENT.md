@@ -78,10 +78,10 @@ across first:
 ### The license rides along
 
 The deploy copies `LICENSE` into **both** halves (the zip root and the server folder) and `README.md`
-into the server folder. This repository is not public and BeamComp is handed out as a download, so the
-copy inside the payload is the only one a user ever sees -- and the license is the only enforcement
-basis there is, since the mod ships as readable source by necessity. A missing `LICENSE` or `README.md`
-**aborts the deploy** instead of producing an unlicensed build.
+into the server folder. BeamComp is MIT-licensed, and MIT's one condition is that the copyright notice
+and the license text travel with every copy -- so each half carries its own, and a server operator who
+only ever sees the server folder still has it. A missing `LICENSE` or `README.md` **aborts the deploy**
+instead of producing a build without them.
 
 ### Proving a client change is actually live
 
