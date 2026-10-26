@@ -538,7 +538,7 @@ end
 -- race starts on.
 function M.set_direction(direction)
     if not M.state.active then
-        return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+        return nil, "not editing, run beamcomp_grid_new(\"<race>\") first"
     end
     if direction ~= "forward" and direction ~= "reverse" then
         return nil, "direction must be 'forward' or 'reverse'"
@@ -569,7 +569,7 @@ end
 -- reason (not editing, unknown knob, non-numeric value).
 function M.set(knob, value)
     if not M.state.active then
-        return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+        return nil, "not editing, run beamcomp_grid_new(\"<race>\") first"
     end
     -- The knobs edit the ACTIVE segment's params (segment 0 by default; a breakpoint selection makes a
     -- later segment active). This is the same block shape as before -- just per segment now.
@@ -620,7 +620,7 @@ end
 -- something in. Returns true + the applied start slot, or nil + a reason.
 function M.select_segment(start_slot)
     if not M.state.active then
-        return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+        return nil, "not editing, run beamcomp_grid_new(\"<race>\") first"
     end
     local number = tonumber(start_slot)
     if not number then
@@ -683,7 +683,7 @@ end
 -- Returns true, or nil + a reason.
 function M.remove_segment()
     if not M.state.active then
-        return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+        return nil, "not editing, run beamcomp_grid_new(\"<race>\") first"
     end
     if M.state.segment <= 1 then
         return nil, "cannot remove the base segment"
@@ -777,7 +777,7 @@ end
 -- value, or nil + a reason when not editing / non-numeric.
 function M.set_preview_count(count)
     if not M.state.active then
-        return nil, "not editing -- beamcomp_grid_new(\"<race>\") first"
+        return nil, "not editing, run beamcomp_grid_new(\"<race>\") first"
     end
     -- A non-numeric value is REJECTED here rather than defaulted: this is the typed surface (the GE
     -- console and the panel), where the caller wants to hear about a typo. Only the stored path defaults.

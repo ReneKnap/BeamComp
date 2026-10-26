@@ -27,7 +27,7 @@ local function list_all_models()
     if #models == 0 then
         return {"BeamComp: no vehicles found"}
     end
-    local lines = {string.format("BeamComp: %d vehicle(s) -- /cars <model> for configs:", #models)}
+    local lines = {string.format("BeamComp: %d vehicle(s), /cars <model> lists the configs:", #models)}
     local row = {}
     for _, model in ipairs(models) do
         row[#row + 1] = model
@@ -67,7 +67,7 @@ local function list_model_configs(model)
     if #configs == 0 then
         return {string.format("BeamComp: no configs for '%s' (unknown model?)", model)}
     end
-    local lines = {string.format("BeamComp: %s -- %d config(s):", model, #configs)}
+    local lines = {string.format("BeamComp: %s has %d config(s):", model, #configs)}
     for _, entry in ipairs(configs) do
         lines[#lines + 1] = describe_config(entry)
     end

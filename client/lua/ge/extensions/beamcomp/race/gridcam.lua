@@ -252,7 +252,7 @@ function M.to_grid(editor, in_race, trigger)
     end
     local slot = first_slot(editor)
     if not slot then
-        return nil, "not editing -- start or load a grid first"
+        return nil, "not editing, start or load a grid first"
     end
     local missing = missing_engine_names()
     if #missing > 0 then

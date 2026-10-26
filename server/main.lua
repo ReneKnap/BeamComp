@@ -303,8 +303,8 @@ local CONFIG_CANDIDATE_PATHS = {
 --   * `admins` / `admin_gate_active` -- normalized (trimmed, lowercased) admin names -> true, and
 --     whether the race-admin gate is on at all (no admins configured = everyone may start races).
 --   * `use_client_name` -- whether player identity resolves to the client-reported player-set name
---     instead of the BeamMP name (ADR-0054). Default on -- a missing file or an unreadable line keeps it on, so the
---     guest-name fix applies out of the box. Set false in beamcomp.config.ini to fall back everywhere.
+--     instead of the BeamMP name (ADR-0054). Default on -- a missing file or an unreadable line keeps it on, so
+--     /name works out of the box. Set false in beamcomp.config.ini to fall back everywhere.
 --   * `stats_enabled` -- whether the per-run statistics subsystem exists at all (ADR-0053): the run log,
 --     best times, track records, the bestNotice toast, the raceRecords push, the analysis overlay and
 --     /analysis. Settings key `enableStatistics`. Default OFF, and note the polarity is the OPPOSITE of
@@ -330,9 +330,10 @@ local cfg = {
 }
 
 -- Password-based race-admin access (ADR-0056, superseding ADR-0016 in part). The name allowlist above
--- authorizes by BeamMP display name -- and that name ROTATES on every game start while BeamMP login is
--- broken (measured: four consecutive sessions of the same user gave four different guest names), so it
--- cannot identify anybody. A password does not depend on identity at all, which is why it works here.
+-- authorizes by BeamMP display name -- and a GUEST's name rotates on every game start (measured while
+-- BeamMP login was broken: four consecutive sessions of the same user gave four different guest names),
+-- so it cannot identify a guest. A password does not depend on identity at all, which is why it works
+-- for everybody, logged in or not.
 --
 -- One namespace table, not a local per symbol: main.lua's main chunk sits at LuaJIT's 200-local ceiling
 -- (see the cfg / identity / f1 / grid_store namespaces around it), and a table costs ONE local no matter
@@ -385,8 +386,8 @@ local client_names = {}
 local identity = {
     CHAT_COMMAND = "/name",
     MSG_SET = "nameSet",              -- server -> client: the accepted REQUESTED name, for the client to persist
-    MSG_PLAYERS = "playerList",       -- server -> clients: every connected player + whether his name is temporary (setup panel)
-    MSG_REMIND = "remindUnnamed",     -- client -> server: admin asks us to hint every player still on a temporary name
+    MSG_PLAYERS = "playerList",       -- server -> clients: every connected player + whether he is on a BeamMP guest name (setup panel)
+    MSG_REMIND = "remindUnnamed",     -- client -> server: admin asks us to hint every player still on a guest name
     -- Name length in BYTES (#name), not codepoints: a name with umlauts therefore reaches the cap sooner
     -- than 20 visible characters. Deliberate -- a UTF-8-aware count is not worth its complexity for a
     -- display name, and the byte bound is what keeps the hand-assembled chat/standings lines sane. Do not
@@ -403,9 +404,10 @@ local identity = {
 }
 -- The Remind button's line (ADR-0054), and only that since the join block took the join over: an admin
 -- pressing Remind is pointing at this one thing, so the block's whole list would be beside the point.
-identity.HINT = "BeamComp: you have no race name set -- type \"" .. identity.CHAT_COMMAND
-    .. " <your name>\" to pick the name everyone sees"
-identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name> ("
+-- Remind reaches only players on a BeamMP guest name (identity.player_list), so the line speaks to one.
+identity.HINT = "BeamComp: your guest name changes every game start. Type \"" .. identity.CHAT_COMMAND
+    .. " <your name>\" to pick one that stays."
+identity.USAGE = "BeamComp: type " .. identity.CHAT_COMMAND .. " <your name> ("
     .. identity.MIN_BYTES .. "-" .. identity.MAX_BYTES .. " characters, spaces allowed)"
 
 -- THE CONNECT-REPORT PULL (ADR-0058). A client cannot simply report at load: its GE extension comes up
@@ -413,8 +415,8 @@ identity.USAGE = "BeamComp: usage -- " .. identity.CHAT_COMMAND .. " <your name>
 -- joined -- 27 seconds later on the measured join (2026-09-19), with every event in between refused as
 -- "Player hasn't joined yet". Both connect reports were being dropped in exactly that window: the assist
 -- keys, and -- shipped and unnoticed since ADR-0054 -- the player-set name. The name failure hid itself,
--- because the "you have no race name set" hint fires precisely when the report is missing, so a named
--- player being told to pick a name looked like the feature working.
+-- because the old "you have no race name set" hint fired precisely when the report was missing, so a
+-- named player being told to pick a name looked like the feature working.
 --
 -- So the SERVER asks, once it can reach the player at all. send_event reports whether BeamMP took the
 -- event, which makes "the channel is open" something this plugin can observe instead of guess, and the
@@ -561,20 +563,23 @@ keys.UNKNOWN = "BeamComp: your game has not reported its keys to this server"
 -- allowlist-only server (see identity.join_block), and a header promising three commands would then be
 -- wrong.
 identity.JOIN_HEADER = "BeamComp: commands worth knowing"
-identity.JOIN_RACEUI = "  " .. CHAT_COMMAND_RACEUI .. " -- open the race panel"
+identity.JOIN_RACEUI = "  " .. CHAT_COMMAND_RACEUI .. ": open the race panel"
 -- The same fact access.refuse states at a refusal -- the panel is the only place the password can be
 -- entered -- written for a player who has not been refused anything yet.
 identity.JOIN_RACEUI_PASSWORD = "  " .. CHAT_COMMAND_RACEUI
-    .. " -- open the race panel and enter the server password"
+    .. ": open the race panel and enter the server password"
 -- Two /name lines, one condition: whether this player has a name by the time the block goes out. The
--- first carries the urgency of identity.HINT, which no longer reaches a joiner any other way; the second
--- is for everyone who has one already and only needs to know the command exists.
+-- first offers the command and names the BeamMP name he races under without one (identity.join_block
+-- appends it); the second is for everyone who has one already and only needs to know the command exists.
+-- A name is optional since BeamMP login works again (2026-10-26), so neither line may read as a demand.
+-- KEEP THE TWO DISTINGUISHABLE: a named player whose connect report went missing reads the first, and
+-- that is the only trace of a lost report anybody sees in chat (ADR-0058).
 identity.JOIN_NAME_PROMPT = "  " .. identity.CHAT_COMMAND
-    .. " <your name> -- you have no race name set; this is the name everyone sees"
-identity.JOIN_NAME = "  " .. identity.CHAT_COMMAND .. " <your name> -- change the name everyone sees"
+    .. " <your name>: pick a race name, otherwise you race as "
+identity.JOIN_NAME = "  " .. identity.CHAT_COMMAND .. " <your name>: change your race name"
 -- Unconditional, even for a connection that reported no keys at all (user decision): a player who types
 -- it then gets keys.UNKNOWN, an honest answer, where a silent command would read as a broken one.
-identity.JOIN_KEYS = "  " .. keys.CHAT_COMMAND .. " -- see and change your repair and recover keys"
+identity.JOIN_KEYS = "  " .. keys.CHAT_COMMAND .. ": see and change your repair and recover keys"
 
 -- The canonical display/record identity for a player (ADR-0054): the player-set name reported by the
 -- client when the option is on and one was reported, else the BeamMP name. The single chokepoint every
@@ -1084,7 +1089,7 @@ end
 function access.refuse(player_id, what)
     local line = "BeamComp: you are not allowed to " .. what
     if cfg.password then
-        line = line .. " -- type " .. CHAT_COMMAND_RACEUI .. " and enter the server password"
+        line = line .. ". Type " .. CHAT_COMMAND_RACEUI .. " and enter the server password"
     end
     MP.SendChatMessage(player_id, line)
 end
@@ -1114,12 +1119,11 @@ function access.log_startup_state()
     end
 
     if cfg.admin_gate_active then
-        -- The reason this item exists, told to the one operator who can still act on it: whoever just
-        -- filled in raceAdmins. Measured 2026-09-09 -- four consecutive sessions of the same user
-        -- produced four different guest names.
-        log_info("beamcomp.cfg", "NOTE: raceAdmins matches the BeamMP name, and while BeamMP login is"
-            .. " broken every player connects as a guest whose name CHANGES on every game start."
-            .. " An entry here will not match the same person tomorrow -- use racePassword instead.")
+        -- Told to the one operator who can still act on it: whoever just filled in raceAdmins. A guest's
+        -- name rotates (measured 2026-09-09: four sessions of the same user, four guest names), a
+        -- logged-in BeamMP name does not. Same wording as the shipped beamcomp.config.ini.
+        log_info("beamcomp.cfg", "NOTE: raceAdmins matches the BeamMP name. A guest gets a new name every"
+            .. " time they start the game, so list only players who log in to BeamMP.")
     end
 end
 
@@ -1482,7 +1486,7 @@ function grid_store.warn_over_capacity(owner_id, grid_params, starters)
     -- least 1), so only the second noun needs the singular.
     local drivers = (authored == 1) and "driver" or "drivers"
     MP.SendChatMessage(owner_id, string.format(
-        "BeamComp: %d starters -- this grid is not tuned for more than %d %s",
+        "BeamComp: %d starters, but this grid is tuned for at most %d %s",
         starters, authored, drivers))
     log_info("beamcomp.grid", string.format("field of %d exceeds the grid's authored %d; issuer notified",
         starters, authored))
@@ -3254,7 +3258,7 @@ function champ.post_table(player_id)
     for position, item in ipairs(ranked) do
         local entry = item.entry
         local wins = champ.wins_of(entry)
-        MP.SendChatMessage(player_id, string.format("  %d. %s -- %d pts (last +%d, %d win%s)",
+        MP.SendChatMessage(player_id, string.format("  %d. %s: %d pts (last +%d, %d win%s)",
             position, item.identity, entry.points, entry.last_gain or 0, wins, wins == 1 and "" or "s"))
     end
 end
@@ -4852,7 +4856,7 @@ function tour.award()
     if record.class_index < #state.classes then
         record.class_index = record.class_index + 1
         record.reached_at[record.class_index] = state.race_count
-        broadcast_chat(string.format("BeamComp: %s wins -- drops to %s",
+        broadcast_chat(string.format("BeamComp: %s wins and drops to %s",
             winner, tour.class_label(record.class_index)))
     else
         state.winner = winner
@@ -5179,7 +5183,7 @@ local function reset_to_lobby()
     -- outlive a single race.
     enter_phase(PHASE.lobby, nil)
     if had_race then
-        broadcast_chat("BeamComp: race cleared -- back in free roam")
+        broadcast_chat("BeamComp: race cleared, back in free roam")
     end
 end
 
@@ -5659,7 +5663,7 @@ local function expire_stale_validation()
     if pending and now() >= pending.deadline then
         session.pending_validation = nil
         MP.SendChatMessage(pending.owner_id,
-            "BeamComp: race validation timed out -- no response from your client")
+            "BeamComp: race validation timed out, your client did not answer")
         log_info("beamcomp.race", "/race '" .. pending.race .. "' validation timed out")
     end
 end
@@ -5678,7 +5682,7 @@ local function maybe_warn_cleanup()
         return
     end
     session.cleanup_warned = true
-    broadcast_chat("BeamComp: race props and results clear in 1 minute -- /raceclear to clear now")
+    broadcast_chat("BeamComp: race props and results clear in 1 minute, /raceclear clears them now")
 end
 
 -- Leave the spawning phase once every rostered player is accounted for -- acked via spawnReady or
@@ -5698,7 +5702,7 @@ local function advance_spawning()
     end
     if session.spawn_ready_count == 0 then
         log_info("beamcomp.race", "no players spawned; cancelling race")
-        broadcast_chat("BeamComp: no players spawned -- race cancelled")
+        broadcast_chat("BeamComp: no players spawned, race cancelled")
         reset_to_lobby()
     elseif not MP.GetPlayers()[session.owner_id] then
         -- The admin who prepared this race left during the spawn gate, so the field would come up
@@ -5706,7 +5710,7 @@ local function advance_spawning()
         -- only watches disconnects that happen DURING staging. Same outcome, applied one seam earlier
         -- (ADR-0021 amendment).
         log_info("beamcomp.race", "race preparer left before staging; cancelling race")
-        broadcast_chat("BeamComp: the host who prepared the race left -- race cancelled")
+        broadcast_chat("BeamComp: the host who prepared the race left, race cancelled")
         reset_to_lobby()
     else
         -- nil duration = open-ended (like lobby and racing): no auto-start, and clients render a wait
@@ -6501,7 +6505,7 @@ local function tick()
             -- one would make %d a runtime error inside the tick.
             log_info("beamcomp.race", string.format("staged race abandoned -- no host start within %.0f s",
                 PHASE_DURATIONS.staging_abandon))
-            broadcast_chat("BeamComp: staged race abandoned -- nobody started it")
+            broadcast_chat("BeamComp: staged race abandoned, nobody started it")
             reset_to_lobby()
         end
         return
@@ -6538,7 +6542,7 @@ local function tick()
 end
 
 local RACE_USAGE =
-    "BeamComp: usage -- /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
+    "BeamComp: type /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]|random|host>] "
     .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
     .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
@@ -6932,7 +6936,7 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         overrides.maxpwr = nil
         overrides.maxkg = nil
         overrides.minkg = nil
-        MP.SendChatMessage(player_id, "BeamComp: car= set -- maxhp/maxpwr/maxkg/minkg ignored")
+        MP.SendChatMessage(player_id, "BeamComp: car= is set, so maxhp/maxpwr/maxkg/minkg are ignored")
     end
 
     local assists = overrides.assists
@@ -7001,7 +7005,8 @@ local function handle_race_command(player_id, player_name, argument)
         return
     end
     if bad_token then
-        MP.SendChatMessage(player_id, "BeamComp: unknown option '" .. bad_token .. "' -- " .. RACE_USAGE)
+        MP.SendChatMessage(player_id, "BeamComp: unknown option '" .. bad_token .. "'")
+        MP.SendChatMessage(player_id, RACE_USAGE)
         return
     end
 
@@ -7086,7 +7091,7 @@ local function handle_race_validation(player_id, payload)
             -- name is the client's own display string; nothing here interprets the spec.
             if type(payload.hostCarName) == "string" and payload.hostCarName ~= "" then
                 MP.SendChatMessage(pending.owner_id,
-                    "BeamComp: car=host -- everyone races your " .. payload.hostCarName)
+                    "BeamComp: car=host, everyone races your " .. payload.hostCarName)
             end
         else
             overrides.host_car = nil
@@ -7223,9 +7228,9 @@ function identity.validate(candidate)
         end
     end
     local normalized = normalize_name(candidate)
-    -- A player calling himself "guest…" would look unnamed and so escape the join hint and the admin's
-    -- reminder list -- the one hole that would defeat the whole discovery mechanism.
-    if normalized:sub(1, 5) == "guest" then
+    -- A player calling himself "guest…" would pass for one of BeamMP's guest names, and the panel's
+    -- guest marker and Remind would then point at somebody who already has the name he wants.
+    if identity.is_guest_name(candidate) then
         return false, "BeamComp: a name may not start with \"guest\""
     end
     -- Wearing an admin's name visually. Meaningful only while the gate is active: a server with no admins
@@ -7286,14 +7291,23 @@ function identity.is_enabled()
     return cfg.use_client_name == true
 end
 
+-- Whether `name` is (or would pass for) one of BeamMP's guest names, `guest9508362` on the measured joins.
+-- A guest gets a new one on every game start; a logged-in BeamMP name stays. The one rule for both
+-- readers: the panel's guest marker below, and identity.validate, which refuses it as a /name so a
+-- player-set name can never look like a guest.
+function identity.is_guest_name(name)
+    return type(name) == "string" and normalize_name(name):sub(1, 5) == "guest"
+end
+
 -- EVERY connected player as {id, name, temporary}, for the race-setup panel's Players section
 -- (ADR-0054, round 2). `name` is the name the player is actually shown under -- resolve_identity, the
--- same chokepoint the standings read -- and `temporary` marks a name BeamMP handed out that he can still
--- replace with /name.
+-- same chokepoint the standings read -- and `temporary` marks a BeamMP GUEST name he can still replace
+-- with /name (panel marker "guest name"; user decision 2026-10-26).
 --
--- `temporary` is deliberately NOT simply "he has no client_names entry": with useClientName off nobody
--- can change his name, so marking it temporary would be an instruction he cannot follow. The field says
--- exactly what the marker in the panel claims, under both settings.
+-- A logged-in player without a /name is NOT temporary: his BeamMP name is stable since BeamMP login
+-- works again, so marking him would ask for something nobody needs. With useClientName off nobody can
+-- change his name at all, so nobody is marked either -- the field says exactly what the marker in the
+-- panel claims, under both settings.
 --
 -- Derived from MP.GetPlayers() on every call -- there is no second bookkeeping table to keep in step with
 -- reality.
@@ -7312,7 +7326,8 @@ function identity.player_list(leaving_id)
             rows[#rows + 1] = {
                 id = player_id,
                 name = resolve_identity(player_id) or beammp_name,
-                temporary = enabled and client_names[player_id] == nil,
+                temporary = enabled and client_names[player_id] == nil
+                    and identity.is_guest_name(beammp_name),
             }
         end
     end
@@ -7437,13 +7452,13 @@ function identity.handle_set_names(player_id, payload)
         return
     end
     MP.SendChatMessage(player_id, "BeamComp: driver names are " .. (wanted and "on" or "off")
-        .. " for this session, but the setting could not be saved -- " .. tostring(reason))
+        .. " for this session, but the setting could not be saved (" .. tostring(reason) .. ")")
     log_info("beamcomp.cfg", "could not persist showDriverNames: " .. tostring(reason))
 end
 
--- The Remind button in the race-setup panel (ADR-0054): send the join hint to everyone still on a
--- temporary name, so the admin can fix a grid full of guest names before the start instead of after it.
--- The panel lists ALL players but Remind targets only the temporary ones -- it filters the very list the
+-- The Remind button in the race-setup panel (ADR-0054): send identity.HINT to everyone still on a BeamMP
+-- guest name, so the admin can fix a grid full of guest names before the start instead of after it.
+-- The panel lists ALL players but Remind targets only the marked ones -- it filters the very list the
 -- panel renders, so the button can never reach somebody the panel does not mark.
 -- Admin-gated like the grid messages (ADR-0023) -- it writes to every targeted player's chat.
 --
@@ -7468,7 +7483,7 @@ function identity.handle_remind(player_id)
             reminded = reminded + 1
         end
     end
-    MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d player(s) to set a name", reminded))
+    MP.SendChatMessage(player_id, string.format("BeamComp: reminded %d guest(s) to pick a name", reminded))
     log_info("beamcomp.identity", string.format("%s by %s reached %d player(s)", identity.MSG_REMIND,
         player_name, reminded))
 end
@@ -7476,7 +7491,7 @@ end
 -- A player joined (ADR-0054): put him on the panel's list and start asking him for his connect reports.
 --
 -- The list is pushed NOW because the panel shows every connected player and a join changes it
--- immediately -- he appears at once marked `temporary name`, and loses the marker once his stored name
+-- immediately -- a guest appears at once marked `guest name`, and loses the marker once his stored name
 -- arrives. (This first push is one of the events BeamMP refuses during the handshake; the second join
 -- event and every later change re-push it, and a panel opened afterwards is seeded on open.)
 --
@@ -7632,7 +7647,8 @@ function identity.join_block(player_id, player_name)
         lines[#lines + 1] = identity.JOIN_RACEUI_PASSWORD
     end
     local named = client_names[player_id] ~= nil
-    lines[#lines + 1] = named and identity.JOIN_NAME or identity.JOIN_NAME_PROMPT
+    lines[#lines + 1] = named and identity.JOIN_NAME
+        or (identity.JOIN_NAME_PROMPT .. (player_name or "your BeamMP name"))
     lines[#lines + 1] = identity.JOIN_KEYS
     return lines, raceui, named and "neutral" or "prompt"
 end
@@ -7681,7 +7697,7 @@ function identity.step()
         end
     end
     -- No list push here. The grace belongs to the BLOCK, not to the display: the player has been on the
-    -- panel's list since he joined, marked `temporary name`, and a chat line changes nothing about the row.
+    -- panel's list since he joined, a guest marked `guest name`, and a chat line changes nothing about the row.
 end
 
 -- /name <x>: the player picks the name everyone sees (ADR-0054). Open to every player -- it changes only
@@ -7694,7 +7710,7 @@ end
 -- error rather than a silently dead comparison.
 function identity.handle_command(player_id, player_name, argument)
     if not identity.is_enabled() then
-        MP.SendChatMessage(player_id, "BeamComp: this server shows BeamMP names -- "
+        MP.SendChatMessage(player_id, "BeamComp: this server shows BeamMP names, "
             .. identity.CHAT_COMMAND .. " is switched off")
         return
     end
@@ -7704,7 +7720,7 @@ function identity.handle_command(player_id, player_name, argument)
     end
 
     if session.phase ~= PHASE.lobby and session.phase ~= PHASE.staging then
-        MP.SendChatMessage(player_id, "BeamComp: too late to change your name -- "
+        MP.SendChatMessage(player_id, "BeamComp: too late to change your name. "
             .. identity.CHAT_COMMAND .. " works in the lobby and while the field is staging")
         return
     end
@@ -7724,7 +7740,7 @@ function identity.handle_command(player_id, player_name, argument)
     send_event(player_id, identity.MSG_SET, {name = argument})
     MP.SendChatMessage(player_id, unique == argument
         and ("BeamComp: you race as " .. unique)
-        or ("BeamComp: name taken -- you race as " .. unique))
+        or ("BeamComp: name taken, you race as " .. unique))
 end
 
 -- Store a client's reported player-set name for identity resolution (ADR-0054). Connection-scoped: kept
@@ -7832,7 +7848,7 @@ end
 -- that knowledge -- and `command` is the ONLY string with which he can find the binding in BeamNG's own
 -- settings, so it is worth repeating per assist rather than naming one of the two for both.
 function keys.rebind(assist)
-    return "change the key in Options > Controls under \"" .. assist.command .. "\""
+    return "Change the key in Options > Controls under \"" .. assist.command .. "\""
 end
 
 function keys.lines(player_id)
@@ -7846,17 +7862,17 @@ function keys.lines(player_id)
         local state = type(entry) == "table" and entry.state or nil
         if state == "key" then
             lines[#lines + 1] = "BeamComp: hold " .. entry.key .. " while standing still to "
-                .. assist.does .. " -- " .. keys.rebind(assist)
+                .. assist.does .. ". " .. keys.rebind(assist)
         elseif state == "device" then
             -- The device is not named. The engine reports a raw devicetype ("xinput", "joystick",
             -- "wheel") and notes itself that some force-feedback wheels identify as joysticks, so
             -- "your wheel" would be a guess -- while the one thing worth saying, that the key is not on
             -- his keyboard, is certain.
             lines[#lines + 1] = "BeamComp: " .. assist.doing
-                .. " is bound on another device, not on the keyboard -- " .. keys.rebind(assist)
+                .. " is bound on another device, not on the keyboard. " .. keys.rebind(assist)
         elseif state == "none" then
             lines[#lines + 1] = "BeamComp: no key is bound for " .. assist.doing .. ". Bind \""
-                .. assist.command .. "\" in Options > Controls -- you will need it during a race."
+                .. assist.command .. "\" in Options > Controls, you will need it during a race."
         end
     end
     return lines
@@ -7998,7 +8014,7 @@ local function handle_raceend_command(player_id, player_name)
     end
     log_info("beamcomp.race", "/raceend (force finish) by " .. player_name)
     finalize_race("force finish")
-    MP.SendChatMessage(player_id, "BeamComp: race finished -- results up (cars stay; /raceclear to clear)")
+    MP.SendChatMessage(player_id, "BeamComp: race finished, results are up (cars stay, /raceclear clears them)")
 end
 
 -- Parse a /championship argument into an action plus optional settings (ADR-0040). Recognizes a bare
@@ -8063,7 +8079,7 @@ function champ.handle_command(player_id, player_name, argument)
         champ.start(preset, order, quali_seconds)  -- nil/reversed -> reversed grid; "normal"/"quali" as given
         champ.broadcast()
         tour.broadcast()  -- tell clients the tournament (if it was on) is now off
-        broadcast_chat(string.format("BeamComp: championship started -- points=%s, grid=%s",
+        broadcast_chat(string.format("BeamComp: championship started (points=%s, grid=%s)",
             session.championship.points_preset, champ.order_label(session.championship.order)))
         log_info("beamcomp.champ", "championship started by " .. player_name)
         return
@@ -8077,7 +8093,7 @@ function champ.handle_command(player_id, player_name, argument)
         local winner = champ.winner_text()
         champ.reset()
         champ.broadcast()
-        broadcast_chat(winner and ("BeamComp: championship over -- winner: " .. winner)
+        broadcast_chat(winner and ("BeamComp: championship over, winner: " .. winner)
             or "BeamComp: championship reset")
         log_info("beamcomp.champ", "championship reset by " .. player_name)
         return
@@ -8085,7 +8101,7 @@ function champ.handle_command(player_id, player_name, argument)
 
     -- action == "set": a live preset / grid-order change on an active championship.
     if not champ.is_active() then
-        MP.SendChatMessage(player_id, "BeamComp: no championship active -- /championship start first")
+        MP.SendChatMessage(player_id, "BeamComp: no championship active, type /championship start first")
         return
     end
     champ.set_preset(preset)
@@ -8094,7 +8110,7 @@ function champ.handle_command(player_id, player_name, argument)
     end
     champ.set_quali(quali_seconds)
     champ.broadcast()
-    MP.SendChatMessage(player_id, string.format("BeamComp: championship updated -- points=%s, grid=%s",
+    MP.SendChatMessage(player_id, string.format("BeamComp: championship updated (points=%s, grid=%s)",
         session.championship.points_preset, champ.order_label(session.championship.order)))
 end
 
@@ -8159,7 +8175,7 @@ end
 local function handle_ping_command(player_id, player_name)
     local player_count = MP.GetPlayerCount()
     log_info("beamcomp", CHAT_COMMAND_PING .. " from " .. player_name .. " (id " .. player_id .. ")")
-    MP.SendChatMessage(player_id, "BeamComp v" .. PLUGIN_VERSION .. " -- alive (" .. player_count .. " players online)")
+    MP.SendChatMessage(player_id, "BeamComp v" .. PLUGIN_VERSION .. " is alive (" .. player_count .. " players online)")
     send_event(player_id, "ping", {
         v = PLUGIN_VERSION,
         players = player_count,
@@ -8387,7 +8403,7 @@ local function on_player_disconnect(player_id)
     -- bookkeeping below -- there is no race left to settle.
     if session.phase == PHASE.staging and player_id == session.staged_by then
         log_info("beamcomp.race", "staging preparer " .. tostring(player_id) .. " left; clearing staged race")
-        broadcast_chat("BeamComp: the host who prepared the race left -- race cancelled")
+        broadcast_chat("BeamComp: the host who prepared the race left, race cancelled")
         reset_to_lobby()
         return
     end
@@ -8559,7 +8575,7 @@ function f1.handle_reaction(player_id, payload)
     if record.reaction and record.reaction < 0 then
         record.jump_penalty = session.jump_penalty_seconds or f1.DEFAULT_PENALTY
         local name = resolve_identity(subject_id) or record.name or "A driver"
-        broadcast_chat(string.format("%s jumped the start -- +%gs penalty", name, record.jump_penalty))
+        broadcast_chat(string.format("%s jumped the start, +%gs penalty", name, record.jump_penalty))
     end
     broadcast_standings()
 end
@@ -8901,7 +8917,7 @@ local function handle_grid_save(player_id, payload)
         or type(payload.name) ~= "string" or payload.name == ""
         or type(payload.race) ~= "string" or payload.race == ""
         or type(payload.forward) ~= "table" then
-        MP.SendChatMessage(player_id, "BeamComp: grid save rejected -- bad data")
+        MP.SendChatMessage(player_id, "BeamComp: grid save rejected (bad data)")
         log_info("beamcomp.grid", "gridSave from id " .. tostring(player_id) .. " rejected: bad payload")
         return
     end
@@ -8923,7 +8939,7 @@ local function handle_grid_save(player_id, payload)
         if promoted == payload.name then
             -- The race had no (valid) default, so this grid just became it. Say so: nothing else in the
             -- editor surfaces that automatic assignment.
-            message = message .. " -- it is now this race's default grid"
+            message = message .. ", it is now this race's default grid"
         end
         MP.SendChatMessage(player_id, message)
         log_info("beamcomp.grid", string.format("saved grid '%s' for race '%s' on map '%s' (%s) by %s",
@@ -8950,7 +8966,7 @@ local function handle_grid_assign(player_id, payload)
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
         or type(payload.race) ~= "string" or payload.race == ""
         or type(payload.name) ~= "string" or payload.name == "" then
-        MP.SendChatMessage(player_id, "BeamComp: grid assign rejected -- bad data")
+        MP.SendChatMessage(player_id, "BeamComp: grid assign rejected (bad data)")
         return
     end
 
@@ -8993,7 +9009,7 @@ local function handle_grid_delete(player_id, payload)
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
         or type(payload.race) ~= "string" or payload.race == ""
         or type(payload.name) ~= "string" or payload.name == "" then
-        MP.SendChatMessage(player_id, "BeamComp: grid delete rejected -- bad data")
+        MP.SendChatMessage(player_id, "BeamComp: grid delete rejected (bad data)")
         return
     end
 
@@ -9007,7 +9023,7 @@ local function handle_grid_delete(player_id, payload)
         if promoted then
             -- The deleted grid was this race's default, so a survivor took over (a race with grids always
             -- has exactly one default).
-            message = message .. " -- '" .. promoted .. "' is now its default grid"
+            message = message .. ", '" .. promoted .. "' is now its default grid"
         end
         MP.SendChatMessage(player_id, message)
         log_info("beamcomp.grid", string.format("deleted grid '%s' for race '%s' on map '%s' by %s",
@@ -9107,7 +9123,7 @@ function grid_store.handle_preset_save(player_id, payload)
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
         or type(payload.name) ~= "string" or payload.name == ""
         or type(payload.form) ~= "string" or payload.form == "" then
-        MP.SendChatMessage(player_id, "BeamComp: preset save rejected -- bad data")
+        MP.SendChatMessage(player_id, "BeamComp: preset save rejected (bad data)")
         log_info("beamcomp.preset", "presetSave from id " .. tostring(player_id) .. " rejected: bad payload")
         return
     end
@@ -9142,7 +9158,7 @@ function grid_store.handle_preset_delete(player_id, payload)
     end
     if type(payload) ~= "table" or type(payload.map) ~= "string" or payload.map == ""
         or type(payload.name) ~= "string" or payload.name == "" then
-        MP.SendChatMessage(player_id, "BeamComp: preset delete rejected -- bad data")
+        MP.SendChatMessage(player_id, "BeamComp: preset delete rejected (bad data)")
         return
     end
 
@@ -9339,7 +9355,7 @@ end
 -- validation handshake + start path the typed /race uses. Race-blind: overrides are relayed, not parsed.
 local function handle_start_race(player_id, payload)
     if type(payload) ~= "table" or type(payload.race) ~= "string" or payload.race == "" then
-        MP.SendChatMessage(player_id, "BeamComp: race setup rejected -- no race selected")
+        MP.SendChatMessage(player_id, "BeamComp: race setup rejected, no race selected")
         return
     end
     local player_name = player_name_of(player_id)
@@ -9414,7 +9430,7 @@ function tour.handle_cmd(player_id, payload)
         end
         champ.broadcast()  -- tell clients the championship (if it was on) is now off
         tour.broadcast()
-        broadcast_chat(string.format("BeamComp: class-drop tournament started -- %d classes", count))
+        broadcast_chat(string.format("BeamComp: class-drop tournament started (%d classes)", count))
         log_info("beamcomp.tour", string.format("tournament started by %s (%d classes)", player_name, count))
         return
     end
@@ -9427,7 +9443,7 @@ function tour.handle_cmd(player_id, payload)
         local winner = tour.winner_text()
         tour.reset()
         tour.broadcast()
-        broadcast_chat(winner and ("BeamComp: tournament over -- winner: " .. winner)
+        broadcast_chat(winner and ("BeamComp: tournament over, winner: " .. winner)
             or "BeamComp: tournament reset")
         log_info("beamcomp.tour", "tournament reset by " .. player_name)
         return
@@ -9435,7 +9451,7 @@ function tour.handle_cmd(player_id, payload)
 
     -- action == "set": a live class/order change on a running tournament (non-retroactive on class_index).
     if not tour.is_active() then
-        MP.SendChatMessage(player_id, "BeamComp: no tournament active -- start one first")
+        MP.SendChatMessage(player_id, "BeamComp: no tournament active, start one first")
         return
     end
     tour.set(payload.classes, payload.order)

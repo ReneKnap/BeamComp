@@ -672,16 +672,16 @@
       </div>
     </div>
 
-    <!-- Players (ADR-0054, round 2): everyone on the server, with the ones still on a BeamMP-assigned
-         name marked, so the admin sees before the start whether the standings will be full of guest
-         names. Remind chat-hints exactly the marked ones and nobody else (the server admin-gates it and
-         decides who, from the same list it sent). Sits above Tournament so it is seen on the way down
-         the panel. -->
+    <!-- Players (ADR-0054, round 2): everyone on the server, with the ones still on a BeamMP guest name
+         marked, so the admin sees before the start whether the standings will be full of guest
+         names. A logged-in player keeps his BeamMP name and is not marked (2026-10-26). Remind
+         chat-hints exactly the marked ones and nobody else (the server admin-gates it and decides who,
+         from the same list it sent). Sits above Tournament so it is seen on the way down the panel. -->
     <div class="bc-section">
       <div class="bc-section-title">Players</div>
       <!-- track by p.id: two guests can carry the same BeamMP name, which a bare ng-repeat rejects
            outright ("Duplicates in a repeater"), and it also keeps Angular from stamping $$hashKey onto
-           rows that came straight off the wire. The server owns the order (temporary first, then
+           rows that came straight off the wire. The server owns the order (guests first, then
            alphabetical), so there is no orderBy here to fight it.
 
            isYou is stamped by GE, not by the server: this list goes out as ONE broadcast to everybody,
@@ -690,13 +690,13 @@
       <div class="bc-players-list" bc-setup-tip="tip('players')">
         <div class="bc-player-row" ng-class="{'bc-player-you': p.isYou}" ng-repeat="p in players track by p.id">
           <span class="bc-player-name">{{p.name}}<span ng-if="p.isYou"> (you)</span></span>
-          <span class="bc-player-temp" ng-if="p.temporary">temporary name</span>
+          <span class="bc-player-temp" ng-if="p.temporary">guest name</span>
         </div>
         <div class="bc-players-empty" ng-if="!players.length">nobody connected</div>
       </div>
-      <!-- The count and the disabled state hang on the TEMPORARY players, not on the list length: the
+      <!-- The count and the disabled state hang on the MARKED players, not on the list length: the
            list is non-empty as soon as anyone is on the server, but Remind has nobody to write to unless
-           somebody is still on a name BeamMP gave him. -->
+           somebody is still on a BeamMP guest name. -->
       <div class="bc-row bc-player-actions">
         <button class="bc-refresh" ng-disabled="!temporaryCount" ng-click="remindUnnamed()"
           bc-setup-tip="tip('remindUnnamed')">Remind ({{temporaryCount}})</button>

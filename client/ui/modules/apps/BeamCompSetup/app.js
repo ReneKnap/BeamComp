@@ -348,11 +348,11 @@ angular.module('beamng.apps')
     tourReset: 'Put everyone back in the fastest class and start the class drop tournament again. The '
       + 'tournament keeps running, to stop it, set Mode to off.',
     // --- Players ---
-    players: 'Everyone on the server right now. "temporary name" means the player still carries the name '
-      + 'BeamMP gave them as guest, they can set their own with "/name <name>" in chat.',
+    players: 'Everyone on the server right now. "guest name" marks a player on a BeamMP guest name, which '
+      + 'changes every game start. They can set their own with "/name <name>" in chat.',
     showDriverNames: 'Draws each driver\'s race name over his car, for everyone on the server, and '
       + 'saves it there. Off means no nametags at all. Race props never carry one either way.',
-    remindUnnamed: 'Send a chat line to the players marked "temporary name", telling them how to pick their '
+    remindUnnamed: 'Send a chat line to the players marked "guest name", telling them how to pick their '
       + 'own.',
     remindKeys: 'Send every player the keys his own game has for repairing his car and getting back to the '
       + 'last checkpoint.',
@@ -1705,7 +1705,7 @@ angular.module('beamng.apps')
 
       // Everyone on the server (ADR-0054): GE pushes the list when the panel opens and whenever it
       // changes -- somebody picks a name, joins, or leaves. Kept as an array so the empty state is simply
-      // a length of zero. The server sorts it (temporary names first, alphabetical inside each group), so
+      // a length of zero. The server sorts it (guest names first, alphabetical inside each group), so
       // the rows do not reorder here.
       scope.players = [];
       scope.temporaryCount = 0;
@@ -1738,8 +1738,8 @@ angular.module('beamng.apps')
         geLuaArg('set_driver_names', scope.server.showDriverNames ? '1' : '0');
       };
 
-      // Remind: the server sends the same chat line a joining player gets, to the players marked
-      // temporary and to nobody else -- it filters the very list it sent us, so the button can never
+      // Remind: the server sends a chat line on how to pick a name to the players marked as guests
+      // and to nobody else -- it filters the very list it sent us, so the button can never
       // reach somebody this panel does not mark. Admin-gated server-side like the grid messages, so a
       // non-admin panel simply gets a refusal in chat.
       scope.remindUnnamed = function () {

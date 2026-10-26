@@ -296,7 +296,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- the grid editor stand CP0's and CP1's posts across the route when they have no normal, lines such a race
 -- up behind its forward finish in reverse, and logs "grid direction for '<id>' (<direction>): ..." once per
 -- race start and per editor anchor when it took the start rotation.
-local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1-gridplan-r4-crawlheading-r1/2026-10-24"
+local BUILD_MARKER = "raceui-reopen-and-nametags-r3-aicar-r1-lists-r1-gridcam-r3-partlock-r1-confirmhint-r1-recoverground-r1-qualilaps-r1-hostaitags-r1-keysdup-r3-adminlists-r1-griddir-r1-revsprint-r1-afkassist-r1-gridenter-r1-gridplan-r4-crawlheading-r1-playertexts-r1/2026-10-26"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -1053,8 +1053,8 @@ local function handle_race_start(payload)
         -- best-effort now, never a non-participation outcome. The ordinary Mode-1 on-foot fresh-spawn does
         -- NOT set this flag, so a plain foot-start stays silent (it is not a no-suitable-car case).
         log("W", RACE_LOG_TAG, "no suitable car -- spawned default; warning and racing")
-        notice.say("No suitable car available -- spawning default car", "warning",
-            "BeamComp -- " .. race.name)
+        notice.say("No suitable car available, spawning the default car", "warning",
+            "BeamComp: " .. race.name)
     end
     if race_car then
         -- Remember the race car as the bounce target for the in-race switch lock (onVehicleSwitched):
@@ -1192,8 +1192,8 @@ local function handle_race_start(payload)
             -- Performance hint (ADR-0036 Etappe B): all AI physics run on this host, so warn once past a
             -- handful. Owner-local + non-blocking -- it never gates the spawn.
             if #cars >= AI_PERF_HINT_THRESHOLD then
-                notice.say(string.format("%d AI cars run on your machine -- expect higher load.", #cars),
-                    "warning", "BeamComp -- AI")
+                notice.say(string.format("%d AI cars run on your machine, expect a higher load.", #cars),
+                    "warning", "BeamComp: AI")
             end
         end
     end
@@ -2733,7 +2733,7 @@ function quali.request_requeue()
         vehicles.set_vehicle_frozen(own, true)
     end
     countdown.clear()
-    notice.say("Recover -- new attempt, back of the queue", "info")
+    notice.say("Recover: new attempt, back of the queue", "info")
     log("I", RACE_LOG_TAG, "staged quali: requeued self on recover")
 end
 
@@ -3261,7 +3261,7 @@ local function handle_validate_race(payload)
             -- server posts this reason to the issuing admin exactly like a geometry refusal, and the
             -- geometry blob is dropped -- nothing is going to be built from this verdict.
             result.ok = false
-            result.reason = "car=host needs you in a car -- get in the one everyone should race, "
+            result.reason = "car=host needs you in a car. Get in the one everyone should race, "
                 .. "then start again"
             result.raceData = nil
         end
@@ -4053,7 +4053,7 @@ local function handle_grid_list(payload)
     for _, group in ipairs(groups) do
         lines[#lines + 1] = tostring(group.race) .. ": " .. table.concat(group.names, ", ")
     end
-    editor_feedback("saved grids (* = race default) -- " .. table.concat(lines, " | "))
+    editor_feedback("saved grids (* = race default): " .. table.concat(lines, " | "))
 end
 
 -- Push the current map's saved preset names to the race-setup panel (ADR-0037 amendment). The panel is
@@ -4809,7 +4809,7 @@ function M.grid_save(name)
     end
     local snapshot = grideditor.snapshot(name)
     if not snapshot then
-        editor_feedback("not editing -- start or load a grid first", "warning")
+        editor_feedback("not editing, start or load a grid first", "warning")
         return
     end
     send_to_server("gridSave", snapshot)
@@ -5130,18 +5130,18 @@ function M.reset_ui_layout()
         return
     end
     if status == "none" then
-        notice.say("No BeamComp window on your layout -- nothing to reset.", "info")
+        notice.say("No BeamComp window on your layout, nothing to reset.", "info")
         return
     end
     if status == "deferred" then
-        notice.say("The HUD apps menu has your layout -- the reset runs when you leave it.", "info")
+        notice.say("The HUD apps menu has your layout. The reset runs when you leave it.", "info")
         return
     end
     if status == "unavailable" then
-        notice.say("Could not read your window layout -- nothing was reset.", "warning")
+        notice.say("Could not read your window layout, nothing was reset.", "warning")
         return
     end
-    notice.say("Could not write your window layout -- nothing was reset.", "warning")
+    notice.say("Could not write your window layout, nothing was reset.", "warning")
 end
 
 -- A server bestNotice: this client set a personal best and/or the race's track record (ADR-0027).
@@ -6565,7 +6565,7 @@ function hold.circuit_run()
     -- vehicle-config respawn, so the freeze cannot be thrown off again.
     hold.sync()
     log("I", RACE_LOG_TAG, "quali hold: lap closed in the grace window; car parked for the session")
-    notice.say("Qualifying run complete -- your car stays parked until the session ends", "info")
+    notice.say("Qualifying run complete. Your car stays parked until the session ends", "info")
 end
 
 -- Surface one detected checkpoint passage: log + centred readout + report to the server. This is the
@@ -7964,11 +7964,11 @@ end
 -- but it also has to read right for a player who has that filter silently no-op on a future engine version.
 function hold.notify_blocked()
     if M.state.quali_status == "done" or M.state.quali_lap_done then
-        notify_assist_blocked("Your qualifying run is over -- the car stays put")
+        notify_assist_blocked("Your qualifying run is over, the car stays put")
     elseif M.state.quali_status == "staged" then
-        notify_assist_blocked("Reset is locked -- your run starts in a moment")
+        notify_assist_blocked("Reset is locked, your run starts in a moment")
     else
-        notify_assist_blocked("Reset is locked -- wait for your turn")
+        notify_assist_blocked("Reset is locked, wait for your turn")
     end
 end
 
@@ -8191,30 +8191,30 @@ local function warn_over_cap(veh, power, weight, caps)
     local detail
     if caps.maxhp and not (type(power) == "number" and power <= caps.maxhp) then
         if type(power) == "number" then
-            detail = string.format("%s has %d hp -- limit is %d hp", name, math.floor(power + 0.5), caps.maxhp)
+            detail = string.format("%s has %d hp, the limit is %d hp", name, math.floor(power + 0.5), caps.maxhp)
         else
-            detail = string.format("%s: engine power couldn't be verified -- limit is %d hp", name, caps.maxhp)
+            detail = string.format("%s: engine power couldn't be verified, the limit is %d hp", name, caps.maxhp)
         end
     elseif caps.maxpwr and not pwr_ok then
         if type(power) == "number" and type(weight) == "number" and weight > 0 then
-            detail = string.format("%s has %.2f hp/kg -- limit is %.2f hp/kg",
+            detail = string.format("%s has %.2f hp/kg, the limit is %.2f hp/kg",
                 name, power / weight, caps.maxpwr)
         else
-            detail = string.format("%s: power-to-weight couldn't be verified -- limit is %.2f hp/kg",
+            detail = string.format("%s: power-to-weight couldn't be verified, the limit is %.2f hp/kg",
                 name, caps.maxpwr)
         end
     elseif breaks_weight_range(weight, caps) then
         if type(weight) == "number" then
-            detail = string.format("%s weighs %d kg -- limit is %s", name, math.floor(weight + 0.5),
+            detail = string.format("%s weighs %d kg, the limit is %s", name, math.floor(weight + 0.5),
                 weight_limit_label(caps))
         else
-            detail = string.format("%s: curb weight couldn't be verified -- limit is %s", name,
+            detail = string.format("%s: curb weight couldn't be verified, the limit is %s", name,
                 weight_limit_label(caps))
         end
     else
         detail = name .. " exceeds the vehicle limit"
     end
-    notice.say("Can't stage that car -- " .. detail, "warning")
+    notice.say("Can't stage that car. " .. detail, "warning")
     log("I", RACE_LOG_TAG, "rejected over-cap staging swap: " .. detail)
 end
 
@@ -8463,7 +8463,7 @@ local function step_staging(dt_real)
     local race = M.state.race
     local hint = nil
     if race and race.startMode == "f1" then
-        hint = "F1 light start -- hold until lights out"
+        hint = "F1 light start: hold until lights out"
         local penalty = tonumber(race.jumpPenaltySeconds)
         if penalty then
             hint = hint .. " (jump = +" .. tostring(penalty) .. "s)"
@@ -8981,7 +8981,7 @@ function beamcomp_grid_new(race_name)
     local ok, reason = grideditor.start_fresh(race_name)
     if ok then
         editor_feedback("editing new grid for '" .. tostring(reason)
-            .. "' -- tune with beamcomp_grid_set(\"<knob>\", <value>)")
+            .. "', tune it with beamcomp_grid_set(\"<knob>\", <value>)")
     else
         editor_feedback(tostring(reason), "warning")
     end
@@ -9066,7 +9066,7 @@ end
 function beamcomp_grid_removebreak()
     local ok, reason = grideditor.remove_segment()
     if ok then
-        editor_feedback("breakpoint removed -- merged into the previous segment")
+        editor_feedback("breakpoint removed, merged into the previous segment")
     else
         editor_feedback(tostring(reason), "warning")
     end
@@ -9086,7 +9086,7 @@ function beamcomp_grid_save(name)
     end
     local snapshot = grideditor.snapshot(name)
     if not snapshot then
-        editor_feedback("not editing -- beamcomp_grid_new(\"<race>\") first", "warning")
+        editor_feedback("not editing, run beamcomp_grid_new(\"<race>\") first", "warning")
         return
     end
     send_to_server("gridSave", snapshot)
@@ -9122,7 +9122,7 @@ function beamcomp_grid_cancel()
     M.state.grid_edit_checkpoints = nil
     -- The console's Close: the camera goes back to where it was before the first jump (ADR-0063).
     M.gridcam.leave("cancel")
-    editor_feedback("grid editing ended -- pillars cleared")
+    editor_feedback("grid editing ended, pillars cleared")
 end
 
 return M

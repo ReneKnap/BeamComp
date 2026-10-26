@@ -503,7 +503,7 @@ local function resolve_race(payload)
         if loaded then
             local elsewhere = discovery.resolve(payload.race, nil, include_deprecated)
             if elsewhere and elsewhere.map and not maps.matches(loaded, elsewhere.map) then
-                return nil, nil, "race is on map '" .. elsewhere.map .. "' -- you are on '"
+                return nil, nil, "race is on map '" .. elsewhere.map .. "', you are on '"
                     .. loaded .. "'"
             end
         end
@@ -610,10 +610,10 @@ function M.validate(payload)
     end
     if not payload.force then
         if payload.direction == "reverse" and not (race.meta and race.meta.reversible) then
-            return {ok = false, reason = "not reversible -- add 'force' to reverse it anyway"}
+            return {ok = false, reason = "not reversible, add 'force' to reverse it anyway"}
         end
         if payload.mode == "circuit" and not (race.meta and race.meta.closed) then
-            return {ok = false, reason = "not a loop -- add 'force' to run as circuit anyway"}
+            return {ok = false, reason = "not a loop, add 'force' to run it as a circuit anyway"}
         end
     end
     -- Hand the server the aiRace content AI defaults (ADR-0036 Etappe B): the race-blind server uses
@@ -671,7 +671,7 @@ local function race_from_distribution(race_data)
     local locator = race_data.locator
     local loaded = maps.current()
     if loaded and locator.map and not maps.matches(loaded, locator.map) then
-        return nil, "race is on map '" .. tostring(locator.map) .. "' -- you are on '"
+        return nil, "race is on map '" .. tostring(locator.map) .. "', you are on '"
             .. tostring(loaded) .. "'"
     end
 

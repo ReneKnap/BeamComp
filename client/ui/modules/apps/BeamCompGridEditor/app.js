@@ -613,7 +613,7 @@ angular.module('beamng.apps')
           if (g.race === scope.form.race) {
             own.push({ v: key, label: g.isDefault ? g.name + ' (default)' : g.name });
           } else {
-            foreign.push({ v: key, label: g.name + ' — ' + raceLabel(g.race) });
+            foreign.push({ v: key, label: g.name + ' (' + raceLabel(g.race) + ')' });
           }
         });
         if (own.length && foreign.length) {
