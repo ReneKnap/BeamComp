@@ -109,7 +109,7 @@ end
 -- The one place the release version lives. scripts/package.ps1 reads this line to name the download,
 -- so the number a user sees on the zip is the number the server reports back with /beamcomp. Bump it
 -- here and nowhere else -- except the three ui/modules/apps/*/app.json, which BeamNG reads directly.
-local PLUGIN_VERSION = "0.9.0"
+local PLUGIN_VERSION = "0.10.0"
 local CHAT_COMMAND_RACE = "/race"
 local CHAT_COMMAND_RACEEND = "/raceend"  -- force-finish the race straight to the results screen, no despawn (ADR-0038)
 local CHAT_COMMAND_RACECLEAR = "/raceclear"  -- force the machine back to lobby + cleanup/despawn (old /raceend; ADR-0038)

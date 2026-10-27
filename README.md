@@ -192,9 +192,9 @@ loaded again next time.
 
 ## Starting grids
 
-**105 races come with a grid already built and assigned**, covering Grid Map, Hirochi Raceway, Italy
-and West Coast USA. You do not have to do anything for those, they start on a proper grid out of the
-box. Every other race starts on a sensible default layout until you build one for it.
+**251 races come with a grid already built and assigned**, on the 13 maps that ship with races. You do
+not have to do anything for those, they start on a proper grid out of the box. Every other race starts
+on a sensible default layout until you build one for it.
 
 **Edit…** next to the grid in the race panel opens the grid editor: rows and columns, spacing, where the
 field sits relative to the start line, and how it is angled. You see the result on the track while you

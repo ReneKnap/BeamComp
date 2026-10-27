@@ -63,8 +63,8 @@ across first:
 
 - **Preserved:** `beamcomp.grids.json`, `beamcomp.presets.json`, `beamcomp.runs.jsonl`. Each preserve
   step is guarded, so deploying to a fresh target is fine.
-  **`server/beamcomp.grids.json` is authored content, not an empty seed.** It holds 105 races with a
-  grid and a default assignment, and it ships. Because the deploy preserves an existing target file, a server
+  **`server/beamcomp.grids.json` is authored content, not an empty seed.** It holds 251 races on 13
+  maps with a grid and a default assignment, and it ships. Because the deploy preserves an existing target file, a server
   that already has grids keeps its own and therefore never receives newly shipped ones; only a fresh
   install gets the current set. Say so in the changelog when the set grows.
   Grids are edited in-game, so updating the shipped set means copying the live file back into the

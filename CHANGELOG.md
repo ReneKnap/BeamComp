@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.0 Early Access (2026-09-12)
+## 0.10.0 Early Access (2026-10-27)
 
 The first release. Everything here is new.
 
@@ -23,8 +23,8 @@ below rather than hidden.
 
 ### Starting the field
 
-- **Grids for 105 races are included and already assigned**, on Grid Map, Hirochi Raceway, Italy and
-  West Coast USA. Every other race starts on a sensible default layout.
+- **Grids for 251 races are included and already assigned**, on the 13 maps that ship with races.
+  Every other race starts on a sensible default layout.
 - Parametric starting grids with rows, columns, spacing, distance behind the line and angle, edited
   in game with a live preview and saved by name.
   Opened from the setup panel, the grid editor starts in the direction the race is set to run, and
@@ -66,7 +66,8 @@ below rather than hidden.
 - `showDriverNames` decides whether names are drawn over the cars at all. It can be switched from the
   setup panel's gear menu while the server runs, and the change is written back into
   `beamcomp.config.ini`. The rest of the file, comments and password included, is left untouched.
-- Players pick the name everyone sees with `/name`.
+- Players can pick the name everyone sees with `/name`. Without one they race under their BeamMP name.
+  The setup panel marks players on a guest name and can remind them to pick one.
 - Recover and repair as a held key during the race, on by default and switchable per race.
   A recovered car stands on its wheels at the checkpoint, following the slope of the road, instead of
   rolled onto its side or sunk into the surface.
