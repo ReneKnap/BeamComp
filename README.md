@@ -1,4 +1,8 @@
-# BeamComp
+<h1 align="center">BeamComp</h1>
+
+<p align="center">
+  <img src="docs/images/logo.png" alt="BeamComp logo" width="160">
+</p>
 
 **Turn BeamNG.drive's singleplayer time-trial races into real multiplayer races on your BeamMP
 server.**
@@ -19,6 +23,8 @@ BeamComp is free and open source. If you enjoy it, you can support it on
 [PayPal](https://paypal.me/ReneKnap). That is voluntary and buys nothing extra.
 
 ## What you get
+
+![A field of cars lined up on a starting grid, waiting for the host to start, with the race setup panel open](docs/images/screenshot.jpg)
 
 - **Real starting grids.** Cars line up in rows and columns, not in a heap on the spawn point. Grids
   are editable in-game and saved per race.
