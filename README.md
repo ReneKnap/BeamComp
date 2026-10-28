@@ -20,9 +20,7 @@ This is an Early Access release: complete and playable, with a few known rough e
 
 **BeamComp is developed with AI.**
 
-BeamComp is free and open source. If you enjoy it, you can support it on
-[Patreon](https://www.patreon.com/c/ReneKnap), [Buy Me a Coffee](https://buymeacoffee.com/rekn) or
-[PayPal](https://paypal.me/ReneKnap). That is voluntary and buys nothing extra.
+BeamComp is free and open source. 
 
 ## What you get
 
