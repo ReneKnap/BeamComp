@@ -240,7 +240,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0/2026-10-27"
+local BUILD_MARKER = "0.10.0-qualifreeze-r1/2026-10-29"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -372,7 +372,7 @@ M.state = {
     player_list = nil,        -- latest server-broadcast list of the connected players {{id, name, temporary}, ...} (ADR-0054), or nil; rendered in the setup panel's Players section. Safe at nil across a GE reload: the panel then shows its empty state until the next broadcast, and the server pushes on every join, leave and accepted name
     qualifying = nil,         -- qualifying-clock {remaining} for the quali time-remaining HUD (ADR-0041), ticked locally; nil outside the qualifying phase
     qualiResults = nil,       -- quali-results pause clock {remaining} for the "race starts in" countdown (ADR-0041), ticked locally; nil outside quali-results
-    quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041)
+    quali_settle = false,     -- true once the quali re-grid has placed the cars on the race grid, opening the post-spawn settle window before the start countdown (ADR-0041). Two readers: the HUD (the small "race starts in" timer) and hold.is_frozen_phase, which keeps the own car frozen from here on (bug quali-results-pause-freeze-not-reasserted). Set only by handle_regrid in qualiResults; reset at qualiResults entry, at racing, at raceStart and in teardown_race_world
     quali = nil,              -- latest server-broadcast quali classification snapshot {rows} (ADR-0041), or nil; rendered on the quali-results card
     sector_track = nil,       -- qualifying live sector-split tracker (race/sectors), armed on a circuit quali; nil on a sprint quali / outside qualifying
     -- Rally staged sprint quali (ADR-0044): the staged single-car-from-P1 sprint variant. All nil/false
@@ -1642,19 +1642,28 @@ function hold.is_held()
     return M.state.quali_lap_done == true
 end
 
--- The FULL "the local driver's car is supposed to be standing still right now" window: the two frozen
--- start phases plus the qualifying hold above. Two layers read it and must never disagree -- the EV
--- throttle clamp arms on it (push_freeze_hold's onUpdate gate) and the in-place reload re-arm
--- re-asserts the GE controller freeze on it (rearm_own_car_on_reload, bug
--- recover-unguarded-when-assists-disabled). One predicate, so they cannot drift apart.
+-- The FULL "the local driver's car is supposed to be standing still right now" window. Two layers read
+-- it and must never disagree -- the EV throttle clamp arms on it (push_freeze_hold's onUpdate gate) and
+-- the in-place reload re-arm re-asserts the GE controller freeze on it (rearm_own_car_on_reload, bug
+-- recover-unguarded-when-assists-disabled). One predicate, so they cannot drift apart. Four windows:
+--   * staging -- the open-ended wait on the grid slot;
+--   * a NUMERIC start countdown (the F1 light start is carved out, see below);
+--   * the settle window after a quali re-grid (bug quali-results-pause-freeze-not-reasserted): the rest of
+--     the qualiResults pause once handle_regrid has put the car on its earned race slot and opened
+--     M.state.quali_settle. The numeric countdown that follows continues it without a gap. The
+--     results-display half BEFORE the re-grid stays out on purpose: the car still stands wherever its quali
+--     ended (parked by a hold, or free after a DNF), and the re-grid teleports and freezes it anyway;
+--   * the qualifying hold above.
 --
 -- The F1 light start is carved out on purpose: it keeps the phase at `countdown` while f1_begin_lights
 -- has already FREED the car at the first light (ADR-0043), so anything re-freezing on a blanket
--- `countdown` would strand the driver on the grid at lights-out. Race-agnostic -- callers add their own
+-- `countdown` would strand the driver on the grid at lights-out. After a quali that is the same release:
+-- f1_begin_lights disarms the clamp the settle window armed. Race-agnostic -- callers add their own
 -- M.state.race check (the reload re-arm has already made it by the time it asks).
 function hold.is_frozen_phase()
     return M.state.phase == "staging"
         or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))
+        or (M.state.phase == "qualiResults" and M.state.quali_settle)
         or hold.is_held()
 end
 
@@ -2168,9 +2177,12 @@ local function handle_regrid(payload)
     end
     -- A quali re-grid (fired during the quali-results pause) is the cars landing on the earned race grid:
     -- open the settle window so the HUD steps the big results card back for a small "race starts in" timer
-    -- before the start countdown (ADR-0041). A pwr re-grid runs in staging and never enters this phase, so
-    -- it leaves the flag untouched. Set before the own-car re-place below so an edge-case early return there
-    -- cannot skip it -- the server still advances to the countdown regardless.
+    -- before the start countdown (ADR-0041). The same flag opens the own car's freeze window
+    -- (hold.is_frozen_phase), so a config respawn from here on is re-frozen in place. A pwr re-grid runs in
+    -- staging and never enters this phase, so it leaves the flag untouched. Set before the own-car re-place
+    -- below so an edge-case early return there cannot skip it -- the server still advances to the countdown
+    -- regardless. A car whose re-place failed is then held where it stands (the EV clamp, a respawn's
+    -- re-freeze), which is no worse than the countdown starting it from there.
     if M.state.phase == "qualiResults" then
         M.state.quali_settle = true
     end
@@ -6354,9 +6366,12 @@ local function rearm_own_car_on_reload(vehicle_id)
     end
     last_reload_rearm_at = now
     -- The freeze half runs only where the car is supposed to be standing still: the staging wait, a
-    -- numeric countdown, or a qualifying HOLD. hold.is_frozen_phase() is the SAME predicate the EV clamp
-    -- arms on, F1-lights carve-out included -- during a light start the phase is still `countdown` while
-    -- ADR-0043 has already freed the car, and re-freezing it there would strand the driver at lights-out.
+    -- numeric countdown, the settle window after a quali re-grid, or a qualifying HOLD. In qualiResults
+    -- that splits the pause: re-frozen once the re-grid has put the car on its race slot, not re-frozen in
+    -- the results display before it (the re-grid freezes it there anyway). hold.is_frozen_phase() is the
+    -- SAME predicate the EV clamp arms on, F1-lights carve-out included -- during a light start the phase
+    -- is still `countdown` while ADR-0043 has already freed the car, and re-freezing it there would strand
+    -- the driver at lights-out.
     local freeze_note = " (drivable phase: not re-frozen)"
     if hold.is_frozen_phase() then
         -- Re-assert the GE controller freeze in place (no teleport) -- the config respawn reset it, and it
@@ -8694,9 +8709,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         or M.state.phase == "qualifying" or M.state.phase == "qualiResults") and M.state.race then
         push_assist_arm()
     end
-    -- Arm the EV start-freeze throttle clamp over the frozen phases (staging + countdown), so it lifts on
-    -- racing with the GE freeze (ADR-0017 amendment). The VE clamps only on EVs. Skip it during an F1
-    -- light-start countdown: that frees the car at the first light (ADR-0043), so the clamp must not re-arm.
+    -- Arm the EV start-freeze throttle clamp over the frozen windows (staging, a numeric countdown, and the
+    -- settle window after a quali re-grid), so it lifts on racing with the GE freeze (ADR-0017 amendment).
+    -- The VE clamps only on EVs. Skip it during an F1 light-start countdown: that frees the car at the first
+    -- light (ADR-0043), so the clamp must not re-arm -- after a quali as well, where f1_begin_lights disarms
+    -- the clamp the settle window armed.
     --
     -- A qualifying HOLD is a frozen phase too (bug quali-hold-reset-and-repaint-leak): controller.setFreeze
     -- is a soft hold that an EV's instant 0-rpm torque creeps through, so without the clamp an electric car
