@@ -240,7 +240,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-qualifreeze-r1/2026-10-29"
+local BUILD_MARKER = "0.10.0-provflash-r1/2026-10-31"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -3345,21 +3345,22 @@ local function handle_finish_grace(payload)
     end
 end
 
--- True when the local player is out of the running race -- finished (detection done) or DNF'd (their
--- standings row is flagged, ADR-0014). Gates the provisional results view during the racing phase.
+-- True when the local player is out of the running race -- the server has flagged his standings row
+-- finished or DNF (ADR-0014). Gates the provisional results view during the racing phase, both the /results
+-- toggle (handle_results_toggle) and the card itself (build_hud_snapshot), so the two always answer alike.
+-- Deliberately the server's flag and not the local detector, which is done one round trip earlier: the
+-- HUD's FINISHED banner fires on that same server flag, and the app can only hold the card behind a banner
+-- that has started, so a detector-keyed card flashed up for that round trip before the banner covered it.
 local function local_is_out()
-    local detection = M.state.detection
-    if detection and detection.done then
-        return true
-    end
     local race = M.state.race
     local my_slot = race and race.mySlot
     local standings = M.state.standings
-    if my_slot ~= nil and standings then
-        for _, e in ipairs(standings) do
-            if e.slot == my_slot then
-                return e.dnf and true or false
-            end
+    if my_slot == nil or not standings then
+        return false
+    end
+    for _, e in ipairs(standings) do
+        if e.slot == my_slot then
+            return (e.finished or e.dnf) and true or false
         end
     end
     return false
@@ -7216,6 +7217,9 @@ local function build_hud_snapshot()
     local checkpoint_count = (race and race.plan and race.plan.count)
         or ((race and race.checkpoints) and #race.checkpoints) or 0
     local lap_count = (race and race.laps) or 1
+    -- The local detector, done on the frame the car crosses the line and one round trip ahead of the
+    -- server's `finished` flag. Right for "can you still finish" (grace_can_finish below); the provisional
+    -- card waits for the server flag instead (local_is_out).
     local local_finished = detection and detection.done
     local local_dnf = false
     -- Both racing and qualifying drive the local detector + lap clock (ADR-0041), so the live local-row
@@ -7586,9 +7590,13 @@ local function build_hud_snapshot()
     end
 
     -- Provisional results card (ADR-0022), shown to a finished/DNF'd player while the race still runs.
+    -- Keyed on the server-confirmed finish (local_is_out), the same flag of the same standings the entries
+    -- above carry as `finished` -- which is what the app's FINISHED banner fires on. Card and banner
+    -- therefore flip in one snapshot, and the app holds the card back until the banner fades; keyed on the
+    -- detector, the card was up one round trip before the banner existed to hold it.
     -- Its penalized row list is built only while the card is actually up -- like the analysis block above,
     -- the closed default costs nothing per frame.
-    local provisional_available = ((phase == "racing") and (local_finished or local_dnf)) and true or false
+    local provisional_available = phase == "racing" and local_is_out()
     local provisional_entries = nil
     if provisional_available and M.state.provisional_open and standings then
         provisional_entries = build_provisional_entries(entries, standings)
