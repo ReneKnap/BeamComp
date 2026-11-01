@@ -2833,6 +2833,8 @@ end
 -- from each report -- ADR-0013); `finished` flips on the final crossing, and `dnf` flips (terminally)
 -- on disconnect, /dnf, or finish-grace expiry (ADR-0014). Splits are 1-based: splits[k] is the
 -- cumulative race-relative time at the k-th scored crossing; segment deltas are derived, not stored.
+-- `left` is not seeded: on_player_disconnect sets it on a leaver's record (and on the AI of a leaving
+-- owner), and quali.regrid reads it to seat only the drivers still here.
 local function build_progress(slots)
     local progress = {}
     for _, entry in ipairs(slots) do
@@ -3746,18 +3748,38 @@ function quali.snapshot()
 end
 
 -- Re-grid the field by the qualifying classification at the quali-results -> countdown seam (ADR-0041),
--- mirroring regrid_by_pwr: reassign every participant a slot in quali-pace order (pole = fastest), rebuild
--- the roster, and send each client its new slot + the reordered roster so it re-places (regrid) before the
--- race countdown. AI slots ride the owner's regrid (ADR-0036). A no-op when this is not a quali event or no
--- one set a time (the provisional random grid then stands).
+-- mirroring regrid_by_pwr: reassign every participant still here a slot in quali-pace order (pole =
+-- fastest), rebuild the roster, and send each client its new slot + the reordered roster so it re-places
+-- (regrid) before the race countdown. AI slots ride the owner's regrid (ADR-0036). A no-op when this is not
+-- a quali event or no one set a time (the provisional random grid then stands).
 function quali.regrid()
     if not session.progress or not quali.is_active() then
         return
     end
     local players = MP.GetPlayers()
-    local ids = {}
-    for id in pairs(session.progress) do
-        ids[#ids + 1] = id
+    -- Seat only the drivers who are still here (ADR-0041 amendment 2026-11-01). The re-seed below writes a
+    -- fresh active record for every id it is handed, so a player who left during the quali, or the AI of an
+    -- owner who left, would come back as a race participant nobody drives: no checkpoints, no AFK report,
+    -- the finish grace held open for its full length. Filtered on PRESENCE, never on `dnf`: a leaver is
+    -- marked `left` by the disconnect handler (an AI with its owner), and that mark is what catches a
+    -- player who reconnected in the meantime -- his client has no race any more, and BeamMP may well have
+    -- handed him the same id back. Not being connected now is the backstop. The classification is untouched
+    -- (quali.snapshot already went out), so the results card still lists the leavers with their times; the
+    -- remaining field simply closes up by quali pace.
+    local owner_here = session.owner_id ~= nil and players[session.owner_id] ~= nil
+    local ids, gone = {}, {}
+    for id, record in pairs(session.progress) do
+        local here
+        if is_ai_id(id) then
+            here = owner_here
+        else
+            here = players[id] ~= nil
+        end
+        if here and not record.left then
+            ids[#ids + 1] = id
+        else
+            gone[#gone + 1] = tostring(id)
+        end
     end
     table.sort(ids, function(a, b) return session.progress[a].slot < session.progress[b].slot end)
     -- place_by_identity maps each id's identity (player license or "AI <k>") onto the quali ranking, fastest
@@ -3809,7 +3831,9 @@ function quali.regrid()
             send_event(entry.id, MSG_REGRID, payload)
         end
     end
-    log_info("beamcomp.race", string.format("quali re-grid: %d participant(s) by best time", #ordered))
+    table.sort(gone)
+    log_info("beamcomp.race", string.format("quali re-grid: %d participant(s) by best time%s", #ordered,
+        #gone > 0 and string.format("; %d gone, no race slot: %s", #gone, table.concat(gone, ", ")) or ""))
 end
 
 -- Size the finish-your-lap grace when the quali clock expires (ADR-0041): a lap's worth of time so a
@@ -4278,7 +4302,7 @@ end
 -- in the existing clearing gate rather than a second timer: the distance condition is purpose-served (this
 -- driver is off the track for gate purposes) and the gap restarts from now, so advance_staged frees the ramp
 -- exactly STAGE_GAP later. clearing_id stays set until then, which keeps release_next held and the queue
--- broadcast's `waiting` flag honest. Callers: quali.requeue (Round 10) and quali.purge_driver (disconnect).
+-- broadcast's `waiting` flag honest. Callers: quali.requeue (Round 10) and quali.purge_drivers (disconnect).
 function quali.settle_ramp(id)
     local q = session.quali
     q.clearing_id = id
@@ -4382,23 +4406,23 @@ function quali.handle_reset(player_id, payload)
     log_info("beamcomp.race", "player " .. tostring(player_id) .. " recover -> requeued (staged quali)")
 end
 
--- Drop a disconnected driver out of the turn rotation (called from on_player_disconnect). Without this the
--- leaver's id stays in the queue forever and keeps being handed ramp turns nobody drives: release_next stages
--- the ghost, nothing ever reports its clear, and STAGE_CLEAR_TIMEOUT force-requeues it to the back -- a ~33 s
--- cycle that burns ramp time the real drivers need for the rest of the window.
+-- Drop disconnected drivers out of the turn rotation (called from on_player_disconnect with the leaver, plus
+-- every AI he drove when he was the race owner -- they leave with him, ADR-0014 amendment 2026-11-01).
+-- Without this a leaver's id stays in the queue forever and keeps being handed ramp turns nobody drives:
+-- release_next stages the ghost, nothing ever reports its clear, and STAGE_CLEAR_TIMEOUT force-requeues it
+-- to the back -- a ~33 s cycle that burns ramp time the real drivers need for the rest of the window.
 --
 -- Deliberately NOT quali.requeue: that would send a hold to a client that is gone, and its reset_progress
 -- would clear the record.dnf the disconnect handler just set. The record itself stays exactly as it is --
--- the leaver keeps their DNF mark, their best run time, their classification rank and the grid slot it earns
--- (ADR-0014; quali.ranking measures pace, not presence). Only the rotation drops them.
+-- the leaver keeps their DNF mark, their best run time and their classification rank (quali.ranking
+-- measures pace, not presence), so the results card still lists them. Only the rotation drops them here;
+-- the race grid is decided later, and the re-grid seats only the drivers still here (quali.regrid).
 --
 -- Staged qualifying only: the circuit quali (ADR-0041) has no queue, and every other phase is already
--- covered by the disconnect handler's own branches.
-function quali.purge_driver(id)
-    if not quali.is_staged() or session.phase ~= PHASE.qualifying then
-        return
-    end
-    if not (session.progress and session.progress[id]) then
+-- covered by the disconnect handler's own branches. One queue broadcast for the whole set, so an owner who
+-- takes eight AI with him costs one snapshot rather than nine.
+function quali.purge_drivers(ids)
+    if not quali.is_staged() or session.phase ~= PHASE.qualifying or not session.progress then
         return
     end
     local q = session.quali
@@ -4408,28 +4432,37 @@ function quali.purge_driver(id)
     if not q.status or not q.queue then
         return
     end
-    -- The leaver occupied the ramp, counting down on it or driving off it. BeamMP does not despawn their car
-    -- instantly, so free the ramp through a settle rather than outright -- the next driver must never be
-    -- teleported into it in the same tick. Both roles settle: a driver mid-count is parked ON the ramp, which
-    -- is if anything more in the way than one that has already launched.
-    local held_ramp = q.staging_id == id or q.clearing_id == id
-    if q.staging_id == id then
-        q.staging_id = nil
-        q.staged_at = nil
+    local purged = false
+    for _, id in ipairs(ids) do
+        if session.progress[id] then
+            -- The leaver occupied the ramp, counting down on it or driving off it. BeamMP does not despawn
+            -- their car instantly, so free the ramp through a settle rather than outright -- the next driver
+            -- must never be teleported into it in the same tick. Both roles settle: a driver mid-count is
+            -- parked ON the ramp, which is if anything more in the way than one that has already launched.
+            local held_ramp = q.staging_id == id or q.clearing_id == id
+            if q.staging_id == id then
+                q.staging_id = nil
+                q.staged_at = nil
+            end
+            if held_ramp then
+                quali.settle_ramp(id)
+            end
+            quali.drop_from_queue(id)
+            -- "done" rather than removing the row: the HUD keeps showing them, reading finished instead of
+            -- queued.
+            q.status[id] = "done"
+            purged = true
+            log_info("beamcomp.race", string.format(
+                "staged quali: driver %s disconnected -- purged from the turn queue (%s)",
+                tostring(id),
+                held_ramp and "held the ramp, settling for STAGE_GAP" or "was waiting in the queue"))
+        end
     end
-    if held_ramp then
-        quali.settle_ramp(id)
-    end
-    quali.drop_from_queue(id)
-    -- "done" rather than removing the row: the HUD keeps showing them, reading finished instead of queued.
-    q.status[id] = "done"
-    log_info("beamcomp.race", string.format(
-        "staged quali: driver %s disconnected -- purged from the turn queue (%s)",
-        tostring(id),
-        held_ramp and "held the ramp, settling for STAGE_GAP" or "was waiting in the queue"))
     -- Re-broadcast now so the remaining drivers' queuePos and the `waiting` flag are right immediately,
     -- rather than at whatever the next state change happens to be.
-    quali.broadcast_queue()
+    if purged then
+        quali.broadcast_queue()
+    end
 end
 
 -- The launched driver has cleared the ramp (client->server qualiCleared, ADR-0044/Round4): the >=15 m gate
@@ -8364,7 +8397,8 @@ local function is_server_empty_without(leaving_id)
 end
 
 -- A player leaving mid-race is marked DNF so the race can still settle; if they were the last one
--- there is no one to race, so fall back to lobby instead (ADR-0014).
+-- there is no one to race, so fall back to lobby instead (ADR-0014). When the leaver is the race owner,
+-- the AI he drove leave with him (ADR-0014 amendment 2026-11-01).
 local function on_player_disconnect(player_id)
     -- Drop the connection-scoped name regardless of phase (ADR-0054) -- a player may leave in lobby too,
     -- and with it any join block still waiting out its grace.
@@ -8412,19 +8446,82 @@ local function on_player_disconnect(player_id)
     if session.spawn_pending then
         session.spawn_pending[player_id] = nil
     end
-    local record = session.progress and session.progress[player_id]
-    if record and not record.finished and not record.dnf then
-        record.dnf = true
-        log_info("beamcomp.race", "player " .. tostring(player_id) .. " disconnected; DNF")
+    -- Everyone this leave takes out of the event: the leaver and, when he is the race owner, every AI he
+    -- was driving (ADR-0014 amendment 2026-11-01). The owner spawns and drives all of them on his own
+    -- machine (ADR-0036), and BeamMP sends every client a delete for each of a leaver's cars before it
+    -- fires this handler, so his AI are gone with him: nobody drives them, reports their checkpoints or
+    -- reports them AFK. Left live they kept the staged quali handing them ramp turns, held every finish
+    -- grace open for its full length and were re-gridded into the race. So each one is treated exactly as
+    -- a player who leaves. No abort and no owner change: the real players race on. Only while the event
+    -- is still running -- spawning is cancelled on the next tick anyway (advance_spawning) and a finished
+    -- race is settled.
+    local owner_left = player_id == session.owner_id
+    local phase = session.phase
+    local gone = {player_id}
+    if owner_left and session.progress and (phase == PHASE.countdown or phase == PHASE.qualifying
+            or phase == PHASE.quali_results or phase == PHASE.racing) then
+        local ai_ids = {}
+        for id in pairs(session.progress) do
+            if is_ai_id(id) then
+                ai_ids[#ai_ids + 1] = id
+            end
+        end
+        table.sort(ai_ids, function(a, b) return session.progress[a].slot < session.progress[b].slot end)
+        for _, id in ipairs(ai_ids) do
+            gone[#gone + 1] = id
+        end
+    end
+    local changed = false
+    local ai_out = {}
+    for _, id in ipairs(gone) do
+        local record = session.progress and session.progress[id]
+        if record then
+            -- Gone for the quali re-grid, which seats only the drivers still here (quali.regrid). Set even
+            -- on a settled record -- a leaver who already finished his run is just as gone -- and kept off
+            -- `dnf` on purpose: the re-grid filters on presence, not on how the record ended.
+            record.left = true
+            if not record.finished and not record.dnf then
+                record.dnf = true
+                changed = true
+                if id == player_id then
+                    log_info("beamcomp.race", "player " .. tostring(player_id) .. " disconnected; DNF")
+                else
+                    ai_out[#ai_out + 1] = id
+                end
+            end
+        end
+    end
+    if owner_left then
+        log_info("beamcomp.race", string.format("race owner %s left; owner cleared%s", tostring(player_id),
+            #ai_out > 0 and string.format(", %d AI driver(s) out with him (DNF): %s", #ai_out,
+                table.concat(ai_out, ", ")) or ""))
+        -- Said once, and only when an AI was still in play: a race whose AI had all finished loses nothing.
+        if #ai_out > 0 then
+            broadcast_chat("BeamComp: the host left, their AI drivers are out")
+        end
+        -- Nobody owns this race any more. Every owner-only route compares against this id, so a stale one
+        -- kept sending AI turns into a dead connection -- and BeamMP reuses player ids, so the next player
+        -- to get this one would have passed every owner check of a race he never started. Those routes
+        -- fail closed on nil (`player_id ~= nil` is always true, `if session.owner_id` false).
+        session.owner_id = nil
+        -- The cached prop map names the owner's prop vehicles, which BeamMP has just deleted for everyone.
+        -- Replayed to a late joiner it could only name dead ids, or a newcomer's cars once BeamMP reuses
+        -- them.
+        session.prop_map = nil
+    end
+    -- One standings broadcast and one early-end check for the whole set, AFTER every AI is DNF: the
+    -- early end counts the remaining field, so it has to see them out in the same call or the finish
+    -- grace is not shortened.
+    if changed then
         broadcast_standings()
         maybe_end_race()
     end
     -- A staged sprint quali (ADR-0044) hands out ramp turns from a queue, and nothing above removes the
-    -- leaver from it -- so they would keep being staged for the rest of the window. Purge them from the
+    -- leavers from it -- so they would keep being staged for the rest of the window. Purge them from the
     -- rotation after the DNF bookkeeping, and unconditionally: a leaver whose record already reads
-    -- finished/dnf skips the block above but must still be dropped from the queue. No-op in every other
+    -- finished/dnf skips the DNF above but must still be dropped from the queue. No-op in every other
     -- phase and in a circuit quali (the purge guards itself).
-    quali.purge_driver(player_id)
+    quali.purge_drivers(gone)
 end
 
 -- Split a chat message into its leading command token and the trimmed remainder.
