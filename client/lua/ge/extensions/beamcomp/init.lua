@@ -240,7 +240,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-provflash-r1/2026-10-31"
+local BUILD_MARKER = "0.10.0-giveup-r1/2026-11-02"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -3364,6 +3364,50 @@ local function local_is_out()
         end
     end
     return false
+end
+
+-- Whether the local player may give up the running race right now (the race HUD's Give up button): the
+-- racing phase, a standings row on this client's slot, and not done yet. Done is asked twice on purpose:
+-- the local detector, so the button is gone on the frame the car crosses the line, and the server's
+-- finished/DNF flag (local_is_out), which also covers a DNF the server set. ONE predicate with two
+-- readers: build_hud_snapshot shows the button on it, and M.give_up_race re-asks it before sending,
+-- because a UI frame can be a frame stale. Neither is the authority; the server's /dnf checks are.
+-- Hung on M rather than a top-level local (the 200-local ceiling), which also makes it callable from
+-- the console as beamcomp_init.can_give_up().
+function M.can_give_up()
+    if M.state.phase ~= "racing" then
+        return false
+    end
+    local detection = M.state.detection
+    if detection and detection.done then
+        return false
+    end
+    local race = M.state.race
+    local my_slot = race and race.mySlot
+    local standings = M.state.standings
+    if my_slot == nil or not standings then
+        return false
+    end
+    for _, e in ipairs(standings) do
+        if e.slot == my_slot then
+            return not local_is_out()
+        end
+    end
+    return false  -- no row of ours: a spectator, or a race this client never got
+end
+
+-- The race HUD's Give up button, on its confirming click (UI -> GE -> server, ADR-0012). It asks the server
+-- to run /dnf for this player: the server answers with the very same handle_dnf_command the typed command
+-- reaches, so the chat line, the DNF mark and the provisional card that follows are exactly /dnf's. Public
+-- as beamcomp_init.give_up_race. The message type is a literal here and in server/main.lua, no local.
+function M.give_up_race()
+    if not M.can_give_up() then
+        log("I", RACE_LOG_TAG, "give up not sent: not available any more (phase "
+            .. tostring(M.state.phase) .. ")")
+        return
+    end
+    log("I", RACE_LOG_TAG, "giving up the race (HUD button), asking the server")
+    send_to_server("raceGiveUp", {})
 end
 
 -- Toggle the local results card on/off (the server relays a /results from this player; ADR-0022).
@@ -7636,6 +7680,10 @@ local function build_hud_snapshot()
         -- is a result view, so it shows the order the final card will show. nil = nothing to re-rank; the
         -- app then binds `entries` unchanged. The live corner board always binds `entries` (ADR-0043).
         provisionalEntries = provisional_entries,
+        -- The live HUD's Give up button (under the standings, in the slot the Results button takes once the
+        -- player is out, so the two never show together). One boolean so the app derives nothing; the same
+        -- predicate gates the send (M.give_up_race), and the server's /dnf checks decide.
+        giveUpAvailable = M.can_give_up(),
         -- The multi-race championship table (ADR-0040), shown on the finished results card when active; nil
         -- or active=false hides it. Rides opaquely through to the app.
         championship = M.state.championship,

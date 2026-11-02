@@ -1,8 +1,7 @@
 # Chat commands
 
-Everything below can also be done in BeamComp's windows, except giving up a race with `/dnf`. The
-commands are for anyone who would rather type. To install BeamComp and find the windows, see
-[README.md](README.md).
+Everything below can also be done in BeamComp's windows. The commands are for anyone who would rather
+type. To install BeamComp and find the windows, see [README.md](README.md).
 
 Commands marked **admin** need race admin rights, see step 3 in the README. Every command hides its own
 chat line, so nobody else sees what you typed.

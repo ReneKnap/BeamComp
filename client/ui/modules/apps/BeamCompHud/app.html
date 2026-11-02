@@ -874,6 +874,16 @@
     .beamcomp-hud .bc-results-actions .bc-analysis-btn {
       margin: 0;
     }
+    /* The live HUD's Give up button, armed by its first click (two clicks give up, like the grid editor's
+       delete). It is a .bc-analysis-btn, which brings its own pointer-events:auto inside the
+       pointer-events:none .bc-tl. The armed look must beat the hover look, because the cursor is sitting
+       on the button at the moment it arms. */
+    .beamcomp-hud .bc-giveup-btn.bc-armed,
+    .beamcomp-hud .bc-giveup-btn.bc-armed:hover {
+      background: #a33;
+      border-color: #e88;
+      font-weight: bold;
+    }
     /* Idle series info box (ADR-0042): the compact between-races readout in the top-right time-block slot. */
     .beamcomp-hud .bc-series-box {
       padding: 6px 10px;
@@ -909,6 +919,10 @@
         </div>
       </div>
       <button type="button" class="bc-analysis-btn" ng-if="hud.provisionalAvailable && !hud.provisionalOpen" ng-click="toggleProvisional()">&#9656; Results</button>
+      <!-- Give up (= /dnf): the same slot as Results, which only exists once the player is out, so the two
+           never show together. GE decides the reach (hud.giveUpAvailable), the server decides the give-up. -->
+      <button type="button" class="bc-analysis-btn bc-giveup-btn" ng-if="hud.giveUpAvailable && !giveUpSent"
+        ng-class="{'bc-armed': giveUpArmed}" ng-click="giveUp()">{{giveUpArmed ? 'Sure? Click again' : 'Give up'}}</button>
     </div>
     <div class="bc-tr" ng-if="hud.localEntry">
       <div class="bc-lapcp-huge">
