@@ -8180,7 +8180,11 @@ end
 
 -- /dnf: the issuing player gives up the current race -- mark them DNF (terminal, ADR-0014). Racing
 -- only; a finished or already-DNF player is told so. Broadcasts standings so all clients reflect it.
-local function handle_dnf_command(player_id, player_name)
+--
+-- The race HUD's Give up button lands here too (raceGiveUp in handle_client_event), so the typed command
+-- and the button share every check, the chat line and the early end -- one function, nothing to drift.
+-- `route` names the sender for the log line only: nil is the typed /dnf, whose line stays as it was.
+local function handle_dnf_command(player_id, player_name, route)
     if session.phase ~= PHASE.racing then
         MP.SendChatMessage(player_id, "BeamComp: no race in progress")
         return
@@ -8199,7 +8203,8 @@ local function handle_dnf_command(player_id, player_name)
         return
     end
     record.dnf = true
-    log_info("beamcomp.race", "/dnf by " .. player_name .. " (id " .. tostring(player_id) .. ")")
+    log_info("beamcomp.race", "/dnf by " .. player_name .. " (id " .. tostring(player_id) .. ")"
+        .. (route and (" via " .. route) or ""))
     broadcast_standings()
     MP.SendChatMessage(player_id, "BeamComp: you are out (DNF)")
     maybe_end_race()
@@ -9677,6 +9682,18 @@ local function handle_client_event(player_id, data)
             elseif action == "end" then
                 handle_raceend_command(player_id, name)
             end
+        end
+    elseif decoded.type == "raceGiveUp" then
+        -- The race HUD's Give up button: THE /dnf PATH, not a second one. handle_dnf_command re-checks the
+        -- phase, the participant and the finished/DNF state on arrival, so its checks are the authority and
+        -- the client's button visibility only a courtesy -- a stale or forced message gets exactly the
+        -- answer a typed /dnf would. Not admin-gated, like /dnf: the record is keyed on the sender's id.
+        -- A string literal, not a MSG_ local, under the 200-local ceiling (same as raceControl above).
+        -- player_name_of is declared above this dispatch; a nil name means the player left between the
+        -- click and this line, and the handler concatenates the name into its log line.
+        local give_up_name = player_name_of(player_id)
+        if give_up_name then
+            handle_dnf_command(player_id, give_up_name, "the HUD Give up button")
         end
     else
         log_info("beamcomp.net", "no handler for client event type=" .. decoded.type)

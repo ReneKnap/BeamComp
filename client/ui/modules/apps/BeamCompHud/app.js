@@ -28,6 +28,9 @@ angular.module('beamng.apps')
   // finished results card is exempt -- it renders the whole field.
   var MAX_LIVE_ROWS = 7;
 
+  // How long the Give up button stays armed after its first click before it falls back by itself.
+  var GIVE_UP_ARM_MS = 3000;
+
   // Race time in seconds -> "m:ss.cs" (e.g. 83.4 -> "1:23.40"); placeholder when not a number.
   function formatTime(t) {
     if (typeof t !== 'number') {
@@ -508,6 +511,7 @@ angular.module('beamng.apps')
         resetFinishBanner();
         resetJumpBanner();
         resetWinnerBanner();
+        disarmGiveUp();
       });
 
       // Announce the local player's own race finish: a one-shot "FINISHED" + reached position banner the
@@ -668,6 +672,43 @@ angular.module('beamng.apps')
         }
       };
 
+      // The live HUD's Give up button, which does what /dnf does: GE relays the confirming click and the
+      // server answers it with the same handle_dnf_command the chat command reaches. Two clicks, like the
+      // grid editor's delete: the first ARMS it for GIVE_UP_ARM_MS ("Sure? Click again"), only a second
+      // click inside that window sends. Pure view state, set through these functions on the directive scope
+      // because the button sits in an ng-if child scope; lost on a reload, it falls back to unarmed.
+      //
+      // giveUpSent hides the button after the confirming click, so it cannot send twice. The push handler
+      // clears it, together with any arm, once hud.giveUpAvailable goes false (the DNF arrived), which is
+      // also what offers the button again in the next race.
+      scope.giveUpArmed = false;
+      scope.giveUpSent = false;
+      var giveUpArmTimer = null;
+
+      function disarmGiveUp() {
+        if (giveUpArmTimer) {
+          $timeout.cancel(giveUpArmTimer);
+          giveUpArmTimer = null;
+        }
+        scope.giveUpArmed = false;
+      }
+
+      scope.giveUp = function () {
+        if (!scope.hud.giveUpAvailable || scope.giveUpSent) {
+          return;
+        }
+        if (!scope.giveUpArmed) {
+          scope.giveUpArmed = true;
+          giveUpArmTimer = $timeout(disarmGiveUp, GIVE_UP_ARM_MS);
+          return;
+        }
+        disarmGiveUp();
+        if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
+          scope.giveUpSent = true;
+          bngApi.engineLua('if beamcomp_init then beamcomp_init.give_up_race() end');
+        }
+      };
+
       // Minimize/restore the finished final-standings card (ADR-0012/0041 pattern): routes to the GE flag, so
       // these buttons and the /results command share one state. Inert if bngApi is unavailable (ADR-0012).
       scope.toggleResultsMin = function () {
@@ -723,6 +764,11 @@ angular.module('beamng.apps')
           // Absent means "bind `entries` unchanged" (GE sends nil when nothing is re-ranked), and an
           // empty array is truthy -- so the fallback below tests for rows, not for presence.
           scope.hud.provisionalEntries = asArray(scope.hud.provisionalEntries);
+          // The Give up button's view state never outlives the button (see scope.giveUp).
+          if (!scope.hud.giveUpAvailable) {
+            disarmGiveUp();
+            scope.giveUpSent = false;
+          }
           if (scope.hud.phase === 'finished') {
             resetFlashState();
           } else {
