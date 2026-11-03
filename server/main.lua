@@ -206,6 +206,8 @@ local PHASE_DURATIONS = {
     countdown = 8.0,      -- pre-race countdown (ADR-0021: was 3.0)
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
     all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end)
+    ai_only_grace = 20.0, -- shortened grace once only AI are still out on track; leaves an AI that is about
+                          -- to cross time to make it (ADR-0014 amendment 2026-11-04)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
     finished_hold = 900.0, -- long results + free-roam window before returning to lobby (ADR-0006 amendment)
     quali_default = 480.0, -- default qualifying session length, 8 min (ADR-0041); per-event override in session.quali.duration
@@ -5337,7 +5339,8 @@ end
 -- Early-end check (ADR-0014): once no player can still finish, don't wait out the full grace. With at
 -- least one finisher, cut the grace to a short results window (never extend, and re-broadcast so the
 -- client countdown resyncs); with everyone DNF and no finisher there is nothing to show, so return to
--- lobby. Called after any finish/DNF while racing.
+-- lobby. Once only AI are still out, the running grace is cut to the AI-only window instead. Called after
+-- any finish/DNF while racing.
 local function maybe_end_race()
     if session.phase ~= PHASE.racing or not session.progress then
         return
@@ -5360,6 +5363,7 @@ local function maybe_end_race()
     -- being nil, which was easy to lose when the threshold itself was deleted.)
     local grace_armed = session.grace_deadline ~= nil
     local active = 0
+    local active_players = 0
     local stalled
     for id, record in pairs(session.progress) do
         -- stall.remaining, not an open-coded test: the cutoff counter announces the end of exactly this
@@ -5372,29 +5376,54 @@ local function maybe_end_race()
             else
                 -- Nobody has reported this driver standing still, so they still count.
                 active = active + 1
+                if not is_ai_id(id) then
+                    active_players = active_players + 1
+                end
             end
         end
     end
     -- The all-or-nothing gate, and the safety property of this whole change: the grace is shortened only
     -- when EVERY remaining driver is stalled. One driver still crossing checkpoints and nothing happens.
     -- It matters more here than in the quali: there a false positive ended one run, here it is a DNF.
-    if active > 0 then
+    -- The AI-only window narrows "every remaining driver" to every remaining PLAYER, and it only ever
+    -- cuts to a window that still gives the AI their 20 s.
+    local window
+    if active == 0 then
+        -- No one can still finish (everyone finished and/or DNF): run the short results/countdown window,
+        -- then the race settles via the normal tick (racing -> finished -> lobby) -- the same 5 s end for
+        -- an all-DNF race as for a completed one (ADR-0014). The window is armed even with no finisher, so
+        -- an all-DNF race no longer hangs. Asked first, so it keeps priority over the AI-only window.
+        window = PHASE_DURATIONS.all_done_grace
+    elseif grace_armed and active_players == 0 then
+        -- Only AI are still out (ADR-0014 amendment 2026-11-04): every player has finished, given up, left
+        -- or been reported AFK, and the rest of the 120 s would be spent watching AI. An AFK player counts
+        -- as done because his own client measured his standstill inside this grace -- the verdict that
+        -- discounts him above, and that cuts to the results window when he is the last driver out. If he
+        -- drives on he counts again, which stops any further cut but never moves the deadline back: he has
+        -- what is left of the 20 s. Armed grace only: with every player out before anybody finished there
+        -- is nothing to cut, and the first AI finish arms the grace and cuts it in that same call.
+        window = PHASE_DURATIONS.ai_only_grace
+    else
         return
     end
-    -- No one can still finish (everyone finished and/or DNF): run the short results/countdown window,
-    -- then the race settles via the normal tick (racing -> finished -> lobby) -- the same 5 s end for an
-    -- all-DNF race as for a completed one (ADR-0014). The window is armed even with no finisher, so an
-    -- all-DNF race no longer hangs.
-    local short_deadline = now() + PHASE_DURATIONS.all_done_grace
+    local short_deadline = now() + window
     if not session.grace_deadline or short_deadline < session.grace_deadline then
         session.grace_deadline = short_deadline
-        broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.all_done_grace})
-        -- Fires exactly once: after this the stored deadline IS the short one, so a later
-        -- now() + all_done_grace is no longer smaller than it and the branch is dead.
-        log_info("beamcomp.race", stalled
-            and string.format("grace shortened to results window; %d AFK driver(s) discounted: %s",
-                #stalled, table.concat(stalled, ", "))
-            or "all players accounted for; grace shortened to results window")
+        broadcast_event(MSG_FINISH_GRACE, {duration = window})
+        -- Fires at most once per window: after this the stored deadline IS the short one, so a later
+        -- now() + window is no longer smaller than it and the branch is dead. Never an extension: with less
+        -- than the window left nothing changes, and after the AI-only cut only the results window can follow.
+        local discounted = stalled and string.format("%d AFK driver(s) discounted: %s", #stalled,
+            table.concat(stalled, ", "))
+        -- `active` is non-zero here only on the AI-only window, and then it counts AI alone.
+        if active > 0 then
+            log_info("beamcomp.race", string.format(
+                "only AI left on track; grace shortened to %.0fs for %d AI still racing%s",
+                window, active, discounted and ("; " .. discounted) or ""))
+        else
+            log_info("beamcomp.race", discounted and ("grace shortened to results window; " .. discounted)
+                or "all players accounted for; grace shortened to results window")
+        end
     end
 end
 
