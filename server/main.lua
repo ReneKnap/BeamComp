@@ -5303,6 +5303,16 @@ function stall.cutoff_due()
             return nil
         end
     end
+    -- A cutoff the race does not live to see is not announced. A car that stops in the last 15 s of the
+    -- racing grace is due after its deadline, and the card would print "AFK in 9" behind "Race ends in
+    -- 0:04", a counter contradicting the one it explains. The AI-only window (PHASE_DURATIONS.ai_only_grace)
+    -- turns that corner of the 120 s into most of its 20 s. The deadline only ever moves earlier, so a
+    -- withheld cutoff stays withheld. The quali graces are never cut to a short window like that and keep
+    -- their counter as it was.
+    if latest and session.phase == PHASE.racing and session.grace_deadline
+            and latest >= session.grace_deadline then
+        return nil
+    end
     return latest
 end
 
