@@ -205,8 +205,8 @@ local PHASE_DURATIONS = {
     staging_abandon = 1800.0,
     countdown = 8.0,      -- pre-race countdown (ADR-0021: was 3.0)
     finish_grace = 120.0, -- DNF cutoff: time after the first finisher for others to finish (ADR-0014)
-    all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end); the circuit
-                          -- quali's lap grace takes the same once nobody is lapping (quali.cut_lap_grace)
+    all_done_grace = 5.0, -- shortened grace once no one can still finish (ADR-0014 early-end); both quali
+                          -- variants end on the same once nobody is out there (quali.shorten_grace)
     ai_only_grace = 20.0, -- shortened grace once only AI are still out on track; leaves an AI that is about
                           -- to cross time to make it (ADR-0014 amendment 2026-11-04)
     abort_window = 1.5,   -- short finished window when /race restarts a running race
@@ -3964,21 +3964,38 @@ function quali.circulating(id, record)
     return stall.remaining(record) and not quali.has_closed_lap(id)
 end
 
--- Nobody is lapping any more: cut the finish-your-lap grace to the race's results window (ADR-0041
--- amendment 2026-11-04), so the last driver still sees his lap time before the classification comes.
--- maybe_end_race's shortening, restated for this grace: only if it is EARLIER than the stored deadline, and
--- re-broadcast so every client's "Waiting m:ss" resyncs. Fires at most once, because afterwards the stored
--- deadline IS the short one. A driver who counts as lapping again after the cut (an AFK one driving on, a
--- crossing after a close) stops nothing and extends nothing: the deadline stays where it is.
-function quali.cut_lap_grace(t)
+-- Nobody is out there any more: put the quali's end on the race's results window (ADR-0041 amendment
+-- 2026-11-04), so the last driver still sees his time before the classification comes. Both variants
+-- end through here, the circuit's finish-your-lap grace and the staged sprint's finish-your-run grace.
+-- maybe_end_race's shortening, restated for the quali: only if it is EARLIER than the stored deadline (a
+-- nil deadline, a staged window that closed with nobody on track, counts as later). Fires at most once,
+-- because afterwards the stored deadline IS the short one, and a driver who counts as out there again
+-- afterwards (an AFK one driving on, a crossing after a close) stops nothing and extends nothing.
+--
+-- `announce` re-broadcasts the new length so every client's grace line ("Waiting m:ss", "FINISH RUN m:ss")
+-- resyncs. Only where the clients show one: with no grace armed they still show the quali clock, and a
+-- MSG_FINISH_GRACE would be the first they hear of a grace at all. Returns the window when the deadline
+-- moved, nil when it did not, so each caller logs only a real cut.
+function quali.shorten_grace(t, announce)
     local q = session.quali
     local window = PHASE_DURATIONS.all_done_grace
     local deadline = t + window
-    if deadline >= q.lap_grace_deadline then
-        return
+    if q.lap_grace_deadline and deadline >= q.lap_grace_deadline then
+        return nil
     end
     q.lap_grace_deadline = deadline
-    broadcast_event(MSG_FINISH_GRACE, {duration = window})
+    if announce then
+        broadcast_event(MSG_FINISH_GRACE, {duration = window})
+    end
+    return window
+end
+
+-- Nobody is lapping any more in the circuit quali: shorten its armed finish-your-lap grace and say why.
+function quali.cut_lap_grace(t)
+    local window = quali.shorten_grace(t, true)
+    if not window then
+        return
+    end
     local closed, afk, out = 0, 0, 0
     for id, record in pairs(session.progress or {}) do
         if not stall.remaining(record) then
@@ -4612,6 +4629,39 @@ function quali.note_stall(id, reason)
         tostring(id), reason))
 end
 
+-- Nobody is still running in the staged sprint once its window has closed: classify after the race's results
+-- window (quali.shorten_grace, ADR-0044 amendment 2026-11-04) instead of on the next tick. Two ways here:
+-- the last running driver finished his run (or was reported AFK, or left) while the finish-your-run grace
+-- ran, which shortens it and re-broadcasts, because every client shows "FINISH RUN m:ss" by then; or the
+-- window closed with nobody on track, so no grace was ever armed and the clients still show the window
+-- clock, which then stands at 0:00 for those seconds and nothing is sent.
+--
+-- The tally is read off the turn statuses: `running` can only mean reported AFK here (a running driver
+-- without a verdict is still out and never reaches this), a DNF in qualifying means he left, and everyone
+-- else (done, or queued when the window closed) has no run left to drive.
+function quali.cut_staged_grace(t)
+    local q = session.quali
+    local armed = q.lap_grace_deadline ~= nil
+    local window = quali.shorten_grace(t, armed)
+    if not window then
+        return
+    end
+    local done, afk, left = 0, 0, 0
+    for id, record in pairs(session.progress or {}) do
+        if record.dnf then
+            left = left + 1
+        elseif q.status[id] == "running" then
+            afk = afk + 1
+        else
+            done = done + 1
+        end
+    end
+    log_info("beamcomp.race", string.format(
+        "staged quali: nobody is still running (%d done, %d reported AFK, %d left); %s", done, afk, left,
+        armed and string.format("finish-your-run grace shortened to %.0fs", window)
+            or string.format("window closed with nobody on track, classifying in %.0fs", window)))
+end
+
 -- Advance the staged sprint quali from the tick (ADR-0044/Round4). Paces one ramp at a time (race-blind):
 -- the staged driver counts for STAGE_COUNTDOWN, then launches (-> clearing_id); the next driver is not staged
 -- until the launcher has BOTH cleared the ramp (the client >=15 m report) AND the STAGE_GAP clearance has
@@ -4684,7 +4734,8 @@ function quali.advance_staged()
     end
 
     -- Window closed: let any driver still counting at the ramp / clearing / running finish their run, then
-    -- classify. (A staged driver mid-count still gets to launch + run; the flip above runs before this.)
+    -- classify after the results window. (A staged driver mid-count still gets to launch + run; the flip
+    -- above runs before this.)
     --
     -- "Still out" means still DRIVING, not merely present (staged-quali-stuck-ai-never-requeued). A
     -- driver who wrecked or hung mid-stage keeps `running` for the rest of the window -- by design nothing
@@ -4705,8 +4756,8 @@ function quali.advance_staged()
                 -- Only once THIS grace is armed, the same gate maybe_end_race applies. On the tick that
                 -- decides whether to arm, no client has started its clock yet, so a flag present here
                 -- could only be a leftover from an earlier grace -- and consulting it would discount the
-                -- driver, leave anyone_out false, and classify the session immediately WITHOUT ever
-                -- arming (so the arming clear below could never run). Unreachable today, because the
+                -- driver, leave anyone_out false, and classify the session after the results window WITHOUT
+                -- ever arming (so the arming clear below could never run). Unreachable today, because the
                 -- window-close arm is the first grace of a staged event and start_race clears; gated so
                 -- it stays impossible by construction rather than by ordering.
                 local reason = q.lap_grace_deadline and stall.verdict(id)
@@ -4719,24 +4770,30 @@ function quali.advance_staged()
             end
         end
     end
-    if not q.lap_grace_deadline then
-        if anyone_out then
-            local window = quali.lap_grace_window()
-            q.lap_grace_deadline = t + window
-            stall.begin_grace()
-            broadcast_event(MSG_FINISH_GRACE, {duration = window})
-            log_info("beamcomp.race",
-                string.format("staged quali window closed; finish-your-run grace armed (%.1fs)", window))
-            return
-        end
-        q.lap_grace_deadline = t  -- no one on track -> classify immediately
+    if not q.lap_grace_deadline and anyone_out then
+        local window = quali.lap_grace_window()
+        q.lap_grace_deadline = t + window
+        stall.begin_grace()
+        broadcast_event(MSG_FINISH_GRACE, {duration = window})
+        log_info("beamcomp.race",
+            string.format("staged quali window closed; finish-your-run grace armed (%.1fs)", window))
+        return
     end
-    if anyone_out and t < q.lap_grace_deadline then
-        -- Keep the live board refreshing through the finish-your-run grace (Round 6). The release path
-        -- above, which drove the periodic broadcast during the window, is gated on window_open, so without
-        -- this the board would freeze until classification. Per-crossing broadcasts (handle_checkpoint_report)
-        -- already refresh it as the running driver progresses; this covers the between-crossing ticks.
-        quali.broadcast_queue()
+    -- Nobody left on track: the race's results window first, then classify (ADR-0044 amendment 2026-11-04).
+    -- It used to classify on the next tick, before the last driver had seen his run time. Every later tick
+    -- finds the short deadline already in place, so this cuts once and never extends.
+    if not anyone_out then
+        quali.cut_staged_grace(t)
+    end
+    if t < q.lap_grace_deadline then
+        if anyone_out then
+            -- Keep the live board refreshing through the finish-your-run grace (Round 6). The release path
+            -- above, which drove the periodic broadcast during the window, is gated on window_open, so
+            -- without this the board would freeze until classification. Per-crossing broadcasts
+            -- (handle_checkpoint_report) already refresh it as the running driver progresses; this covers
+            -- the between-crossing ticks.
+            quali.broadcast_queue()
+        end
         return
     end
     quali.finish_session()
@@ -5430,8 +5487,8 @@ function stall.cutoff_due()
     -- racing grace is due after its deadline, and the card would print "AFK in 9" behind "Race ends in
     -- 0:04", a counter contradicting the one it explains. The AI-only window (PHASE_DURATIONS.ai_only_grace)
     -- turns that corner of the 120 s into most of its 20 s. The deadline only ever moves earlier, so a
-    -- withheld cutoff stays withheld. The quali graces keep their counter as it was: the circuit quali's cut
-    -- to the results window (quali.cut_lap_grace) only fires once nobody it waits on is still lapping, and a
+    -- withheld cutoff stays withheld. The quali graces keep their counter as it was: their cut to the
+    -- results window (quali.shorten_grace) only fires once nobody they wait on is still out there, and a
     -- driver with a due time but no verdict still is, so no due time is pending at the cut.
     if latest and session.phase == PHASE.racing and session.grace_deadline
             and latest >= session.grace_deadline then
