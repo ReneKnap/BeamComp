@@ -246,7 +246,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-capslive-r1/2026-11-04"
+local BUILD_MARKER = "0.10.0-capslive-r2/2026-11-04"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -478,7 +478,9 @@ local disarm_freeze_hold_ve
 -- Every player-facing message this mod raises goes through notice.say. While the race HUD stands it
 -- lands in the screen centre, under the countdown block; anywhere else it stays the top-left toast it
 -- always was. The cut runs along the PHASE, not along the text: at a panel or in the grid editor the
--- player is already looking at the screen edge, at the wheel he is looking at the road.
+-- player is already looking at the screen edge, at the wheel he is looking at the road. One exception
+-- (ADR-0057 amendment 2026-11-04): a menu that unmounts the HUD apps -- the vehicle config menu is one --
+-- takes the centred surface with it, so while such a menu is open the message is the toast, at once.
 
 -- How long a centred message stands before it clears itself, and how long the checkpoint readout does.
 -- Both are in-game tuning knobs -- neither can be judged outside the game -- as are the two CSS tops in
@@ -540,11 +542,49 @@ function notice.paint()
             and {seconds = M.state.afk_notice.seconds, hint = M.state.afk_notice.hint} or nil)
 end
 
+-- Which source last answered notice.hud_apps_hidden, so the line naming it is written once per GE load
+-- and again only when the answer's source changes (ADR-0017: the source, not a count, is the tripwire).
+notice.surface_source = nil
+
+-- Whether a menu has taken the HUD apps -- and with them the centred surface, which lives in the
+-- BeamCompHud app -- off the screen right now. Asked of the engine's own router (uilayout.hud_apps_shown,
+-- the field the UI unmounts the apps overlay on), never of a list of route names. When the router cannot
+-- answer, nothing is hidden as far as this knows: the message stays where it always went, centred.
+function notice.hud_apps_hidden()
+    local shown, route = M.uilayout.hud_apps_shown()
+    local source = shown == nil and "none" or "router"
+    if source ~= notice.surface_source then
+        notice.surface_source = source
+        if source == "router" then
+            log("I", "beamcomp.ui", "message surface: the UI router says whether the HUD apps are shown"
+                .. " (route " .. tostring(route) .. ")")
+        else
+            log("W", "beamcomp.ui", "message surface: the UI router cannot say whether the HUD apps are"
+                .. " shown (" .. tostring(route) .. "); race messages stay centred")
+        end
+    end
+    return shown == false, route
+end
+
 -- Say one thing to the player. `kind` is the toastr type ("info" / "warning" / "success") and doubles as
 -- the centred line's colour; `title` is used only on the toast path, so the two richer toast titles
 -- survive verbatim where they are still shown (no text is rewritten by this feature).
+--
+-- Two ways to the toast: no race HUD on this client (notice.in_race), or a race HUD a menu has unmounted
+-- (notice.hud_apps_hidden). The second is asked only in a race, so it costs nothing outside one; the
+-- toast it sends is drawn above that menu (ui-vue App.vue mounts ToastHost unconditionally, fixed, above
+-- the routed view), where a centred line would have expired unseen behind it.
 function notice.say(msg, kind, title)
-    if not notice.in_race() then
+    local to_toast = not notice.in_race()
+    if not to_toast then
+        local hidden, route = notice.hud_apps_hidden()
+        if hidden then
+            to_toast = true
+            log("I", "beamcomp.ui", "message shown as a toast: route " .. tostring(route)
+                .. " hides the HUD apps")
+        end
+    end
+    if to_toast then
         if guihooks then
             guihooks.trigger("toastrMsg", {type = kind or "info", title = title or "BeamComp", msg = msg})
         end
