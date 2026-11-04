@@ -221,16 +221,12 @@ local PHASE_DURATIONS = {
     quali_lap_grace_min = 20.0,  -- floor: even a pathologically small best lap still lets a mid-lap driver cross
     quali_lap_grace_max = 300.0, -- ceiling (5 min): covers genuinely long laps yet caps one slow/limping lap
                                  -- so it cannot hold the whole field for minutes
-    quali_results = 30.0,  -- classification pause between qualifying and the race countdown (ADR-0041):
-                           -- ~10 s results display + a ~20 s settle window after the re-grid (see lead)
-    quali_regrid_lead = 20.0, -- lead before the countdown at which the AI re-grid + respawn run inside
-                              -- quali-results, so (a) the multi-second re-spawn freeze lands on the static
-                              -- results card, not the race countdown, and (b) a settle window of this length
-                              -- follows the respawn. The freeze eats the first seconds of that window, so the
-                              -- visible settle (the client's small "race starts in" timer, counting the
-                              -- remaining pause to 0) is ~lead minus the freeze -- generous so it always runs
-                              -- fully to the countdown rather than being cut short (ADR-0041). The
-                              -- despawn->respawn gap that keeps cars under MaxCars stays quali_results - lead.
+    -- The quali-results pause (ADR-0041) is this card plus the configured respawn settle, so it has no
+    -- entry of its own here: quali.results_timing derives both numbers from the one setting
+    -- (cfg.quali_race_respawn_settle_seconds), and no table entry can say a pause that is not in effect.
+    quali_results_card = 10.0, -- results card from quali-results entry to the re-grid + respawn. Also the
+                               -- despawn->respawn gap that keeps the AI under MaxCars, which is why it is
+                               -- fixed whatever settle time the server sets
 }
 
 -- Seconds before the finished results window expires to warn players that the props and results
@@ -324,6 +320,11 @@ local CONFIG_CANDIDATE_PATHS = {
 --     live on `access` below, because those are what the session accumulates. That split is what makes
 --     "a Lua-state reload drops every grant" true by construction -- the reload rebuilds both literals,
 --     load_config refills this one and access comes back empty.
+--   * `quali_race_respawn_settle_seconds` -- seconds from the quali re-grid + respawn to the race countdown
+--     (ADR-0041 amendment 2026-11-04). Settings key `qualiRaceRespawnSettleSeconds`, bounds and default in
+--     cfg.QUALI_RACE_RESPAWN_SETTLE. It is the re-grid LEAD, and quali.results_timing derives the whole
+--     quali-results pause from it: nothing else states either number. The respawn freeze eats the first
+--     seconds of it, so the visible "Countdown starts in" count is a little shorter than the setting.
 local cfg = {
     admins = {},
     admin_gate_active = false,
@@ -800,6 +801,40 @@ function cfg.boolean(settings, key, default)
     return default
 end
 
+-- A number setting within [min, max]. A missing key keeps the default without a word; everything else
+-- that cannot apply as written is corrected and SAID, naming the key, what was read and what applies: a
+-- value that is no number falls back to the default, one outside the bounds is set to the bound it
+-- crossed. Reads the raw value rather than cfg.value on purpose: that one folds an empty value into "not
+-- set", silently, and a number key ships with its value filled in, so an empty one means the number was
+-- deleted. The applied value is the default either way.
+function cfg.number(settings, key, default, min, max)
+    local raw = settings[key]
+    if raw == nil then
+        return default
+    end
+    local value = tonumber(raw)
+    if value == nil then
+        local read = raw == "" and "empty" or ("'" .. raw .. "', which is not a number")
+        log_info("beamcomp.cfg", string.format("  %s is %s; using %g", key, read, default))
+        return default
+    end
+    if value < min then
+        log_info("beamcomp.cfg", string.format("  %s is '%s', below the minimum of %g; using %g",
+            key, raw, min, min))
+        return min
+    end
+    if value > max then
+        log_info("beamcomp.cfg", string.format("  %s is '%s', above the maximum of %g; using %g",
+            key, raw, max, max))
+        return max
+    end
+    return value
+end
+
+-- qualiRaceRespawnSettleSeconds (see cfg.quali_race_respawn_settle_seconds above), in seconds. The default
+-- is written here and nowhere else; default and range are the owner's choice (2026-11-04).
+cfg.QUALI_RACE_RESPAWN_SETTLE = {default = 35, min = 10, max = 120}
+
 -- The comment block that goes with a key this server appends to a settings file that does not have it
 -- yet. Same voice as the shipped file: what it does, plus the one thing that changes a decision.
 cfg.SETTING_COMMENTS = {
@@ -970,6 +1005,7 @@ local function load_config()
     cfg.use_client_name = true
     cfg.show_driver_names = true
     cfg.stats_enabled = false
+    cfg.quali_race_respawn_settle_seconds = cfg.QUALI_RACE_RESPAWN_SETTLE.default
     cfg.password = nil
     cfg.path = nil
 
@@ -982,6 +1018,9 @@ local function load_config()
         log_info("beamcomp.cfg", "useClientName=on (default; no settings file)")
         log_info("beamcomp.cfg", "showDriverNames=on (default; no settings file)")
         log_info("beamcomp.cfg", "enableStatistics=off (default; no settings file)")
+        log_info("beamcomp.cfg", string.format(
+            "qualiRaceRespawnSettleSeconds=%g (default; no settings file)",
+            cfg.quali_race_respawn_settle_seconds))
         return
     end
 
@@ -1020,6 +1059,14 @@ local function load_config()
     -- the switch is observable; it is the acceptance check after a deploy.
     cfg.stats_enabled = cfg.boolean(settings, "enableStatistics", false)
     log_info("beamcomp.cfg", "enableStatistics=" .. (cfg.stats_enabled and "on" or "off"))
+
+    -- The time from the quali respawn to the race countdown (ADR-0041 amendment 2026-11-04). Above the
+    -- raceAdmins early return like the settings above it: a server without an admin list still gets it.
+    local settle = cfg.QUALI_RACE_RESPAWN_SETTLE
+    cfg.quali_race_respawn_settle_seconds = cfg.number(settings, "qualiRaceRespawnSettleSeconds",
+        settle.default, settle.min, settle.max)
+    log_info("beamcomp.cfg", string.format("qualiRaceRespawnSettleSeconds=%g",
+        cfg.quali_race_respawn_settle_seconds))
 
     local count = 0
     for entry in (cfg.value(settings, "raceAdmins") or ""):gmatch("[^,]+") do
@@ -4106,11 +4153,26 @@ function quali.advance_qualifying()
     if t < q.lap_grace_deadline then
         return
     end
+    quali.finish_session()
+end
+
+-- The quali-results pause and the re-grid lead inside it, in seconds (ADR-0041 amendment 2026-11-04): the
+-- fixed results card, then the configured settle from the respawn to the race countdown. The one place
+-- either number is computed; the entry below and quali.maybe_regrid both ask here.
+function quali.results_timing()
+    local lead = cfg.quali_race_respawn_settle_seconds
+    return PHASE_DURATIONS.quali_results_card + lead, lead
+end
+
+-- Classify the session and enter the quali-results pause: the one entry for both quali kinds, the circuit
+-- (quali.advance_qualifying) and the staged sprint (quali.advance_staged, ADR-0044). Broadcasts the pace
+-- snapshot first, then carries the re-grid lead so the client can split the pause display: a clean
+-- "results" countdown (pause - lead) before the respawn, then the settle timer (the remaining pause) after
+-- it (ADR-0041). The re-grid by best time reuses quali.regrid (which reads quali.ranking, staged-aware).
+function quali.finish_session()
     broadcast_event(quali.MSG, quali.snapshot())
-    -- Carry the re-grid lead so the client can split the pause display: a clean "results" countdown
-    -- (pause - lead) before the respawn, then the settle timer (the remaining pause) after it (ADR-0041).
-    enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
-        {regridLead = PHASE_DURATIONS.quali_regrid_lead})
+    local pause, lead = quali.results_timing()
+    enter_phase(PHASE.quali_results, pause, {regridLead = lead})
 end
 
 -- Run the quali re-grid once, a lead time before the results pause ends (ADR-0041 amendment). The owner
@@ -4124,8 +4186,8 @@ function quali.maybe_regrid()
     if not q or q.regridded then
         return
     end
-    local pause = session.phase_duration or PHASE_DURATIONS.quali_results
-    if phase_elapsed() < pause - PHASE_DURATIONS.quali_regrid_lead then
+    local pause, lead = quali.results_timing()
+    if phase_elapsed() < (session.phase_duration or pause) - lead then
         return
     end
     q.regridded = true
@@ -4601,16 +4663,6 @@ function quali.handle_cleared(player_id, payload)
     if session.quali.clearing_id == id then
         session.quali.cleared = true
     end
-end
-
--- Classify the staged session and hand off to the ADR-0041 quali-results pause (ADR-0044). Mirrors the
--- circuit advance_qualifying tail: broadcast the pace snapshot, then enter quali-results carrying the
--- re-grid lead so the client can split the pause display. The re-grid by best time reuses quali.regrid
--- (which reads quali.ranking, staged-aware).
-function quali.finish_session()
-    broadcast_event(quali.MSG, quali.snapshot())
-    enter_phase(PHASE.quali_results, PHASE_DURATIONS.quali_results,
-        {regridLead = PHASE_DURATIONS.quali_regrid_lead})
 end
 
 -- Log one driver being discounted from the finish-your-run grace, ONCE per driver per session. The tick
