@@ -150,6 +150,7 @@ raceAdmins = Alice, Bob
 racePassword = something-only-we-know
 useClientName = true
 showDriverNames = true
+qualiRaceRespawnSettleSeconds = 35
 ```
 
 - `useClientName`: whether players may pick the name everyone sees with `/name`. `false` always uses
@@ -157,6 +158,8 @@ showDriverNames = true
 - `showDriverNames`: whether a driver's name is drawn over their car. `false` removes every nametag in
   the session. The race's props never carry one either way. An admin can also switch it in the race
   panel's gear menu, and that change is written back into this file.
+- `qualiRaceRespawnSettleSeconds`: seconds from the respawn after qualifying to the race countdown, from
+  10 to 120. Raise it when players with slower computers are still loading their cars.
 - A line that cannot be read is **skipped with a warning naming its line number**, and every other
   setting still applies. A typo costs you that one line, not the password three lines below it.
 - A `#` (or `;`) starts a comment **only at the start of a line**. Mid-line it is an ordinary character,
