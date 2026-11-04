@@ -2167,9 +2167,9 @@ function quali.respawn_ai_for_regrid(ai_slots)
     if type(ai_slots) ~= "table" or #ai_slots == 0 or not M.state.race then
         return
     end
-    -- The quali AI were despawned at quali-results entry, so BeamMP has had the lead gap (the pause minus
-    -- quali_regrid_lead) to remove them; spawn fresh + frozen at the new poses now, with the same
-    -- spawn-notification mute as race start.
+    -- The quali AI were despawned at quali-results entry, so BeamMP has had the results card (the server's
+    -- PHASE_DURATIONS.quali_results_card, 10 s) to remove them; spawn fresh + frozen at the new poses now,
+    -- with the same spawn-notification mute as race start.
     -- Lift the in-race action lock first: the full fixed-car lock persists from the first countdown through
     -- qualifying and this pause, and it gates core_vehicles.spawnNewVehicle -- which would silently refuse
     -- the AI spawn (ai.spawn returns 0). It is re-installed at the end of this function: the re-grid now runs
