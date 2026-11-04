@@ -6204,6 +6204,11 @@ function M.onExtensionLoaded()
     lock.car_is_forced = function()
         return M.state.race_forced_car == true
     end
+    -- And whether it has a vehicle limit (ADR-0064 amendment 2026-11-04): the full lock then refuses parts
+    -- changes too, so from the countdown on only tuning is left for the live check to measure and revert.
+    lock.race_has_caps = function()
+        return M.state.race_caps ~= nil
+    end
     -- Listen to BeamMP's two nametag switches (the "Player Nametags" key and hideNicknames), so the AI tags
     -- the host draws itself go on and off with every other tag (ADR-0062 amendment 2026-10-08). Given back
     -- in onExtensionUnloaded; a second install unwraps an earlier one instead of stacking on it. Guarded
