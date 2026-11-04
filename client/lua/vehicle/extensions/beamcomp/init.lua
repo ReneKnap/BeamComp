@@ -20,6 +20,11 @@
 -- armed (staging + countdown), we clamp the throttle to 0 each frame. GE arms/disarms this over the
 -- frozen phases (separate from the assist arm); combustion cars are left untouched so launch-revving
 -- against the freeze still works.
+--
+-- And it measures the car for the vehicle limit (ADR-0032 amendment 2026-11-04): GE asks for the live
+-- power and weight with a token, we compute them the way the engine computed the shipped metadata and
+-- answer with the token. The metadata describes the preset a car was spawned from, never the car after a
+-- parts or tuning change, so this is the only reading the limit can trust.
 
 local M = {}
 
@@ -125,6 +130,137 @@ end
 -- GE disarms the hold on the racing transition (alongside the GE freeze release) and on teardown.
 function M.on_freeze_hold_disarm()
     freeze_hold = false
+end
+
+-- The shipped metadata rounds the curb weight UP to this many kg (dynamicVehicleData.lua weightRoundValue).
+local WEIGHT_ROUND_KG = 5
+
+local function is_finite(value)
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function add_reason(reading, reason)
+    reading.reason = reading.reason and (reading.reason .. "; " .. reason) or reason
+end
+
+-- One engine device's torque data, or nil plus why not. Called as a method like the engine does
+-- (engines[1]:getTorqueData()), pcall-guarded: the powertrain is engine-version-coupled.
+local function torque_data(engine)
+    if type(engine) ~= "table" or type(engine.getTorqueData) ~= "function" then
+        return nil, "engine device has no getTorqueData"
+    end
+    local ok, data = pcall(engine.getTorqueData, engine)
+    if not ok then
+        return nil, "getTorqueData failed: " .. tostring(data)
+    end
+    if type(data) ~= "table" then
+        return nil, "getTorqueData returned no table"
+    end
+    return data
+end
+
+-- Peak power over several engines: their final power curves summed rpm by rpm, then the highest point.
+-- That is how the engine rates a multi-engine car (getVehiclePerformanceData), not the sum of the peaks.
+local function summed_peak_power(engines)
+    local curve = {}
+    for _, engine in ipairs(engines) do
+        local data, err = torque_data(engine)
+        if not data then
+            return nil, err
+        end
+        local final = type(data.curves) == "table" and data.curves[data.finalCurveName] or nil
+        if type(final) ~= "table" or type(final.power) ~= "table" then
+            return nil, "an engine has no final power curve"
+        end
+        for rpm, power in pairs(final.power) do
+            curve[rpm] = (curve[rpm] or 0) + power
+        end
+    end
+    local peak = -1
+    for _, power in pairs(curve) do
+        if power > peak then
+            peak = power
+        end
+    end
+    return peak
+end
+
+local function read_weight(reading)
+    local ok, stats = pcall(function() return obj:calcBeamStats() end)
+    if not ok then
+        add_reason(reading, "obj:calcBeamStats unavailable: " .. tostring(stats))
+    elseif type(stats) ~= "table" or not is_finite(stats.total_weight) then
+        add_reason(reading, "calcBeamStats gave no total_weight")
+    else
+        reading.weight = math.ceil(stats.total_weight / WEIGHT_ROUND_KG) * WEIGHT_ROUND_KG
+    end
+end
+
+local function read_power(reading)
+    if type(powertrain) ~= "table" or type(powertrain.getDevicesByCategory) ~= "function" then
+        add_reason(reading, "powertrain.getDevicesByCategory unavailable")
+        return
+    end
+    local ok, engines = pcall(powertrain.getDevicesByCategory, "engine")
+    if not ok or type(engines) ~= "table" then
+        add_reason(reading, "getDevicesByCategory failed: " .. tostring(engines))
+        return
+    end
+    reading.engines = #engines
+    if #engines == 0 then
+        add_reason(reading, "no engine device")
+        return
+    end
+    local peak, err
+    if #engines == 1 then
+        local data
+        data, err = torque_data(engines[1])
+        peak = data and data.maxPower
+    else
+        peak, err = summed_peak_power(engines)
+    end
+    if err then
+        add_reason(reading, err)
+    elseif is_finite(peak) and peak > 0 then
+        reading.power = math.floor(peak)
+    else
+        add_reason(reading, "no positive power on the torque curve")
+    end
+end
+
+-- The car's live engine power (hp) and curb weight (kg) as {power, weight, engines, reason}: exactly what
+-- lua/vehicle/extensions/dynamicVehicleData.lua getVehiclePerformanceData computes, reduced to the two
+-- numbers the vehicle limit compares -- and that function generated the shipped Power/Weight metadata, so
+-- units and rounding match the caps: weight ceil(total_weight / 5) * 5, power the peak of the final
+-- torque curve (turbo, supercharger and nitrous applied, i.e. tuning included) floored, mechanical hp.
+-- A value that cannot be read stays nil and `reason` names why (ADR-0017: every touchpoint probed).
+-- getTorqueData subtracts friction scaled by damage, so a damaged car reads lower; GE measures after a
+-- respawn or the race-start repair, where the car is fresh.
+function M.read_live_spec()
+    local reading = {engines = 0}
+    read_weight(reading)
+    read_power(reading)
+    return reading
+end
+
+local function lua_number(value)
+    return is_finite(value) and string.format("%.17g", value) or "nil"
+end
+
+local function lua_string(value)
+    return type(value) == "string" and string.format("%q", value) or "nil"
+end
+
+-- GE asks (vehicles.request_live_spec); answer with the token it handed us, so a late answer for a request
+-- GE has given up on is recognised and dropped there. The read never throws into the VE runtime.
+function M.measure_spec(token)
+    local ok, reading = pcall(M.read_live_spec)
+    if not ok then
+        reading = {engines = 0, reason = "measurement failed: " .. tostring(reading)}
+    end
+    forward(string.format("on_live_spec(%s, %s, %s, %s, %s, %s)",
+        lua_number(obj:getId()), lua_number(token), lua_number(reading.power), lua_number(reading.weight),
+        lua_number(reading.engines), lua_string(reading.reason)))
 end
 
 -- Per-frame: while the hold is armed on an electric car, pin the throttle to 0 so instant motor torque

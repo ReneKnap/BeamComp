@@ -84,6 +84,12 @@ M.uilayout = require("beamcomp/race/uilayout")
 -- Hung on M for the same reason as uilayout -- it costs no top-level local -- which also lets its pose
 -- constants be tuned live from the console (beamcomp_init.gridcam.PITCH_DEG = 45).
 M.gridcam = require("beamcomp/race/gridcam")
+-- The vehicle limit check of the own race car (ADR-0032 amendment 2026-11-04): race/capcheck.lua is the
+-- pure state machine, M.caps below (defined beside restage_swapped_car) is its engine-facing half -- the
+-- requests, the verdicts carried out, the notices. Both hung on M for the same reason as uilayout: no
+-- top-level local, and both are readable from the console (beamcomp_init.caps / beamcomp_init.capcheck).
+M.capcheck = require("beamcomp/race/capcheck")
+M.caps = {}
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -240,7 +246,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-giveup-r1/2026-11-02"
+local BUILD_MARKER = "0.10.0-capslive-r2/2026-11-04"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -328,9 +334,9 @@ M.state = {
     size_track = {},          -- lobby car-footprint poll state {wait, reported} owned by race/vehicles.poll_own_size (ADR-0051 round 2); plain numbers, so no engine handle can go stale in it
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
-    race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the staging swap-compliance check (ADR-0032); nil in Modes 1/2 (no cap)
+    race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the live vehicle limit check (ADR-0032) and, from the countdown on, the parts lock (lock.race_has_caps, ADR-0064 amendment); nil in Modes 1/2 (no cap)
     race_forced_car = false,  -- whether the active race forces this player's car (payload.car: car=<model[:config]>, random, host, or a class-drop class with a car). Read by race/lock.lua through lock.car_is_forced on every install: true locks the parts and the staging swap, tuning and paint stay free (ADR-0064). Set at raceStart; the literal's false is also the teardown value (ADR-0052)
-    staged_spec = nil,        -- spec {model, config, paint...} of the last COMPLIANT staged car, to revert an over-cap staging swap back to (ADR-0032), or nil
+    caps_check = nil,         -- the vehicle limit check of the own race car (race/capcheck.lua M.new: the last setup within the limit to revert to, the one live measurement in flight, our revert awaiting its reload), Mode 3 only, or nil (ADR-0032 amendment 2026-11-04). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052): the reload tears the race down with it, and a late VE answer finds nothing to land in
     revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
     staging_swap_reverting = false,  -- true only for the restage cycle that our revert started, so its known-compliant car is adopted without re-gating; recomputed from revert_pending at each consume (prevents a revert loop, ADR-0032)
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
@@ -472,7 +478,9 @@ local disarm_freeze_hold_ve
 -- Every player-facing message this mod raises goes through notice.say. While the race HUD stands it
 -- lands in the screen centre, under the countdown block; anywhere else it stays the top-left toast it
 -- always was. The cut runs along the PHASE, not along the text: at a panel or in the grid editor the
--- player is already looking at the screen edge, at the wheel he is looking at the road.
+-- player is already looking at the screen edge, at the wheel he is looking at the road. One exception
+-- (ADR-0057 amendment 2026-11-04): a menu that unmounts the HUD apps -- the vehicle config menu is one --
+-- takes the centred surface with it, so while such a menu is open the message is the toast, at once.
 
 -- How long a centred message stands before it clears itself, and how long the checkpoint readout does.
 -- Both are in-game tuning knobs -- neither can be judged outside the game -- as are the two CSS tops in
@@ -534,11 +542,49 @@ function notice.paint()
             and {seconds = M.state.afk_notice.seconds, hint = M.state.afk_notice.hint} or nil)
 end
 
+-- Which source last answered notice.hud_apps_hidden, so the line naming it is written once per GE load
+-- and again only when the answer's source changes (ADR-0017: the source, not a count, is the tripwire).
+notice.surface_source = nil
+
+-- Whether a menu has taken the HUD apps -- and with them the centred surface, which lives in the
+-- BeamCompHud app -- off the screen right now. Asked of the engine's own router (uilayout.hud_apps_shown,
+-- the field the UI unmounts the apps overlay on), never of a list of route names. When the router cannot
+-- answer, nothing is hidden as far as this knows: the message stays where it always went, centred.
+function notice.hud_apps_hidden()
+    local shown, route = M.uilayout.hud_apps_shown()
+    local source = shown == nil and "none" or "router"
+    if source ~= notice.surface_source then
+        notice.surface_source = source
+        if source == "router" then
+            log("I", "beamcomp.ui", "message surface: the UI router says whether the HUD apps are shown"
+                .. " (route " .. tostring(route) .. ")")
+        else
+            log("W", "beamcomp.ui", "message surface: the UI router cannot say whether the HUD apps are"
+                .. " shown (" .. tostring(route) .. "); race messages stay centred")
+        end
+    end
+    return shown == false, route
+end
+
 -- Say one thing to the player. `kind` is the toastr type ("info" / "warning" / "success") and doubles as
 -- the centred line's colour; `title` is used only on the toast path, so the two richer toast titles
 -- survive verbatim where they are still shown (no text is rewritten by this feature).
+--
+-- Two ways to the toast: no race HUD on this client (notice.in_race), or a race HUD a menu has unmounted
+-- (notice.hud_apps_hidden). The second is asked only in a race, so it costs nothing outside one; the
+-- toast it sends is drawn above that menu (ui-vue App.vue mounts ToastHost unconditionally, fixed, above
+-- the routed view), where a centred line would have expired unseen behind it.
 function notice.say(msg, kind, title)
-    if not notice.in_race() then
+    local to_toast = not notice.in_race()
+    if not to_toast then
+        local hidden, route = notice.hud_apps_hidden()
+        if hidden then
+            to_toast = true
+            log("I", "beamcomp.ui", "message shown as a toast: route " .. tostring(route)
+                .. " hides the HUD apps")
+        end
+    end
+    if to_toast then
         if guihooks then
             guihooks.trigger("toastrMsg", {type = kind or "info", title = title or "BeamComp", msg = msg})
         end
@@ -615,8 +661,11 @@ end
 -- then the race phase may already be gone. Three nil checks when nothing stands.
 --
 -- The AFK count is NOT aged here -- it has no lifetime, stall.check owns it. What it does get here is its
--- one unconditional guard: it belongs to the finish timer, so no timer means no count. This runs in every
--- phase where stall.step does not, which is what makes it a property rather than a list of clear sites.
+-- one unconditional guard: it belongs to a RUNNING finish timer, so no running timer means no count. This
+-- runs in every phase where stall.step does not, which is what makes it a property rather than a list of
+-- clear sites. M.state.grace alone does not say "running": the `finished` transition leaves it standing,
+-- and stall.step is only called in racing and qualifying, so a count raised in the last seconds of the
+-- grace stood through the final standings until the lobby. Hence the phase test, the one stall.step makes.
 function notice.step(dt)
     local line = M.state.notice
     local readout = M.state.cp_readout
@@ -624,7 +673,9 @@ function notice.step(dt)
         return
     end
     local expired = false
-    if M.state.afk_notice and not M.state.grace then
+    local timer_running = M.state.grace ~= nil
+        and (M.state.phase == "racing" or M.state.phase == "qualifying")
+    if M.state.afk_notice and not timer_running then
         M.state.afk_notice = nil
         expired = true
     end
@@ -708,7 +759,7 @@ local function handle_race_start(payload)
         M.state.race_car_id = nil
         M.state.race_caps = nil
         M.state.race_forced_car = false
-        M.state.staged_spec = nil
+        M.state.caps_check = nil
         M.state.revert_pending = false
         M.state.staging_swap_reverting = false
         M.state.detection = nil
@@ -948,18 +999,19 @@ local function handle_race_start(payload)
         -- where nothing should happen at all.
         hostCarIsOwn = payload.propOwner == true,
     }
-    -- Remember the Mode-3 caps for the staging swap-compliance gate (ADR-0032): a car swap during staging
-    -- must not stage a car over the cap. Mode 3 only -- a fixed car (Mode 2, car=) or no policy (Mode 1)
-    -- leaves this nil and the gate is skipped. Seeded fresh here; staged_spec (the compliant car to revert
-    -- an over-cap swap back to) is captured at staging entry, once the placed car's jbeam is loaded.
+    -- Remember the Mode-3 caps for the live vehicle limit check (ADR-0032 amendment 2026-11-04): the own car,
+    -- every staging swap and every parts or tuning respawn is measured against them, and from the countdown
+    -- on they lock the parts (lock.race_has_caps). Mode 3 only -- a fixed car (Mode 2, car=) or no policy
+    -- (Mode 1) leaves this nil and nothing is checked. The check's state starts empty with every race: the
+    -- first setup within the limit is the one its first measurement passes.
     M.state.race_caps = (not policy.car and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg))
         and {maxhp = policy.maxhp, maxpwr = policy.maxpwr, maxkg = policy.maxkg, minkg = policy.minkg} or nil
+    M.state.caps_check = M.state.race_caps and M.caps.new_state() or nil
     -- Whether this race forces the car, for the race lock's parts guard (ADR-0064). All four forced modes
     -- (a model, random, host, a class-drop class with a car) arrive in this one field, so the lock never
     -- needs to know which. Decided on the policy, not on the car that ends up on the slot: a car=host whose
     -- relay failed keeps the own car, and the lock then freezes that car as it stands.
     M.state.race_forced_car = type(policy.car) == "string" and policy.car ~= ""
-    M.state.staged_spec = nil
     M.state.revert_pending = false
     M.state.staging_swap_reverting = false
     -- Capture the own-car id BEFORE respawn: a forced/fresh spawn (spawn_fixed / fresh_spawn_own)
@@ -1034,6 +1086,18 @@ local function handle_race_start(payload)
             -- restage, once its jbeam has loaded. Only this fresh-spawn path carries a plate -- a staging
             -- swap (lock.consume_replace) is the player's own pick and keeps the plate it spawned with.
             M.state.restage_plate = own_plate
+        end
+        if M.state.race_caps then
+            if own_car_id and race_car:getId() == own_car_id then
+                -- Mode 3 kept the own car for now (vehicles.respawn_for_cap): its LIVE power and weight
+                -- decide, and an over-limit verdict replaces it in staging (M.caps.settle).
+                M.caps.begin(race_car, "start")
+            else
+                -- A fresh car from the metadata search, or the degraded default: a stock config, for which
+                -- the metadata is what the car measures. Adopted at its restage without a check, like our
+                -- own substitute (a later player swap is gated again, see the consume branch).
+                M.state.staging_swap_reverting = true
+            end
         end
         log("I", RACE_LOG_TAG, string.format("placed at grid slot %d", race.mySlot))
     else
@@ -1297,7 +1361,7 @@ local function teardown_race_world()
     M.state.restage_plate = nil
     M.state.race_caps = nil
     M.state.race_forced_car = false
-    M.state.staged_spec = nil
+    M.state.caps_check = nil
     M.state.revert_pending = false
     M.state.staging_swap_reverting = false
     -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
@@ -1770,15 +1834,8 @@ local function handle_race_phase(payload)
         -- No clock: staging is open-ended and waits for the host (ADR-0021 amendment), so the server
         -- sends no duration. Zero makes the first onUpdate paint the waiting line immediately.
         M.state.staging = {repaint_in = 0}
-        -- Seed the compliance revert target from the (guaranteed compliant) car we staged, so an over-cap
-        -- swap can be reverted to it (ADR-0032). Mode 3 only; the race car's jbeam is loaded by staging, so
-        -- the spec read is reliable. A later compliant swap moves the target forward (restage_swapped_car).
-        if M.state.race_caps and M.state.race_car_id and be then
-            local staged = be:getObjectByID(M.state.race_car_id)
-            if staged then
-                M.state.staged_spec = vehicles.capture_spec(staged) or M.state.staged_spec
-            end
-        end
+        -- Under a vehicle limit nothing is seeded as the revert target here: the car on the slot is only known
+        -- to be within it once its live measurement says so (M.caps), which then makes it the target.
     elseif phase == "countdown" then
         -- Staging over: upgrade the lock to the full fixed-car lock (no more replace or selector) for
         -- the countdown + racing span, then seed the start countdown; the local onUpdate tick renders
@@ -1970,9 +2027,11 @@ local function handle_race_phase(payload)
         -- Race over, but the results + props stay up for the long free-roam window (ADR-0006/0017
         -- amendments, B3). Release the in-race lock and hand the recover/repair keys back to vanilla
         -- now, so players can drive, switch vehicles, recover, and roam the track while results show.
-        -- Everything else (race state, props, standings, HUD) lives on until the lobby teardown.
+        -- Everything else (race state, props, standings, HUD) lives on until the lobby teardown -- except
+        -- the vehicle limit check: free roam is free, so nothing is measured or reverted from here on.
         lock.remove()
         disarm_assist_ve()
+        M.state.caps_check = nil
     elseif phase == "lobby" then
         -- Race over (back to lobby): despawn the track props/cones and drop all race state, but leave
         -- the player's vehicle exactly where it is -- never despawn or move it (only unfrozen, so a
@@ -3129,7 +3188,11 @@ function stall.step()
 
     local measured_own = false
     local detection = M.state.detection
-    if detection and not detection.done and not hold.is_held() and not M.state.stall_pause then
+    -- A driver who gave up (the HUD's Give up, /dnf) is out of the race but not `done`: only a finish sets
+    -- that. The server's DNF flag on his standings row is what says so (M.local_is_out), and a car that is
+    -- out holds no finish timer open, so it is not measured -- its count goes below, nothing new is sent.
+    if detection and not detection.done and not M.local_is_out() and not hold.is_held()
+            and not M.state.stall_pause then
         -- The car the detector scores checkpoints with, not M.state.race_car_id: if a switch ever gets
         -- past the in-race lock, the stall verdict must follow the car actually being scored, or we would
         -- report a stall for a car the player is no longer in.
@@ -3351,7 +3414,10 @@ end
 -- Deliberately the server's flag and not the local detector, which is done one round trip earlier: the
 -- HUD's FINISHED banner fires on that same server flag, and the app can only hold the card behind a banner
 -- that has started, so a detector-keyed card flashed up for that round trip before the banner covered it.
-local function local_is_out()
+-- The AFK standstill clock asks it too (stall.step): a give-up sets no detector flag, only this one. Hung
+-- on M, not a top-level local: stall.step is defined above this point, and a local declared here would be
+-- a nil global there (the 200-local ceiling says the same).
+function M.local_is_out()
     local race = M.state.race
     local my_slot = race and race.mySlot
     local standings = M.state.standings
@@ -3369,7 +3435,7 @@ end
 -- Whether the local player may give up the running race right now (the race HUD's Give up button): the
 -- racing phase, a standings row on this client's slot, and not done yet. Done is asked twice on purpose:
 -- the local detector, so the button is gone on the frame the car crosses the line, and the server's
--- finished/DNF flag (local_is_out), which also covers a DNF the server set. ONE predicate with two
+-- finished/DNF flag (M.local_is_out), which also covers a DNF the server set. ONE predicate with two
 -- readers: build_hud_snapshot shows the button on it, and M.give_up_race re-asks it before sending,
 -- because a UI frame can be a frame stale. Neither is the authority; the server's /dnf checks are.
 -- Hung on M rather than a top-level local (the 200-local ceiling), which also makes it callable from
@@ -3390,7 +3456,7 @@ function M.can_give_up()
     end
     for _, e in ipairs(standings) do
         if e.slot == my_slot then
-            return not local_is_out()
+            return not M.local_is_out()
         end
     end
     return false  -- no row of ours: a spectator, or a race this client never got
@@ -3415,7 +3481,7 @@ end
 -- without affecting anyone else. Phase-aware: while the race still runs, a finished/DNF'd player toggles
 -- the provisional card; once finished it toggles the final results card.
 local function handle_results_toggle()
-    if M.state.phase == "racing" and local_is_out() then
+    if M.state.phase == "racing" and M.local_is_out() then
         M.toggle_provisional_results()
         return
     end
@@ -6190,6 +6256,11 @@ function M.onExtensionLoaded()
     lock.car_is_forced = function()
         return M.state.race_forced_car == true
     end
+    -- And whether it has a vehicle limit (ADR-0064 amendment 2026-11-04): the full lock then refuses parts
+    -- changes too, so from the countdown on only tuning is left for the live check to measure and revert.
+    lock.race_has_caps = function()
+        return M.state.race_caps ~= nil
+    end
     -- Listen to BeamMP's two nametag switches (the "Player Nametags" key and hideNicknames), so the AI tags
     -- the host draws itself go on and off with every other tag (ADR-0062 amendment 2026-10-08). Given back
     -- in onExtensionUnloaded; a second install unwraps an earlier one instead of stacking on it. Guarded
@@ -6404,9 +6475,12 @@ local function rearm_own_car_on_reload(vehicle_id)
         return
     end
     -- Collapse the several lifecycle events one respawn raises into a single re-arm (also stops any stray
-    -- repeat from re-freezing every frame).
+    -- repeat from re-freezing every frame). Not while the vehicle limit's own setup revert is on its way:
+    -- that second respawn lands a few frames after the player's, inside this window, and its fresh VE needs
+    -- the override and the freeze as much as the first one did.
     local now = os.clock()
-    if now - last_reload_rearm_at < RELOAD_REARM_THROTTLE then
+    if now - last_reload_rearm_at < RELOAD_REARM_THROTTLE
+            and not M.capcheck.awaits_own_respawn(M.state.caps_check) then
         return
     end
     last_reload_rearm_at = now
@@ -6479,6 +6553,9 @@ function M.onVehicleSpawned(vehicleId)
     -- here too. The guard no-ops for cones, AI, remotes, and any vehicle that is not the player's own race
     -- car -- see onVehicleResetted, the primary hook.
     rearm_own_car_on_reload(vehicleId)
+    -- The same respawn may carry a parts or tuning change: under a vehicle limit the race car is looked at
+    -- next frame (M.caps.process_reload), when the new VE exists to be measured.
+    M.caps.note_reload(vehicleId)
     -- Host: a vehicle appearing while we own this race's props may BE a prop -- either one the prefab load
     -- just created, or BeamMP re-spawning one under a new id ~5 s later (memory
     -- beammp-respawns-prefab-vehicles-under-new-ids). Re-arm the derivation; onUpdate re-runs the diff and
@@ -6501,6 +6578,7 @@ end
 -- a running race is a no-op.
 function M.onVehicleResetted(vehicleId)
     rearm_own_car_on_reload(vehicleId)
+    M.caps.note_reload(vehicleId)
 end
 
 -- BeamNG fires this GE hook (lua/vehicle/ai.lua queues onAiRouteDone(<id>) when a car stops at the end of
@@ -7263,7 +7341,7 @@ local function build_hud_snapshot()
     local lap_count = (race and race.laps) or 1
     -- The local detector, done on the frame the car crosses the line and one round trip ahead of the
     -- server's `finished` flag. Right for "can you still finish" (grace_can_finish below); the provisional
-    -- card waits for the server flag instead (local_is_out).
+    -- card waits for the server flag instead (M.local_is_out).
     local local_finished = detection and detection.done
     local local_dnf = false
     -- Both racing and qualifying drive the local detector + lap clock (ADR-0041), so the live local-row
@@ -7634,13 +7712,13 @@ local function build_hud_snapshot()
     end
 
     -- Provisional results card (ADR-0022), shown to a finished/DNF'd player while the race still runs.
-    -- Keyed on the server-confirmed finish (local_is_out), the same flag of the same standings the entries
+    -- Keyed on the server-confirmed finish (M.local_is_out), the same flag of the same standings the entries
     -- above carry as `finished` -- which is what the app's FINISHED banner fires on. Card and banner
     -- therefore flip in one snapshot, and the app holds the card back until the banner fades; keyed on the
     -- detector, the card was up one round trip before the banner existed to hold it.
     -- Its penalized row list is built only while the card is actually up -- like the analysis block above,
     -- the closed default costs nothing per frame.
-    local provisional_available = phase == "racing" and local_is_out()
+    local provisional_available = phase == "racing" and M.local_is_out()
     local provisional_entries = nil
     if provisional_available and M.state.provisional_open and standings then
         provisional_entries = build_provisional_entries(entries, standings)
@@ -8160,78 +8238,341 @@ local function step_assist(dt_real)
     end
 end
 
--- os.clock() reading of the last over-cap staging-swap toast, throttled by CAP_SWAP_TOAST_THROTTLE. A
--- plain file-scope local (a Lua reload resets it -- at worst one extra toast), mirroring last_block_toast_at.
+-- os.clock() reading of the last over-limit notice, throttled by CAP_SWAP_TOAST_THROTTLE. A plain file-scope
+-- local (a Lua reload resets it -- at worst one extra notice), mirroring last_block_toast_at.
 local last_cap_swap_toast_at = 0
 
--- English label for the active strict weight range: "1200-1800 kg", "<=1500 kg", or ">=1200 kg".
--- Only called with at least one of maxkg/minkg set (the weight branch of warn_over_cap).
-local function weight_limit_label(caps)
-    if caps.minkg and caps.maxkg then
-        return string.format("%d-%d kg", math.floor(caps.minkg + 0.5), math.floor(caps.maxkg + 0.5))
-    elseif caps.maxkg then
-        return string.format("<=%d kg", math.floor(caps.maxkg + 0.5))
-    end
-    return string.format(">=%d kg", math.floor(caps.minkg + 0.5))
-end
-
--- True when the live weight breaks the strict range: an unreadable weight under a set bound fails (cannot
--- verify => blocked, ADR-0032), else a readable weight below minkg or above maxkg fails.
-local function breaks_weight_range(weight, caps)
-    if not (caps.maxkg or caps.minkg) then
-        return false
-    end
-    if type(weight) ~= "number" then
-        return true
-    end
-    return (caps.minkg and weight < caps.minkg) or (caps.maxkg and weight > caps.maxkg) or false
-end
-
--- Warn (throttled, English, native toast) that a staging car swap was rejected for breaking the Mode-3 cap
--- (ADR-0032). Names the offending car and the numbers, e.g. "etk800 has 450 hp -- limit is 300 hp". Reports
--- the first axis that failed off the live power/weight and the caps, in is_compliant order: the max-HP cap,
--- then the power-to-weight cap, then the strict weight range (maxkg/minkg); an unreadable value says that
--- reading couldn't be verified (cannot verify => blocked, ADR-0032's load-bearing rule). Uses the same
--- guihooks toast surface as the switch/spawn block warnings.
-local function warn_over_cap(veh, power, weight, caps)
+-- Tell the player (throttled, through notice.say) that his car is over the Mode-3 limit (ADR-0032): `lead`
+-- says what happened ("Setup reverted."), the detail names the car and the numbers off the live reading, e.g.
+-- "etk800 has 450 hp, the limit is 300 hp" (capcheck.limit_detail). Returns the detail for the caller's log
+-- line, which is written whether or not the notice was throttled.
+local function warn_over_cap(veh, power, weight, caps, lead)
+    local detail = M.capcheck.limit_detail((veh and veh.JBeam) or "That car", power, weight, caps)
     local now = os.clock()
-    if now - last_cap_swap_toast_at < CAP_SWAP_TOAST_THROTTLE then
+    if now - last_cap_swap_toast_at >= CAP_SWAP_TOAST_THROTTLE then
+        last_cap_swap_toast_at = now
+        notice.say(lead .. " " .. detail, "warning")
+    end
+    return detail
+end
+
+-- ===== the vehicle limit check of the own race car (ADR-0032 amendment 2026-11-04) ======
+-- The engine-facing half of race/capcheck.lua (which holds the state machine and every decision): building
+-- the per-race state, sending the measurement requests, taking the VE's answers, logging each verdict, and
+-- carrying out what an over-limit verdict calls for -- put the last setup within the limit back in place, put
+-- the last car within it back, or replace the car with the first one within it. Three purposes feed it:
+-- "start" (handle_race_start), "swap" (the restage gate below) and "config" (a respawn of the race car,
+-- M.caps.note_reload from onVehicleSpawned / onVehicleResetted).
+
+-- A fresh check for one race. The token seed comes from the clock so an answer to the previous race's last
+-- request can never match one this race is waiting for.
+function M.caps.new_state()
+    return M.capcheck.new(math.floor(os.clock() * 1000))
+end
+
+-- The race car the check is about, or nil.
+function M.caps.race_car()
+    local id = M.state.race_car_id
+    if id == nil or not be then
+        return nil
+    end
+    return be:getObjectByID(id)
+end
+
+-- Whether a car replace or a fresh race-start car is being re-staged, so the restage (and its gate) owns
+-- the car. Only up to the countdown, the last phase restage_swapped_car runs in: a restage left pending past
+-- it must not silence the check for the rest of the race.
+function M.caps.restaging()
+    local phase = M.state.phase
+    return lock.replace_seen
+        or (M.state.restage_pending
+            and phase ~= "racing" and phase ~= "qualifying" and phase ~= "qualiResults")
+end
+
+-- Advance the measurement clock and send what is due (first request or a resend).
+function M.caps.pump(dt)
+    local state = M.state.caps_check
+    local token = M.capcheck.step(state, dt)
+    if not token then
         return
     end
-    last_cap_swap_toast_at = now
-    local name = (veh and veh.JBeam) or "That car"
-    local pwr_ok = caps.maxpwr == nil
-        or (type(power) == "number" and type(weight) == "number" and weight > 0
-            and power / weight <= caps.maxpwr)
-    local detail
-    if caps.maxhp and not (type(power) == "number" and power <= caps.maxhp) then
-        if type(power) == "number" then
-            detail = string.format("%s has %d hp, the limit is %d hp", name, math.floor(power + 0.5), caps.maxhp)
-        else
-            detail = string.format("%s: engine power couldn't be verified, the limit is %d hp", name, caps.maxhp)
-        end
-    elseif caps.maxpwr and not pwr_ok then
-        if type(power) == "number" and type(weight) == "number" and weight > 0 then
-            detail = string.format("%s has %.2f hp/kg, the limit is %.2f hp/kg",
-                name, power / weight, caps.maxpwr)
-        else
-            detail = string.format("%s: power-to-weight couldn't be verified, the limit is %.2f hp/kg",
-                name, caps.maxpwr)
-        end
-    elseif breaks_weight_range(weight, caps) then
-        if type(weight) == "number" then
-            detail = string.format("%s weighs %d kg, the limit is %s", name, math.floor(weight + 0.5),
-                weight_limit_label(caps))
-        else
-            detail = string.format("%s: curb weight couldn't be verified, the limit is %s", name,
-                weight_limit_label(caps))
-        end
-    else
-        detail = name .. " exceeds the vehicle limit"
+    local veh = be and be:getObjectByID(state.pending.veh_id)
+    local sent, err = vehicles.request_live_spec(veh, token)
+    if not sent then
+        log("W", RACE_LOG_TAG, "vehicle limit: could not ask the car for its live power and weight: "
+            .. tostring(err))
     end
-    notice.say("Can't stage that car. " .. detail, "warning")
-    log("I", RACE_LOG_TAG, "rejected over-cap staging swap: " .. detail)
 end
+
+-- Start measuring `veh` for `purpose`. `spec` / `fingerprint` are the setup measured, read now when not
+-- given; whatever was pending is replaced.
+function M.caps.begin(veh, purpose, spec, fingerprint)
+    local state = M.state.caps_check
+    if not state or not veh then
+        return
+    end
+    if spec == nil then
+        local setup
+        spec, setup = vehicles.capture_setup(veh)
+        fingerprint = M.capcheck.fingerprint(setup)
+    end
+    M.capcheck.begin(state, veh:getId(), purpose, spec, fingerprint)
+    M.caps.pump(0)
+end
+
+-- The race car was respawned or reset (onVehicleSpawned / onVehicleResetted). Looked at next frame, when the
+-- respawned car's VE exists to be measured; the hooks fire before it does (core/vehicle/manager.lua).
+function M.caps.note_reload(vehicle_id)
+    local state = M.state.caps_check
+    if state and M.state.race and M.state.race_car_id ~= nil
+            and tostring(vehicle_id) == tostring(M.state.race_car_id) then
+        state.reload_due = true
+    end
+end
+
+-- Our setup revert has landed (`how` for the log): hand the parts and tuning menus the car as it now is, the
+-- way the parts lock answers a refusal (sendDataToUI). No-op when no revert was waiting.
+function M.caps.revert_landed(veh, how)
+    if not M.capcheck.land_own_respawn(M.state.caps_check) then
+        return
+    end
+    local ok, err = pcall(function() core_vehicle_partmgmt.sendDataToUI() end)
+    if not ok then
+        log("W", RACE_LOG_TAG, "vehicle limit: menu resync failed: " .. tostring(err))
+    end
+    log("I", RACE_LOG_TAG, "vehicle limit: the setup revert of '" .. vehicles.setup_label(veh) .. "' landed "
+        .. how)
+end
+
+-- Look at the race car after a respawn or reset: a plain reset leaves its setup fingerprint equal and costs
+-- nothing; a parts or tuning change is measured (capcheck.classify_reload names every case).
+function M.caps.process_reload()
+    local state = M.state.caps_check
+    state.reload_due = false
+    local veh = M.caps.race_car()
+    if not veh then
+        return
+    end
+    local spec, setup = vehicles.capture_setup(veh)
+    local fingerprint = M.capcheck.fingerprint(setup)
+    if not fingerprint then
+        log("W", RACE_LOG_TAG, "vehicle limit: could not read the setup of '" .. vehicles.setup_label(veh)
+            .. "'; measuring it")
+    end
+    local kind = M.capcheck.classify_reload(state, fingerprint, M.caps.restaging())
+    if kind == "pending_changed" then
+        M.caps.begin(veh, state.pending.purpose, spec, fingerprint)
+    elseif kind == "unchanged" then
+        state.snapshot.spec = spec or state.snapshot.spec
+        M.caps.revert_landed(veh, "as requested")
+    elseif kind == "own" then
+        M.capcheck.remember(state, spec, fingerprint)
+        M.caps.revert_landed(veh, "in a form that does not compare equal; adopted without a new check")
+    elseif kind == "changed" then
+        local snapshot = state.snapshot
+        local keys = M.capcheck.changed_keys(snapshot and snapshot.fingerprint, fingerprint)
+        log("I", RACE_LOG_TAG, string.format("vehicle limit: setup of '%s' changed (%s); measuring it",
+            vehicles.setup_label(veh), #keys > 0 and table.concat(keys, ", ") or "nothing known before"))
+        M.caps.begin(veh, "config", spec, fingerprint)
+    end
+end
+
+-- Log the verdict on a finished measurement (the one line per measurement, capcheck.describe) and return
+-- the measurement with `compliant` set.
+function M.caps.judge(veh, taken)
+    local reading = taken.reading or {}
+    local compliant, missing = M.capcheck.verdict(reading, M.state.race_caps)
+    local meta_power, meta_weight = vehicles.metadata_reading(veh)
+    local level, line = M.capcheck.describe(vehicles.setup_label(veh), taken.purpose, reading, meta_power,
+        meta_weight, vehicles.is_stock_setup(veh), compliant, missing)
+    log(level, RACE_LOG_TAG, line)
+    taken.compliant = compliant
+    return taken
+end
+
+-- Make what `veh` stands on now the setup to go back to: the measured setup when there was a measurement
+-- (`judged`), else the car as it is (our own revert or substitute, adopted without one).
+function M.caps.remember(veh, judged)
+    local state = M.state.caps_check
+    if not state then
+        return
+    end
+    if judged then
+        M.capcheck.remember(state, judged.spec, judged.fingerprint)
+        return
+    end
+    local spec, setup = vehicles.capture_setup(veh)
+    M.capcheck.remember(state, spec, M.capcheck.fingerprint(setup))
+end
+
+-- Respawn the car in place on the last setup within the limit. Returns whether the respawn went out.
+function M.caps.revert_setup(veh, judged)
+    local state = M.state.caps_check
+    local reading = judged.reading or {}
+    local label = vehicles.setup_label(veh)
+    local reverted, err = vehicles.respawn_setup(veh, state.snapshot.spec)
+    if not reverted then
+        local detail = warn_over_cap(veh, reading.power, reading.weight, M.state.race_caps,
+            "Over the vehicle limit.")
+        log("W", RACE_LOG_TAG, "vehicle limit: could not put the last setup back on '" .. label .. "' ("
+            .. tostring(err) .. "): " .. detail)
+        return false
+    end
+    M.capcheck.expect_own_respawn(state, judged.fingerprint)
+    local detail = warn_over_cap(veh, reading.power, reading.weight, M.state.race_caps, "Setup reverted.")
+    log("I", RACE_LOG_TAG, "vehicle limit: put the last setup within the limit back on '" .. label .. "': "
+        .. detail)
+    return true
+end
+
+-- Replace the car with the last car within the limit (staging only: the swap-allowed lock's pass-through
+-- re-stages it, and revert_pending adopts it without a new check). Returns whether the replace went out.
+function M.caps.revert_car(veh, judged)
+    local reading = judged.reading or {}
+    local detail = warn_over_cap(veh, reading.power, reading.weight, M.state.race_caps,
+        "Can't stage that car.")
+    local reverted, err = vehicles.replace_spec(veh, M.state.caps_check.snapshot.spec)
+    if not reverted then
+        log("W", RACE_LOG_TAG, "vehicle limit: could not put the last car within the limit back: "
+            .. tostring(err))
+        return false
+    end
+    M.state.revert_pending = true
+    log("I", RACE_LOG_TAG, "vehicle limit: put the last car within the limit back: " .. detail)
+    return true
+end
+
+-- Replace the car with the first car within the limit, or the default car when there is none (staging only,
+-- the same pipeline as revert_car). The player keeps his plate on it. Returns whether the replace went out.
+function M.caps.substitute(veh, judged)
+    local caps = M.state.race_caps
+    local reading = judged.reading or {}
+    local outgoing = tostring(veh.JBeam)
+    local spec, degraded = vehicles.cap_substitute_spec(veh.JBeam, caps)
+    local plate = vehicles.read_plate(veh)
+    local detail = M.capcheck.limit_detail(outgoing, reading.power, reading.weight, caps)
+    local replaced, err = vehicles.replace_spec(veh, spec)
+    if not replaced then
+        warn_over_cap(veh, reading.power, reading.weight, caps, "Over the vehicle limit.")
+        log("W", RACE_LOG_TAG, "vehicle limit: could not replace '" .. outgoing .. "': " .. tostring(err))
+        return false
+    end
+    M.state.revert_pending = true
+    M.state.restage_plate = plate
+    if degraded then
+        notice.say("No suitable car available, spawning the default car", "warning")
+        log("W", RACE_LOG_TAG, string.format(
+            "vehicle limit: no car meets it; replaced '%s' with the default '%s' (%s)",
+            outgoing, tostring(spec.model), detail))
+        return true
+    end
+    notice.say("Car replaced. " .. detail, "warning")
+    log("I", RACE_LOG_TAG, string.format(
+        "vehicle limit: replaced '%s' with '%s:%s', the first car within it (%s)",
+        outgoing, tostring(spec.model), tostring(spec.config), detail))
+    return true
+end
+
+-- Carry out an over-limit verdict (capcheck.decide). Returns whether the car was respawned or replaced, so a
+-- restage leaves it to that cycle.
+function M.caps.reject(veh, judged)
+    local action = M.capcheck.decide(judged.purpose, false, M.state.phase, M.state.caps_check.snapshot,
+        veh.JBeam)
+    if action == "revert_setup" then
+        return M.caps.revert_setup(veh, judged)
+    elseif action == "revert_car" then
+        return M.caps.revert_car(veh, judged)
+    elseif action == "substitute" then
+        return M.caps.substitute(veh, judged)
+    end
+    local reading = judged.reading or {}
+    local detail = warn_over_cap(veh, reading.power, reading.weight, M.state.race_caps,
+        "Over the vehicle limit.")
+    log("W", RACE_LOG_TAG, "vehicle limit: '" .. vehicles.setup_label(veh) .. "' stays over it in "
+        .. tostring(M.state.phase) .. ", nothing is left to put back: " .. detail)
+    return false
+end
+
+-- Act on a finished start or config measurement, once the phase allows it (capcheck.ACTING_PHASES). Nothing
+-- is settled while a restage owns the car: a swap measurement is its gate's, and a start or config one is
+-- about a car the replace is taking away (the consume branch drops it). A swap measurement left behind by a
+-- restage that never finished is settled here like the others, so it cannot block every later check.
+function M.caps.settle()
+    local state = M.state.caps_check
+    local finished = M.capcheck.finished(state)
+    if not finished or not M.capcheck.ACTING_PHASES[M.state.phase] or M.caps.restaging() then
+        return
+    end
+    M.capcheck.take(state)
+    local veh = M.caps.race_car()
+    if not veh or tostring(veh:getId()) ~= tostring(finished.veh_id) then
+        return
+    end
+    local judged = M.caps.judge(veh, finished)
+    if judged.compliant then
+        M.capcheck.remember(state, judged.spec, judged.fingerprint)
+        return
+    end
+    M.caps.reject(veh, judged)
+end
+
+-- The per-frame step (onUpdate, any phase while the check exists). Sim time: a paused game measures nothing.
+function M.caps.step(dt_sim)
+    local state = M.state.caps_check
+    if not state or not M.state.race then
+        return
+    end
+    if M.capcheck.step_own_respawn(state, dt_sim) then
+        log("W", RACE_LOG_TAG, string.format("vehicle limit: the setup revert raised no reload within %d s;"
+            .. " looking at the car again", M.capcheck.OWN_RESPAWN_WAIT))
+        state.reload_due = true
+    end
+    if state.reload_due then
+        M.caps.process_reload()
+    end
+    M.caps.pump(dt_sim)
+    M.caps.settle()
+end
+
+-- The restage gate's measurement of a swapped car (purpose "swap"): nil while it is out, then the judged
+-- measurement. Started on the first call, i.e. once the restage has waited for the new jbeam.
+function M.caps.gate(own)
+    if not M.state.caps_check then
+        M.state.caps_check = M.caps.new_state()
+    end
+    local state = M.state.caps_check
+    local pending = state.pending
+    if not pending or pending.purpose ~= "swap" or tostring(pending.veh_id) ~= tostring(own:getId()) then
+        M.caps.begin(own, "swap")
+        return nil
+    end
+    if not pending.done then
+        return nil
+    end
+    M.capcheck.take(state)
+    return M.caps.judge(own, pending)
+end
+
+-- The VE's answer to a measurement request (lua/vehicle/extensions/beamcomp/init.lua measure_spec). Public
+-- as beamcomp_init.on_live_spec, the name the VE calls through queueGameEngineLua. An answer nobody waits
+-- for any more (replaced, given up, another race) is dropped with a line.
+function M.on_live_spec(vehicle_id, token, power, weight, engines, reason)
+    local state = M.state.caps_check
+    if not state then
+        return
+    end
+    local reading = {
+        power = type(power) == "number" and power or nil,
+        weight = type(weight) == "number" and weight or nil,
+        engines = tonumber(engines) or 0,
+        reason = type(reason) == "string" and reason or nil,
+    }
+    if not M.capcheck.on_answer(state, vehicle_id, token, reading) then
+        log("I", RACE_LOG_TAG, "vehicle limit: dropped a live spec answer nobody waits for (token "
+            .. tostring(token) .. ")")
+    end
+end
+-- ===== end vehicle limit check ==========================================================
 
 -- Re-stage the staging car to its grid slot, front-anchored, once its jbeam has loaded. Two arming
 -- paths share this one deferred placement:
@@ -8288,6 +8629,11 @@ local function restage_swapped_car(dt_real)
         -- the reverted car's multi-frame load wait, which would otherwise let a second over-cap swap through.
         M.state.staging_swap_reverting = M.state.revert_pending == true
         M.state.revert_pending = false
+        -- The replace owns the car now: a vehicle limit measurement or setup revert still out for the car it
+        -- replaced is about a car that no longer stands there (the gate below measures the new one).
+        if M.state.caps_check then
+            M.capcheck.cancel(M.state.caps_check)
+        end
         log("I", RACE_LOG_TAG, "staging vehicle replace detected; re-staging")
     end
 
@@ -8339,53 +8685,42 @@ local function restage_swapped_car(dt_real)
         return
     end
 
-    -- Mode-3 compliance gate (ADR-0032): the swap-allowed staging lock lets the player replace their car via
-    -- the vehicle/parts selector, but must not let them stage a car over the power cap. The jbeam is loaded
-    -- here (we are past the load wait), so the car's LIVE power/weight read is reliable -- unlike pre-spawn
-    -- config metadata, and unlike a pre-intercepted replace it also handles a customized car correctly. On a
-    -- violation, warn and revert to the last compliant staged car; the reverting flag makes the next cycle
-    -- adopt that known-compliant car without re-gating, so a transient nil read can't loop. Mode 1/2
-    -- (race_caps nil) skip the gate; a fresh Mode-3 substitute is compliant by construction. See ADR-0032:
-    -- reverting (not a true pre-intercept) is the documented behavior -- the over-cap car is briefly visible
-    -- while its jbeam loads, the same load window any staging swap already has.
+    -- Mode-3 vehicle limit gate (ADR-0032, amendment 2026-11-04): the swap-allowed staging lock lets the
+    -- player replace his car via the vehicle/parts selector, but must not let him stage a car over the
+    -- limit. The jbeam is loaded here (we are past the load wait), so the car's VE can be MEASURED -- live
+    -- power and weight, the only reading that sees a customized car; its config metadata describes the
+    -- preset it came from. The restage stays pending until the answer is in (M.caps.gate, a few frames, 4 s
+    -- at worst; no answer counts as over). Over the limit: warn and put the last car within it back (in
+    -- staging, where the lock passes a replace through), and the reverting flag makes the next cycle adopt
+    -- that car without re-gating, so a broken read cannot loop. Mode 1/2 (race_caps nil) skip the gate; our
+    -- own revert and substitute and the fresh race-start car are adopted unchecked. Reverting, not a
+    -- pre-intercept, is the documented behavior (ADR-0032): the over-limit car is briefly visible while its
+    -- jbeam loads.
     local caps = M.state.race_caps
-    local staged_ok = true  -- whether the car about to be adopted is cap-compliant (always true without caps)
+    local staged_ok = true  -- whether the car about to be adopted is within the limit (always without caps)
+    local measured = nil    -- the measurement it passed, which becomes the setup to go back to
     if caps and not M.state.staging_swap_reverting then
-        local compliant, power, weight =
-            vehicles.car_compliant(own, caps.maxhp, caps.maxpwr, caps.minkg, caps.maxkg)
-        if not compliant then
+        local judged = M.caps.gate(own)
+        if not judged then
+            return
+        end
+        if judged.compliant then
+            measured = judged
+        else
             staged_ok = false
-            warn_over_cap(own, power, weight, caps)
-            -- Revert only in the staging phase: replaceVehicle is a working pass-through only under the
-            -- swap-allowed staging lock. Past staging (a late swap whose jbeam loads only after the
-            -- countdown began) the full lock refuses replaceVehicle silently, so a revert can't take effect
-            -- there -- we adopt (warned) rather than falsely believe we reverted. Needs a compliant car
-            -- captured to revert to.
-            if M.state.staged_spec and M.state.phase == "staging" then
-                local reverted, revert_err = vehicles.replace_spec(own, M.state.staged_spec)
-                if reverted then
-                    -- Mark our own revert so the consume branch skips the gate for exactly the cycle it
-                    -- starts (and no later player swap); the reverted car is adopted on the next cycle.
-                    M.state.revert_pending = true
-                    log("I", RACE_LOG_TAG, "over-cap staging swap reverted to the last compliant car")
-                    return
-                end
-                -- Revert call failed outright: fall through and adopt so the player is at least frozen on
-                -- the grid -- they were warned above.
-                log("W", RACE_LOG_TAG, "could not revert over-cap staging swap: " .. tostring(revert_err))
-            else
-                -- No compliant car to revert to, or past staging where the lock refuses a replace: adopt
-                -- (warned) rather than trap the player.
-                log("W", RACE_LOG_TAG, "over-cap staging swap not reverted (no target / not staging); adopting")
+            -- Past staging (a late swap whose jbeam loads only after the countdown began) the full lock
+            -- refuses replaceVehicle, so the car is adopted, warned, rather than falsely believed reverted.
+            if M.caps.reject(own, judged) then
+                return
             end
         end
     end
-    -- Clear the one-cycle revert flag and, when the adopted car is compliant, move the revert target forward
-    -- to it (Mode 3 only) so a later over-cap swap reverts to the car actually staged now. A non-compliant
-    -- car we had to adopt (revert failed / nothing to revert to) must NOT become the revert target.
+    -- Clear the one-cycle revert flag and, when the adopted car is within the limit, move the revert
+    -- target forward to it (Mode 3 only) so a later over-limit change goes back to the car actually staged
+    -- now. A car over the limit we had to adopt (revert failed / nothing to revert to) must NOT become it.
     M.state.staging_swap_reverting = false
     if caps and staged_ok then
-        M.state.staged_spec = vehicles.capture_spec(own) or M.state.staged_spec
+        M.caps.remember(own, measured)
     end
 
     -- Adopt the staging car: re-point the bounce target, re-place front-anchored to its now-correct
@@ -8627,6 +8962,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- that second. Physics time, so a paused game does not read a car that has not moved yet. One nil
     -- check when no recover is pending.
     vehicles.step_recover_readback(dtSim)
+    -- Phase-independent while a race with a vehicle limit runs (ADR-0032 amendment 2026-11-04): send and time
+    -- the live measurements of the own race car, look at it after a respawn, and carry out a verdict once the
+    -- phase allows it (M.caps.step). Before the restage below, which takes a swap's verdict in the same
+    -- frame. One nil check in every other race and outside one.
+    if M.state.caps_check then
+        M.caps.step(dtSim)
+    end
     -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
     -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
     -- polling lives in race/vehicles (it is a measurement of the car); this is only the wiring, kept

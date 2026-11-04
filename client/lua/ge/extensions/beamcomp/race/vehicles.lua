@@ -167,9 +167,8 @@ end
 
 -- (public) Snapshot a spawned car as a spec table -- model + part config + all three paint layers (mirrors
 -- core_vehicles.cloneCurrent) -- the shape spawn_vehicle_at and replace_spec consume. Returns the spec, or
--- nil when the read fails. pcall-guarded (the paint/handle reads are engine-boundary). Used by the staging
--- compliance gate (init.lua) to remember the last compliant car to revert an over-cap swap back to;
--- capture_own_spec wraps it with the owned-car guard.
+-- nil when the read fails. pcall-guarded (the paint/handle reads are engine-boundary). capture_own_spec
+-- wraps it with the owned-car guard; capture_setup builds the vehicle limit's revert target on it.
 function M.capture_spec(veh)
     if not veh then
         return nil
@@ -255,6 +254,89 @@ function M.replace_spec(veh, spec)
     local ok, err = pcall(core_vehicles.replaceVehicle, spec.model, opt)
     if not ok then
         return nil, "replaceVehicle failed: " .. tostring(err)
+    end
+    return true
+end
+
+-- A deep copy of a config table's plain values (no functions, no engine handles).
+local function copy_plain(value)
+    local kind = type(value)
+    if kind == "table" then
+        local copy = {}
+        for key, inner in pairs(value) do
+            copy[key] = copy_plain(inner)
+        end
+        return copy
+    end
+    if kind == "string" or kind == "number" or kind == "boolean" then
+        return value
+    end
+    return nil
+end
+
+-- (public) A car's setup for the vehicle limit check (ADR-0032 amendment 2026-11-04), as two values:
+--   1. a spec in capture_spec's shape, but with the RAW partConfig -- a .pc path for a preset, the
+--      engine's own serialized config for a custom build -- plus `setup`. safe_config drops exactly that
+--      raw string, which made a reverted custom build come back as the model's default trim. This spec is
+--      the revert target, kept on this client only and never sent anywhere (the ~74 KB blob is why
+--      safe_config exists);
+--   2. `setup`: a deep copy of the live config (core_vehicle_partmgmt.getConfigOfVehicle), which the check
+--      fingerprints and a setup revert respawns into. A copy, because the engine merges the next change
+--      into its own table before it respawns.
+-- Either is nil when it cannot be read. A raw config carrying linkedPCFile would come back as that preset
+-- on a replace (memory beamng-linked-pcfile-drops-inline-tuning); a single car's config has none.
+function M.capture_setup(veh)
+    local spec = M.capture_spec(veh)
+    if spec then
+        local ok, raw = pcall(function() return veh.partConfig end)
+        spec.config = ok and raw or nil
+    end
+    local config
+    local ok, err = pcall(function()
+        if type(core_vehicle_partmgmt) == "table"
+                and type(core_vehicle_partmgmt.getConfigOfVehicle) == "function" then
+            config = core_vehicle_partmgmt.getConfigOfVehicle(veh:getId())
+        end
+    end)
+    if not ok then
+        log("W", LOG_TAG, "could not read the vehicle config: " .. tostring(err))
+    end
+    if type(config) ~= "table" then
+        return spec, nil
+    end
+    local setup = copy_plain(config)
+    if spec then
+        spec.setup = setup
+    end
+    return spec, setup
+end
+
+-- (public) Respawn `veh` in place on a setup taken by capture_setup: veh:respawn(serialize(config)), the
+-- very call every parts and tuning change of the game ends in (core/vehicle/partmgmt.lua
+-- mergeConfigOfVehicle), so the car keeps its id and its spot and nothing goes through replaceVehicle --
+-- which the full race lock refuses. The raw partConfig is the fallback when the config copy cannot be
+-- serialized. The vehicle limit's way back from a setup over it, in every race phase. Returns true, or nil
+-- plus a reason.
+function M.respawn_setup(veh, spec)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    if type(spec) ~= "table" then
+        return nil, "no setup to respawn into"
+    end
+    local config = spec.config
+    if type(spec.setup) == "table" and type(serialize) == "function" then
+        local ok, text = pcall(serialize, spec.setup)
+        if ok and type(text) == "string" then
+            config = text
+        end
+    end
+    if type(config) ~= "string" then
+        return nil, "no setup to respawn into"
+    end
+    local ok, err = pcall(function() veh:respawn(config) end)
+    if not ok then
+        return nil, "respawn failed: " .. tostring(err)
     end
     return true
 end
@@ -399,6 +481,29 @@ local function model_config_of(veh)
         return nil
     end
     return model, config_key(config, model)
+end
+
+-- (public) "<model>:<preset>" for a car on a named preset, "<model>:custom" for one whose setup was changed
+-- since it spawned (its partConfig is then the serialized config). For the vehicle limit's log line.
+function M.setup_label(veh)
+    local model, config = model_config_of(veh)
+    if not model then
+        return "unknown"
+    end
+    return model .. ":" .. (config or "custom")
+end
+
+-- (public) Whether `veh` still runs the named preset it was spawned from. Only for such a car must its live
+-- power and weight equal the metadata, which is what makes the vehicle limit's log line a tripwire.
+function M.is_stock_setup(veh)
+    local _, config = model_config_of(veh)
+    return config ~= nil
+end
+
+-- (public) The metadata power (hp) and weight (kg) of the preset `veh` was spawned from, for the vehicle
+-- limit's log line beside the live reading. Either may be nil.
+function M.metadata_reading(veh)
+    return vehiclespecs.metadata_power(veh), vehiclespecs.metadata_weight(veh)
 end
 
 -- WHICH point of the car's box a pose names -- the anchor convention (ADR-0034 amendment 2026-10-07,
@@ -1208,53 +1313,45 @@ local function spawn_default_degraded(pose)
     return veh, nil, true
 end
 
--- (public) Live Mode-3 compliance check for a SPAWNED car (ADR-0032): read the car's live power/weight --
--- reliable, unlike pre-spawn config metadata (see the POWER-READ RISK note) -- and apply is_compliant,
--- returning (compliant, power, weight) so a caller can both gate and build a warning from the readings. A
--- nil cap is "no limit on that axis"; an unreadable input under a set cap is non-compliant (cannot verify
--- => blocked). maxkg/minkg (kg) are the STRICT player weight range, exclude-on-unreadable like the power
--- caps (distinct from the AI's lenient big-car nicety). Shared by the race-start cap resolve
--- (respawn_for_cap) and the staging swap gate (init.lua).
-function M.car_compliant(veh, maxhp, maxpwr, minkg, maxkg)
-    local power = vehiclespecs.vehicle_power(veh)
-    local weight = vehiclespecs.vehicle_weight(veh)
-    local range = vehiclespecs.weight_range(minkg, maxkg)
-    return vehiclespecs.is_compliant(power, weight, maxhp, maxpwr, nil, range), power, weight
+-- (public) The car a player over the vehicle limit races instead, as a {model, config} spec, plus whether it
+-- is the degraded default (ADR-0032 amendment 2026-07-07): the first car within the limit by the metadata
+-- search -- the own model's strongest legal trim first, then other models (find_compliant) -- or, when no
+-- installed car meets the limit, the fixed default car even though it is over it, so the player still
+-- races. The candidates are stock configs, for which the metadata IS what the car measures. Shared by the
+-- race start without an own car (respawn_for_cap) and the staging substitute of an own car measured over the
+-- limit (init.lua caps.substitute).
+function M.cap_substitute_spec(own_model, caps)
+    local range = vehiclespecs.weight_range(caps.minkg, caps.maxkg)
+    local pick = vehiclespecs.find_compliant(own_model, caps.maxhp, caps.maxpwr, nil, range)
+    if pick then
+        return {model = pick.model, config = pick.config}, false
+    end
+    return {model = DEFAULT_VEHICLE_MODEL}, true
 end
 
--- Mode 3 (ADR-0032, §5 superseded by the 2026-07-07 amendment): keep the own car when it meets the power /
--- power-to-weight / weight-range cap, else substitute the first compliant car (own model's strongest legal
--- trim first, then other models -- find_compliant), else -- when NO installed car meets the cap -- spawn the
--- fixed default car (even though it violates the cap) so the player still races (best-effort cap), instead of
--- the old abort. Own-car power + weight are read from the spawned vehicle (reliable); candidates from config
--- metadata. Returns the kept/spawned car, (nil, reason) on a spawn failure, or (car, nil, true) where the
--- third value flags "degraded to the default because no suitable car" so the caller warns, then races.
+-- Mode 3 (ADR-0032, amendments 2026-07-07 and 2026-11-04). A player with an own car KEEPS it here, whatever
+-- it is: whether it is within the limit is decided by its LIVE power and weight, which only its VE can
+-- measure and which arrive a few frames later (init.lua caps, purpose "start"); an over-limit verdict
+-- replaces it in staging. Deciding here from the metadata was the bug: that is the preset's numbers, so a car
+-- rebuilt before the race passed, and a detuned strong preset would have been replaced. Without an own car
+-- the substitute spawns right away (cap_substitute_spec). Returns the kept/spawned car, (nil, reason) on a
+-- spawn failure, or (car, nil, true) when it degraded to the default because no car meets the limit, so the
+-- caller warns, then races.
 local function respawn_for_cap(pose, own_car, policy)
-    local own_model = own_car and own_car.JBeam or nil
-    local compliant, own_power, own_weight = false, nil, nil
     if own_car then
-        compliant, own_power, own_weight =
-            M.car_compliant(own_car, policy.maxhp, policy.maxpwr, policy.minkg, policy.maxkg)
-    end
-
-    if compliant then
-        log("I", LOG_TAG, string.format("own car '%s' meets the cap (power=%s, weight=%s) -- kept",
-            tostring(own_model), tostring(own_power), tostring(own_weight)))
+        log("I", LOG_TAG, string.format("own car '%s' kept for now; its live power and weight decide on"
+            .. " the grid", tostring(own_car.JBeam)))
         return keep_own(pose, own_car)
     end
 
-    local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
-    local pick = vehiclespecs.find_compliant(own_model, policy.maxhp, policy.maxpwr, nil, range)
-    if pick then
-        log("I", LOG_TAG, string.format("own car over the cap -- substituting '%s:%s'",
-            tostring(pick.model), tostring(pick.config)))
-        return spawn_fixed(pose, pick.model, pick.config)
+    local spec, degraded = M.cap_substitute_spec(nil, policy)
+    if degraded then
+        log("W", LOG_TAG, "no car meets the limit; spawning the default '" .. DEFAULT_VEHICLE_MODEL .. "'")
+        return spawn_default_degraded(pose)
     end
-
-    -- No installed car meets the cap: best-effort default (ADR-0032 §5 superseded) -- spawn etk800 even
-    -- over the cap and signal the caller to warn; the player races rather than sitting out.
-    log("W", LOG_TAG, "no car meets the cap -- spawning default '" .. DEFAULT_VEHICLE_MODEL .. "'")
-    return spawn_default_degraded(pose)
+    log("I", LOG_TAG, string.format("no own car; spawning '%s:%s', the first car within the limit",
+        tostring(spec.model), tostring(spec.config)))
+    return spawn_fixed(pose, spec.model, spec.config)
 end
 
 -- car=random (ADR-0032 amendment): roll a per-player random car locally at race start, composing with the
@@ -1328,8 +1425,9 @@ end
 --   * Mode 2 (car=<model>) -- fixed model[:config] for everyone; but keep the own car when it already IS the
 --     forced car (colours/plate/tuning preserved), or spawn the forced config in the player's paint when
 --     only the config differs.
---   * Mode 3 (maxhp/maxpwr/maxkg/minkg) -- keep the own car if compliant, else substitute, else the
---     best-effort default car (ADR-0032 §5 superseded -- no more abort).
+--   * Mode 3 (maxhp/maxpwr/maxkg/minkg) -- keep the own car for its live check (the caller measures it and
+--     substitutes it in staging when it is over), else the first car within the limit, else the best-effort
+--     default car (ADR-0032 §5 superseded -- no more abort).
 -- Returns the resolved race car (the caller enters + freezes it), (nil, reason) on a failure, or
 -- (car, nil, true) where the third value flags "degraded to the default because no suitable car was
 -- available" (car=random empty pool, or the Mode-3 no-compliant-car case) so the caller warns then races.
@@ -1880,9 +1978,11 @@ function M.collect_client_info(veh)
 
     -- Power-to-weight (hp/kg) of the race car, for the start-order pwr mode (ADR-0033). Read client-side
     -- here so the server stays vehicle-blind (ADR-0005); nil when power or weight is unreadable, in which
-    -- case the player sorts to the back of a pwr grid.
-    local power = vehiclespecs.vehicle_power(veh)
-    local weight = vehiclespecs.vehicle_weight(veh)
+    -- case the player sorts to the back of a pwr grid. These are the METADATA numbers of the preset the car
+    -- was spawned from, so a rebuilt car sorts by its preset (known, not part of the vehicle limit's live
+    -- read).
+    local power = vehiclespecs.metadata_power(veh)
+    local weight = vehiclespecs.metadata_weight(veh)
     if type(power) == "number" and type(weight) == "number" and weight > 0 then
         info.pwr = power / weight
     end
@@ -1939,6 +2039,29 @@ function M.set_vehicle_frozen(veh, frozen)
     end)
     if not ok then
         return nil, "setFreeze failed: " .. tostring(err)
+    end
+    return true
+end
+
+-- The VE command asking a car for its live power and weight. The VE extension is not auto-loaded and a
+-- config respawn re-creates the VE without it, so the command loads it first, exactly like the assist arm
+-- (init.lua push_assist_arm). An extension from an older client zip that has no measure_spec stays
+-- silent, which GE reads as no answer.
+local LIVE_SPEC_COMMAND = "if not beamcomp_init then extensions.load('beamcomp_init') end "
+    .. "if beamcomp_init and beamcomp_init.measure_spec then beamcomp_init.measure_spec(%d) end"
+
+-- (public) Ask `veh`'s VE for its live power and weight (ADR-0032 amendment 2026-11-04). The answer
+-- comes back asynchronously as beamcomp_init.on_live_spec(vehicle_id, token, ...). `token` is an integer
+-- the caller matches the answer against. Returns true, or nil plus a reason.
+function M.request_live_spec(veh, token)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    local ok, err = pcall(function()
+        veh:queueLuaCommand(string.format(LIVE_SPEC_COMMAND, token))
+    end)
+    if not ok then
+        return nil, "queueLuaCommand failed: " .. tostring(err)
     end
     return true
 end

@@ -137,25 +137,40 @@ end
 -- lower-cased as a prefix, so a future sub-route of the family is covered without a code change.
 local HUD_APPS_ROUTE_PREFIX = "pause.hudapps"
 
--- The UI route the player is on, or nil when the router cannot answer. ui_router is a core startup
--- extension and indexing `extensions` auto-loads it; the pcalls absorb a missing build or a throwing
--- loader, exactly like layout_api above.
-local function current_ui_route()
+-- The router's entry for the UI route the player is on (a NavigationEntry, ui/router/models/
+-- ResolvedRoute.lua), or nil plus why not. ui_router is a core startup extension and indexing
+-- `extensions` auto-loads it; the pcalls absorb a missing build or a throwing loader, exactly like
+-- layout_api above.
+local function current_ui_entry()
     local ok, router = pcall(function()
         return extensions.ui_router
     end)
     if not ok or type(router) ~= "table" or type(router.getCurrent) ~= "function" then
-        return nil
+        return nil, "no ui_router.getCurrent"
     end
     local got, entry = pcall(router.getCurrent)
-    if not got or type(entry) ~= "table" then
-        return nil
+    if not got then
+        return nil, "ui_router.getCurrent failed: " .. tostring(entry)
     end
+    if type(entry) ~= "table" then
+        return nil, "the router has no current route"
+    end
+    return entry
+end
+
+-- The name of a router entry, or nil.
+local function entry_route_name(entry)
     local name = type(entry.request) == "table" and entry.request.name or nil
     if type(name) ~= "string" then
         name = type(entry.resolved) == "table" and entry.resolved.name or nil
     end
     return type(name) == "string" and name or nil
+end
+
+-- The UI route the player is on, or nil when the router cannot answer.
+local function current_ui_route()
+    local entry = current_ui_entry()
+    return entry and entry_route_name(entry) or nil
 end
 
 -- Why a layout write must not happen right now, or nil when it may -- the wider window described in
@@ -793,6 +808,39 @@ function M.step()
     if not ok then
         log("W", LOG_TAG, "deferred replay failed: " .. tostring(err))
     end
+end
+
+-- Whether the UI shows the HUD apps on the route the player is on, read the way the UI itself decides
+-- it: the current router entry's resolved `ui.uiApps.shown` is the very field
+-- ui/entrypoints/main/globalRouter.js emitUiAppsRouteUpdate hands to the apps store
+-- (ui-vue/src/modules/apps/appLayoutsStore.js), which unmounts the whole apps overlay when it is false
+-- (UiAppsOverlay.vue v-if). A route that sets nothing inherits the router default {shown = false}
+-- (ui/router/constants.lua UiAppsDefaults) -- the vehicle config menu and its parts / tuning / paint
+-- children are such routes, so the HUD apps, and every BeamComp app with them, are gone while it is open.
+--
+-- Returns (shown, route) when the router answers, or (nil, why) when it cannot: no router, no current
+-- route, or an entry without the field. nil is "unknown", never "hidden" -- the caller keeps what it did
+-- before the router could be asked. No route name list anywhere: route strings are engine strings the
+-- engine never validates, and this field is what the engine itself reads.
+function M.hud_apps_shown()
+    local ok, shown, route = pcall(function()
+        local entry, why = current_ui_entry()
+        if not entry then
+            return nil, why
+        end
+        local resolved = type(entry.resolved) == "table" and entry.resolved or nil
+        local ui = resolved and type(resolved.ui) == "table" and resolved.ui or nil
+        local apps = ui and type(ui.uiApps) == "table" and ui.uiApps or nil
+        local name = entry_route_name(entry) or "unnamed route"
+        if not apps or type(apps.shown) ~= "boolean" then
+            return nil, "route " .. name .. " carries no ui.uiApps.shown"
+        end
+        return apps.shown, name
+    end)
+    if not ok then
+        return nil, "reading the route failed: " .. tostring(shown)
+    end
+    return shown, route
 end
 
 -- Whether a layout write would be swallowed right now. The seam checks this itself; public so the

@@ -31,7 +31,9 @@
 -- A race that FORCES this player's car (ADR-0064) narrows both modes: the replace is refused from staging
 -- on, and a guard on core_vehicle_partmgmt refuses every parts change before its respawn, while tuning
 -- and paint go through untouched. Whether the race forces the car is asked of M.car_is_forced on every
--- install, never passed in.
+-- install, never passed in. A race with a vehicle limit (Mode 3) arms the same guard in the full lock only
+-- (ADR-0064 amendment 2026-11-04): in staging a parts change is allowed and measured afterwards, from the
+-- countdown on it is refused. Asked of M.race_has_caps the same way.
 --
 -- On top of those, an independent HOLD LOCK (ADR-0017 amendment, quali-hold-reset-and-repaint-leak)
 -- blocks the two recover keys for the span of a qualifying hold -- see set_recover_blocked below. It is
@@ -57,6 +59,14 @@ M.replace_seen = false
 -- re-grid's remove/install pair re-arms the parts lock without knowing it exists. This default answers
 -- false: a seam nobody installed keeps the lock exactly as it was before forced cars locked their parts.
 function M.car_is_forced()
+    return false
+end
+
+-- Whether the running race has a vehicle limit (maxhp / maxpwr / minkg / maxkg, ADR-0032). Installed by
+-- init.lua beside car_is_forced and asked by every install the same way. Under a limit the parts are locked
+-- from the countdown on (the full lock): a change there would land on a car that is already about to race,
+-- and only tuning is left to measure and revert (init.lua M.caps). This default answers false.
+function M.race_has_caps()
     return false
 end
 
@@ -153,6 +163,17 @@ local last_spawn_block_toast_at = 0
 -- a refused car pick right before it does not swallow it.
 local PARTS_LOCKED_NOTICE = "Parts are locked for this race"
 local last_parts_block_notice_at = 0
+
+-- Why the parts guard is armed by the current install ("forced car" or "vehicle limit"), for the refusal's
+-- log line; nil while it is not armed. Module state a GE reload forgets together with the guard itself
+-- (remove() runs from the teardown first).
+local parts_lock_reason = nil
+
+-- What a refusal's log line says the lock is for, per reason.
+local PARTS_LOCK_WHY = {
+    ["forced car"] = "this race forces the car",
+    ["vehicle limit"] = "parts are locked under the vehicle limit from the countdown on",
+}
 
 -- Prefix of the per-function stash keys on core_vehicle_partmgmt. On the engine table for the same reason
 -- as ORIG_SPAWN_KEY: a present original means we are already guarding, whatever this module's state says.
@@ -499,7 +520,8 @@ end
 -- notice at most every SPAWN_BLOCK_TOAST_THROTTLE seconds. The resync goes first: it is the part the menu
 -- cannot do without.
 local function refuse_parts_change(partmgmt, name)
-    log("I", LOG_TAG, "refused a parts change (" .. name .. "): this race forces the car")
+    log("I", LOG_TAG, "refused a parts change (" .. name .. "): "
+        .. (PARTS_LOCK_WHY[parts_lock_reason] or "the parts are locked"))
     resync_parts_menu(partmgmt)
     local now = os.clock()
     if now - last_parts_block_notice_at >= SPAWN_BLOCK_TOAST_THROTTLE then
@@ -580,33 +602,48 @@ local function unguard_partmgmt()
     return restored
 end
 
--- One line per forced-car install naming what is wrapped. A function missing after a game update is the
--- tripwire, so it is named at W; the count alone would read as success with one route open.
-local function report_parts_guard(wrapped, missing)
+-- One line per guarded install naming what is wrapped and why ("forced car" / "vehicle limit"). A function
+-- missing after a game update is the tripwire, so it is named at W; the count alone would read as success
+-- with one route open.
+local function report_parts_guard(wrapped, missing, reason)
     if wrapped == nil then
-        log("W", LOG_TAG,
-            "parts lock (forced car): core_vehicle_partmgmt is not loaded, parts are NOT locked")
+        log("W", LOG_TAG, "parts lock (" .. reason
+            .. "): core_vehicle_partmgmt is not loaded, parts are NOT locked")
         return
     end
-    local summary = string.format("parts lock (forced car): wrapped %d of %d (%s)",
-        #wrapped, #PARTS_ENTRIES, table.concat(wrapped, ", "))
+    local summary = string.format("parts lock (%s): wrapped %d of %d (%s)",
+        reason, #wrapped, #PARTS_ENTRIES, table.concat(wrapped, ", "))
     if #missing == 0 then
         log("I", LOG_TAG, summary)
     else
         log("W", LOG_TAG, summary .. "; not found: " .. table.concat(missing, ", ")
-            .. " -- re-check the engine's core/vehicle/partmgmt.lua")
+            .. "; re-check the engine's core/vehicle/partmgmt.lua")
     end
 end
 
--- The answer of the installed M.car_is_forced. A predicate that throws reads as "not forced" -- the same
--- answer as no predicate at all, i.e. the lock as it was before ADR-0064 -- and says so.
-local function race_forces_car()
-    local ok, forced = pcall(M.car_is_forced)
+-- The answer of an installed policy seam (M.car_is_forced / M.race_has_caps). A predicate that throws
+-- reads as false -- the same answer as no predicate at all, i.e. the lock as it was before that seam -- and
+-- says so.
+local function ask_policy(predicate, what)
+    local ok, answer = pcall(predicate)
     if not ok then
-        log("W", LOG_TAG, "could not read the race's car policy, parts stay unlocked: " .. tostring(forced))
+        log("W", LOG_TAG, "could not read " .. what .. ", parts stay unlocked: " .. tostring(answer))
         return false
     end
-    return forced == true
+    return answer == true
+end
+
+-- Why this install locks the parts, or nil: a forced car locks them in every mode (ADR-0064), a vehicle limit
+-- in the full lock only (ADR-0064 amendment 2026-11-04) -- the staging lock leaves them open there, and the
+-- change is measured after its respawn instead.
+local function parts_lock_reason_for(is_forced, allow_replace)
+    if is_forced then
+        return "forced car"
+    end
+    if not allow_replace and ask_policy(M.race_has_caps, "the race's vehicle limit") then
+        return "vehicle limit"
+    end
+    return nil
 end
 
 -- Arm the lock: block the input actions and guard the spawn/replace functions. Idempotent. With
@@ -617,20 +654,27 @@ end
 -- A race that forces the car (M.car_is_forced, ADR-0064) overrides allow_replace for the replace only:
 -- the replace is refused from staging on, while the selector keys stay open -- the parts-selector key is
 -- the way into the tuning menu, and the vehicle selector answers a pick with the vehicle notice. The parts
--- guard follows the same answer on every install, so it is armed or put back declaratively.
+-- guard follows the same answer on every install, so it is armed or put back declaratively. A vehicle limit
+-- (M.race_has_caps) arms the parts guard in the full lock and changes nothing else: the staging swap stays
+-- open, because the limit measures the swapped car instead.
 function M.install(opts)
     local allow_replace = opts ~= nil and opts.allow_replace == true
-    local is_forced = race_forces_car()
+    local is_forced = ask_policy(M.car_is_forced, "the race's car policy")
+    local reason = parts_lock_reason_for(is_forced, allow_replace)
     set_action_filter(true, allow_replace)
     guard_core_vehicles(allow_replace and not is_forced)
-    if is_forced then
-        report_parts_guard(guard_partmgmt())
+    parts_lock_reason = reason
+    if reason then
+        local wrapped, missing = guard_partmgmt()
+        report_parts_guard(wrapped, missing, reason)
     else
         unguard_partmgmt()
     end
     local mode = allow_replace and "swap-allowed" or "full"
     if is_forced then
         mode = (allow_replace and "staging" or "full") .. ", forced car"
+    elseif reason then
+        mode = mode .. ", " .. reason
     end
     log("I", LOG_TAG, "in-race vehicle-action lock installed (" .. mode .. ")")
 end
@@ -668,6 +712,7 @@ function M.remove()
     if unguard_partmgmt() > 0 then
         log("I", LOG_TAG, "parts lock lifted")
     end
+    parts_lock_reason = nil
     M.replace_seen = false
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
 end
