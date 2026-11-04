@@ -4900,6 +4900,25 @@ function tour.award()
     end
 end
 
+-- The running series that scores this race's result, or nil when none does (ADR-0014 amendment 2026-11-04).
+-- Such a race gets no AI-only cut in maybe_end_race: an AI still out when the 20 s run out is DNF, and a DNF
+-- scores nothing -- no championship points (champ.award) and no finish in the class-drop countback
+-- (tour.award) -- so the cut would hand the players places the AI were about to take. Those two are the
+-- only folds finalize_race runs on a race result. A finished tournament scores no further race (tour.award
+-- returns), so it is left out like a plain race; order=last only grids the next race and scores nothing.
+--
+-- On `tour` rather than `champ` because tour is declared after champ: a function here sees both tables,
+-- while one written up in the champ block would resolve `tour` to a nil global.
+function tour.scoring_series()
+    if champ.is_active() then
+        return "championship"
+    end
+    if tour.is_active() and not session.tournament.ended then
+        return "class-drop tournament"
+    end
+    return nil
+end
+
 -- Countback of two finish histograms (ADR-0040 style): whoever has more finishes at the best still-differing
 -- position is ahead. Returns 1 (a ahead), -1 (b ahead), or 0 (tied) -- the final tiebreak among drivers who
 -- never dropped a class (all still in class 1, reached at race 0).
@@ -5404,14 +5423,16 @@ local function maybe_end_race()
         -- an all-DNF race as for a completed one (ADR-0014). The window is armed even with no finisher, so
         -- an all-DNF race no longer hangs. Asked first, so it keeps priority over the AI-only window.
         window = PHASE_DURATIONS.all_done_grace
-    elseif grace_armed and active_players == 0 then
+    elseif grace_armed and active_players == 0 and not tour.scoring_series() then
         -- Only AI are still out (ADR-0014 amendment 2026-11-04): every player has finished, given up, left
         -- or been reported AFK, and the rest of the 120 s would be spent watching AI. An AFK player counts
         -- as done because his own client measured his standstill inside this grace -- the verdict that
         -- discounts him above, and that cuts to the results window when he is the last driver out. If he
         -- drives on he counts again, which stops any further cut but never moves the deadline back: he has
         -- what is left of the 20 s. Armed grace only: with every player out before anybody finished there
-        -- is nothing to cut, and the first AI finish arms the grace and cuts it in that same call.
+        -- is nothing to cut, and the first AI finish arms the grace and cuts it in that same call. Never in
+        -- a race a series scores (tour.scoring_series): there the AI keep the full grace, and the skip is
+        -- said once at the arm (start_finish_grace), not here on every tick.
         window = PHASE_DURATIONS.ai_only_grace
     else
         return
@@ -5686,6 +5707,12 @@ local function start_finish_grace()
     end
     session.grace_deadline = now() + PHASE_DURATIONS.finish_grace
     log_info("beamcomp.race", "finish grace armed")
+    -- The one place that says why a scored race keeps its full grace with only AI left: maybe_end_race skips
+    -- that cut without a word on every tick, and this function runs once per race (the guard above).
+    local series = tour.scoring_series()
+    if series then
+        log_info("beamcomp.race", series .. " running; no AI-only cut this race")
+    end
     stall.begin_grace()
     -- Tell every client the cutoff length so still-racing players can show a live countdown (ADR-0014).
     broadcast_event(MSG_FINISH_GRACE, {duration = PHASE_DURATIONS.finish_grace})
