@@ -661,8 +661,11 @@ end
 -- then the race phase may already be gone. Three nil checks when nothing stands.
 --
 -- The AFK count is NOT aged here -- it has no lifetime, stall.check owns it. What it does get here is its
--- one unconditional guard: it belongs to the finish timer, so no timer means no count. This runs in every
--- phase where stall.step does not, which is what makes it a property rather than a list of clear sites.
+-- one unconditional guard: it belongs to a RUNNING finish timer, so no running timer means no count. This
+-- runs in every phase where stall.step does not, which is what makes it a property rather than a list of
+-- clear sites. M.state.grace alone does not say "running": the `finished` transition leaves it standing,
+-- and stall.step is only called in racing and qualifying, so a count raised in the last seconds of the
+-- grace stood through the final standings until the lobby. Hence the phase test, the one stall.step makes.
 function notice.step(dt)
     local line = M.state.notice
     local readout = M.state.cp_readout
@@ -670,7 +673,9 @@ function notice.step(dt)
         return
     end
     local expired = false
-    if M.state.afk_notice and not M.state.grace then
+    local timer_running = M.state.grace ~= nil
+        and (M.state.phase == "racing" or M.state.phase == "qualifying")
+    if M.state.afk_notice and not timer_running then
         M.state.afk_notice = nil
         expired = true
     end
@@ -3183,7 +3188,11 @@ function stall.step()
 
     local measured_own = false
     local detection = M.state.detection
-    if detection and not detection.done and not hold.is_held() and not M.state.stall_pause then
+    -- A driver who gave up (the HUD's Give up, /dnf) is out of the race but not `done`: only a finish sets
+    -- that. The server's DNF flag on his standings row is what says so (M.local_is_out), and a car that is
+    -- out holds no finish timer open, so it is not measured -- its count goes below, nothing new is sent.
+    if detection and not detection.done and not M.local_is_out() and not hold.is_held()
+            and not M.state.stall_pause then
         -- The car the detector scores checkpoints with, not M.state.race_car_id: if a switch ever gets
         -- past the in-race lock, the stall verdict must follow the car actually being scored, or we would
         -- report a stall for a car the player is no longer in.
@@ -3405,7 +3414,10 @@ end
 -- Deliberately the server's flag and not the local detector, which is done one round trip earlier: the
 -- HUD's FINISHED banner fires on that same server flag, and the app can only hold the card behind a banner
 -- that has started, so a detector-keyed card flashed up for that round trip before the banner covered it.
-local function local_is_out()
+-- The AFK standstill clock asks it too (stall.step): a give-up sets no detector flag, only this one. Hung
+-- on M, not a top-level local: stall.step is defined above this point, and a local declared here would be
+-- a nil global there (the 200-local ceiling says the same).
+function M.local_is_out()
     local race = M.state.race
     local my_slot = race and race.mySlot
     local standings = M.state.standings
@@ -3423,7 +3435,7 @@ end
 -- Whether the local player may give up the running race right now (the race HUD's Give up button): the
 -- racing phase, a standings row on this client's slot, and not done yet. Done is asked twice on purpose:
 -- the local detector, so the button is gone on the frame the car crosses the line, and the server's
--- finished/DNF flag (local_is_out), which also covers a DNF the server set. ONE predicate with two
+-- finished/DNF flag (M.local_is_out), which also covers a DNF the server set. ONE predicate with two
 -- readers: build_hud_snapshot shows the button on it, and M.give_up_race re-asks it before sending,
 -- because a UI frame can be a frame stale. Neither is the authority; the server's /dnf checks are.
 -- Hung on M rather than a top-level local (the 200-local ceiling), which also makes it callable from
@@ -3444,7 +3456,7 @@ function M.can_give_up()
     end
     for _, e in ipairs(standings) do
         if e.slot == my_slot then
-            return not local_is_out()
+            return not M.local_is_out()
         end
     end
     return false  -- no row of ours: a spectator, or a race this client never got
@@ -3469,7 +3481,7 @@ end
 -- without affecting anyone else. Phase-aware: while the race still runs, a finished/DNF'd player toggles
 -- the provisional card; once finished it toggles the final results card.
 local function handle_results_toggle()
-    if M.state.phase == "racing" and local_is_out() then
+    if M.state.phase == "racing" and M.local_is_out() then
         M.toggle_provisional_results()
         return
     end
@@ -7329,7 +7341,7 @@ local function build_hud_snapshot()
     local lap_count = (race and race.laps) or 1
     -- The local detector, done on the frame the car crosses the line and one round trip ahead of the
     -- server's `finished` flag. Right for "can you still finish" (grace_can_finish below); the provisional
-    -- card waits for the server flag instead (local_is_out).
+    -- card waits for the server flag instead (M.local_is_out).
     local local_finished = detection and detection.done
     local local_dnf = false
     -- Both racing and qualifying drive the local detector + lap clock (ADR-0041), so the live local-row
@@ -7700,13 +7712,13 @@ local function build_hud_snapshot()
     end
 
     -- Provisional results card (ADR-0022), shown to a finished/DNF'd player while the race still runs.
-    -- Keyed on the server-confirmed finish (local_is_out), the same flag of the same standings the entries
+    -- Keyed on the server-confirmed finish (M.local_is_out), the same flag of the same standings the entries
     -- above carry as `finished` -- which is what the app's FINISHED banner fires on. Card and banner
     -- therefore flip in one snapshot, and the app holds the card back until the banner fades; keyed on the
     -- detector, the card was up one round trip before the banner existed to hold it.
     -- Its penalized row list is built only while the card is actually up -- like the analysis block above,
     -- the closed default costs nothing per frame.
-    local provisional_available = phase == "racing" and local_is_out()
+    local provisional_available = phase == "racing" and M.local_is_out()
     local provisional_entries = nil
     if provisional_available and M.state.provisional_open and standings then
         provisional_entries = build_provisional_entries(entries, standings)
