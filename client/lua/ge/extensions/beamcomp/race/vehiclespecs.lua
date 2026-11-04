@@ -455,10 +455,14 @@ function M.config_anchor(model, config)
     }
 end
 
--- Engine power (hp) of a SPAWNED vehicle, read from its live details -- the reliable source for the
--- player's own car's compliance check (computed for a real vehicle, unlike static config metadata).
--- Number or nil. pcall-guarded; mirrors vehicles.collect_client_info's getVehicleDetails read.
-function M.vehicle_power(veh)
+-- Engine power (hp) of a SPAWNED vehicle as its METADATA states it: core_vehicles.getVehicleDetails matches
+-- the car's partConfig against its model's configs and returns that config's info entry. That describes the
+-- PRESET the car was spawned from, not the car: after a parts or tuning change partConfig is the serialized
+-- config, which still names the old .pc, so the new engine is never seen (bug
+-- caps-race-part-swap-skips-power-check). The vehicle limit therefore measures the car live instead (the VE
+-- extension's read_live_spec); this read only feeds the pwr start order and the limit's log line. Number or
+-- nil. pcall-guarded.
+function M.metadata_power(veh)
     if not veh then
         return nil
     end
@@ -476,9 +480,9 @@ function M.vehicle_power(veh)
     return power
 end
 
--- Curb weight (kg) of a SPAWNED vehicle from its live details -- the reliable source for the own car's
--- power-to-weight check. Number or nil. pcall-guarded; mirrors vehicle_power.
-function M.vehicle_weight(veh)
+-- Curb weight (kg) of a SPAWNED vehicle as its METADATA states it -- the preset's number, with exactly
+-- metadata_power's limits. Number or nil. pcall-guarded.
+function M.metadata_weight(veh)
     if not veh then
         return nil
     end
