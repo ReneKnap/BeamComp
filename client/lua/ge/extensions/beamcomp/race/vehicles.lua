@@ -1943,4 +1943,27 @@ function M.set_vehicle_frozen(veh, frozen)
     return true
 end
 
+-- The VE command asking a car for its live power and weight. The VE extension is not auto-loaded and a
+-- config respawn re-creates the VE without it, so the command loads it first, exactly like the assist arm
+-- (init.lua push_assist_arm). An extension from an older client zip that has no measure_spec stays
+-- silent, which GE reads as no answer.
+local LIVE_SPEC_COMMAND = "if not beamcomp_init then extensions.load('beamcomp_init') end "
+    .. "if beamcomp_init and beamcomp_init.measure_spec then beamcomp_init.measure_spec(%d) end"
+
+-- (public) Ask `veh`'s VE for its live power and weight (ADR-0032 amendment 2026-11-04). The answer
+-- comes back asynchronously as beamcomp_init.on_live_spec(vehicle_id, token, ...). `token` is an integer
+-- the caller matches the answer against. Returns true, or nil plus a reason.
+function M.request_live_spec(veh, token)
+    if not veh then
+        return nil, "no vehicle"
+    end
+    local ok, err = pcall(function()
+        veh:queueLuaCommand(string.format(LIVE_SPEC_COMMAND, token))
+    end)
+    if not ok then
+        return nil, "queueLuaCommand failed: " .. tostring(err)
+    end
+    return true
+end
+
 return M
