@@ -17,7 +17,9 @@
 --      bindings; the vehicle selector is also reachable from the Esc/UI menu, which is not an input
 --      action. Guarding the spawn/replace functions themselves closes that route too. BeamComp's own
 --      race-start spawn runs in the spawning phase, before this lock arms at countdown, so it is not
---      affected (and handle_race_start removes the lock up front as a belt-and-braces guard).
+--      affected (and handle_race_start removes the lock up front as a belt-and-braces guard). The
+--      selector's own buttons reach the car without either of the two, so four more core_vehicles
+--      functions are refused in every mode (VEHICLE_BUTTONS, ADR-0017 amendment 2026-11-05).
 --
 -- The lock has two modes (ADR-0021/0017 amendments, staging-allow-vehicle-swap):
 --   * swap-allowed -- installed for the staging wait so the player may still change car (replace the
@@ -154,6 +156,21 @@ local HOLD_ACTIONS = {
 local ORIG_SPAWN_KEY = "beamcomp_orig_spawnNewVehicle"
 local ORIG_REPLACE_KEY = "beamcomp_orig_replaceVehicle"
 
+-- The core_vehicles functions behind the vehicle selector's own buttons, which change the car without
+-- passing spawnNewVehicle / replaceVehicle (bug vehicle-selector-load-default-bypasses-race-lock):
+--   spawnDefault  -- "Load default". In MP the field is BeamMP's spawnDefaultRequest, which calls BeamMP's
+--                    own stashed replaceVehicle; in SP the engine calls its file-local one.
+--   cloneCurrent  -- "Clone current" (also the radial menu and the pause tab): the engine's file-local
+--                    spawnNewVehicle, behind BeamMP's protected-config wrapper.
+--   removeCurrent -- "Remove current": veh:delete(), nothing else.
+--   removeAll     -- the dev build's Debug tab.
+-- Refused in every lock mode, staging included even when the race forces no car: a staging swap goes
+-- through the selector's normal pick, never through these.
+local VEHICLE_BUTTONS = {"spawnDefault", "cloneCurrent", "removeCurrent", "removeAll"}
+
+-- Prefix of their stash keys on core_vehicles, the same shape as the two keys above.
+local VEHICLE_BUTTON_ORIG_PREFIX = "beamcomp_orig_"
+
 -- Min seconds between "locked" toasts on a refused spawn/replace, so mashing the selector shows one
 -- toast, not a flood. os.clock() is monotonic CPU seconds -- precise enough to gate a toast.
 local SPAWN_BLOCK_TOAST_THROTTLE = 2.0
@@ -199,13 +216,15 @@ function M.notify(msg, kind)
     guihooks.trigger("toastrMsg", {type = kind or "warning", title = "BeamComp", msg = msg})
 end
 
-local function notify_spawn_blocked()
+-- `route` names the refused core_vehicles function in the log line; the two original guards pass none.
+local function notify_spawn_blocked(route)
     local now = os.clock()
     if now - last_spawn_block_toast_at >= SPAWN_BLOCK_TOAST_THROTTLE then
         last_spawn_block_toast_at = now
         M.notify("Switching or spawning vehicles is locked during the race", "warning")
     end
-    log("I", LOG_TAG, "blocked a vehicle spawn/replace during the race")
+    log("I", LOG_TAG, "blocked a vehicle spawn/replace during the race"
+        .. (route and " (core_vehicles." .. route .. ")" or ""))
 end
 
 -- The node-grabber actions to block, preferring the engine's own template over the built-in list.
@@ -457,6 +476,76 @@ local function unguard_core_vehicles()
     end
 end
 
+-- The stand-in for one VEHICLE_BUTTONS function: the vehicle notice and nil, never an error. The selector
+-- calls these from a fade callback after `app:waiting true`, so a throw would leave its spinner standing.
+-- Every caller already reads nil as "nothing happened" (a refused clone logs its own failure and clears
+-- the spinner).
+local function refuse_vehicle_button(name)
+    return function()
+        local ok, err = pcall(notify_spawn_blocked, name)
+        if not ok then
+            log("W", LOG_TAG, "refused " .. name .. ", but answering it failed: " .. tostring(err))
+        end
+        return nil
+    end
+end
+
+-- Wrap every VEHICLE_BUTTONS function present on core_vehicles. Same shape as guard_partmgmt: the original
+-- is stashed once on the engine table, the stand-in is (re)assigned on every install, so a second install
+-- never captures our own stand-in as the "original". Returns the wrapped and the missing names, or nil when
+-- core_vehicles is not loaded.
+local function guard_vehicle_buttons()
+    if type(core_vehicles) ~= "table" then
+        return nil
+    end
+    local wrapped, missing = {}, {}
+    for _, name in ipairs(VEHICLE_BUTTONS) do
+        local stash_key = VEHICLE_BUTTON_ORIG_PREFIX .. name
+        if core_vehicles[stash_key] == nil and type(core_vehicles[name]) == "function" then
+            core_vehicles[stash_key] = core_vehicles[name]
+        end
+        if core_vehicles[stash_key] ~= nil then
+            core_vehicles[name] = refuse_vehicle_button(name)
+            wrapped[#wrapped + 1] = name
+        else
+            missing[#missing + 1] = name
+        end
+    end
+    return wrapped, missing
+end
+
+-- Put back every stashed VEHICLE_BUTTONS original. No-op when not guarding.
+local function unguard_vehicle_buttons()
+    if type(core_vehicles) ~= "table" then
+        return
+    end
+    for _, name in ipairs(VEHICLE_BUTTONS) do
+        local stash_key = VEHICLE_BUTTON_ORIG_PREFIX .. name
+        if core_vehicles[stash_key] ~= nil then
+            core_vehicles[name] = core_vehicles[stash_key]
+            core_vehicles[stash_key] = nil
+        end
+    end
+end
+
+-- One line per install naming what is wrapped. A function missing after a game update is an open route,
+-- so it is named at W, like report_parts_guard.
+local function report_vehicle_buttons(wrapped, missing)
+    if wrapped == nil then
+        log("W", LOG_TAG, "vehicle buttons: core_vehicles is not loaded, Load default / Clone / Remove"
+            .. " are NOT locked")
+        return
+    end
+    local summary = string.format("vehicle buttons: wrapped %d of %d core_vehicles functions (%s)",
+        #wrapped, #VEHICLE_BUTTONS, table.concat(wrapped, ", "))
+    if #missing == 0 then
+        log("I", LOG_TAG, summary)
+    else
+        log("W", LOG_TAG, summary .. "; not found: " .. table.concat(missing, ", ")
+            .. "; re-check the engine's core/vehicles.lua")
+    end
+end
+
 -- Whether a mergeConfig payload changes more than tuning and paint. A whitelist on purpose: partsTree and
 -- parts are the obvious keys, but a mainPartName or model would be another car altogether, and an unknown
 -- key refused costs a notice where one let through costs the race its forced car. Anything that is not a
@@ -646,10 +735,11 @@ local function parts_lock_reason_for(is_forced, allow_replace)
     return nil
 end
 
--- Arm the lock: block the input actions and guard the spawn/replace functions. Idempotent. With
--- opts.allow_replace the swap-allowed staging mode is installed (replace + the car selector stay open,
--- extra spawn + everything else blocked); with no opts (or false) the full fixed-car lock. Calling it
--- again without allow_replace upgrades a swap-allowed lock to full (ADR-0021/0017 amendments).
+-- Arm the lock: block the input actions and guard the spawn/replace functions and the selector's own car
+-- buttons. Idempotent. With opts.allow_replace the swap-allowed staging mode is installed (replace + the car
+-- selector stay open, extra spawn + everything else blocked); with no opts (or false) the full fixed-car
+-- lock. Calling it again without allow_replace upgrades a swap-allowed lock to full (ADR-0021/0017
+-- amendments). The car buttons are refused the same way in both modes.
 --
 -- A race that forces the car (M.car_is_forced, ADR-0064) overrides allow_replace for the replace only:
 -- the replace is refused from staging on, while the selector keys stay open -- the parts-selector key is
@@ -663,6 +753,7 @@ function M.install(opts)
     local reason = parts_lock_reason_for(is_forced, allow_replace)
     set_action_filter(true, allow_replace)
     guard_core_vehicles(allow_replace and not is_forced)
+    report_vehicle_buttons(guard_vehicle_buttons())
     parts_lock_reason = reason
     if reason then
         local wrapped, missing = guard_partmgmt()
@@ -701,14 +792,15 @@ function M.set_recover_blocked(blocked)
     log("I", LOG_TAG, "recover keys " .. (blocked and "blocked (quali hold)" or "released"))
 end
 
--- Lift the lock: unblock the input actions and restore the spawn/replace functions and the parts guard.
--- Idempotent, so it is safe to call on lobby, on a fresh race start, and on extension unload. Clears the
--- hold group too -- without that, a race ending while a driver is held would leave the recover keys dead in
--- the finished free-roam window and the lobby.
+-- Lift the lock: unblock the input actions and restore the spawn/replace functions, the car buttons and the
+-- parts guard. Idempotent, so it is safe to call on lobby, on a fresh race start, and on extension unload.
+-- Clears the hold group too -- without that, a race ending while a driver is held would leave the recover
+-- keys dead in the finished free-roam window and the lobby.
 function M.remove()
     set_action_filter(false)
     set_hold_filter(false)
     unguard_core_vehicles()
+    unguard_vehicle_buttons()
     if unguard_partmgmt() > 0 then
         log("I", LOG_TAG, "parts lock lifted")
     end
