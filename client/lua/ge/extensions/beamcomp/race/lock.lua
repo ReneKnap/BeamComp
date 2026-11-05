@@ -1,11 +1,11 @@
 -- BeamComp -- in-race vehicle-action lock (GE side).
 --
 -- Lives at lua/ge/extensions/beamcomp/race/lock.lua inside the client mod zip. Target: client GE
--- (LuaJIT 5.1). Near-stateless (one transient replace_seen flag, see below): the caller (init.lua)
--- installs the lock when the race countdown starts and removes it when the race returns to lobby
--- (ADR-0017).
+-- (LuaJIT 5.1). Near-stateless (a few transient flags, see below): the caller (init.lua) installs the
+-- lock when the race countdown starts and removes it when the race returns to lobby (ADR-0017), and
+-- calls M.step once per frame for the selector bar.
 --
--- During countdown + racing the player must stay in their one race car. Two layers prevent leaving
+-- During countdown + racing the player must stay in their one race car. Three layers prevent leaving
 -- it or swapping it (ADR-0017):
 --   1. core_input_actionFilter -- BeamNG's own input-action blocker (the mechanism scenarios use).
 --      We block the switch / vehicle-selector / parts-selector / reload keys (no car swap or extra
@@ -20,6 +20,9 @@
 --      affected (and handle_race_start removes the lock up front as a belt-and-braces guard). The
 --      selector's own buttons reach the car without either of the two, so four more core_vehicles
 --      functions are refused in every mode (VEHICLE_BUTTONS, ADR-0017 amendment 2026-11-05).
+--   3. The vehicle selector's management bar is hidden for the whole lock through the engine's own switch,
+--      the one career and challenges use. That also takes Reset all and Remove all away, which have no
+--      core_vehicles field to guard. The pick itself (spawn / replace) stays, so the staging swap works.
 --
 -- The lock has two modes (ADR-0021/0017 amendments, staging-allow-vehicle-swap):
 --   * swap-allowed -- installed for the staging wait so the player may still change car (replace the
@@ -170,6 +173,31 @@ local VEHICLE_BUTTONS = {"spawnDefault", "cloneCurrent", "removeCurrent", "remov
 
 -- Prefix of their stash keys on core_vehicles, the same shape as the two keys above.
 local VEHICLE_BUTTON_ORIG_PREFIX = "beamcomp_orig_"
+
+-- The engine module that builds the vehicle selector's management bar (Set as default, Load default, Save
+-- current config, Clone current, Select random, Reset all, Remove all / current / others). It is read with
+-- rawget and never through `extensions.<name>`, which would LOAD it (common/extensions.lua __index): the lock
+-- acts only on a module the game has loaded itself, and catches a later one in M.step.
+local SELECTOR_OPS_MODULE = "ui_vehicleSelector_vehicleOperations"
+local SELECTOR_NOT_LOADED = SELECTOR_OPS_MODULE .. " is not loaded yet"
+
+-- Stash key of the original getManagementDetails, on the module table: a reloaded module is a fresh table
+-- without it, which is how M.step tells a module it still has to hide the bar on.
+local ORIG_MANAGEMENT_KEY = "beamcomp_orig_getManagementDetails"
+
+-- The selector's own redraw event and backend name. The engine fires exactly this after it switches the bar
+-- (ui/vehicleSelector/general.lua, openVehicleSelectorForChallenge); only a mounted selector listens.
+local SELECTOR_REDRAW_EVENT = "gridSelectorRefreshAll"
+local SELECTOR_BACKEND = "vehicleSelector"
+
+-- The bar's bookkeeping. Module state a GE reload forgets together with the wrapper itself (the teardown
+-- runs M.remove first), like parts_lock_reason.
+--   wanted    -- the lock is installed, so the bar is to be hidden
+--   announced -- the bar state an open selector was last asked to redraw for (true = hidden)
+--   outcome   -- why the bar could not be hidden at the last attempt (nil = hidden), so M.step never logs
+--                the same failure twice
+--   warned    -- the "engine ignored the switch" tripwire already fired for this hide
+local selector_bar = {wanted = false, announced = false, outcome = nil, warned = false}
 
 -- Min seconds between "locked" toasts on a refused spawn/replace, so mashing the selector shows one
 -- toast, not a flood. os.clock() is monotonic CPU seconds -- precise enough to gate a toast.
@@ -546,6 +574,124 @@ local function report_vehicle_buttons(wrapped, missing)
     end
 end
 
+-- The selector module the game has loaded right now, or nil. Never loads it (see SELECTOR_OPS_MODULE).
+local function selector_ops()
+    local ops = rawget(_G, SELECTOR_OPS_MODULE)
+    if type(ops) ~= "table" then
+        return nil
+    end
+    return ops
+end
+
+local function is_selector_bar_hidden()
+    local ops = selector_ops()
+    return ops ~= nil and ops[ORIG_MANAGEMENT_KEY] ~= nil
+end
+
+-- The tripwire behind the switch: with managementButtonsEnabled off the engine builds no button at all, so a
+-- button in the answer means it reads another switch now and the bar is back. Once per hide, never per call.
+local function check_bar_hidden(details)
+    if selector_bar.warned or type(details) ~= "table" or type(details.buttonInfo) ~= "table" then
+        return
+    end
+    if next(details.buttonInfo) ~= nil then
+        selector_bar.warned = true
+        log("W", LOG_TAG, string.format("vehicle selector bar: the engine built %d buttons although"
+            .. " managementButtonsEnabled was off, the bar is NOT hidden; re-check the engine's"
+            .. " ui/vehicleSelector/vehicleOperations.lua", #details.buttonInfo))
+    end
+end
+
+-- Put the engine's switch back, then hand on what the original answered, or its error unchanged.
+local function finish_management_call(ops, enabled, ok, ...)
+    ops.managementButtonsEnabled = enabled
+    if not ok then
+        error((...), 0)
+    end
+    check_bar_hidden((...))
+    return ...
+end
+
+-- The wrapper for getManagementDetails. It turns the engine's switch off for the length of the call only
+-- and puts the engine's own value back right after, so the lock never owns the switch: the selector may
+-- set it on every open, and whatever it set last is what stands once the lock is lifted (a career false
+-- stays false). Off is the engine's own career / challenge path: no management button, the current car's
+-- name and thumbnail still built. Once the stash is gone (the lock was lifted) a kept copy is a plain
+-- pass-through.
+local function bar_guard_for(ops, original)
+    return function(...)
+        if ops[ORIG_MANAGEMENT_KEY] == nil then
+            return original(...)
+        end
+        local enabled = ops.managementButtonsEnabled
+        ops.managementButtonsEnabled = false
+        return finish_management_call(ops, enabled, pcall(original, ...))
+    end
+end
+
+-- Hide the bar on the loaded module. Returns nil when it is hidden (now or already), else why not.
+-- Whether the engine still reads managementButtonsEnabled is not probed here: the field may legitimately
+-- hold nil, and a renamed switch shows up as buttons in the first answer (check_bar_hidden), which is the
+-- evidence a probe could only guess at.
+local function hide_selector_bar()
+    local ops = selector_ops()
+    if ops == nil then
+        return SELECTOR_NOT_LOADED
+    end
+    if ops[ORIG_MANAGEMENT_KEY] ~= nil then
+        return nil
+    end
+    if type(ops.getManagementDetails) ~= "function" then
+        return SELECTOR_OPS_MODULE .. " has no getManagementDetails"
+    end
+    local original = ops.getManagementDetails
+    ops[ORIG_MANAGEMENT_KEY] = original
+    ops.getManagementDetails = bar_guard_for(ops, original)
+    selector_bar.warned = false
+    return nil
+end
+
+-- Give the bar back. Only the function goes back; the switch was never ours. Returns whether anything did.
+local function show_selector_bar()
+    local ops = selector_ops()
+    if ops == nil or ops[ORIG_MANAGEMENT_KEY] == nil then
+        return false
+    end
+    ops.getManagementDetails = ops[ORIG_MANAGEMENT_KEY]
+    ops[ORIG_MANAGEMENT_KEY] = nil
+    return true
+end
+
+-- One line per outcome of a hide. A module that is not loaded yet is expected and is caught by M.step; a
+-- missing function is the tripwire after a game update. `context` says which hide it was.
+local function report_selector_bar(reason, context)
+    selector_bar.outcome = reason
+    if reason == nil then
+        log("I", LOG_TAG, "vehicle selector bar: hidden " .. context)
+    elseif reason == SELECTOR_NOT_LOADED then
+        log("I", LOG_TAG, "vehicle selector bar: " .. reason .. ", hidden as soon as the game loads it")
+    else
+        log("W", LOG_TAG, "vehicle selector bar NOT hidden: " .. reason
+            .. "; re-check the engine's ui/vehicleSelector/vehicleOperations.lua")
+    end
+end
+
+-- Ask an open vehicle selector to fetch its bar again. A selector fetches it only when it opens or its
+-- selection clears, so one that stayed open across the install would otherwise keep Reset all and Remove all
+-- for the whole staging. A closed selector has no listener, so this costs nothing then.
+local function redraw_open_selector(is_hidden)
+    if type(guihooks) ~= "table" then
+        return
+    end
+    local ok, err = pcall(guihooks.trigger, SELECTOR_REDRAW_EVENT, SELECTOR_BACKEND)
+    if not ok then
+        log("W", LOG_TAG, "vehicle selector redraw failed: " .. tostring(err))
+        return
+    end
+    log("I", LOG_TAG, "vehicle selector bar " .. (is_hidden and "hidden" or "back")
+        .. ": asked an open selector to redraw (" .. SELECTOR_REDRAW_EVENT .. ")")
+end
+
 -- Whether a mergeConfig payload changes more than tuning and paint. A whitelist on purpose: partsTree and
 -- parts are the obvious keys, but a mainPartName or model would be another car altogether, and an unknown
 -- key refused costs a notice where one let through costs the race its forced car. Anything that is not a
@@ -735,11 +881,12 @@ local function parts_lock_reason_for(is_forced, allow_replace)
     return nil
 end
 
--- Arm the lock: block the input actions and guard the spawn/replace functions and the selector's own car
--- buttons. Idempotent. With opts.allow_replace the swap-allowed staging mode is installed (replace + the car
--- selector stay open, extra spawn + everything else blocked); with no opts (or false) the full fixed-car
--- lock. Calling it again without allow_replace upgrades a swap-allowed lock to full (ADR-0021/0017
--- amendments). The car buttons are refused the same way in both modes.
+-- Arm the lock: block the input actions, guard the spawn/replace functions and the selector's own car
+-- buttons, and hide the selector's management bar. Idempotent. With opts.allow_replace the swap-allowed
+-- staging mode is installed (replace + the car selector stay open, extra spawn + everything else blocked);
+-- with no opts (or false) the full fixed-car lock. Calling it again without allow_replace upgrades a
+-- swap-allowed lock to full (ADR-0021/0017 amendments). The car buttons and the bar are the same in both
+-- modes.
 --
 -- A race that forces the car (M.car_is_forced, ADR-0064) overrides allow_replace for the replace only:
 -- the replace is refused from staging on, while the selector keys stay open -- the parts-selector key is
@@ -754,6 +901,8 @@ function M.install(opts)
     set_action_filter(true, allow_replace)
     guard_core_vehicles(allow_replace and not is_forced)
     report_vehicle_buttons(guard_vehicle_buttons())
+    selector_bar.wanted = true
+    report_selector_bar(hide_selector_bar(), "for the lock")
     parts_lock_reason = reason
     if reason then
         local wrapped, missing = guard_partmgmt()
@@ -792,21 +941,49 @@ function M.set_recover_blocked(blocked)
     log("I", LOG_TAG, "recover keys " .. (blocked and "blocked (quali hold)" or "released"))
 end
 
--- Lift the lock: unblock the input actions and restore the spawn/replace functions, the car buttons and the
--- parts guard. Idempotent, so it is safe to call on lobby, on a fresh race start, and on extension unload.
--- Clears the hold group too -- without that, a race ending while a driver is held would leave the recover
--- keys dead in the finished free-roam window and the lobby.
+-- Lift the lock: unblock the input actions and restore the spawn/replace functions, the car buttons, the
+-- selector's bar and the parts guard. Idempotent, so it is safe to call on lobby, on a fresh race start, and
+-- on extension unload. Clears the hold group too -- without that, a race ending while a driver is held would
+-- leave the recover keys dead in the finished free-roam window and the lobby.
 function M.remove()
     set_action_filter(false)
     set_hold_filter(false)
     unguard_core_vehicles()
     unguard_vehicle_buttons()
+    selector_bar.wanted = false
+    selector_bar.outcome = nil
+    if show_selector_bar() then
+        log("I", LOG_TAG, "vehicle selector bar: given back")
+    end
     if unguard_partmgmt() > 0 then
         log("I", LOG_TAG, "parts lock lifted")
     end
     parts_lock_reason = nil
     M.replace_seen = false
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
+end
+
+-- Once per frame from init.lua's onUpdate, in every phase. Two jobs for the selector's bar, two boolean reads
+-- when there is no lock and nothing to tell:
+--   1. While the lock stands, hide the bar on a selector module the game loaded, or reloaded, after the
+--      install. Install alone would only work when the module happened to be there first.
+--   2. When the bar's state differs from what an open selector was last asked to draw, ask it to redraw.
+--      Here and not in install/remove, so the quali re-grid's remove/install pair in one frame asks nothing.
+function M.step()
+    if not selector_bar.wanted and not selector_bar.announced then
+        return
+    end
+    if selector_bar.wanted and not is_selector_bar_hidden() then
+        local reason = hide_selector_bar()
+        if reason == nil or reason ~= selector_bar.outcome then
+            report_selector_bar(reason, "(the selector module was loaded after the install)")
+        end
+    end
+    local is_hidden = is_selector_bar_hidden()
+    if is_hidden ~= selector_bar.announced then
+        selector_bar.announced = is_hidden
+        redraw_open_selector(is_hidden)
+    end
 end
 
 -- Whether BeamNG's binding table can be read at all right now. core_input_bindings.bindings starts life
