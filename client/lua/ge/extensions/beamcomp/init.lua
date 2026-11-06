@@ -246,7 +246,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-capslive-r2/2026-11-04"
+local BUILD_MARKER = "0.10.0-selectorlock-r1/2026-11-05"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -8957,6 +8957,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- is a one-shot, so a call that lands in that window used to be lost for good -- the seam now
     -- records it and replays it here once the UI is done. One nil check when nothing is pending.
     M.uilayout.step()
+    -- Phase-independent: keep the vehicle selector's management bar hidden while the race lock stands, on a
+    -- selector module the game loads after the install too, and ask an open selector to redraw when the bar
+    -- comes or goes, including the lobby's give-back (ADR-0017 amendment 2026-11-05). Two boolean reads with
+    -- no lock.
+    lock.step()
     -- Phase-independent: write the one delayed read-back line of the last recover (how the car actually
     -- stands a second after the teleport, ADR-0034 amendment 2026-10-07) -- even if the race ended in
     -- that second. Physics time, so a paused game does not read a car that has not moved yet. One nil
