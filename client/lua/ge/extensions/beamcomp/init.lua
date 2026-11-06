@@ -246,7 +246,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-selectorlock-r1/2026-11-05"
+local BUILD_MARKER = "0.10.0-afkrows-r1/2026-11-06"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -316,6 +316,7 @@ M.state = {
     car_info = nil,      -- one-shot per-driver car descriptors, cached from the carInfo channel keyed by the standings row (slot, else name); the standings entries no longer carry `car` (ADR-0029 amendment, bug partconfig-blob-bloats-standings), or nil
     grace = nil,         -- finish-grace countdown {remaining = seconds}, ticked locally (ADR-0014), or nil
     stall_cutoff = nil,  -- server-broadcast AFK cutoff {remaining = seconds}: how long until the LAST still-standing driver is counted out and the finish grace shortens (feature standings-afk-cutoff-counter). Ticked locally beside `grace` in stall.step_clocks, which also drops it whenever `grace` is gone -- the addendum may never outlive the counter it stands behind. nil = nothing to announce, which is also what an older server, a dropped message and a GE Lua reload leave behind (ADR-0052): absence means unknown, never "what I saw last"
+    stall_drivers = nil,  -- server-broadcast per-driver AFK counts for the provisional card's rows {[tostring(id)] = {remaining = seconds} | {out = true}} (feature provisional-standings-afk-count-per-driver, ADR-0060 amendment 2026-11-06). Keyed like car_info, so a standings row finds its own by tostring(row.id). Ticked and dropped beside stall_cutoff in stall.step_clocks and cleared wherever stall_cutoff is; nil = no count on any row, which is what an older server, a broken message and a GE Lua reload leave behind (ADR-0052)
     staging = nil,       -- staging-wait {remaining = seconds}, ticked locally for the indicator (ADR-0021), or nil
     countdown = nil,     -- start-countdown {remaining = seconds}, ticked locally to drive the 8s count (ADR-0021), or nil
     f1 = nil,            -- F1 light start (ADR-0043): grid baselines, first-movement times and report latches for the own car and (host) each AI, plus lights_out_at; nil outside an F1 start
@@ -773,6 +774,7 @@ local function handle_race_start(payload)
         M.state.grace = nil
         M.state.stall_track = nil
         M.state.stall_cutoff = nil
+        M.state.stall_drivers = nil
         M.state.assist_armed = false
         M.state.assist_held = nil
         M.state.stall_pause = nil
@@ -847,6 +849,7 @@ local function handle_race_start(payload)
     M.state.grace = nil
     M.state.stall_track = nil
     M.state.stall_cutoff = nil
+    M.state.stall_drivers = nil
     M.state.staging = nil
     M.state.countdown = nil
     -- Drop any F1 light-start state (ADR-0043) so a prior race's latched jump can never leak into this one.
@@ -1320,6 +1323,7 @@ local function teardown_race_world()
     M.state.grace = nil
     M.state.stall_track = nil
     M.state.stall_cutoff = nil
+    M.state.stall_drivers = nil
     M.state.staging = nil
     M.state.countdown = nil
     -- Drop any F1 light-start state (ADR-0043) so a prior race's latched jump can never leak into this one.
@@ -1976,6 +1980,7 @@ local function handle_race_phase(payload)
         M.state.grace = nil
         M.state.stall_track = nil
         M.state.stall_cutoff = nil
+        M.state.stall_drivers = nil
         M.state.detection = nil
         M.state.laptimer = nil
         M.state.quali_settle = false
@@ -2903,6 +2908,18 @@ stall.MSG = "stallReport"
 -- {active = false} takes it back; the seconds are ticked down locally, like the finish grace itself.
 stall.MSG_CUTOFF = "afkCutoff"
 
+-- server->client: every driver of the racing grace who is being counted out, for his own row on the
+-- provisional results card (feature provisional-standings-afk-count-per-driver, ADR-0060 amendment
+-- 2026-11-06). {drivers = {{id = <id>, dueIn = <s>}, {id = <id>, out = true}, ...}}: the whole set on every
+-- send, an empty list takes the last one back. Independent of the field: one standing driver gets his
+-- count while the rest drive on.
+stall.MSG_DRIVERS = "afkDrivers"
+
+-- The two texts a provisional-card row can carry in its Time column: the count while the server holds the
+-- driver's due time, and the bare word once it holds his verdict.
+stall.ROW_COUNTING = "AFK in %d"
+stall.ROW_OUT = "AFK"
+
 -- The sentence under the driver's own count. Kept beside the count rather than in the app, so the whole
 -- message has one owner and every push carries it (ADR-0057). It is the second half of the message this
 -- feature turned from a one-shot into a count -- the words are unchanged.
@@ -2993,15 +3010,79 @@ function stall.handle_cutoff(payload)
         "AFK cutoff in %.1fs -- every remaining driver is standing still", remaining))
 end
 
--- Tick both finish-timer clocks one frame. Display only -- the server stays authoritative on the actual
+-- Server->client per-driver counts (stall.MSG_DRIVERS). Rebuilds the whole map from the list on every
+-- message, keyed by tostring(id) -- the key car_info uses, so a standings row finds its entry by its own id,
+-- a player's number and an AI's "ai:N" alike.
+--
+-- Anything that is not a well-formed item contributes nothing, and an empty or broken message ends at nil:
+-- a count on a row that is not being counted out is worse than no count, so absence is the safe direction.
+function stall.handle_drivers(payload)
+    local list = type(payload) == "table" and payload.drivers or nil
+    local drivers = nil
+    local said = {}
+    for _, item in ipairs(type(list) == "table" and list or {}) do
+        local state = stall.parse_driver(item)
+        if state then
+            local key = tostring(item.id)
+            drivers = drivers or {}
+            drivers[key] = state
+            said[#said + 1] = state.out and (key .. " counted out")
+                or string.format("%s in %.1fs", key, state.remaining)
+        end
+    end
+    M.state.stall_drivers = drivers
+    log("I", RACE_LOG_TAG, "AFK count per driver: "
+        .. (#said > 0 and table.concat(said, ", ") or "none"))
+end
+
+-- One item of a stall.MSG_DRIVERS list as {out = true} or {remaining = seconds}, or nil when it is not a
+-- well-formed item: no number or string id, or neither the verdict nor a non-negative due time.
+function stall.parse_driver(item)
+    if type(item) ~= "table" or (type(item.id) ~= "number" and type(item.id) ~= "string") then
+        return nil
+    end
+    if item.out == true then
+        return {out = true}
+    end
+    local remaining = tonumber(item.dueIn)
+    if remaining and remaining >= 0 then
+        return {remaining = remaining}
+    end
+    return nil
+end
+
+-- The Time-column text of one provisional-card row, or nil: "AFK in 7" while the server holds the driver's
+-- due time, "AFK" once it holds his verdict. `row` is the server's standings row (id, finished, dnf).
+--
+-- A finished or DNF row never gets one, whatever the map still says: the cell shows his time or "DNF"
+-- there, and the server takes the count back on its next tick anyway. Same rounding as the driver's own
+-- count (stall.show_countdown) and the field addendum: ceil, so no 0 half a second early. Never negative
+-- without a clamp here: stall.parse_driver refuses a negative due time and stall.step_clocks floors at 0.
+function stall.row_text(row)
+    local drivers = M.state.stall_drivers
+    if not drivers or not row or row.finished or row.dnf or row.id == nil then
+        return nil
+    end
+    local state = drivers[tostring(row.id)]
+    if not state then
+        return nil
+    end
+    if state.out then
+        return stall.ROW_OUT
+    end
+    return string.format(stall.ROW_COUNTING, math.ceil(state.remaining))
+end
+
+-- Tick the finish-timer clocks one frame. Display only -- the server stays authoritative on the actual
 -- cutoff (ADR-0014) and on the AFK verdict.
 --
--- ONE function for both, called from both race phases, because the AFK addendum may never outlive the
--- counter it stands behind: no grace, no addendum. That is a property of this function rather than a
--- promise made at each of the places that drop M.state.grace.
+-- ONE function for all of them, called from both race phases, because no AFK count may outlive the
+-- counter it stands behind: no grace, no addendum and no count on any row. That is a property of this
+-- function rather than a promise made at each of the places that drop M.state.grace.
 function stall.step_clocks(dt)
     if not M.state.grace then
         M.state.stall_cutoff = nil
+        M.state.stall_drivers = nil
         return
     end
     M.state.grace.remaining = math.max(0, M.state.grace.remaining - (dt or 0))
@@ -3010,6 +3091,15 @@ function stall.step_clocks(dt)
         -- Floors at 0 and stays there until the server takes it back, which rides the same tick that
         -- shortens the grace: the last second must not blink out before the thing it announced happens.
         cutoff.remaining = math.max(0, cutoff.remaining - (dt or 0))
+    end
+    -- Same floor for each row's count: it holds at 0 until the verdict replaces it with "AFK".
+    local drivers = M.state.stall_drivers
+    if drivers then
+        for _, state in pairs(drivers) do
+            if state.remaining then
+                state.remaining = math.max(0, state.remaining - (dt or 0))
+            end
+        end
     end
 end
 
@@ -5423,6 +5513,9 @@ local HANDLERS = {
     -- standings-afk-cutoff-counter). Keyed off the constant so the wire name lives in exactly one place
     -- on this side, and handled on the `stall` namespace so it costs no top-level local.
     [stall.MSG_CUTOFF] = stall.handle_cutoff,
+    -- Each standing driver's own count, for his row on the provisional card (feature
+    -- provisional-standings-afk-count-per-driver). Same keying and same namespace as the line above.
+    [stall.MSG_DRIVERS] = stall.handle_drivers,
     resultsToggle = handle_results_toggle,
     analysisToggle = handle_analysis_toggle,
     -- /keys (ADR-0061): open or close this client's controls window. An inline function rather than a
@@ -7721,6 +7814,16 @@ local function build_hud_snapshot()
     local provisional_available = phase == "racing" and M.local_is_out()
     local provisional_entries = nil
     if provisional_available and M.state.provisional_open and standings then
+        -- Each driver's own AFK count for his Time cell (feature provisional-standings-afk-count-per-driver),
+        -- set BEFORE the re-rank: build_provisional_entries copies every field, so both sources of the
+        -- card's rows carry it. Only while the card is up and only inside the grace, like the addendum.
+        -- `entries` is also what the live corner board slices, which is safe because only the provisional
+        -- card's template reads `afk`. Index-aligned with `standings`, so each row joins its own server id.
+        if grace ~= nil then
+            for i = 1, #entries do
+                entries[i].afk = stall.row_text(standings[i])
+            end
+        end
         provisional_entries = build_provisional_entries(entries, standings)
     end
 

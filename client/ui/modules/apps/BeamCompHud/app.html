@@ -519,8 +519,11 @@
     /* The AFK cutoff addendum (feature standings-afk-cutoff-counter): " . AFK in 7" behind the finish
        timer on the provisional results card and on the three qualifying lines, shown only while EVERY
        remaining driver is being counted out. Red rather than the amber of the counters it sits behind --
-       it is the reason that counter is about to jump, and it must not read as part of it. Four call
-       sites, all with this class: grep for it to find them all.
+       it is the reason that counter is about to jump, and it must not read as part of it. Also each
+       driver's own "AFK in 7" / "AFK" in his Time cell on the provisional card (feature
+       provisional-standings-afk-count-per-driver): the same statement for one row, so the same red, not a
+       second one the reader would have to tell apart. Five call sites, all with this class: grep for it
+       to find them all.
 
        No opacity of its own: .bc-provisional-badge sets 0.85 on the parent, and a child cannot be more
        opaque than the element it sits in -- an opacity here would look like it did something. */
@@ -1146,7 +1149,10 @@
        as not-yet-final; the live corner regions are hidden while it is up.
        Rows come from `provisionalRows`, not `entries`: this is a RESULT view, so it ranks (and shows the
        time/gap) with the F1 jump-start penalty applied, exactly as the final card will (ADR-0043). The
-       live corner board next to it keeps the on-track order with the penalty still pending. -->
+       live corner board next to it keeps the on-track order with the penalty still pending.
+       A driver who is still out and being counted out carries `afk` ("AFK in 7" / "AFK", composed by GE)
+       in his otherwise empty Time cell. This card is the only template that reads it (ADR-0060 amendment
+       2026-11-06). -->
   <div class="bc-results-card" ng-if="hud.provisionalShown">
     <div class="bc-results-title">Provisional Standings</div>
     <div class="bc-provisional-badge">{{hud.grace != null ? 'Race ends in ' + formatTime(hud.grace) : 'Race in progress'}}<span class="bc-afk-cutoff" ng-if="hud.afkCutoff != null"> &middot; AFK in {{formatAfk(hud.afkCutoff)}}</span></div>
@@ -1164,7 +1170,7 @@
             ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai}">
           <td class="bc-pos">P{{e.position}}</td>
           <td class="bc-name"><span class="bc-fin-mark" ng-if="e.finished">&#10003; </span>{{e.name}}<span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
-          <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : (e.finished ? formatTime(e.time) : '')}}</td>
+          <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : (e.finished ? formatTime(e.time) : '')}}<span class="bc-afk-cutoff" ng-if="e.afk">{{e.afk}}</span></td>
           <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
           <td class="bc-int">{{formatLeaderGap(e)}}</td>
           <td class="bc-react" ng-if="hud.f1Start">{{formatReaction(e.reaction)}}</td>

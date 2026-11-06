@@ -3335,9 +3335,9 @@ end
 -- The flags live on session.stall_reported -- deliberately a sibling of session.progress, not a field on
 -- the progress records. build_standings and the run log both read those records, and a new record field
 -- is the shape that leaks into a broadcast or persisted blob; a sibling table cannot, which is what
--- keeps the wire format byte-identical here. session.stall_due (when each standing driver is counted out)
--- and session.stall_cutoff (the value the clients were last told) are siblings for the same reason -- no
--- AFK information belongs in a standings row.
+-- keeps the wire format byte-identical here. session.stall_due (when each standing driver is counted out),
+-- session.stall_cutoff and session.stall_drivers (what the clients were last told, for the field and per
+-- driver) are siblings for the same reason -- no AFK information belongs in a standings row.
 --
 -- Declared ahead of the `quali` namespace on purpose: quali.advance_staged closes over `stall`, and Lua
 -- binds upvalues when the closure is created, so a local declared after that function would silently
@@ -3358,6 +3358,16 @@ stall.MSG = "stallReport"
 -- it back; clients count down locally, exactly as they do for the finish grace itself. Edge-driven -- see
 -- stall.cutoff_step, far below (it needs the `quali` namespace, which is declared after this block).
 stall.MSG_CUTOFF = "afkCutoff"
+
+-- server->client: every driver of the racing grace who is being counted out, for his own row on the
+-- provisional results card (feature provisional-standings-afk-count-per-driver, ADR-0060 amendment
+-- 2026-11-06). {drivers = {{id = <id>, dueIn = <s>}, {id = <id>, out = true}, ...}}, the whole set on every
+-- send; an empty list takes the last one back. A LIST with the id inside each item, never a table keyed by
+-- id: the host is player 0 and the AI are "ai:N", and a Lua table keyed like that is not something a JSON
+-- encoder can be trusted with. A sibling of MSG_CUTOFF rather than a field on it, because the two change on
+-- different edges and {active = false} must keep meaning exactly "no field addendum". Edge-driven -- see
+-- stall.drivers_step, beside stall.cutoff_step.
+stall.MSG_DRIVERS = "afkDrivers"
 
 -- Upper bound on a client-supplied due time, in seconds. NOT a mirror of the client's standstill window --
 -- the whole point of taking the deadline from the client is that this side has no opinion about its length
@@ -5448,7 +5458,7 @@ local function reset_to_lobby()
 end
 
 -- ===== the AFK cutoff counter (feature standings-afk-cutoff-counter) =======================
--- The four functions below belong to the `stall` namespace above but live HERE, behind `quali`, because
+-- The functions below belong to the `stall` namespace above but live HERE, behind `quali`, because
 -- stall.waiting_ids reads quali.is_staged(): Lua binds upvalues when a closure is created, so a function
 -- written up there would resolve `quali` to a nil global. Same reason `stall` itself is declared ahead of
 -- `quali` -- the two namespaces reach into each other and the file order decides which way works.
@@ -5456,7 +5466,8 @@ end
 -- What they add: ADR-0014's early end is invisible. When every remaining driver has been reported AFK the
 -- grace is cut to the results window, and a player watching from the finish line sees "Race ends in 1:40"
 -- turn into "0:05" with nothing saying why. These broadcast the LATEST due time of the field so the card
--- can print "AFK in 7" behind the counter it is about to change.
+-- can print "AFK in 7" behind the counter it is about to change -- and, since the per-driver counts
+-- (ADR-0060 amendment 2026-11-06), each standing driver's own count for his row on that card.
 
 -- The drivers the staged sprint's finish-your-run grace is waiting on (ADR-0044), or nil when there are
 -- none to announce. Its own `running` status, not stall.remaining: a staged driver who has done his run
@@ -5535,18 +5546,87 @@ function stall.cutoff_due()
             return nil
         end
     end
-    -- A cutoff the race does not live to see is not announced. A car that stops in the last 15 s of the
-    -- racing grace is due after its deadline, and the card would print "AFK in 9" behind "Race ends in
-    -- 0:04", a counter contradicting the one it explains. The AI-only window (PHASE_DURATIONS.ai_only_grace)
-    -- turns that corner of the 120 s into most of its 20 s. The deadline only ever moves earlier, so a
-    -- withheld cutoff stays withheld. The quali graces keep their counter as it was: their cut to the
-    -- results window (quali.shorten_grace) only fires once nobody they wait on is still out there, and a
-    -- driver with a due time but no verdict still is, so no due time is pending at the cut.
-    if latest and session.phase == PHASE.racing and session.grace_deadline
-            and latest >= session.grace_deadline then
+    if latest and not stall.announceable(latest) then
         return nil
     end
     return latest
+end
+
+-- Whether a due time may be put on a card at all. A cutoff the race does not live to see is not announced.
+-- A car that stops in the last 15 s of the racing grace is due after its deadline, and the card would print
+-- "AFK in 9" behind "Race ends in 0:04", a counter contradicting the one it explains. The AI-only window
+-- (PHASE_DURATIONS.ai_only_grace) turns that corner of the 120 s into most of its 20 s. The deadline only
+-- ever moves earlier, so a withheld cutoff stays withheld, and one already shown is taken back. The quali
+-- graces keep their counter as it was: their cut to the results window (quali.shorten_grace) only fires
+-- once nobody they wait on is still out there, and a driver with a due time but no verdict still is, so no
+-- due time is pending at the cut.
+--
+-- ONE statement for the field addendum (stall.cutoff_due) and the per-driver rows (stall.driver_states):
+-- the row and the addendum behind the counter must never disagree about whether a due time is announced.
+function stall.announceable(due)
+    return not (session.phase == PHASE.racing and session.grace_deadline
+        and due >= session.grace_deadline)
+end
+
+-- Every driver of the racing grace who is being counted out, as id -> his absolute due time, or id -> true
+-- once his own client has delivered the verdict. nil when there is nobody (feature
+-- provisional-standings-afk-count-per-driver).
+--
+-- Unlike stall.cutoff_due this is per driver and needs nobody else: one standing driver gets his count
+-- while the whole rest of the field is driving. That is the point of it -- the field addendum only appears
+-- when everybody stands, and a player waiting at the finish for one stuck car saw nothing.
+--
+-- The set is stall.waiting_ids(), the one statement of who the grace waits on. Racing only: its one surface
+-- is the provisional card, which exists in that phase alone, so the quali graces would be traffic nobody
+-- draws. A verdict is shown whatever the deadline -- it is a fact, not a forecast -- while a due time goes
+-- through stall.announceable like the field addendum.
+--
+-- Reads stall.verdict and session.stall_due and writes neither: a driver with a due time and no verdict
+-- still holds the grace open, exactly as ADR-0060 decision 3 says.
+function stall.driver_states()
+    if session.phase ~= PHASE.racing then
+        return nil
+    end
+    local ids = stall.waiting_ids()
+    if not ids then
+        return nil
+    end
+    local states = nil
+    for _, id in ipairs(ids) do
+        local state = nil
+        if stall.verdict(id) then
+            state = true
+        else
+            local due = session.stall_due and session.stall_due[id]
+            if due and stall.announceable(due) then
+                state = due
+            end
+        end
+        if state ~= nil then
+            states = states or {}
+            states[id] = state
+        end
+    end
+    return states
+end
+
+-- Whether two stall.driver_states() answers say the same thing. nil means nobody, and a non-nil answer is
+-- never empty, so nil only ever equals nil -- which is also every tick of a race with nothing to show.
+function stall.same_states(a, b)
+    if a == nil or b == nil then
+        return a == b
+    end
+    for id, state in pairs(a) do
+        if b[id] ~= state then
+            return false
+        end
+    end
+    for id in pairs(b) do
+        if a[id] == nil then
+            return false
+        end
+    end
+    return true
 end
 
 -- Broadcast the cutoff counter when the condition becomes true, take it back when it becomes false, and
@@ -5576,6 +5656,43 @@ function stall.cutoff_step()
     broadcast_event(stall.MSG_CUTOFF, {active = true, dueIn = remaining})
     log_info("beamcomp.race", string.format(
         "every remaining driver is standing still; AFK cutoff in %.1fs", remaining))
+end
+
+-- Broadcast the per-driver counts (stall.MSG_DRIVERS) whenever they differ from what the clients were last
+-- told, the whole set each time. The twin of stall.cutoff_step and driven from the same place in the tick.
+--
+-- Edges, never seconds: session.stall_drivers holds absolute due times and verdict flags, which change only
+-- on an early edge, a verdict, a withdrawal, a driver leaving the waiting set (finish, DNF, disconnect) or a
+-- deadline moving in front of a shown due time. Each of those is one broadcast; every tick in between
+-- compares and sends nothing. The clients count down locally.
+--
+-- session.stall_drivers is deliberately NOT cleared by stall.clear(), for the reason session.stall_cutoff is
+-- not: it records what the clients believe, and forgetting it would forget a withdrawal still owed. The
+-- truth it is compared against (stall_due, stall_reported) IS cleared there, so after a race start, a lobby
+-- or a new grace the next tick takes back whatever was shown.
+function stall.drivers_step()
+    local states = stall.driver_states()
+    if stall.same_states(states, session.stall_drivers) then
+        return
+    end
+    session.stall_drivers = states
+    local t = now()
+    local drivers = {}
+    local said = {}
+    for id, state in pairs(states or {}) do
+        if state == true then
+            drivers[#drivers + 1] = {id = id, out = true}
+            said[#said + 1] = tostring(id) .. " counted out"
+        else
+            local remaining = math.max(0, state - t)
+            drivers[#drivers + 1] = {id = id, dueIn = remaining}
+            said[#said + 1] = string.format("%s in %.1fs", tostring(id), remaining)
+        end
+    end
+    broadcast_event(stall.MSG_DRIVERS, {drivers = drivers})
+    table.sort(said)
+    log_info("beamcomp.race", "AFK count per driver: "
+        .. (#said > 0 and table.concat(said, ", ") or "none"))
 end
 -- ===== end the AFK cutoff counter ==========================================================
 
@@ -6763,8 +6880,10 @@ local function tick()
     identity.step()
     -- Ahead of the phase branching below, because both branches that could host it return early and the
     -- counter has to be taken back on the way out of either (feature standings-afk-cutoff-counter). It
-    -- reads the phase itself and costs one nil compare when nothing is armed.
+    -- reads the phase itself and costs one nil compare when nothing is armed. The per-driver counts beside
+    -- it, for the same reason (feature provisional-standings-afk-count-per-driver).
     stall.cutoff_step()
+    stall.drivers_step()
 
     local phase = session.phase
     if phase == PHASE.lobby then
