@@ -20,17 +20,35 @@
 -- The session best per sector comes from the standings broadcast `splits` (ADR-0015) on a circuit; a
 -- staged sprint reads the server-relayed field bests (`sectorBests` + `sectorCounts`, ADR-0044)
 -- instead. Both fold every crossing -- including the own one, once relayed back -- so classification
--- anchors on the references frozen AT crossing time; the live field best applies when strictly
+-- anchors on the references frozen AT crossing time; the live field best applies when genuinely
 -- faster (round 3), and once a SECOND scoring of the sector exists a still-fastest no-reference
 -- split upgrades to purple live (round 4) -- but the first-ever time alone stays plain white, never
 -- a record against itself (effective_session_best). No persistence (all session-live).
+-- "Genuinely faster" means faster by more than SPLIT_EPSILON: the field best is built from times that
+-- crossed the network, and the driver's own split comes back from that trip a few trillionths of a
+-- second off (bug quali-sector-late-purple-missed). Every field-best comparison goes through
+-- M.is_genuinely_faster, so the bar and the readout cannot answer differently.
 
 local M = {}
+
+local LOG_TAG = "beamcomp.race"
 
 -- Record-class threshold (feature quali-sector-progress-bar): a split MORE than 16 % over the
 -- driver's per-sector personal best classifies "off" (red) instead of "slower" (yellow). Exactly
 -- 1.16 x PB is still "slower".
 M.OFF_THRESHOLD = 1.16
+
+-- Tie tolerance, in seconds, for comparing a split against the FIELD best (bug
+-- quali-sector-late-purple-missed). The field best contains the driver's own split after a round trip:
+-- BeamNG's jsonEncode writes a number through LuaJIT's number-to-text, which keeps 14 significant
+-- digits, so a reported cumulative time loses everything past ~1e-11 s, and the split rebuilt from two
+-- of them comes back up to ~1e-10 s off (measured up to 10^4 s of session time). Compared strictly,
+-- that copy undercut the local full-precision split about every second sector, and the sector never
+-- turned purple. 1 microsecond sits four orders of magnitude above that error and far below any real
+-- gap between two drivers: a crossing is stamped at frame resolution (~16 ms), the readout shows
+-- milliseconds, and a 0.0003 s difference still decides. Personal-best comparisons never cross the
+-- network and stay exact.
+M.SPLIT_EPSILON = 1e-6
 
 -- Per-lap section arrays from a cumulative splits array (ADR-0015/0030): lap l section s =
 -- splits[(l-1)*cps + s] - splits[(l-1)*cps + s - 1], total = splits[l*cps] - splits[(l-1)*cps]. Only
@@ -83,9 +101,10 @@ function M.new(cps)
         seq = 0,              -- monotonic count of completed sectors this session
         personal_best = {},   -- [sector] = the fastest split seen for that sector across the session
         last = nil,           -- the just-completed sector, see M.on_crossing, or nil
-        run = {},             -- [sector] = {split, prev_personal_best} of the CURRENT lap/run (feature
-                              -- quali-sector-progress-bar): the reference frozen at crossing time, so
-                              -- M.run_states can re-classify live against a moving session best
+        run = {},             -- [sector] = {split, prev_personal_best, prev_session_best} of the CURRENT
+                              -- lap/run (feature quali-sector-progress-bar): the references frozen at
+                              -- crossing time, so M.run_states can re-classify live against a moving
+                              -- session best; M.note_field_tie adds its once-mark `tie_logged`
     }
 end
 
@@ -243,20 +262,27 @@ function M.cumulative_through(sections, sector)
     return total
 end
 
+-- Whether the field time `field_best` beats `split` for real: by more than SPLIT_EPSILON. Anything
+-- closer is a tie, and a tie counts as still fastest (ADR-0044 round 4). The ONE field-best
+-- comparison -- effective_session_best and record_class both ask it.
+function M.is_genuinely_faster(field_best, split)
+    return field_best < split - M.SPLIT_EPSILON
+end
+
 -- The motorsport record class for a just-completed sector `split`, checked best-first: "session"
--- (purple) when it is the fastest that sector by anyone (<= the field's known best, which excludes this
--- fresh split) -- possible even on your first run through the sector; else "personal" (green) when it
--- matched/beat your own best for that sector; else "slower" (yellow) when it is at most
--- OFF_THRESHOLD x your best; else "off" (red, clearly off the pace). The session-best check runs
--- before the first-run guard, so beating the field is purple even without a personal reference yet.
--- "normal" only when there is nothing to compare against -- the split is not a number, or there is no
--- session best to beat and no personal reference yet (your first time through this sector).
--- `session_best` / `prev_personal_best` may be nil (no data yet).
+-- (purple) when it is the fastest that sector by anyone (the field's known best, which excludes this
+-- fresh split, is not genuinely faster) -- possible even on your first run through the sector; else
+-- "personal" (green) when it matched/beat your own best for that sector; else "slower" (yellow) when
+-- it is at most OFF_THRESHOLD x your best; else "off" (red, clearly off the pace). The session-best
+-- check runs before the first-run guard, so beating the field is purple even without a personal
+-- reference yet. "normal" only when there is nothing to compare against -- the split is not a number,
+-- or there is no session best to beat and no personal reference yet (your first time through this
+-- sector). `session_best` / `prev_personal_best` may be nil (no data yet).
 function M.record_class(split, prev_personal_best, session_best)
     if type(split) ~= "number" then
         return "normal"
     end
-    if type(session_best) == "number" and split <= session_best then
+    if type(session_best) == "number" and not M.is_genuinely_faster(session_best, split) then
         return "session"
     end
     if prev_personal_best == nil then
@@ -273,22 +299,26 @@ end
 
 -- The session reference a stored split is re-evaluated against on a HUD push (round 3, upgrade
 -- branch round 4). Three branches, first match wins:
---   1. The CURRENT field best STRICTLY beats the stored split -- someone genuinely undercut it, so
---      the purple falls (and a no-reference sector goes back to white via record_class).
+--   1. The CURRENT field best is genuinely faster than the stored split (M.is_genuinely_faster: by
+--      more than SPLIT_EPSILON) -- someone undercut it, so the purple falls (and a no-reference
+--      sector goes back to white via record_class).
 --   2. At least one FURTHER scoring of this sector exists (`session_count_now >= 2` -- the stored
---      split's own fold is one of them) and nobody is strictly faster -- the split IS the field
---      best against real competition, so it upgrades to purple live (an exact tie counts as still
---      fastest, consistent with 3.2). A solo first-ever time stays white: its own relay makes
---      count 1, so the round-3 self-purple bug cannot return by construction.
+--      split's own fold is one of them) and nobody is genuinely faster -- the split IS the field
+--      best against real competition, so it upgrades to purple live (a tie counts as still fastest,
+--      consistent with 3.2). A solo first-ever time stays white: its own relay makes count 1, so the
+--      round-3 self-purple bug cannot return by construction.
 --   3. Otherwise the reference frozen at crossing time stands, so a class can never be won or lost
 --      against the split itself.
+-- The tolerance in branch 1 is what lets branch 2 happen at all: the field best always holds the
+-- split's own copy back from the server, and that copy is a few trillionths of a second off -- below
+-- the local split about every second time, which a strict compare read as a rival who was faster.
 -- This is the one seam the bar (run_states) and the centred readout share, per the round-3
 -- contract: the readout must never show purple where the bar is white.
 function M.effective_session_best(split, prev_session_best, session_best_now, session_count_now)
     if type(split) ~= "number" then
         return prev_session_best
     end
-    if type(session_best_now) == "number" and session_best_now < split then
+    if type(session_best_now) == "number" and M.is_genuinely_faster(session_best_now, split) then
         return session_best_now
     end
     if type(session_count_now) == "number" and session_count_now >= 2 then
@@ -297,12 +327,30 @@ function M.effective_session_best(split, prev_session_best, session_best_now, se
     return prev_session_best
 end
 
+-- Log once per driven sector when the live field best sits below its split by no more than
+-- SPLIT_EPSILON -- the one case the tolerance turns from "a rival was faster" into a tie. In practice
+-- that is the split's own copy back from the server, so the gap the line names is the rounding error
+-- measured live (around 1e-12 s); a gap anywhere near SPLIT_EPSILON would be a real near-tie. The mark
+-- sits on the run entry, which the next lap/run replaces, so this never repeats per frame.
+function M.note_field_tie(sector, crossed, field_best)
+    if crossed.tie_logged or type(field_best) ~= "number" or type(crossed.split) ~= "number" then
+        return
+    end
+    local gap = crossed.split - field_best
+    if gap <= 0 or gap > M.SPLIT_EPSILON then
+        return
+    end
+    crossed.tie_logged = true
+    log("I", LOG_TAG, string.format("sector %d: field best %.3g s under the split %.3f s, inside "
+        .. "SPLIT_EPSILON (%g s) -- counted as a tie", sector, gap, crossed.split, M.SPLIT_EPSILON))
+end
+
 -- The record class of every sector of the current lap/run, for the bottom progress bar (feature
 -- quali-sector-progress-bar): a dense 1..cps array of class strings -- "none" for sectors not driven
 -- this lap/run (grey segment), else record_class re-evaluated NOW while both references stay
 -- anchored at crossing time: the personal best as frozen then, and the session best through
 -- effective_session_best (round 3, upgrade branch round 4) -- the live field best applies when
--- strictly faster (degradation), a second scoring of the sector upgrades a still-fastest white to
+-- genuinely faster (degradation), a second scoring of the sector upgrades a still-fastest white to
 -- purple (`session_counts`, round 4), and the own relayed-back split alone can never turn itself
 -- purple. A DRIVEN sector without any comparison keeps record_class's "normal" (white segment,
 -- round 2) -- visibly distinct from undriven grey. nil on a degenerate tracker.
@@ -315,9 +363,10 @@ function M.run_states(state, session_reference, session_counts)
     for s = 1, state.cps do
         local crossed = run[s]
         if crossed then
+            local field_best = session_reference and session_reference[s] or nil
+            M.note_field_tie(s, crossed, field_best)
             local session_best = M.effective_session_best(crossed.split,
-                crossed.prev_session_best, session_reference and session_reference[s] or nil,
-                session_counts and session_counts[s] or nil)
+                crossed.prev_session_best, field_best, session_counts and session_counts[s] or nil)
             states[s] = M.record_class(crossed.split, crossed.prev_personal_best, session_best)
         else
             states[s] = "none"
