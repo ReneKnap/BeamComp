@@ -23,7 +23,9 @@
 -- Run, sitting in any car in singleplayer free roam, in the GE Lua console:
 --   extensions.load("beamcompdev_weightprobe") beamcompdev_weightprobe.run()
 -- Options: run({presets = {"model:config", ...}}) or run({models = {"vivace"}}) for every config of a
--- model; stop() ends a run early and writes what it has.
+-- model; stop() ends a run early and writes what it has. When a run ends the player is put back into the
+-- car he started in (or the first default preset), with a message on screen. To start it without the
+-- console, install scripts/dev/beamcomp_weightprobe_autostart as well (see its autostart.lua).
 --
 -- Every engine touchpoint is probed (ADR-0017): a missing API writes a named reason into the result instead
 -- of a guess. Target: client GE (LuaJIT 2.1). The VE half travels as a string (VE_SAMPLE_BODY) and runs in
@@ -853,10 +855,46 @@ local function new_result(preset)
     return {model = preset.model, config = preset.config, samples = {}, reasons = {}}
 end
 
+-- The car the player sat in when the run started, as a preset to spawn back, or nil when he walked or had no
+-- car. A car on an inline config (tuned) cannot be spawned by name and comes back as its model's default.
+local function home_car()
+    local veh = player_vehicle()
+    local model = veh and jbeam_of(veh)
+    if not model or model == "unicycle" then
+        return nil
+    end
+    local ok, part_config = pcall(function() return veh.partConfig end)
+    local config = ok and type(part_config) == "string"
+        and part_config:match("vehicles/" .. model:gsub("%p", "%%%0") .. "/(.+)%.pc$") or nil
+    return {model = model, config = config}
+end
+
+-- Put the player into a drivable car again: the one he started in, else the first default preset. A run
+-- ends in whatever it measured last (the default list ends on a trailer), which looks like a hung game.
+local function return_player(home)
+    local car = home or parse_preset(M.DEFAULT_PRESETS[1])
+    local ok, why = spawn_preset(car)
+    if ok then
+        log("I", LOG_TAG, string.format("put the player back into '%s:%s'", car.model, tostring(car.config)))
+    else
+        log("W", LOG_TAG, "could not put the player back into a car: " .. tostring(why))
+    end
+end
+
+local function show_message(text)
+    if type(ui_message) == "function" then
+        pcall(ui_message, text, 15, "beamcompWeightProbe")
+    end
+end
+
 local function finish_run(why)
     log("I", LOG_TAG, string.format("run %s: %d of %d presets measured, results in %s%s and %s", why,
         #run.rows, #run.presets, user_path(), RESULT_JSON:sub(2), RESULT_CSV:sub(2)))
+    show_message(string.format("Weight probe %s: %d of %d presets measured, results in %s", why, #run.rows,
+        #run.presets, RESULT_CSV:sub(2)))
+    local home = run.home
     run = nil
+    return_player(home)
 end
 
 local start_preset
@@ -1018,11 +1056,19 @@ function M.run(options)
         next_token = 1,
         clock = 0,
         started = os.date("%Y-%m-%d %H:%M:%S"),
+        home = home_car(),
     }
     log("I", LOG_TAG, string.format("measuring %d presets, about %d s each (game %s)", #presets,
         math.ceil(TIMELINE[#TIMELINE].at + 2), tostring(game_version())))
+    show_message(string.format("Weight probe: measuring %d presets, hands off for about %d minutes", #presets,
+        math.ceil(#presets * (TIMELINE[#TIMELINE].at + 4) / 60)))
     start_preset()
     return true
+end
+
+-- Whether a run is in progress (the autostart waits on it).
+function M.is_running()
+    return run ~= nil
 end
 
 -- End a run early; the preset in progress is written with what it has.
