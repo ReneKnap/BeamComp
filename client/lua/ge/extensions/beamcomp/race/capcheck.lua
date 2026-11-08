@@ -6,10 +6,11 @@
 -- sends the requests this module asks for, hands it the answers and carries out its decisions.
 --
 -- Under a Mode-3 limit (maxhp / maxpwr / minkg / maxkg, ADR-0032) every check reads the car as it really
--- is: the VE extension measures power and weight the way the engine generated the shipped metadata
--- (lua/vehicle/extensions/beamcomp/init.lua read_live_spec). The metadata itself describes the preset a car
--- was spawned from and never sees a parts or tuning change (ADR-0032 amendment 2026-11-04). Three purposes
--- arm a measurement:
+-- is: the VE extension measures the power the way the engine generated the shipped metadata, and the weight
+-- of the car with every fuel tank full and nobody on board, the quantity the shipped "Weight" states for a
+-- stock preset (lua/vehicle/extensions/beamcomp/init.lua read_live_spec; ADR-0032 amendment 2026-11-08). The
+-- metadata itself describes the preset a car was spawned from and never sees a parts or tuning change
+-- (ADR-0032 amendment 2026-11-04). Three purposes arm a measurement:
 --   start  -- the own car kept at race start (race/vehicles.lua respawn_for_cap keeps it for now);
 --   swap   -- a staging car swap, at the restage once the new jbeam has loaded;
 --   config -- a parts or tuning respawn of the race car, told apart from a plain reset by its setup
@@ -21,8 +22,6 @@
 -- next reload that is neither the snapshot nor the rejected setup is adopted without a check ("own").
 
 local M = {}
-
-local vehiclespecs = require("beamcomp/race/vehiclespecs")
 
 -- One measurement's clock, in seconds of sim time clamped per frame (M.step): the request goes out after
 -- `send_after`, again every RESEND_AFTER up to MAX_SENDS times, and is given up GIVE_UP_AFTER after the first
@@ -44,6 +43,15 @@ M.OWN_RESPAWN_WAIT = 10.0
 -- the verdict waits: a car replace only goes through the restage pipeline under the staging lock, and a
 -- respawn before staging would lose the freeze nothing re-asserts there.
 M.ACTING_PHASES = {staging = true, countdown = true, racing = true, qualifying = true, qualiResults = true}
+
+-- The weight tolerance, in kg, given to the car in its favour on every weight bound (owner decision
+-- 2026-11-08). It is NOT the metadata's 5 kg rounding, though it exists because of it: "Weight" is the car
+-- with a full tank rounded up to 5 kg, plus 1 on most presets, so a stock preset's list value can sit up to
+-- just under 6 kg above what the check measures (0.1 to 4.98 kg on the 123 race presets measured 2026-11-08,
+-- with vehiclespecs' correction table for the 17 that were further off). With 6 kg a car the list shows
+-- inside a limit is never refused at its edge -- maxkg, minkg and maxpwr alike -- on the unmeasured presets
+-- too. The price is that a car up to 6 kg outside is let through.
+M.WEIGHT_STEP_KG = 6
 
 -- Config keys that change neither power nor weight. Everything else is part of the setup fingerprint -- a
 -- blacklist on purpose, so a key this file has never heard of is measured rather than waved through.
@@ -156,24 +164,102 @@ function M.take(state)
     return pending
 end
 
+local function finite_number(value)
+    if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+        return value
+    end
+    return nil
+end
+
+local function join_reasons(first, second)
+    if first and second then
+        return first .. "; " .. second
+    end
+    return first or second
+end
+
+-- The reading out of one VE answer (lua/vehicle/extensions/beamcomp/init.lua measure_spec). `parts` is the
+-- weight's breakdown {total, static, fuel, full_fuel}; an answer without it comes from an older vehicle
+-- extension (a stale client mod cache), whose weight is the live total with the driver in it, not the car
+-- with a full tank. That weight is not used: no weight is over the limit, with the reason named.
+function M.reading_from_answer(power, weight, engines, reason, parts)
+    local reading = {
+        power = finite_number(power),
+        engines = tonumber(engines) or 0,
+        reason = type(reason) == "string" and reason or nil,
+    }
+    if type(parts) ~= "table" then
+        reading.reason = join_reasons(reading.reason,
+            "the vehicle answered without the weight parts (an older BeamComp vehicle extension)")
+        return reading
+    end
+    reading.weight = finite_number(weight)
+    reading.total = finite_number(parts.total)
+    reading.static = finite_number(parts.static)
+    reading.fuel = finite_number(parts.fuel)
+    reading.full_fuel = finite_number(parts.full_fuel)
+    return reading
+end
+
+-- The caps that are set, numbers only (the server relays numbers; anything else is no limit on that axis).
+local function limits_of(caps)
+    caps = caps or {}
+    return {
+        maxhp = finite_number(caps.maxhp),
+        maxpwr = finite_number(caps.maxpwr),
+        minkg = finite_number(caps.minkg),
+        maxkg = finite_number(caps.maxkg),
+    }
+end
+
+-- Each axis of the limit, judged on the live reading. The weight axes give the car one WEIGHT_STEP_KG in its
+-- favour: lighter against maxkg, heavier against minkg and in the power-to-weight ratio.
+local function power_within(power, limits)
+    return limits.maxhp == nil or (type(power) == "number" and power <= limits.maxhp)
+end
+
+local function pwr_within(power, weight, limits)
+    if limits.maxpwr == nil then
+        return true
+    end
+    if type(power) ~= "number" or type(weight) ~= "number" then
+        return false
+    end
+    local heaviest = weight + M.WEIGHT_STEP_KG
+    return heaviest > 0 and power / heaviest <= limits.maxpwr
+end
+
+local function weight_within(weight, limits)
+    if limits.minkg == nil and limits.maxkg == nil then
+        return true
+    end
+    if type(weight) ~= "number" then
+        return false
+    end
+    if limits.maxkg ~= nil and weight - M.WEIGHT_STEP_KG > limits.maxkg then
+        return false
+    end
+    return limits.minkg == nil or weight + M.WEIGHT_STEP_KG >= limits.minkg
+end
+
 -- Whether `reading` is within `caps`, plus which value the caps needed and the reading lacks ("power" or
 -- "weight") when that is what failed it. A missing value is over the limit, never a pass: the user chose
 -- this over a metadata fallback knowing that a read broken by a game update fails every capped driver, which
 -- is why init.lua logs it at W every time.
 function M.verdict(reading, caps)
     reading = reading or {}
-    local range = vehiclespecs.weight_range(caps.minkg, caps.maxkg)
-    local compliant = vehiclespecs.is_compliant(reading.power, reading.weight, caps.maxhp, caps.maxpwr,
-        nil, range)
-    if compliant then
+    local limits = limits_of(caps)
+    local power, weight = reading.power, reading.weight
+    if power_within(power, limits) and pwr_within(power, weight, limits)
+            and weight_within(weight, limits) then
         return true, nil
     end
-    local needs_power = caps.maxhp ~= nil or caps.maxpwr ~= nil
-    local needs_weight = caps.maxpwr ~= nil or range ~= nil
-    if needs_power and type(reading.power) ~= "number" then
+    local needs_power = limits.maxhp ~= nil or limits.maxpwr ~= nil
+    local needs_weight = limits.maxpwr ~= nil or limits.minkg ~= nil or limits.maxkg ~= nil
+    if needs_power and type(power) ~= "number" then
         return false, "power"
     end
-    if needs_weight and type(reading.weight) ~= "number" then
+    if needs_weight and type(weight) ~= "number" then
         return false, "weight"
     end
     return false, nil
@@ -343,57 +429,43 @@ function M.decide(purpose, compliant, phase, snapshot, model)
     return "substitute"
 end
 
--- English label for the active strict weight range: "1200-1800 kg", "<=1500 kg", or ">=1200 kg".
-local function weight_limit_label(caps)
-    if caps.minkg and caps.maxkg then
-        return string.format("%d-%d kg", math.floor(caps.minkg + 0.5), math.floor(caps.maxkg + 0.5))
-    elseif caps.maxkg then
-        return string.format("<=%d kg", math.floor(caps.maxkg + 0.5))
+-- English label for the active weight range: "1200-1800 kg", "<=1500 kg", or ">=1200 kg".
+local function weight_limit_label(limits)
+    if limits.minkg and limits.maxkg then
+        return string.format("%d-%d kg", math.floor(limits.minkg + 0.5), math.floor(limits.maxkg + 0.5))
+    elseif limits.maxkg then
+        return string.format("<=%d kg", math.floor(limits.maxkg + 0.5))
     end
-    return string.format(">=%d kg", math.floor(caps.minkg + 0.5))
+    return string.format(">=%d kg", math.floor(limits.minkg + 0.5))
 end
 
--- True when the weight breaks the strict range: an unreadable weight under a set bound fails (cannot verify
--- means blocked, ADR-0032), else a readable weight below minkg or above maxkg fails.
-local function breaks_weight_range(weight, caps)
-    if not (caps.maxkg or caps.minkg) then
-        return false
-    end
-    if type(weight) ~= "number" then
-        return true
-    end
-    return (caps.minkg and weight < caps.minkg) or (caps.maxkg and weight > caps.maxkg) or false
-end
-
--- Why `name` is over the limit, in the player's words: the first axis that fails, in is_compliant order
--- (max hp, then power-to-weight, then the weight range), e.g. "etk800 has 450 hp, the limit is 300 hp". An
--- unreadable value says that it could not be verified.
+-- Why `name` is over the limit, in the player's words: the first axis that fails, in the verdict's order
+-- (max hp, then power-to-weight, then the weight range), judged exactly as the verdict judges it, e.g.
+-- "etk800 has 450 hp, the limit is 300 hp". An unreadable value says that it could not be verified.
 function M.limit_detail(name, power, weight, caps)
-    local pwr_ok = caps.maxpwr == nil
-        or (type(power) == "number" and type(weight) == "number" and weight > 0
-            and power / weight <= caps.maxpwr)
-    if caps.maxhp and not (type(power) == "number" and power <= caps.maxhp) then
+    local limits = limits_of(caps)
+    if not power_within(power, limits) then
         if type(power) == "number" then
             return string.format("%s has %d hp, the limit is %d hp", name, math.floor(power + 0.5),
-                caps.maxhp)
+                limits.maxhp)
         end
-        return string.format("%s: engine power couldn't be verified, the limit is %d hp", name, caps.maxhp)
+        return string.format("%s: engine power couldn't be verified, the limit is %d hp", name, limits.maxhp)
     end
-    if caps.maxpwr and not pwr_ok then
+    if not pwr_within(power, weight, limits) then
         if type(power) == "number" and type(weight) == "number" and weight > 0 then
             return string.format("%s has %.2f hp/kg, the limit is %.2f hp/kg", name, power / weight,
-                caps.maxpwr)
+                limits.maxpwr)
         end
         return string.format("%s: power-to-weight couldn't be verified, the limit is %.2f hp/kg", name,
-            caps.maxpwr)
+            limits.maxpwr)
     end
-    if breaks_weight_range(weight, caps) then
+    if not weight_within(weight, limits) then
         if type(weight) == "number" then
             return string.format("%s weighs %d kg, the limit is %s", name, math.floor(weight + 0.5),
-                weight_limit_label(caps))
+                weight_limit_label(limits))
         end
-        return string.format("%s: curb weight couldn't be verified, the limit is %s", name,
-            weight_limit_label(caps))
+        return string.format("%s: weight couldn't be verified, the limit is %s", name,
+            weight_limit_label(limits))
     end
     return name .. " exceeds the vehicle limit"
 end
@@ -405,24 +477,50 @@ local function amount(value, unit)
     return string.format("%d %s", math.floor(value + 0.5), unit)
 end
 
--- The one log line per measurement, as (level, text): what the car measures live beside what its metadata
--- says, and the verdict. For an unmodified stock preset (`stock`) the two readings must agree -- the shipped
--- metadata was generated by the same arithmetic on the same car -- so a disagreement there is a W: the
--- tripwire for a measurement that drifted from the engine's own after a game update. A value the limit
--- needed and did not get is a W every time (decision 5).
+-- "car 1370 kg + full tank 38 kg, live 1491 kg = car + fuel 38 kg + 84 kg on board": what the checked
+-- weight is made of and how the live total relates to it. "On board" is everything the run time adds besides
+-- fuel, the seated player above all (84 kg).
+local function weight_breakdown(reading)
+    local static, full_fuel = reading.static, reading.full_fuel
+    local text = string.format("car %s + full tank %s", amount(static, "kg"), amount(full_fuel, "kg"))
+    local total, fuel = reading.total, reading.fuel
+    if type(total) == "number" and type(static) == "number" and type(fuel) == "number" then
+        text = text .. string.format(", live %s = car + fuel %s + %s on board", amount(total, "kg"),
+            amount(fuel, "kg"), amount(total - static - fuel, "kg"))
+    end
+    return text
+end
+
+-- Whether a stock preset's live reading disagrees with its metadata: the power exactly (both are the same
+-- floored peak), the weight by more than the tolerance (WEIGHT_STEP_KG), i.e. exactly where the list and the
+-- check could disagree at a limit's edge.
+local function differs_from_metadata(reading, meta_power, meta_weight)
+    if type(reading.power) ~= "number" or type(reading.weight) ~= "number" then
+        return false
+    end
+    return reading.power ~= meta_power or math.abs(reading.weight - meta_weight) > M.WEIGHT_STEP_KG
+end
+
+-- The one log line per measurement, as (level, text): what the check weighs beside what the lists state
+-- for the preset (metadata "Weight", corrected where it is known to be stale), the weight's parts, and the
+-- verdict. For an unmodified stock preset (`stock`) the two must agree within the tolerance, so a
+-- disagreement there is a W: the tripwire for a measurement that drifted from the metadata after a game
+-- update, or a stale "Weight" the correction table does not know yet. A value the limit needed and did not
+-- get is a W every time (decision 5).
 function M.describe(label, purpose, reading, meta_power, meta_weight, stock, compliant, missing)
     reading = reading or {}
     local parts = {
-        string.format("live spec for '%s' (%s): live %s, %s; metadata %s, %s; %d engine(s)",
+        string.format("live spec for '%s' (%s): checked %s, %s; listed %s, %s; %s; %d engine(s)",
             tostring(label), tostring(purpose), amount(reading.power, "hp"), amount(reading.weight, "kg"),
-            amount(meta_power, "hp"), amount(meta_weight, "kg"), tonumber(reading.engines) or 0),
+            amount(meta_power, "hp"), amount(meta_weight, "kg"), weight_breakdown(reading),
+            tonumber(reading.engines) or 0),
     }
     local level = "I"
     if reading.reason then
         parts[#parts + 1] = "read: " .. reading.reason
     end
     local metadata_known = type(meta_power) == "number" and type(meta_weight) == "number"
-    if stock and metadata_known and (reading.power ~= meta_power or reading.weight ~= meta_weight) then
+    if stock and metadata_known and differs_from_metadata(reading, meta_power, meta_weight) then
         level = "W"
         parts[#parts + 1] = "differs from the metadata of this stock preset"
     end

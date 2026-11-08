@@ -21,10 +21,12 @@
 -- frozen phases (separate from the assist arm); combustion cars are left untouched so launch-revving
 -- against the freeze still works.
 --
--- And it measures the car for the vehicle limit (ADR-0032 amendment 2026-11-04): GE asks for the live
--- power and weight with a token, we compute them the way the engine computed the shipped metadata and
--- answer with the token. The metadata describes the preset a car was spawned from, never the car after a
--- parts or tuning change, so this is the only reading the limit can trust.
+-- And it measures the car for the vehicle limit (ADR-0032 amendments 2026-11-04 and 2026-11-08): GE asks for
+-- the live power and weight with a token, we answer with the token. Power is computed the way the engine
+-- computed the shipped metadata; the weight is the car with every fuel tank full and nobody on board, the
+-- quantity the shipped "Weight" states for a stock preset. The metadata describes the preset a car was
+-- spawned from, never the car after a parts or tuning change, so this is the only reading the limit can
+-- trust.
 
 local M = {}
 
@@ -132,9 +134,6 @@ function M.on_freeze_hold_disarm()
     freeze_hold = false
 end
 
--- The shipped metadata rounds the curb weight UP to this many kg (dynamicVehicleData.lua weightRoundValue).
-local WEIGHT_ROUND_KG = 5
-
 local function is_finite(value)
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
@@ -185,15 +184,86 @@ local function summed_peak_power(engines)
     return peak
 end
 
+local function count_entries(entries)
+    local count = 0
+    for _ in pairs(entries) do
+        count = count + 1
+    end
+    return count
+end
+
+-- The jbeam's own node masses, summed: the car as built, every seat empty and every tank dry. A parts or
+-- tuning change rebuilds the jbeam, so it counts here; what rides in the car (the fuel, the seated player,
+-- cargo) is put on the nodes at run time with obj:setNodeMass and does not.
+local function static_mass()
+    local nodes = type(v) == "table" and type(v.data) == "table" and v.data.nodes or nil
+    if type(nodes) ~= "table" then
+        return nil, "v.data.nodes unavailable"
+    end
+    local total = 0
+    for _, node in pairs(nodes) do
+        if type(node) == "table" and is_finite(node.nodeWeight) then
+            total = total + node.nodeWeight
+        end
+    end
+    if total <= 0 then
+        return nil, "the jbeam nodes carry no weight"
+    end
+    return total
+end
+
+-- The fuel on the tanks' nodes now and with every tank full, put there the way
+-- lua/vehicle/energyStorage/fuelTank.lua does: energy * fuelNodeMassCoef on each fuel node. A tank without
+-- fuel nodes carries no fuel mass, full or not. Other storages carry none on a stock car (no N2O bottle has
+-- mass nodes, air tanks measured 0 kg) and are left out.
+local function fuel_masses()
+    if type(energyStorage) ~= "table" or type(energyStorage.getStorages) ~= "function" then
+        return nil, nil, "energyStorage.getStorages unavailable"
+    end
+    local ok, storages = pcall(energyStorage.getStorages)
+    if not ok or type(storages) ~= "table" then
+        return nil, nil, "energyStorage.getStorages failed: " .. tostring(storages)
+    end
+    local now, full = 0, 0
+    for name, storage in pairs(storages) do
+        if type(storage) == "table" and storage.type == "fuelTank" then
+            local coefficient, nodes = storage.fuelNodeMassCoef, storage.fuelNodes
+            if not is_finite(coefficient) or type(nodes) ~= "table" or not is_finite(storage.storedEnergy)
+                    or not is_finite(storage.energyCapacity) then
+                return nil, nil, "fuel tank '" .. tostring(name) .. "' has no readable fuel mass"
+            end
+            local per_energy = coefficient * count_entries(nodes)
+            now = now + storage.storedEnergy * per_energy
+            full = full + storage.energyCapacity * per_energy
+        end
+    end
+    return now, full
+end
+
+-- The vehicle limit's weight (ADR-0032 amendment 2026-11-08): the car with every fuel tank full and nobody on
+-- board, so neither the fill level nor the seated player counts. Measured on 17 stock presets (BeamNG
+-- 0.40.5): total_weight = static mass + fuel + 84 kg for the seated player, to 0.01 kg, and the shipped
+-- "Weight" is static mass + a full tank rounded up to 5 kg. The static mass needs no settling time: the
+-- seated player's mass is applied after every spawn and reset, the jbeam's node weights are there from the
+-- start. The live total and the current fuel only go into the log line.
 local function read_weight(reading)
     local ok, stats = pcall(function() return obj:calcBeamStats() end)
-    if not ok then
-        add_reason(reading, "obj:calcBeamStats unavailable: " .. tostring(stats))
-    elseif type(stats) ~= "table" or not is_finite(stats.total_weight) then
-        add_reason(reading, "calcBeamStats gave no total_weight")
-    else
-        reading.weight = math.ceil(stats.total_weight / WEIGHT_ROUND_KG) * WEIGHT_ROUND_KG
+    if ok and type(stats) == "table" and is_finite(stats.total_weight) then
+        reading.total = stats.total_weight
     end
+    local static, static_why = static_mass()
+    if not static then
+        add_reason(reading, static_why)
+        return
+    end
+    reading.static = static
+    local fuel_now, fuel_full, fuel_why = fuel_masses()
+    if not fuel_full then
+        add_reason(reading, fuel_why)
+        return
+    end
+    reading.fuel, reading.full_fuel = fuel_now, fuel_full
+    reading.weight = static + fuel_full
 end
 
 local function read_power(reading)
@@ -228,14 +298,14 @@ local function read_power(reading)
     end
 end
 
--- The car's live engine power (hp) and curb weight (kg) as {power, weight, engines, reason}: exactly what
--- lua/vehicle/extensions/dynamicVehicleData.lua getVehiclePerformanceData computes, reduced to the two
--- numbers the vehicle limit compares -- and that function generated the shipped Power/Weight metadata, so
--- units and rounding match the caps: weight ceil(total_weight / 5) * 5, power the peak of the final
--- torque curve (turbo, supercharger and nitrous applied, i.e. tuning included) floored, mechanical hp.
--- A value that cannot be read stays nil and `reason` names why (ADR-0017: every touchpoint probed).
--- getTorqueData subtracts friction scaled by damage, so a damaged car reads lower; GE measures after a
--- respawn or the race-start repair, where the car is fresh.
+-- The car's live engine power (hp) and weight (kg) as {power, weight, engines, reason} plus the weight's
+-- parts for the log {total, static, fuel, full_fuel}. Power is exactly what
+-- lua/vehicle/extensions/dynamicVehicleData.lua getVehiclePerformanceData computes, the function that
+-- generated the shipped Power metadata: the peak of the final torque curve (turbo, supercharger and nitrous
+-- applied, i.e. tuning included) floored, mechanical hp. The weight is unrounded, the car with a full tank
+-- and nobody on board (read_weight). A value that cannot be read stays nil and `reason` names why
+-- (ADR-0017: every touchpoint probed). getTorqueData subtracts friction scaled by damage, so a damaged car
+-- reads lower; GE measures after a respawn or the race-start repair, where the car is fresh.
 function M.read_live_spec()
     local reading = {engines = 0}
     read_weight(reading)
@@ -253,14 +323,21 @@ end
 
 -- GE asks (vehicles.request_live_spec); answer with the token it handed us, so a late answer for a request
 -- GE has given up on is recognised and dropped there. The read never throws into the VE runtime.
+-- The weight's parts as a Lua table literal, the answer's last argument. Its presence is also what tells GE
+-- that the weight is the car with a full tank: an older extension sends no parts and a different weight.
+local function lua_weight_parts(reading)
+    return string.format("{total = %s, static = %s, fuel = %s, full_fuel = %s}", lua_number(reading.total),
+        lua_number(reading.static), lua_number(reading.fuel), lua_number(reading.full_fuel))
+end
+
 function M.measure_spec(token)
     local ok, reading = pcall(M.read_live_spec)
     if not ok then
         reading = {engines = 0, reason = "measurement failed: " .. tostring(reading)}
     end
-    forward(string.format("on_live_spec(%s, %s, %s, %s, %s, %s)",
+    forward(string.format("on_live_spec(%s, %s, %s, %s, %s, %s, %s)",
         lua_number(obj:getId()), lua_number(token), lua_number(reading.power), lua_number(reading.weight),
-        lua_number(reading.engines), lua_string(reading.reason)))
+        lua_number(reading.engines), lua_string(reading.reason), lua_weight_parts(reading)))
 end
 
 -- Per-frame: while the hold is armed on an electric car, pin the throttle to 0 so instant motor torque
