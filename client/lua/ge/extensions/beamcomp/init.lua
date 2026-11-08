@@ -4698,10 +4698,12 @@ function M.roll_ai_roster(json)
 end
 
 -- Re-draw one roster entry's name (UI -> GE, ADR-0047): payload {index, exclude, ai, policy}. When the
--- drawn name carries a preferred car that applies (nothing else names a car, restrictions pass), the car
--- rides the reply too -- decision 4's "they always get it". The policy goes into preferred_applies for the
--- same reason entry_from_drawn passes it: a forced Car (all) beats the driver file (ADR-0048 amendment
--- 2026-09-28), and omitting it here would leave this one path handing out preferred cars silently.
+-- drawn name carries a preferred car that applies (nothing else names a car, it is a usable race car), the
+-- car rides the reply too -- decision 4's "they always get it". Over the vehicle limit it is still the
+-- driver's own car; the panel's lineup preview shows the car he races instead (ai.limit_lineup). The
+-- policy goes into preferred_applies for the same reason entry_from_drawn passes it: a forced Car (all)
+-- beats the driver file (ADR-0048 amendment 2026-09-28), and omitting it here would leave this one path
+-- handing out preferred cars silently.
 -- Result pushed via BeamCompAiRosterName. Public as beamcomp_init.reroll_ai_name.
 function M.reroll_ai_name(json)
     local ok, request = pcall(jsonDecode, json)
@@ -4712,7 +4714,7 @@ function M.reroll_ai_name(json)
     local drawn = ai.draw_roster_names(1, request.exclude)[1]
     local reply = {index = tonumber(request.index), name = drawn.name}
     if drawn.preferred and ai.preferred_applies(request.ai, request.policy)
-            and ai.preferred_car_compliant(drawn.preferred, request.ai, request.policy) then
+            and ai.preferred_car_usable(drawn.preferred, request.ai) then
         reply.car = drawn.preferred
         reply.carLabel = ai.car_label(drawn.preferred)
     end

@@ -238,8 +238,9 @@ end
 
 -- THE vehicle list of the whole mod: a sorted array of installed race-car model keys. Every enumeration
 -- BeamComp offers reads this one function -- the setup panel's three car dropdowns (carlist.options), the
--- /cars chat listing (carlist.build), the player's Mode-3 substitute search (find_compliant) and the
--- random AI pool (find_compliant_car / random_compliant / random_stock_compliant, race/ai.lua) -- so what
+-- /cars chat listing (carlist.build), the player's Mode-3 substitute search (find_compliant), the AI's
+-- replacement under a vehicle limit (limit_candidates) and the random AI pool (find_compliant_car /
+-- random_compliant / random_stock_compliant, race/ai.lua) -- so what
 -- an admin sees listed is exactly what an AI can draw and what a substitute search can land on
 -- (ADR-0032 amendment 2026-08-09; before it, /cars and find_compliant read an unfiltered second list).
 function M.list_car_models()
@@ -673,6 +674,108 @@ function M.find_compliant_car(max_power, max_pwr, max_weight, weight_range)
         end
     end
     return nil
+end
+
+-- The listed power (hp) and weight (kg) of the car a "model[:config]" token spawns, each nil when unreadable.
+-- A bare model spawns its default config (`default_pc`, the key core/vehicles.lua prepareConfigData falls
+-- back to), so that is the config it is judged by. The weight goes through listed_weight, the correction
+-- table included, like every other list read.
+function M.token_specs(model, config)
+    local data = get_model(model)
+    if not data or type(data.configs) ~= "table" then
+        return nil, nil
+    end
+    local key = config
+    if key == nil or key == "" then
+        local info = data.model
+        key = type(info) == "table" and info.default_pc or nil
+    end
+    if type(key) ~= "string" then
+        return nil, nil
+    end
+    local info = data.configs[key]
+    probe_config_fields(info)
+    return read_numeric(info, POWER_FIELDS), listed_weight(model, key, info)
+end
+
+-- Which bounds of a vehicle limit (`limit` = {max_power?, max_pwr?, weight_range?}) a car with `power` and
+-- `weight` breaks, as a list of {axis, limit, value}: axis "maxhp", "maxpwr", "minkg" or "maxkg", value the
+-- car's own number on that axis (nil when unreadable, which counts as broken). nil when the car fits.
+--
+-- Every axis is asked through is_compliant on its own, so this can never disagree with it: is_compliant is
+-- an AND of these four checks, and a car fits exactly when none of them breaks.
+function M.limit_breaks(power, weight, limit)
+    local broken = {}
+    if limit.max_power ~= nil and not M.is_compliant(power, weight, limit.max_power) then
+        broken[#broken + 1] = {axis = "maxhp", limit = limit.max_power, value = power}
+    end
+    if limit.max_pwr ~= nil and not M.is_compliant(power, weight, nil, limit.max_pwr) then
+        local ratio = (type(power) == "number" and type(weight) == "number" and weight > 0)
+            and power / weight or nil
+        broken[#broken + 1] = {axis = "maxpwr", limit = limit.max_pwr, value = ratio}
+    end
+    local range = limit.weight_range
+    if range and range.min ~= nil and not M.is_compliant(power, weight, nil, nil, nil, {min = range.min}) then
+        broken[#broken + 1] = {axis = "minkg", limit = range.min, value = weight}
+    end
+    if range and range.max ~= nil and not M.is_compliant(power, weight, nil, nil, nil, {max = range.max}) then
+        broken[#broken + 1] = {axis = "maxkg", limit = range.max, value = weight}
+    end
+    if #broken == 0 then
+        return nil
+    end
+    return broken
+end
+
+-- Every car that fits `limit`, in the order an AI whose own car of `model` is over it is offered them
+-- (feature ai-cars-follow-vehicle-limit, race/ai.lua M.limit_lineup): first the fitting configs of `model`
+-- itself, strongest first (power descending, unreadable power last, then config key), then one car per
+-- further model, its strongest fitting config, starting after `model`'s place in the car list and wrapping
+-- round. That is the player substitute's search order (find_compliant: keep the brand, then the other models)
+-- with a start that depends on the car, so two AI over the limit in different cars do not both land on the
+-- alphabetically first one. `max_weight` is the AI's own lenient big-car ceiling, nil for none. `models` is
+-- M.list_car_models(), passed in so a caller sizing a whole field reads the list once. Returns a list of
+-- {model, config}, empty when nothing installed fits.
+function M.limit_candidates(model, limit, max_weight, models)
+    models = models or M.list_car_models()
+    local candidates = {}
+    if not M.is_known_non_car(model) then
+        local own = {}
+        for _, entry in ipairs(M.list_configs(model)) do
+            if M.is_compliant(entry.power, entry.weight, limit.max_power, limit.max_pwr, max_weight,
+                    limit.weight_range) then
+                own[#own + 1] = entry
+            end
+        end
+        table.sort(own, function(a, b)
+            local power_a, power_b = a.power or -1, b.power or -1
+            if power_a ~= power_b then
+                return power_a > power_b
+            end
+            return a.config < b.config
+        end)
+        for _, entry in ipairs(own) do
+            candidates[#candidates + 1] = {model = model, config = entry.config}
+        end
+    end
+    local start = #models + 1
+    for index, other in ipairs(models) do
+        if other > model then
+            start = index
+            break
+        end
+    end
+    for step = 0, #models - 1 do
+        local other = models[((start - 1 + step) % #models) + 1]
+        if other ~= model then
+            local pick = strongest_compliant(other, limit.max_power, limit.max_pwr, max_weight,
+                limit.weight_range)
+            if pick then
+                candidates[#candidates + 1] = {model = other, config = pick.config}
+            end
+        end
+    end
+    return candidates
 end
 
 -- The config keys of `model` whose power/weight satisfy the caps (its legal trims), as an array; empty when
