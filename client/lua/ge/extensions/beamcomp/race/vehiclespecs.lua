@@ -27,6 +27,17 @@ local LOG_TAG = "beamcomp.vehiclespecs"
 local POWER_FIELDS = {"Power", "power", "Power (KW)", "Power (hp)"}
 local WEIGHT_FIELDS = {"Weight", "weight", "Weight (kg)"}
 
+-- Stock presets whose shipped "Weight" is stale, with the weight measured in game instead (ADR-0032 amendment
+-- 2026-11-08). On a stock preset "Weight" is the car with every fuel tank full and nobody on board, rounded
+-- up to 5 kg -- the very quantity the vehicle limit weighs live -- except where a model update left it
+-- behind, and there the lists would show the car lighter than the check weighs it. Keyed
+-- "<model>:<config key>" (the key core_vehicles indexes configs by), in kg rounded up to 5 like the metadata.
+-- Measured 2026-11-08 on BeamNG.drive 0.40.5.0.302427 with scripts/dev/beamcomp_weightprobe; a new entry
+-- needs the same measurement, never an estimate.
+local WEIGHT_CORRECTIONS = {
+    ["etk800:844_150_A"] = 1575, -- "Weight" 1491; measured 1572.2 kg
+}
+
 -- The walking unicycle is never a race car (mirrors race/vehicles.lua); kept out of every listing/search.
 local EXCLUDED_MODELS = {unicycle = true}
 
@@ -109,6 +120,20 @@ local function read_numeric(info, fields)
         end
     end
     return nil
+end
+
+-- THE "Weight" read: the listed weight (kg) of `model`'s config `config` from its info table, with the
+-- correction table first. Every list (/cars, the setup panel, the AI pick, the substitute search) and the
+-- vehicle limit's log line read a stock preset's weight through here, so a corrected preset reads the same
+-- everywhere. Number or nil.
+local function listed_weight(model, config, info)
+    if type(model) == "string" and type(config) == "string" then
+        local corrected = WEIGHT_CORRECTIONS[model .. ":" .. config]
+        if corrected then
+            return corrected
+        end
+    end
+    return read_numeric(info, WEIGHT_FIELDS)
 end
 
 -- Log one config-info table's keys the first time we touch metadata, so the populated power/index field
@@ -277,7 +302,7 @@ function M.list_configs(model)
                 config = key,
                 name = label,
                 power = read_numeric(info, POWER_FIELDS),
-                weight = read_numeric(info, WEIGHT_FIELDS),
+                weight = listed_weight(model, key, info),
             }
         end
     end
@@ -297,14 +322,14 @@ function M.config_power(model, config)
     return read_numeric(info, POWER_FIELDS)
 end
 
--- Curb weight (kg) of one config from metadata, or nil. With config_power it yields the power-to-weight
--- ratio used by the Mode-3 maxpwr cap.
+-- Listed weight (kg) of one config (listed_weight: the car with a full tank and nobody on board), or nil.
+-- With config_power it yields the power-to-weight ratio used by the Mode-3 maxpwr cap.
 function M.config_weight(model, config)
     local data = get_model(model)
     if not data or type(data.configs) ~= "table" then
         return nil
     end
-    return read_numeric(data.configs[config], WEIGHT_FIELDS)
+    return listed_weight(model, config, data.configs[config])
 end
 
 -- The config-info table whose BoundingBox represents `model`/`config`, or nil. Resolution (R3 of
@@ -480,8 +505,9 @@ function M.metadata_power(veh)
     return power
 end
 
--- Curb weight (kg) of a SPAWNED vehicle as its METADATA states it -- the preset's number, with exactly
--- metadata_power's limits. Number or nil. pcall-guarded.
+-- Weight (kg) of a SPAWNED vehicle as the lists state it for its preset (listed_weight, the correction
+-- table included) -- the preset's number, with exactly metadata_power's limits. Number or nil.
+-- pcall-guarded.
 function M.metadata_weight(veh)
     if not veh then
         return nil
@@ -492,7 +518,8 @@ function M.metadata_weight(veh)
         end
         local details = core_vehicles.getVehicleDetails(veh:getId())
         local info = details and (details.configs or details.model)
-        return read_numeric(info, WEIGHT_FIELDS)
+        local current = details and type(details.current) == "table" and details.current or {}
+        return listed_weight(current.key, current.config_key, info)
     end)
     if not ok then
         return nil

@@ -501,8 +501,8 @@ function M.is_stock_setup(veh)
     return config ~= nil
 end
 
--- (public) The metadata power (hp) and weight (kg) of the preset `veh` was spawned from, for the vehicle
--- limit's log line beside the live reading. Either may be nil.
+-- (public) The metadata power (hp) and the listed weight (kg, correction table included) of the preset
+-- `veh` was spawned from, for the vehicle limit's log line beside the live reading. Either may be nil.
 function M.metadata_reading(veh)
     return vehiclespecs.metadata_power(veh), vehiclespecs.metadata_weight(veh)
 end
