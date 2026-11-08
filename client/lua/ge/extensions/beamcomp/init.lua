@@ -246,7 +246,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-capsweight-r3/2026-11-08"
+local BUILD_MARKER = "0.10.0-ailimit-r1/2026-11-09"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -3662,7 +3662,7 @@ function M.start_race_from_ui(json)
     -- Remember what this Confirm asked for, so the grid it builds can be compared with the panel later.
     -- The string as the panel sent it, not `decoded` re-encoded (see M.state.setup_built).
     setup.note_request(json, decoded)
-    send_to_server("startRace", {race = decoded.race, overrides = decoded.overrides})
+    send_to_server("startRace", {race = decoded.race, overrides = setup.limit_roster(decoded.overrides)})
 end
 
 -- The panel's "Start Race" (ADR-0037): end the staging wait and begin the countdown (the /go equivalent).
@@ -4791,6 +4791,118 @@ function M.repair_ai_roster(json)
     end
     guihooks.trigger("BeamCompAiRosterRepair", {token = request.token, entries = entries})
 end
+
+-- ===== the AI lineup under the vehicle limit (feature ai-cars-follow-vehicle-limit) ===================
+-- The panel's lineup holds each driver's OWN car; ai.limit_lineup decides which car he races while it is over
+-- the vehicle limit. Two callers of that one rule live here: the panel's live preview and the Confirm that
+-- sends the lineup. Both hang off the `setup` namespace table -- init.lua sits at 178/200 top-level locals.
+
+-- The player policy slice of a race request's overrides, as ai.limit_spec reads it.
+function setup.request_policy(overrides)
+    return {
+        car = overrides.car,
+        maxhp = overrides.maxhp,
+        maxpwr = overrides.maxpwr,
+        maxkg = overrides.maxkg,
+        minkg = overrides.minkg,
+    }
+end
+
+-- The race request Confirm sends, with each roster car over the vehicle limit swapped for the car that AI
+-- races (ai.limit_lineup, logged). The server therefore stores, reserves grid space for, and hands the owner
+-- the car that spawns -- session.ai_roster, the pre-flight footprints, the owner's pre-spawn report and the
+-- quali re-grid all read the roster car, unchanged. The panel keeps the own cars in its form and its saved
+-- presets, so a limit removed or the AI set free of it gives every driver his own car back.
+--
+-- Returns a copy where something changed and `overrides` itself otherwise; the decoded request stays as the
+-- panel sent it (setup.note_request holds it). Skipped while a class-drop tournament runs: the server ignores
+-- roster cars then (the class decides, ADR-0042), so a swap here would only log a change that never spawns.
+function setup.limit_roster(overrides)
+    local request_ai = type(overrides) == "table" and overrides.ai or nil
+    if type(request_ai) ~= "table" or type(request_ai.roster) ~= "table" then
+        return overrides
+    end
+    local tournament = M.state.tournament
+    if tournament and tournament.active then
+        return overrides
+    end
+    local field = ai.limit_lineup(request_ai.roster, request_ai, setup.request_policy(overrides), true)
+    local roster, changed = {}, false
+    for index, entry in ipairs(request_ai.roster) do
+        local result = field[index]
+        if result and result.replaced and type(entry) == "table" then
+            roster[index] = {name = entry.name, car = result.car, color = entry.color}
+            changed = true
+        else
+            roster[index] = entry
+        end
+    end
+    if not changed then
+        return overrides
+    end
+    local outgoing_ai = {}
+    for key, value in pairs(request_ai) do
+        outgoing_ai[key] = value
+    end
+    outgoing_ai.roster = roster
+    local outgoing = {}
+    for key, value in pairs(overrides) do
+        outgoing[key] = value
+    end
+    outgoing.ai = outgoing_ai
+    return outgoing
+end
+
+-- The preview the panel draws for a lineup: payload {token, entries = [{name, car}], ai, policy}, the same
+-- slices a roll sends. Returns {token, entries} with ONE item per driver whose own car is over the limit:
+-- {name, origin, car, carLabel, typeLabel, originLabel, breaks = [axis], unmet?}. `car` is what he races
+-- (the own car again when nothing installed fits, `unmet`), `breaks` names the bounds his own car breaks
+-- ("maxhp", "maxpwr", "minkg", "maxkg"). A driver whose car fits is not listed, so an empty list means the
+-- whole lineup races its own cars. Silent: the panel asks on every change, the log line belongs to Confirm.
+function setup.limit_preview(request)
+    local lineup = {}
+    for index, entry in ipairs(type(request.entries) == "table" and request.entries or {}) do
+        -- The same 16-AI ceiling the roll paths clamp to.
+        if index > 16 then
+            break
+        end
+        lineup[index] = type(entry) == "table" and entry or {}
+    end
+    local entries = {}
+    for index, result in ipairs(ai.limit_lineup(lineup, request.ai, request.policy, false)) do
+        if result.breaks then
+            local model_label, config_label = ai.car_label_parts(result.car)
+            local axes = {}
+            for _, broken in ipairs(result.breaks) do
+                axes[#axes + 1] = broken.axis
+            end
+            entries[#entries + 1] = {
+                name = lineup[index].name,
+                origin = result.origin,
+                car = result.car,
+                carLabel = model_label,
+                typeLabel = config_label or "stock",
+                originLabel = ai.car_label(result.origin),
+                breaks = axes,
+                unmet = result.unmet,
+            }
+        end
+    end
+    return {token = request.token, entries = entries}
+end
+
+-- The panel's live lineup preview (UI -> GE): payload as setup.limit_preview reads it, answer pushed via
+-- BeamCompAiLimit with the token echoed (last request wins, like the roll replies). Public as
+-- beamcomp_init.limit_ai_lineup.
+function M.limit_ai_lineup(json)
+    local ok, request = pcall(jsonDecode, json)
+    if not ok or type(request) ~= "table" then
+        log("W", RACE_LOG_TAG, "limit_ai_lineup: bad payload")
+        return
+    end
+    guihooks.trigger("BeamCompAiLimit", setup.limit_preview(request))
+end
+-- ===== end the AI lineup under the vehicle limit ===================================================
 
 -- Build the grid-editor panel's option dataset and push it to the app (ADR-0037 amendment): every race on
 -- the current map (deprecated included -- a grid can be authored for any race) and the race to pre-seed
