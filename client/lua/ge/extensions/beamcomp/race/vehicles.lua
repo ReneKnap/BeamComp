@@ -494,8 +494,8 @@ function M.setup_label(veh)
 end
 
 -- (public) Whether `veh` still runs the named preset it was spawned from. Only for such a car must its live
--- power equal the metadata and its weight agree with it within one rounding step, which is what makes the
--- vehicle limit's log line a tripwire.
+-- power equal the metadata and its weight agree with it within the check's tolerance
+-- (capcheck.WEIGHT_STEP_KG), which is what makes the vehicle limit's log line a tripwire.
 function M.is_stock_setup(veh)
     local _, config = model_config_of(veh)
     return config ~= nil

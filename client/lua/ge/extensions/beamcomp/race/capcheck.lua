@@ -44,13 +44,14 @@ M.OWN_RESPAWN_WAIT = 10.0
 -- respawn before staging would lose the freeze nothing re-asserts there.
 M.ACTING_PHASES = {staging = true, countdown = true, racing = true, qualifying = true, qualiResults = true}
 
--- The metadata states a weight in 5 kg steps: "Weight" is the car with a full tank rounded up to 5 kg (plus
--- 1 on most presets), so a stock preset's list value sits up to one step above what the check measures
--- (0.1 to 4.98 kg on the 123 race presets measured 2026-11-08, with vehiclespecs' correction table for the
--- 17 that were further off). The check gives the car that one step on every
--- weight bound, in its favour, so a car the list shows inside a limit is never refused at its edge -- maxkg,
--- minkg and maxpwr alike. The price is that a car up to one step outside is let through.
-M.WEIGHT_STEP_KG = 5
+-- The weight tolerance, in kg, given to the car in its favour on every weight bound (owner decision
+-- 2026-11-08). It is NOT the metadata's 5 kg rounding, though it exists because of it: "Weight" is the car
+-- with a full tank rounded up to 5 kg, plus 1 on most presets, so a stock preset's list value can sit up to
+-- just under 6 kg above what the check measures (0.1 to 4.98 kg on the 123 race presets measured 2026-11-08,
+-- with vehiclespecs' correction table for the 17 that were further off). With 6 kg a car the list shows
+-- inside a limit is never refused at its edge -- maxkg, minkg and maxpwr alike -- on the unmeasured presets
+-- too. The price is that a car up to 6 kg outside is let through.
+M.WEIGHT_STEP_KG = 6
 
 -- Config keys that change neither power nor weight. Everything else is part of the setup fingerprint -- a
 -- blacklist on purpose, so a key this file has never heard of is measured rather than waved through.
@@ -491,7 +492,8 @@ local function weight_breakdown(reading)
 end
 
 -- Whether a stock preset's live reading disagrees with its metadata: the power exactly (both are the same
--- floored peak), the weight by more than the one step the metadata's rounding leaves (WEIGHT_STEP_KG).
+-- floored peak), the weight by more than the tolerance (WEIGHT_STEP_KG), i.e. exactly where the list and the
+-- check could disagree at a limit's edge.
 local function differs_from_metadata(reading, meta_power, meta_weight)
     if type(reading.power) ~= "number" or type(reading.weight) ~= "number" then
         return false
@@ -501,7 +503,7 @@ end
 
 -- The one log line per measurement, as (level, text): what the check weighs beside what the lists state
 -- for the preset (metadata "Weight", corrected where it is known to be stale), the weight's parts, and the
--- verdict. For an unmodified stock preset (`stock`) the two must agree within one weight step, so a
+-- verdict. For an unmodified stock preset (`stock`) the two must agree within the tolerance, so a
 -- disagreement there is a W: the tripwire for a measurement that drifted from the metadata after a game
 -- update, or a stale "Weight" the correction table does not know yet. A value the limit needed and did not
 -- get is a W every time (decision 5).

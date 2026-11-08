@@ -31,9 +31,9 @@ local WEIGHT_FIELDS = {"Weight", "weight", "Weight (kg)"}
 -- 2026-11-08). On a stock preset "Weight" is the car with every fuel tank full and nobody on board, rounded
 -- up to 5 kg -- the very quantity the vehicle limit weighs live -- except where a model update left it
 -- behind. Off in EITHER direction it breaks the promise that a car the list shows inside a limit is never
--- refused: listed too light, the check refuses it under maxkg; listed too heavy, under minkg (the check's one
--- 5 kg step covers only what the rounding leaves). Keyed "<model>:<config key>" (the key core_vehicles
--- indexes configs by), in kg rounded up to 5 like the metadata.
+-- refused: listed too light, the check refuses it under maxkg; listed too heavy, under minkg (the check's
+-- 6 kg tolerance, capcheck.WEIGHT_STEP_KG, covers only what the metadata's rounding leaves). Keyed
+-- "<model>:<config key>" (the key core_vehicles indexes configs by), in kg rounded up to 5 like the metadata.
 -- Measured 2026-11-08 on BeamNG.drive 0.40.5.0.302427 with scripts/dev/beamcomp_weightprobe, three runs, 124
 -- stock presets: these 17 are more than 5 kg off, the other 107 within 5 kg. A new entry needs the same
 -- measurement, never an estimate.
