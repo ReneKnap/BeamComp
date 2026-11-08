@@ -107,6 +107,7 @@ and `repair:<secs>` set how long the key has to be held, from 1 to 30 seconds.
 | `ai <n>` | Adds this many computer drivers, 1 to 16. |
 | `ai <n> easy` | The same, with a difficulty: `easy`, `medium` or `hard`. |
 | `aicar=<model>` | What the computer drivers drive. Add `:<config>` for a factory version. |
+| `ailimit=off` | Lets the computer drivers keep a car that is over the vehicle limit. Without it, such a car is swapped for one that fits. |
 | `aiaggr=<0..1>` | How hard they fight for position. |
 | `aiskill=<0..1>` | How cleanly and quickly they drive. |
 | `airubber=<0..1>` | How much they speed up when behind and ease off when ahead. Higher keeps the field together. |
