@@ -46,7 +46,8 @@ M.ACTING_PHASES = {staging = true, countdown = true, racing = true, qualifying =
 
 -- The metadata states a weight in 5 kg steps: "Weight" is the car with a full tank rounded up to 5 kg (plus
 -- 1 on most presets), so a stock preset's list value sits up to one step above what the check measures
--- (0.2 to 4.4 kg on the 15 race presets measured 2026-11-08). The check gives the car that one step on every
+-- (0.1 to 4.98 kg on the 123 race presets measured 2026-11-08, with vehiclespecs' correction table for the
+-- 17 that were further off). The check gives the car that one step on every
 -- weight bound, in its favour, so a car the list shows inside a limit is never refused at its edge -- maxkg,
 -- minkg and maxpwr alike. The price is that a car up to one step outside is let through.
 M.WEIGHT_STEP_KG = 5

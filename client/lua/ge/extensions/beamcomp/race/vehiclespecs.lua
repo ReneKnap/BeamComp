@@ -30,12 +30,31 @@ local WEIGHT_FIELDS = {"Weight", "weight", "Weight (kg)"}
 -- Stock presets whose shipped "Weight" is stale, with the weight measured in game instead (ADR-0032 amendment
 -- 2026-11-08). On a stock preset "Weight" is the car with every fuel tank full and nobody on board, rounded
 -- up to 5 kg -- the very quantity the vehicle limit weighs live -- except where a model update left it
--- behind, and there the lists would show the car lighter than the check weighs it. Keyed
--- "<model>:<config key>" (the key core_vehicles indexes configs by), in kg rounded up to 5 like the metadata.
--- Measured 2026-11-08 on BeamNG.drive 0.40.5.0.302427 with scripts/dev/beamcomp_weightprobe; a new entry
--- needs the same measurement, never an estimate.
+-- behind. Off in EITHER direction it breaks the promise that a car the list shows inside a limit is never
+-- refused: listed too light, the check refuses it under maxkg; listed too heavy, under minkg (the check's one
+-- 5 kg step covers only what the rounding leaves). Keyed "<model>:<config key>" (the key core_vehicles
+-- indexes configs by), in kg rounded up to 5 like the metadata.
+-- Measured 2026-11-08 on BeamNG.drive 0.40.5.0.302427 with scripts/dev/beamcomp_weightprobe, three runs, 124
+-- stock presets: these 17 are more than 5 kg off, the other 107 within 5 kg. A new entry needs the same
+-- measurement, never an estimate.
 local WEIGHT_CORRECTIONS = {
-    ["etk800:844_150_A"] = 1575, -- "Weight" 1491; measured 1572.2 kg
+    ["etk800:844_150_A"] = 1575,                    -- "Weight" 1491, measured 1572.2
+    ["fullsize:drag"] = 1815,                       -- "Weight" 1756, measured 1811.3
+    ["fullsize:limo_base"] = 2870,                  -- "Weight" 2861, measured 2868.6
+    ["fullsize:limo_luxe"] = 2895,                  -- "Weight" 2881, measured 2892.6
+    ["fullsize:limo_official"] = 2895,              -- "Weight" 2886, measured 2893.6
+    ["fullsize:limo_special"] = 2880,               -- "Weight" 2866, measured 2876.1
+    ["percheron:l310_6x4_flatbed_M"] = 10580,       -- "Weight" 10601, measured 10577.0
+    ["percheron:s310_4x2_box_A"] = 10140,           -- "Weight" 10161, measured 10137.5
+    ["percheron:s310_4x2_flatbed_M"] = 9080,        -- "Weight" 9101, measured 9076.5
+    ["percheron:s310_fifthwheel_m"] = 7475,         -- "Weight" 7461, measured 7472.1
+    ["percheron:s410_4x2_box_cola_A"] = 17785,      -- "Weight" 17806, measured 17783.6
+    ["percheron:xl450_4x2_6_fifthwheel_m"] = 8805,  -- "Weight" 8821, measured 8800.4
+    ["percheron:xl450_4x2_fifthwheel_M"] = 8075,    -- "Weight" 8096, measured 8071.3
+    ["percheron:xl450_6x2_tag_box_M"] = 11895,      -- "Weight" 11916, measured 11893.1
+    ["percheron:xl500_6x4_box_M"] = 11945,          -- "Weight" 11966, measured 11942.3
+    ["percheron:xl500_6x4_fifthwheel_m"] = 9280,    -- "Weight" 9296, measured 9275.7
+    ["pigeon:gambler"] = 1055,                      -- "Weight" 1046, measured 1051.9
 }
 
 -- The walking unicycle is never a race car (mirrors race/vehicles.lua); kept out of every listing/search.
