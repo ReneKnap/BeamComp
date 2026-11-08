@@ -246,7 +246,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-sectortie-r1/2026-11-07"
+local BUILD_MARKER = "0.10.0-capsweight-r1/2026-11-08"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -8658,18 +8658,14 @@ end
 
 -- The VE's answer to a measurement request (lua/vehicle/extensions/beamcomp/init.lua measure_spec). Public
 -- as beamcomp_init.on_live_spec, the name the VE calls through queueGameEngineLua. An answer nobody waits
--- for any more (replaced, given up, another race) is dropped with a line.
-function M.on_live_spec(vehicle_id, token, power, weight, engines, reason)
+-- for any more (replaced, given up, another race) is dropped with a line. `parts` is the weight's breakdown
+-- (capcheck.reading_from_answer).
+function M.on_live_spec(vehicle_id, token, power, weight, engines, reason, parts)
     local state = M.state.caps_check
     if not state then
         return
     end
-    local reading = {
-        power = type(power) == "number" and power or nil,
-        weight = type(weight) == "number" and weight or nil,
-        engines = tonumber(engines) or 0,
-        reason = type(reason) == "string" and reason or nil,
-    }
+    local reading = M.capcheck.reading_from_answer(power, weight, engines, reason, parts)
     if not M.capcheck.on_answer(state, vehicle_id, token, reading) then
         log("I", RACE_LOG_TAG, "vehicle limit: dropped a live spec answer nobody waits for (token "
             .. tostring(token) .. ")")
