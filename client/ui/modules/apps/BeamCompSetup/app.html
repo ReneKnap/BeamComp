@@ -533,6 +533,9 @@
              (covet:base forced against a bare covet row), and a line reading "other than Ibishu Covet"
              above rows that all say Ibishu Covet would look like the warning was the broken part. -->
         <div class="bc-warn" ng-if="rosterIgnoresForcedCar()">AI lineup holds a different car than Car (all) forces.</div>
+        <!-- Whether the vehicle limit reaches the AI cars (feature ai-cars-follow-vehicle-limit). Shown only
+             while a limit is set, because without one it decides nothing. Off, the AI keep their own cars. -->
+        <label class="bc-row bc-check" ng-if="aiLimitShown()" bc-setup-tip="tip('aiBindLimit')"><input type="checkbox" ng-model="form.aiBindLimit"><span>Bind AI to the limit</span></label>
         <!-- Composable random-AI axes: only meaningful when the AI car is "random". Trim toggles stock vs
              random config variant; Exclude big vehicles drops buses/trucks/vans by curb weight. -->
         <div ng-if="form.aiCar === 'random'">
@@ -556,6 +559,9 @@
               ng-click="toggleRoster()">{{rosterOpen ? 'Hide' : 'Edit…'}}</button>
           </span>
         </div>
+        <!-- The vehicle limit swaps AI cars (feature ai-cars-follow-vehicle-limit): said here, outside the
+             editor, so a collapsed lineup cannot hide it. Edit… shows which driver races what. -->
+        <div class="bc-warn" ng-if="form.aiRoster.length && aiLimitNote()">{{aiLimitNote()}}</div>
         <div ng-if="rosterOpen && form.aiRoster.length">
           <!-- The former Create/Re-create, now the deliberate "give me a new field" action inside the
                editor: fresh names, cars and colours. The live settings above only ever re-roll the CARS of
@@ -589,17 +595,27 @@
                 bc-setup-tip="tip('rosterNameRoll')">Roll</button>
             </div>
             <!-- Read-only summary (R3: two lines so it never overflows) -- line 1 = car model (change D:
-                 model only) + inline colour swatch + Change; line 2 = the type (config). -->
+                 model only) + inline colour swatch + Change; line 2 = the type (config). Both name the car the
+                 driver RACES: the replacement while his own car is over the vehicle limit, and a third line
+                 then names his own car (feature ai-cars-follow-vehicle-limit). -->
             <div class="bc-row" ng-if="!e._open">
               <span bc-setup-tip="tip('rosterCarShown')">Car</span>
-              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterCarShown')">{{rosterCarLabel(e)}} <span class="bc-swatch bc-swatch-inline"
+              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterCarShown')">{{rosterRaceCarLabel(e)}} <span class="bc-swatch bc-swatch-inline"
                 ng-style="rosterSwatchStyle(e.color)"></span></span>
               <button type="button" class="bc-preset" ng-click="toggleRosterEntry(e)"
                 bc-setup-tip="tip('rosterChange')">Change…</button>
             </div>
             <div class="bc-row" ng-if="!e._open && rosterModelOf(e) && rosterModelOf(e) !== 'host'">
               <span bc-setup-tip="tip('rosterTypeShown')">Type</span>
-              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterTypeShown')">{{rosterConfigLabel(e)}}</span>
+              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterTypeShown')">{{rosterRaceTypeLabel(e)}}</span>
+            </div>
+            <div class="bc-row" ng-if="!e._open && limitSwapped(e)">
+              <span bc-setup-tip="tip('rosterOwnCar')">Own car</span>
+              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterOwnCar')">{{limitOwnCarText(e)}}</span>
+            </div>
+            <div class="bc-row" ng-if="limitOf(e).unmet">
+              <span bc-setup-tip="tip('rosterNoFit')">Limit</span>
+              <span class="bc-roster-carshown" bc-setup-tip="tip('rosterNoFit')">{{limitNoFitText(e)}}</span>
             </div>
             <!-- Expanded edit panel: Car / Type / Colour, each with its own dropdown/palette + a Roll, then
                  one Save & Done (R3): persists this name's preferred and collapses -- closing always saves. -->
@@ -627,6 +643,12 @@
                 </div>
                 <button type="button" class="bc-preset" ng-click="rerollRosterConfig(e)"
                   bc-setup-tip="tip('rosterConfigRoll')">Roll</button>
+              </div>
+              <!-- The two dropdowns above pick the driver's OWN car. Over the vehicle limit he races another
+                   one, and this row names it. -->
+              <div class="bc-row" ng-if="limitSwapped(e)">
+                <span bc-setup-tip="tip('rosterRacesIn')">Races in</span>
+                <span class="bc-roster-carshown" bc-setup-tip="tip('rosterRacesIn')">{{limitRaceCarText(e)}}</span>
               </div>
               <div class="bc-row">
                 <span bc-setup-tip="tip('rosterColor')">Colour</span>
