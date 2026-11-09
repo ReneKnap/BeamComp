@@ -46,6 +46,13 @@ angular.module('beamng.apps')
   // apply immediately, so this only bounds how long a purely typed change waits.
   var ROSTER_COUNT_DELAY = 500;
 
+  // How long after the last change to the AI lineup or the vehicle limit the panel asks GE which AI cars the
+  // limit swaps (ms). Short: it only bounds how far the preview trails a keystroke in a limit field.
+  var LIMIT_PREVIEW_DELAY = 250;
+
+  // The panel's own names for the bounds of a vehicle limit, keyed by the axis names GE's preview uses.
+  var LIMIT_AXIS_LABELS = { maxhp: 'Max hp', maxpwr: 'Max hp/kg', minkg: 'Min kg', maxkg: 'Max kg' };
+
   // The two race modes (ADR-0013). There is no 'auto' entry any more: the panel learns the track's own
   // type (BeamCompRaceMeta) and preselects the matching mode, marked '(recommended)' by rebuildModeOpts.
   // A preselection, not a lock -- the other mode stays pickable, which is the only thing that makes the
@@ -295,6 +302,8 @@ angular.module('beamng.apps')
       + 'otherwise gives each driver the car that belongs to their name.',
     aiRandomTrim: 'Give each AI car a random factory version instead of the standard one.',
     aiNoBigCars: 'Leave buses, trucks and vans out of the AI draw (it goes by weight).',
+    // Shown only while a vehicle limit is set. Off, the AI keep their cars over it (race/ai.lua limit_spec).
+    aiBindLimit: 'Swaps an AI car that is over the vehicle limit for one that fits.',
     rosterToggle: 'Show the drivers, so you can change them one by one.',
     rollAll: 'Draw a whole new set of drivers: new names, cars colors and grid position.',
     rosterName: 'Pick this driver from the name list. A name brings its own car and color with it.',
@@ -304,6 +313,10 @@ angular.module('beamng.apps')
     rosterCarShown: 'The car this driver starts in, with their color.',
     rosterChange: 'Open this driver\'s car, version and color. Changes are only for this session.',
     rosterTypeShown: 'The factory version this car spawns as.',
+    // The three rows of a driver whose own car is over the vehicle limit (race/ai.lua limit_lineup).
+    rosterOwnCar: 'This driver\'s own car. It is over the vehicle limit, so he races the car above.',
+    rosterRacesIn: 'The car this driver races, because his own car is over the vehicle limit.',
+    rosterNoFit: 'No installed car meets the vehicle limit, so this driver keeps his own car.',
     rosterCar: 'The car for this one driver.',
     rosterCarRoll: 'Draw a different car for this driver.',
     rosterConfig: 'The factory version of this driver\'s car.',
@@ -429,6 +442,9 @@ angular.module('beamng.apps')
       // values -- presets serialise these as explicit booleans, so the new default only affects fresh forms
       // and presets saved after this change.
       aiRandomTrim: true, aiNoBigCars: true,
+      // Whether the vehicle limit reaches the AI cars (feature ai-cars-follow-vehicle-limit). On by default,
+      // and a preset saved before it lacks the key, so the freshForm merge reads it as on too.
+      aiBindLimit: true,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
       tourMode: 'off', tourClasses: defaultTourClasses(), tourOrder: 'random',
     };
@@ -698,6 +714,9 @@ angular.module('beamng.apps')
       // variant; noBigCars true excludes big/heavy vehicles (curb-weight ceiling).
       ai.randomTrim = !!form.aiRandomTrim;
       ai.noBigCars = !!form.aiNoBigCars;
+      // Whether the vehicle limit binds the AI cars (feature ai-cars-follow-vehicle-limit). The roster above
+      // carries the OWN cars; GE swaps the ones over the limit on the way out (init.lua setup.limit_roster).
+      ai.bindLimit = !!form.aiBindLimit;
       var params = {};
       if (num(form.aiAggr) !== undefined) { params.aggr = num(form.aiAggr); }
       if (num(form.aiSkill) !== undefined) { params.skill = num(form.aiSkill); }
@@ -1146,8 +1165,11 @@ angular.module('beamng.apps')
       scope.aiCarOptLabel = function (o) {
         return aiCarLabel(o.v, o.label);
       };
+      // The head names the car the AI race, so an AI car that is over the vehicle limit says so: the drivers
+      // race the replacements the lineup lists instead (feature ai-cars-follow-vehicle-limit).
       scope.aiCarHeadLabel = function () {
-        return aiCarLabel(scope.form.aiCar, scope.labelFor('aiCar'));
+        var label = aiCarLabel(scope.form.aiCar, scope.labelFor('aiCar'));
+        return scope.aiCarOverLimit() ? label + ' (over the limit)' : label;
       };
 
       // Whether the AI have been given a car of their own that overrides a forced Car (all). An explicit
@@ -1940,7 +1962,8 @@ angular.module('beamng.apps')
       // The roll request's shared slice: the AI car mode + axes and the player policy, mirroring what
       // the race payload would relay (buildRosterPolicy) so panel rolls and spawn cannot drift.
       function rosterRollSpec() {
-        var spec = { ai: { randomTrim: !!scope.form.aiRandomTrim, noBigCars: !!scope.form.aiNoBigCars } };
+        var spec = { ai: { randomTrim: !!scope.form.aiRandomTrim, noBigCars: !!scope.form.aiNoBigCars,
+          bindLimit: !!scope.form.aiBindLimit } };
         if (scope.form.aiCar) { spec.ai.car = scope.form.aiCar; }
         spec.policy = buildRosterPolicy(scope.form);
         return spec;
@@ -2172,6 +2195,178 @@ angular.module('beamng.apps')
           rerollRosterCars();
         }
       }, true);
+
+      // ----- The vehicle limit on the AI lineup (feature ai-cars-follow-vehicle-limit) ------------------
+      // The lineup holds each driver's OWN car. While it is over the vehicle limit he races another one, and
+      // GE picks it with the one rule Confirm and the spawn use too (race/ai.lua limit_lineup), so this panel
+      // never chooses a car itself: it asks, and draws the answer. scope.aiLimit is not part of the form, so
+      // it is never saved, never restored and never sent.
+      //
+      // A $watch, which the live ROLLS must not use (applyStoredForm swaps the whole form, and a watcher that
+      // acts would re-roll what a restore just brought back). This one only asks and its answer only paints,
+      // so re-firing on a preset load or a UI reload is exactly right: a restored lineup must show its swaps.
+      // It watches the request itself, which is every input the answer depends on and nothing else.
+      scope.aiLimit = { byName: {} };
+      var limitToken = 0;
+      var limitTimer = null;
+
+      // The preview question for the current form, or null when there is nothing to ask: AI off, no lineup,
+      // or a class-drop running (the classes decide the AI cars then, and the server ignores the lineup's).
+      function limitPreviewRequest() {
+        var roster = scope.form.aiRoster || [];
+        if (!scope.form.aiEnabled || !roster.length || scope.tournament.active) {
+          return null;
+        }
+        var spec = rosterRollSpec();
+        spec.entries = roster.map(function (e) { return { name: e.name, car: e.car || '' }; });
+        return spec;
+      }
+
+      function cancelLimitPreview() {
+        if (limitTimer) {
+          $timeout.cancel(limitTimer);
+          limitTimer = null;
+        }
+      }
+
+      scope.$watch(function () {
+        var request = limitPreviewRequest();
+        return request ? angular.toJson(request) : '';
+      }, function (json) {
+        cancelLimitPreview();
+        // A reply still in flight answers a question the panel no longer asks: last request wins.
+        limitToken += 1;
+        if (!json) {
+          scope.aiLimit = { byName: {} };
+          return;
+        }
+        var token = limitToken;
+        // invokeApply false: the GE call is the whole effect, the reply brings its own digest.
+        limitTimer = $timeout(function () {
+          limitTimer = null;
+          var request = JSON.parse(json);
+          request.token = token;
+          geLuaArg('limit_ai_lineup', JSON.stringify(request));
+        }, LIMIT_PREVIEW_DELAY, false);
+      });
+
+      scope.$on('$destroy', cancelLimitPreview);
+
+      // GE lists only the drivers whose own car is over the limit, so an empty list means every driver races
+      // his own car.
+      scope.$on('BeamCompAiLimit', function (event, payload) {
+        scope.$evalAsync(function () {
+          if (!payload || payload.token !== limitToken) {
+            return;
+          }
+          var byName = {};
+          asArray(payload.entries).forEach(function (e) {
+            if (e && e.name) {
+              byName[e.name] = {
+                origin: e.origin || '',
+                car: e.car,
+                carLabel: e.carLabel,
+                typeLabel: e.typeLabel,
+                originLabel: e.originLabel,
+                breaks: asArray(e.breaks),
+                unmet: !!e.unmet,
+              };
+            }
+          });
+          scope.aiLimit = { byName: byName };
+        });
+      });
+
+      // This driver's preview record while his own car is over the limit, else null. A record for a car the
+      // row no longer holds is ignored: the answer to the newer question is on its way.
+      scope.limitOf = function (e) {
+        var rec = (e && e.name) ? scope.aiLimit.byName[e.name] : null;
+        return (rec && rec.origin === (e.car || '')) ? rec : null;
+      };
+      function swapOf(e) {
+        var rec = scope.limitOf(e);
+        return (rec && !rec.unmet) ? rec : null;
+      }
+      scope.limitSwapped = function (e) {
+        return !!swapOf(e);
+      };
+      function limitBreaksLabel(rec) {
+        return rec.breaks.map(function (axis) { return LIMIT_AXIS_LABELS[axis] || axis; }).join(', ');
+      }
+
+      // The car and type a driver RACES, which the collapsed row shows: the replacement while his own car is
+      // over the limit, his own car otherwise. The editor's dropdowns keep showing and changing the own car.
+      scope.rosterRaceCarLabel = function (e) {
+        var rec = swapOf(e);
+        return rec ? rec.carLabel : scope.rosterCarLabel(e);
+      };
+      scope.rosterRaceTypeLabel = function (e) {
+        var rec = swapOf(e);
+        return rec ? rec.typeLabel : scope.rosterConfigLabel(e);
+      };
+      scope.limitOwnCarText = function (e) {
+        var rec = scope.limitOf(e);
+        return rec ? rec.originLabel + ' (over ' + limitBreaksLabel(rec) + ')' : '';
+      };
+      scope.limitRaceCarText = function (e) {
+        var rec = swapOf(e);
+        if (!rec) {
+          return '';
+        }
+        if (!rec.typeLabel || rec.typeLabel === 'stock') {
+          return rec.carLabel;
+        }
+        return rec.carLabel + ' - ' + rec.typeLabel;
+      };
+      scope.limitNoFitText = function (e) {
+        var rec = scope.limitOf(e);
+        return rec ? 'over ' + limitBreaksLabel(rec) + ', no car fits' : '';
+      };
+
+      // The one line under "AI lineup" that says the limit swaps cars, so a collapsed lineup cannot hide it.
+      scope.aiLimitNote = function () {
+        var swapped = 0;
+        var unmet = 0;
+        (scope.form.aiRoster || []).forEach(function (e) {
+          var rec = scope.limitOf(e);
+          if (rec && rec.unmet) {
+            unmet += 1;
+          } else if (rec) {
+            swapped += 1;
+          }
+        });
+        var parts = [];
+        if (swapped) {
+          parts.push(swapped === 1
+            ? '1 AI car is over the vehicle limit and is swapped for one that fits.'
+            : swapped + ' AI cars are over the vehicle limit and are swapped for ones that fit.');
+        }
+        if (unmet) {
+          parts.push('No car meets the vehicle limit, so '
+            + (unmet === 1 ? '1 AI keeps its car.' : unmet + ' AI keep their cars.'));
+        }
+        return parts.join(' ');
+      };
+
+      // Whether the explicit AI car is one the limit swaps -- the AI car head then says so.
+      scope.aiCarOverLimit = function () {
+        var car = scope.form.aiCar;
+        if (!car || car === 'random' || car === 'host') {
+          return false;
+        }
+        return (scope.form.aiRoster || []).some(function (e) {
+          var rec = scope.limitOf(e);
+          return !!rec && rec.origin === car;
+        });
+      };
+
+      // The "Bind AI to the limit" toggle shows while a vehicle limit is set: without one it decides nothing.
+      scope.aiLimitShown = function () {
+        var form = scope.form;
+        return scope.showRestrictions() && !!form.restrictVehicles
+          && (num(form.maxhp) !== undefined || num(form.maxpwr) !== undefined
+            || num(form.maxkg) !== undefined || num(form.minkg) !== undefined);
+      };
 
       // ----- The AI count, live on a debounce (round 2) -----------------------------------------------
       // Resize the roster to `count` entries. Fewer -> the TAIL drops and every kept entry stays exactly as

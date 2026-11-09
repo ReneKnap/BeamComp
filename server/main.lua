@@ -21,7 +21,7 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] [aiaggr=/aiskill=/airubber=<0..1>] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 car=random = a per-player random car composing with the caps (the exception to car-wins);
@@ -34,6 +34,8 @@
 --                 configure their vehicle + driving. airoute=snap|direct picks the AI line (snap =
 --                 road-navgraph snap, default; direct = exact custom-navgraph race line, off-road,
 --                 Step-3b). AI mix into random and sort by reported pwr; else back of grid.
+--                 ailimit=off frees the AI from the vehicle limit (default on: an AI car over the caps is
+--                 swapped for one that fits, owner-side, feature ai-cars-follow-vehicle-limit).
 --                 start order (ADR-0033/0040/0041): order=entry (default) | random | last (prev race
 --                 result) | pwr (power-to-weight) | championship (points table) | quali (qualifying pace);
 --                 :rev flips a directional mode (last:rev/pwr:rev = handicap). quali=<min> sets the
@@ -2738,9 +2740,15 @@ end
 --   * the FIXED car, for everyone, when there is one (the issuer's client resolved its box during the
 --     pre-flight check).
 --   * each AI's roster car, else the uniform aicar (same source). A randomly rolled AI car cannot be
---     known here and is reported after its spawn.
+--     known here and is reported after its spawn. The uniform aicar only while no vehicle limit binds the
+--     AI: the owner swaps an AI car over the limit (feature ai-cars-follow-vehicle-limit), so like the
+--     lobby car above it may not be the car on the grid. A roster car needs no such rule -- the panel
+--     sends the car each AI races, already held to the limit.
 function grid_fit.seed_known(overrides, ai_count)
     local capped = overrides.maxhp or overrides.maxpwr or overrides.maxkg or overrides.minkg
+    local ai_bound = capped and session.tournament == nil
+        and not (overrides.ai and overrides.ai.bindLimit == false)
+    local ai_car_size = not ai_bound and overrides.ai_car_size or nil
     if overrides.car_size then
         for id in pairs(MP.GetPlayers()) do
             grid_fit.seed(id, overrides.car_size.length, overrides.car_size.width)
@@ -2756,7 +2764,7 @@ function grid_fit.seed_known(overrides, ai_count)
         end
     end
     for k = 1, (tonumber(ai_count) or 0) do
-        local size = (overrides.ai_roster_sizes and overrides.ai_roster_sizes[k]) or overrides.ai_car_size
+        local size = (overrides.ai_roster_sizes and overrides.ai_roster_sizes[k]) or ai_car_size
         if size then
             grid_fit.seed(AI_ID_PREFIX .. k, size.length, size.width)
         end
@@ -5952,6 +5960,12 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                     -- random trim, and exclude big/heavy vehicles.
                     randomTrim = overrides.ai.randomTrim,
                     noBigCars = overrides.ai.noBigCars,
+                    -- Whether the vehicle limit binds the AI cars (absent = bound), and whether a class-drop
+                    -- tournament runs: then the owner's `policy` is HIS class's, and the classes decide every
+                    -- AI car, so the owner must not hold them to it (feature ai-cars-follow-vehicle-limit).
+                    -- Relayed, never interpreted (ADR-0005).
+                    bindLimit = overrides.ai.bindLimit,
+                    classDrop = tour.is_active() or nil,
                 } or nil,
                 mode = overrides.mode,            -- nil = auto (client derives from meta.closed); ADR-0013
                 laps = overrides.laps,            -- nil = auto (client uses meta.defaultLaps); ADR-0013
@@ -6978,8 +6992,8 @@ local RACE_USAGE =
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]|random|host>] "
     .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
     .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
-    .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [aiaggr=/aiskill=/airubber=<0..1>] "
-    .. "[aiavoid=on|off] [airoute=snap|direct] [all]"
+    .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] "
+    .. "[aiaggr=/aiskill=/airubber=<0..1>] [aiavoid=on|off] [airoute=snap|direct] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -7123,8 +7137,10 @@ end
 -- Classify one "ai*=" raw-parameter override token into the BeamNG ai parameter it sets (ADR-0036
 -- Etappe B + Step-3b). aggression/skill/rubberband take a [0,1] number (clamped); avoid takes on/off;
 -- route takes snap|direct (the AI route variant, default snap: snap = road-navgraph snap, direct = exact
--- custom-navgraph race line, off-road). Returns (key, value) or nil for an unknown ai key or an invalid
--- value, so the caller can reply usage. "aicar=" is NOT an ai parameter (model token) and resolves to nil.
+-- custom-navgraph race line, off-road); limit takes on/off (whether the vehicle limit binds the AI cars,
+-- feature ai-cars-follow-vehicle-limit -- not a driving parameter, so the caller files it apart). Returns
+-- (key, value) or nil for an unknown ai key or an invalid value, so the caller can reply usage. "aicar=" is
+-- NOT an ai parameter (model token) and resolves to nil.
 local function parse_ai_param_token(token)
     local key, raw = token:match("^[Aa][Ii](%a+)=(.+)$")
     if not key then
@@ -7138,7 +7154,7 @@ local function parse_ai_param_token(token)
         end
         return key, math.max(0, math.min(1, value))
     end
-    if key == "avoid" then
+    if key == "avoid" or key == "limit" then
         local lowered = raw:lower()
         if lowered == "on" or lowered == "true" then
             return key, true
@@ -7204,8 +7220,8 @@ local function parse_race_args(argument)
     local bad_token
     -- AI vehicle + raw-parameter overrides (ADR-0036 Etappe B), collected in the scan below and attached
     -- to overrides.ai afterwards. Only meaningful when an `ai` request is present; an ai*= token without
-    -- one falls to bad_token via the terminal branch.
-    local ai_car, ai_params = nil, {}
+    -- one falls to bad_token via the terminal branch. ai_bind_limit is ailimit=on|off, nil when not typed.
+    local ai_car, ai_params, ai_bind_limit = nil, {}, nil
     local overrides = {
         force = false,
         all = false,
@@ -7322,7 +7338,10 @@ local function parse_race_args(argument)
                     handled = true
                 else
                     local ai_key, ai_value = parse_ai_param_token(token)
-                    if ai_key then
+                    if ai_key == "limit" then
+                        ai_bind_limit = ai_value
+                        handled = true
+                    elseif ai_key then
                         ai_params[ai_key] = ai_value
                         handled = true
                     end
@@ -7338,6 +7357,8 @@ local function parse_race_args(argument)
     -- preset and content defaults fill the rest client-side.
     if ai then
         ai.car = ai_car
+        -- Relayed to the owner, who alone reads it (race/ai.lua limit_spec); absent means bound.
+        ai.bindLimit = ai_bind_limit
         if next(ai_params) then
             ai.params = ai_params
         end
@@ -7393,7 +7414,8 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         order_echo,
         overrides.ai and (" ai=" .. overrides.ai.count
             .. (overrides.ai.explicit and "" or "(default)")
-            .. (overrides.ai.preset and (" " .. overrides.ai.preset) or "")) or ""))
+            .. (overrides.ai.preset and (" " .. overrides.ai.preset) or "")
+            .. (overrides.ai.bindLimit == false and " ailimit=off" or "")) or ""))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
@@ -9825,6 +9847,11 @@ local function sanitize_overrides(raw)
         end
         if type(raw.ai.noBigCars) == "boolean" then
             ai.noBigCars = raw.ai.noBigCars
+        end
+        -- Whether the vehicle limit binds the AI cars (the panel's toggle, /race ailimit=): an opaque boolean
+        -- for the owner's resolver, absent = bound (feature ai-cars-follow-vehicle-limit).
+        if type(raw.ai.bindLimit) == "boolean" then
+            ai.bindLimit = raw.ai.bindLimit
         end
         -- Named AI roster (ADR-0047): opaque {name, car?} entries relayed race-blind (ADR-0005). The
         -- Create gate makes the roster the source of truth, so the AI count follows its length; entries

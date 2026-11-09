@@ -175,11 +175,41 @@ local function resolve_random_spec(spec)
     return random_stock_model(), nil
 end
 
+-- The vehicle limit the AI cars are held to (feature ai-cars-follow-vehicle-limit), as
+-- {max_power?, max_pwr?, weight_range?} for vehiclespecs, or nil when none binds them. `config` is the AI
+-- config (relayed aiConfig, or the panel's ai slice), `policy` the player vehicle policy. The ONE answer to
+-- "does the limit reach the AI", read by every random roll here and by M.limit_lineup. None binds them when:
+--   * the AI were set free of it (config.bindLimit == false, the panel toggle or /race ailimit=off). Absent
+--     means on, so an older client or a typed /race without the parameter binds them;
+--   * a class-drop tournament runs (config.classDrop): the classes decide every car (ADR-0042), and the
+--     owner's policy is then HIS class's, which must not reach the AI's class cars;
+--   * the players are forced into a FIXED car (a concrete model or "host"): the car wins over the caps
+--     (ADR-0032 section 2), and the server drops them anyway. car=random is not a fixed car, so the caps
+--     compose with it;
+--   * there are no caps.
+function M.limit_spec(config, policy)
+    config = type(config) == "table" and config or {}
+    policy = type(policy) == "table" and policy or {}
+    if config.bindLimit == false or config.classDrop then
+        return nil
+    end
+    if policy.car ~= nil and policy.car ~= "" and policy.car ~= "random" then
+        return nil
+    end
+    local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
+    local max_power = type(policy.maxhp) == "number" and policy.maxhp or nil
+    local max_pwr = type(policy.maxpwr) == "number" and policy.maxpwr or nil
+    if not (max_power or max_pwr or range) then
+        return nil
+    end
+    return {max_power = max_power, max_pwr = max_pwr, weight_range = range}
+end
+
 -- A random AI vehicle {model, config} for an EXPLICIT aicar=random, filter-aware (ADR-0032/0037). Composes
 -- three orthogonal filters, each rolled independently per AI:
---   * power/weight cap -- the relayed player policy's maxhp/maxpwr and the strict maxkg/minkg weight range,
---     active unless there is a FIXED player car=<model> (car=random is NOT a fixed car -- the caps compose,
---     mirroring the ADR-0032 amendment; only a concrete model drops them, Mode-2-before-Mode-3);
+--   * the vehicle limit -- the relayed player policy's maxhp/maxpwr and the strict maxkg/minkg weight range,
+--     whenever it binds the AI (M.limit_spec: not under a FIXED player car=<model>, not with the AI set free
+--     of it, not in a class-drop tournament; car=random is NOT a fixed car -- the caps compose);
 --   * big-car exclusion -- the AI config's noBigCars bool -> the BIG_CAR_MAX_WEIGHT curb-weight ceiling,
 --     independent of the player policy (it is the AI's own filter);
 --   * trim -- the AI config's randomTrim bool: false = the model's STOCK/default config, true = a random
@@ -189,33 +219,37 @@ end
 -- The pool pick + best-effort fallback is the shared resolve_random_spec. Returns (model, config).
 local function random_ai_vehicle(policy, config)
     config = type(config) == "table" and config or {}
-    -- The cap applies unless the player forces a FIXED car (a concrete model). car=random is NOT a fixed car
-    -- -- the caps still compose with the random pick -- so an explicit aicar=random under car=random maxhp=N
-    -- also respects the cap. Only a concrete car=<model> drops the caps (car-wins precedence).
-    local fixed_player_car = policy.car ~= nil and policy.car ~= "random"
-    local cap_active = not fixed_player_car
-        and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg)
+    local limit = M.limit_spec(config, policy)
     -- Resolve the effective trim: nil keeps today's cap-coupled default (random trim under a cap, else
     -- stock); an explicit bool from the panel overrides that coupling.
     local random_trim = config.randomTrim
     if random_trim == nil then
-        random_trim = cap_active and true or false
+        random_trim = limit ~= nil
     end
     return resolve_random_spec({
-        max_power = cap_active and policy.maxhp or nil,
-        max_pwr = cap_active and policy.maxpwr or nil,
-        weight_range = cap_active and vehiclespecs.weight_range(policy.minkg, policy.maxkg) or nil,
+        max_power = limit and limit.max_power or nil,
+        max_pwr = limit and limit.max_pwr or nil,
+        weight_range = limit and limit.weight_range or nil,
         max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil,
         random_trim = random_trim,
     })
 end
 
--- Resolve one AI car's {model, config} via the Etappe-B fallback chain (ADR-0036). Precedence: explicit
--- aicar= (config.car), incl. the "random" and "host" sentinels -> the player vehicle policy (ADR-0032:
--- Mode 2 fixed car / Mode 3 cap-compliant car; Mode 1 = no policy falls through) -> the aiRace content
--- default vehicle(s) -> a random stock model. `index` (1-based) cycles the content vehicle list so multiple
--- AI vary. `host_car` is the owner's actual resolved race car {model, config} (aicar=host), read GE-side by
--- the caller at spawn (only the owner spawns AI); nil when unavailable. Returns (model, config).
+-- Resolve one AI car's OWN {model, config} via the Etappe-B fallback chain (ADR-0036). Precedence: the
+-- per-slot policy (class car or roster car) -> explicit aicar= (config.car), incl. the "random" and "host"
+-- sentinels -> the player vehicle policy's car (ADR-0032 Mode 2; car=random rolls) -> the aiRace content
+-- default vehicle(s) -> a random car. `index` (1-based, the AI's number) cycles the content vehicle list so
+-- multiple AI vary. `host_car` is the owner's actual resolved race car {model, config} (aicar=host), read
+-- GE-side by the caller at spawn (only the owner spawns AI); nil when unavailable.
+--
+-- The vehicle limit is NOT a tier of this chain any more (feature ai-cars-follow-vehicle-limit). It used to
+-- be: under a cap with no aicar, every AI got vehiclespecs.find_compliant(nil, ...), the alphabetically first
+-- fitting car, so the whole field sat in one car. The chain now names each AI's own car, and M.limit_lineup
+-- holds the whole field to the limit afterwards. Only the random rolls still draw from the fitting pool
+-- (while M.limit_spec binds the AI), because a random car has no own car to start a replacement from.
+--
+-- Returns (model, config, exempt): `exempt` is true for the host's car, which the host's own client checks
+-- live against the limit (ADR-0032 amendment 2026-11-04), so the lineup leaves it alone.
 local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_policy, host_car)
     config = type(config) == "table" and config or {}
     policy = type(policy) == "table" and policy or {}
@@ -229,7 +263,7 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
     -- spec falls through to the normal chain so the AI still races.
     if slot_policy.car == "host" then
         if type(host_car) == "table" and host_car.model then
-            return host_car.model, host_car.config
+            return host_car.model, host_car.config, true
         end
         log("W", LOG_TAG, "roster car 'host': no resolved host car; falling back to the AI-car chain")
     elseif slot_policy.car then
@@ -255,8 +289,8 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
 
     if config.car == "random" then
         -- The panel's "random" AI car (ADR-0037): an independent random car per AI so the field varies,
-        -- refined by the composable trim + big-car axes and the active power cap (random_ai_vehicle).
-        -- Distinct from no aicar (the content default below).
+        -- refined by the composable trim + big-car axes and the vehicle limit when it binds the AI
+        -- (random_ai_vehicle). Distinct from no aicar (the content default below).
         return random_ai_vehicle(policy, config)
     elseif config.car == "host" then
         -- "same as host" (aicar=host): the AI inherit the OWNER's actual resolved race car (model+config),
@@ -266,7 +300,7 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         -- unresolved host car (placement degraded) falls through the chain below so the AI still races. The
         -- elseif keeps "host" out of the split_car_token branch (there is no model named "host").
         if type(host_car) == "table" and host_car.model then
-            return host_car.model, host_car.config
+            return host_car.model, host_car.config, true
         end
         log("W", LOG_TAG, "aicar=host: no resolved host car; falling back to the AI-car chain")
     elseif config.car then
@@ -283,7 +317,12 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         -- random axes via the SAME spec the player uses (random_spec_from_policy) -- so player and inheriting
         -- AI never drift. Empty pool -> the AI best-effort fallback (resolve_random_spec), never a prop or
         -- nothing. Branched BEFORE the split_car_token below so "random" is never spawned as a model name.
-        return resolve_random_spec(vehiclespecs.random_spec_from_policy(policy))
+        -- AI set free of the vehicle limit (M.limit_spec) roll from the player's pool minus his caps.
+        local spec = vehiclespecs.random_spec_from_policy(policy)
+        if not M.limit_spec(config, policy) then
+            spec.max_power, spec.max_pwr, spec.weight_range = nil, nil, nil
+        end
+        return resolve_random_spec(spec)
     elseif policy.car == "host" then
         -- The players are on car=host and this AI has no explicit aicar= (default): AI without their own
         -- pick follow the player policy, and "same as host" is no exception (user decision 2026-09-25).
@@ -293,19 +332,11 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         -- still races. The elseif is what keeps "host" out of split_car_token: there is no model named
         -- "host".
         if type(host_car) == "table" and host_car.model then
-            return host_car.model, host_car.config
+            return host_car.model, host_car.config, true
         end
         log("W", LOG_TAG, "car=host: no resolved host car; falling back to the AI-car chain")
     elseif policy.car then
         return split_car_token(policy.car)
-    end
-    if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
-        local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
-        local pick = vehiclespecs.find_compliant(nil, policy.maxhp, policy.maxpwr, nil, range)
-        if pick then
-            return pick.model, pick.config
-        end
-        -- No compliant car: fall through to content/stock so the AI still races (best effort).
     end
 
     local vehicle_list = content_defaults.vehicles
@@ -317,32 +348,189 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         end
     end
 
-    -- Ultimate fallback: a random car honouring the active power cap and the AI's trim/big-car axes
-    -- (random_ai_vehicle) -- so an AI resolved this far still respects every active filter.
+    -- Ultimate fallback: a random car honouring the vehicle limit when it binds the AI and the AI's
+    -- trim/big-car axes (random_ai_vehicle) -- so an AI resolved this far still respects every active filter.
     return random_ai_vehicle(policy, config)
+end
+
+-- A car as the "model[:config]" token the lineup and the panel speak, or nil without a model. A config that
+-- is not a string (an inline parts table, only ever the host's car) has no token form.
+local function car_token(model, vehicle_config)
+    if type(model) ~= "string" or model == "" then
+        return nil
+    end
+    if type(vehicle_config) == "string" and vehicle_config ~= "" then
+        return model .. ":" .. vehicle_config
+    end
+    return model
+end
+
+-- The broken bounds of a vehicle limit as one log fragment: "maxhp 200: 240 hp, minkg 1200: unknown".
+local function breaks_text(breaks)
+    local units = {maxhp = "hp", maxpwr = "hp/kg", minkg = "kg", maxkg = "kg"}
+    local parts = {}
+    for _, broken in ipairs(breaks) do
+        local value = "unknown"
+        if type(broken.value) == "number" then
+            value = string.format(broken.axis == "maxpwr" and "%.3f %s" or "%g %s", broken.value,
+                units[broken.axis])
+        end
+        parts[#parts + 1] = string.format("%s %s: %s", broken.axis, tostring(broken.limit), value)
+    end
+    return table.concat(parts, ", ")
+end
+
+-- One beamcomp.race line per AI the lineup touched (requirement 7 of the feature): who, which number/slot,
+-- the own car, the broken bounds, and the replacement -- or a W line when nothing installed fits. The number
+-- is the AI's own (entry.number, the k of "ai:<k>") when the caller knows it, else its place in the list.
+local function log_limit_result(entry, position, result)
+    local who = string.format("AI '%s' (#%d%s)", tostring(entry.label or entry.name),
+        entry.number or position, entry.slot ~= nil and (", slot " .. tostring(entry.slot)) or "")
+    if result.replaced then
+        log("I", "beamcomp.race", string.format("%s: '%s' is over the vehicle limit (%s) -> '%s'", who,
+            tostring(result.origin), breaks_text(result.breaks), tostring(result.car)))
+    else
+        log("W", "beamcomp.race", string.format(
+            "%s: '%s' is over the vehicle limit (%s), and no installed car fits it; the AI keeps its car",
+            who, tostring(result.origin), breaks_text(result.breaks)))
+    end
+end
+
+-- Hold a whole AI field to the vehicle limit (feature ai-cars-follow-vehicle-limit). THE one rule for the
+-- setup panel's lineup preview, the Confirm that sends the lineup to the server, and the spawn -- so what
+-- the panel shows, what the server reserves grid space for and what spawns cannot disagree.
+--
+-- `entries` lists the field in AI order (roster index, the k of "ai:<k>"), each {car = "model[:config]",
+-- label?/name?, number?, slot?, exempt?} (number, slot and the name only feed the log line). `config` is
+-- the AI config and `policy` the player policy, read through M.limit_spec. With `say`, every AI that is
+-- over the limit gets its log line. Returns one result per entry,
+-- {car, origin, breaks?, replaced?, unmet?}: `car` is the car the AI races, `origin` its own car.
+--
+-- Per entry, in order:
+--   * no limit binds the AI, the entry is exempt (the host's car), or it names no car or a sentinel: kept;
+--   * its own car fits (vehiclespecs.token_specs + limit_breaks; a bare model is judged by the config it
+--     spawns as): kept, untouched;
+--   * otherwise it takes the next candidate of its MODEL's sequence (vehiclespecs.limit_candidates: the
+--     model's own fitting trims, strongest first, then one car per further model from its place in the car
+--     list on, wrapping). The first AI of a model gets candidate 1, the second candidate 2 and so on,
+--     wrapping when the field is longer -- the same setting always gives the same lineup, and not everyone
+--     the same car. The counter is per model, not per token, so two trims of one model do not both land on
+--     candidate 1. The AI's own big-car filter shapes the sequence; if it leaves nothing, the sequence is
+--     built without it, because the limit is the rule and the filter a preference;
+--   * nothing installed fits the limit: the AI keeps its own car (unmet). It is a real car, so "an AI never
+--     spawns a prop or nothing" (ADR-0036) holds, and unlike a random roll it is what the panel showed.
+function M.limit_lineup(entries, config, policy, say)
+    local field = {}
+    local limit = M.limit_spec(config, policy)
+    local max_weight = type(config) == "table" and config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil
+    local sequences = {}
+    local models
+    for number, entry in ipairs(type(entries) == "table" and entries or {}) do
+        entry = type(entry) == "table" and entry or {}
+        local token = type(entry.car) == "string" and entry.car or nil
+        local result = {car = token, origin = token}
+        field[number] = result
+        local model, vehicle_config = split_car_token(token)
+        if limit and model and not entry.exempt and token ~= "host" and token ~= "random" then
+            local power, weight = vehiclespecs.token_specs(model, vehicle_config)
+            result.breaks = vehiclespecs.limit_breaks(power, weight, limit)
+        end
+        if result.breaks then
+            local sequence = sequences[model]
+            if not sequence then
+                models = models or vehiclespecs.list_car_models()
+                local list = vehiclespecs.limit_candidates(model, limit, max_weight, models)
+                if #list == 0 and max_weight then
+                    list = vehiclespecs.limit_candidates(model, limit, nil, models)
+                end
+                sequence = {list = list, used = 0}
+                sequences[model] = sequence
+            end
+            if #sequence.list > 0 then
+                sequence.used = sequence.used + 1
+                local pick = sequence.list[((sequence.used - 1) % #sequence.list) + 1]
+                result.car = car_token(pick.model, pick.config)
+                result.replaced = true
+            else
+                result.unmet = true
+            end
+            if say then
+                log_limit_result(entry, number, result)
+            end
+        end
+    end
+    return field
+end
+
+-- The AI number behind a slot's id "ai:<k>" (the roster index on the server), else its position in the list.
+local function ai_number(slot_info, position)
+    local number = type(slot_info.id) == "string" and tonumber(slot_info.id:match("^ai:(%d+)$")) or nil
+    return number or position
+end
+
+-- Resolve the car of every AI slot (ADR-0036): each AI's own car through resolve_ai_vehicle, then the whole
+-- field held to the vehicle limit through M.limit_lineup, in AI-number order -- the order the panel previewed
+-- it in, and one a quali re-grid's new slot order cannot shuffle. Returns one {model, config} per slot, in
+-- the slots' own order.
+local function resolve_field(ai_slots, config, content_defaults, policy, host_car)
+    local order = {}
+    for position, slot_info in ipairs(ai_slots) do
+        order[#order + 1] = {
+            slot_info = slot_info,
+            number = ai_number(slot_info, position),
+            position = position,
+        }
+    end
+    table.sort(order, function(a, b)
+        if a.number ~= b.number then
+            return a.number < b.number
+        end
+        return a.position < b.position
+    end)
+    local picks, entries = {}, {}
+    for index, item in ipairs(order) do
+        -- slot_info carries this AI's per-class policy (car/maxhp/maxpwr) in a class-drop tournament
+        -- (ADR-0042) or its roster car (ADR-0047); it takes precedence inside resolve_ai_vehicle.
+        local model, vehicle_config, exempt = resolve_ai_vehicle(config, content_defaults, policy,
+            item.number, item.slot_info, host_car)
+        picks[item.position] = {model = model, config = vehicle_config}
+        entries[index] = {
+            car = car_token(model, vehicle_config),
+            label = item.slot_info.label,
+            number = item.number,
+            slot = item.slot_info.slot,
+            exempt = exempt,
+        }
+    end
+    for index, result in ipairs(M.limit_lineup(entries, config, policy, true)) do
+        if result.replaced then
+            local model, vehicle_config = split_car_token(result.car)
+            picks[order[index].position] = {model = model, config = vehicle_config}
+        end
+    end
+    return picks
 end
 
 -- Spawn one host-owned AI car per slot at its grid pose (ADR-0036). `ai_slots` is the owner's relayed
 -- list of {slot, id, label}; `grid_poses` is the full resolved grid (race/start). Each car's vehicle is
--- resolved via the Etappe-B fallback chain (resolve_ai_vehicle) from the relayed `config`/`content_defaults`
--- (ADR-0036 Etappe B) and the player `policy` (ADR-0032). `host_car` is the owner's actual resolved race car
--- {model, config} for the aicar=host mode, read GE-side by the caller at this spawn; nil otherwise. Returns
--- a list of spawned cars {id, slot, label, veh_id}; a slot whose spawn fails is logged and skipped (the
--- field degrades to fewer AI rather than aborting). BeamMP propagates each spawn to all clients.
+-- resolved by resolve_field: the Etappe-B fallback chain (resolve_ai_vehicle) from the relayed
+-- `config`/`content_defaults` (ADR-0036 Etappe B) and the player `policy` (ADR-0032), then the vehicle limit
+-- over the whole field (M.limit_lineup). `host_car` is the owner's actual resolved race car {model, config}
+-- for the aicar=host mode, read GE-side by the caller at this spawn; nil otherwise. Returns a list of
+-- spawned cars {id, slot, label, veh_id}; a slot whose spawn fails is logged and skipped (the field degrades
+-- to fewer AI rather than aborting). BeamMP propagates each spawn to all clients.
 function M.spawn(ai_slots, grid_poses, config, content_defaults, policy, host_car)
     local cars = {}
     if type(ai_slots) ~= "table" or type(grid_poses) ~= "table" then
         return cars
     end
+    local picks = resolve_field(ai_slots, config, content_defaults, policy, host_car)
     for index, slot_info in ipairs(ai_slots) do
         local pose = grid_poses[(slot_info.slot or 0) + 1]
         if not pose then
             log("W", LOG_TAG, "no grid pose for AI slot " .. tostring(slot_info.slot))
         else
-            -- slot_info carries this AI's per-class policy (car/maxhp/maxpwr) in a class-drop tournament
-            -- (ADR-0042); it takes precedence inside resolve_ai_vehicle. nil fields = the normal chain.
-            local model, vehicle_config = resolve_ai_vehicle(config, content_defaults, policy, index,
-                slot_info, host_car)
+            local model, vehicle_config = picks[index].model, picks[index].config
             -- The roster's per-AI primary-paint colour (ADR-0047), an opaque hex string relayed per slot;
             -- nil = stock paint (chat path / no roster). Paint is applied inside spawn_at, pcall-guarded --
             -- a paint failure degrades to stock and never blocks the spawn.
@@ -366,13 +554,16 @@ function M.spawn(ai_slots, grid_poses, config, content_defaults, policy, host_ca
                 -- landed position sits about half a car length BEHIND the pose along the grid direction
                 -- (that is the car's front sitting on the pose) -- expected, not a bug. Without a box for
                 -- this config the car lands centred on the pose instead and the restage corrects it.
+                -- An inline parts table (the host's tuned car) has no token and is named "custom".
                 local landed = veh:getPosition()
                 log("I", LOG_TAG, string.format(
-                    "spawned AI '%s' (%s) '%s%s' slot %s -> pose (%.1f, %.1f, %.1f), "
+                    "spawned AI '%s' (%s) '%s' slot %s -> pose (%.1f, %.1f, %.1f), "
                     .. "landed (%.1f, %.1f, %.1f)",
-                    tostring(slot_info.label), tostring(slot_info.id), tostring(model),
-                    vehicle_config and (":" .. vehicle_config) or "", tostring(slot_info.slot),
-                    pose.pos.x, pose.pos.y, pose.pos.z, landed.x, landed.y, landed.z))
+                    tostring(slot_info.label), tostring(slot_info.id),
+                    type(vehicle_config) == "table" and (tostring(model) .. ":custom")
+                        or tostring(car_token(model, vehicle_config)),
+                    tostring(slot_info.slot), pose.pos.x, pose.pos.y, pose.pos.z,
+                    landed.x, landed.y, landed.z))
             else
                 log("W", LOG_TAG, "AI spawn failed for slot " .. tostring(slot_info.slot)
                     .. ": " .. tostring(reason))
@@ -1944,8 +2135,8 @@ end
 --     or aicar=host is an explicit admin choice that stays authoritative.
 --   * the player policy (policy.car) forces a car on the whole field -- a fixed car, car=random and
 --     car=host alike -- and a preference out of the driver file does not beat a setting out of the race
---     options (bug ai-roster-car-ignores-forced-car). Caps are NOT part of this question: they keep
---     filtering the preferred car through preferred_car_compliant, exactly as before.
+--     options (bug ai-roster-car-ignores-forced-car). Caps are NOT part of this question: a preferred car
+--     over the vehicle limit is still the driver's own car, and M.limit_lineup swaps it.
 -- This is the ONE place the car precedence is decided, which is what keeps the two roll paths
 -- (roll_roster_entries, resolve_pick) from drifting; colour is orthogonal and stays always-applied
 -- (round 3). An absent policy means "forces nothing", i.e. the pre-fix behaviour -- so a caller that
@@ -1960,57 +2151,42 @@ function M.preferred_applies(config, policy)
     return forced == nil or forced == ""
 end
 
--- Whether a preferred-car token passes the ACTIVE vehicle restrictions, with the same filter set the
--- random roll for this row would compose (ADR-0047 / ADR-0032): the player policy caps -- unless a fixed
--- player car dropped them (the random_ai_vehicle gate) -- plus the AI big-car ceiling. No active filter
--- means compliant. A "model:config" token checks that config's own power/weight; a model-only (stock)
--- token uses the representative "any compliant trim" rule (random_stock_compliant's rule -- model-level
--- metadata is unreliable pre-spawn). Unreadable specs under a set cap are non-compliant
--- (vehiclespecs.is_compliant), so the caller then treats the preferred car like a discarded random
--- candidate and keeps rolling.
-function M.preferred_car_compliant(token, config, policy)
-    config = type(config) == "table" and config or {}
-    policy = type(policy) == "table" and policy or {}
+-- Whether a driver's preferred-car token may be the AI's own car: it names a race car, and it passes the
+-- AI's own big-car filter (noBigCars, the lenient curb-weight ceiling, judged on the config the token spawns
+-- as -- vehiclespecs.token_specs). A token that fails is treated like a discarded random candidate and the
+-- caller rolls a car instead.
+--
+-- The vehicle limit is NOT this function's question any more (feature ai-cars-follow-vehicle-limit). It was:
+-- a preferred car over the limit was swapped for a rolled car here, at roll time, which under a cap was the
+-- alphabetically first fitting car for every such driver, and which a limit changed later never reached. The
+-- preferred car is now simply the driver's own car, and M.limit_lineup swaps it while it is over the limit --
+-- in the panel's preview, on Confirm and at the spawn alike -- so a limit removed or the AI set free of it
+-- gives every driver his own car back. Call sites: race/ai.lua entry_from_drawn, init.lua reroll_ai_name.
+function M.preferred_car_usable(token, config)
     local model, vehicle_config = split_car_token(token)
     if not model or model == "host" then
         return false
     end
-    -- A preferred car that is not a race car at all never applies, whatever the caps say -- the driver
-    -- file is hand-edited, and a prop/traffic model slipping into it must not reach a grid slot. The
-    -- caller then rolls a car instead, exactly as it does for a cap-violating preference.
+    -- A preferred car that is not a race car at all never applies -- the driver file is hand-edited, and a
+    -- prop/traffic model slipping into it must not reach a grid slot.
     if vehiclespecs.is_known_non_car(model) then
         return false
     end
-    local fixed_player_car = policy.car ~= nil and policy.car ~= "random"
-    local cap_active = not fixed_player_car
-        and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg)
-    local max_power = cap_active and policy.maxhp or nil
-    local max_pwr = cap_active and policy.maxpwr or nil
-    local range = cap_active and vehiclespecs.weight_range(policy.minkg, policy.maxkg) or nil
-    local max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil
-    if not (max_power or max_pwr or range or max_weight) then
+    if not (type(config) == "table" and config.noBigCars) then
         return true
     end
-    if vehicle_config then
-        local power = vehiclespecs.config_power(model, vehicle_config)
-        local weight = vehiclespecs.config_weight(model, vehicle_config)
-        return vehiclespecs.is_compliant(power, weight, max_power, max_pwr, max_weight, range)
-    end
-    for _, entry in ipairs(vehiclespecs.list_configs(model)) do
-        if vehiclespecs.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, range) then
-            return true
-        end
-    end
-    return false
+    local _, weight = vehiclespecs.token_specs(model, vehicle_config)
+    return vehiclespecs.is_compliant(nil, weight, nil, nil, vehiclespecs.BIG_CAR_MAX_WEIGHT)
 end
 
 -- Roll one roster car token for the panel (ADR-0047): the SAME resolution chain as the spawn
 -- (resolve_ai_vehicle) minus the spawn-only inputs -- content defaults come from the parsed race (not
 -- available at panel time) and the host car resolves at spawn, so BOTH host modes -- an explicit
--- aicar=host and an inherited car=host -- stay the opaque "host" sentinel. Because the rolled token then
--- rides the per-slot ai_entry.car with HIGHEST precedence, the panel-shown car IS the spawned car by
--- construction (one-truth) -- which is also why the inherited mode must be kept opaque: a token rolled
--- here would be pinned into the roster row and the AI would race that instead of the host's car.
+-- aicar=host and an inherited car=host -- stay the opaque "host" sentinel. The rolled token is the AI's
+-- OWN car; it rides the per-slot ai_entry.car with HIGHEST precedence once M.limit_lineup has held it to the
+-- vehicle limit (the panel previews that, Confirm sends it), so the panel-shown car IS the spawned car
+-- (one-truth) -- which is also why the inherited mode must be kept opaque: a token rolled here would be
+-- pinned into the roster row and the AI would race that instead of the host's car.
 -- `index` is 1-based (varies content cycling if defaults ever apply). Returns "model[:config]" or "host".
 function M.roll_roster_car(config, policy, index)
     config = type(config) == "table" and config or {}
@@ -2088,34 +2264,46 @@ function M.repair_roster_cars(entries, config, policy)
     return repaired
 end
 
--- A human label for a roster car token (ADR-0047): the model's display name (vehiclespecs.model_label)
--- plus the config's in-game name when the token carries one; "host's car" for the host sentinel. Display
--- only -- the opaque token stays the value everywhere.
+-- The two halves of a car token's human label: the model's display name (vehiclespecs.model_label) and the
+-- config's in-game name, nil for a bare model (stock). The setup panel shows them on two rows (Car, Type).
+function M.car_label_parts(token)
+    local model, vehicle_config = split_car_token(token)
+    if not model then
+        return tostring(token or "?"), nil
+    end
+    local label = vehiclespecs.model_label(model)
+    if not vehicle_config then
+        return label, nil
+    end
+    for _, entry in ipairs(vehiclespecs.list_configs(model)) do
+        if entry.config == vehicle_config then
+            return label, entry.name
+        end
+    end
+    return label, vehicle_config
+end
+
+-- A human label for a roster car token (ADR-0047): the model's display name plus the config's in-game name
+-- when the token carries one; "host's car" for the host sentinel. Display only -- the opaque token stays
+-- the value everywhere.
 function M.car_label(token)
     if token == "host" then
         return "host's car"
     end
-    local model, vehicle_config = split_car_token(token)
-    if not model then
-        return tostring(token or "?")
+    local model_label, config_label = M.car_label_parts(token)
+    if not config_label then
+        return model_label
     end
-    local label = vehiclespecs.model_label(model)
-    if not vehicle_config then
-        return label
-    end
-    for _, entry in ipairs(vehiclespecs.list_configs(model)) do
-        if entry.config == vehicle_config then
-            return label .. " - " .. entry.name
-        end
-    end
-    return label .. " - " .. vehicle_config
+    return model_label .. " - " .. config_label
 end
 
 -- Resolve one drawn candidate ({name, preferred, preferredColor}) to a full roster entry
 -- {name, car, carLabel, color} (ADR-0047/0048). Car: the name's preferred car when nothing else names one
--- (preferred_applies -- neither the AI axis nor the player policy) and it passes the active restrictions
--- (preferred_car_compliant), else a car rolled through the spawn chain (roll_roster_car), which under a
--- forced car resolves to exactly that car. Colour: the name's preferred colour ALWAYS when it
+-- (preferred_applies -- neither the AI axis nor the player policy) and it may be the driver's own car
+-- (preferred_car_usable), else a car rolled through the spawn chain (roll_roster_car), which under a
+-- forced car resolves to exactly that car. The vehicle limit does not pick here: the car this returns is the
+-- driver's OWN car, and M.limit_lineup swaps it while it is over the limit. Colour: the name's preferred
+-- colour ALWAYS when it
 -- carries one (colour is unrestricted -- no compliance, ADR-0047 round 3), else a palette colour drawn
 -- without replacement across `used`. `index` cycles content defaults if they ever apply; `used` is the
 -- colour set for the fallback draws. Shared by roll_roster_entries (random names) and resolve_pick (a
@@ -2123,7 +2311,7 @@ end
 local function entry_from_drawn(drawn, config, policy, index, used)
     local car
     if drawn.preferred and M.preferred_applies(config, policy)
-            and M.preferred_car_compliant(drawn.preferred, config, policy) then
+            and M.preferred_car_usable(drawn.preferred, config) then
         car = drawn.preferred
     else
         car = M.roll_roster_car(config, policy, index)
