@@ -3,9 +3,9 @@
 -- Lives at lua/ge/extensions/beamcomp/race/lock.lua inside the client mod zip. Target: client GE
 -- (LuaJIT 5.1). Near-stateless (a few transient flags, see below): the caller (init.lua) installs the
 -- lock when the race countdown starts and removes it when the race returns to lobby (ADR-0017), and
--- calls M.step once per frame for the selector bar.
+-- calls M.step once per frame for the selector bar and the pause menu's vehicle tab.
 --
--- During countdown + racing the player must stay in their one race car. Three layers prevent leaving
+-- During countdown + racing the player must stay in their one race car. Four layers prevent leaving
 -- it or swapping it (ADR-0017):
 --   1. core_input_actionFilter -- BeamNG's own input-action blocker (the mechanism scenarios use).
 --      We block the switch / vehicle-selector / parts-selector / reload keys (no car swap or extra
@@ -23,6 +23,11 @@
 --   3. The vehicle selector's management bar is hidden for the whole lock through the engine's own switch,
 --      the one career and challenges use. That also takes Reset all and Remove all away, which have no
 --      core_vehicles field to guard. The pick itself (spawn / replace) stays, so the staging swap works.
+--   4. The pause menu's vehicle tab decides whether its car buttons are enabled only when it builds them, so
+--      one built before the install keeps them working. Its single public entry is wrapped for the lock and
+--      refuses Remove, Reset, Repair here, Remove all other vehicles and Switch to vehicle, and an open tab
+--      is asked to rebuild so they grey out (ADR-0017 amendment 2026-11-10). The same amendment adds
+--      toggleAITraffic to layer 1: the tab and the radial menu ask it before they hand a car to the AI.
 --
 -- The lock has two modes (ADR-0021/0017 amendments, staging-allow-vehicle-swap):
 --   * swap-allowed -- installed for the staging wait so the player may still change car (replace the
@@ -134,6 +139,19 @@ local NODEGRABBER_ACTIONS = {
     "nodegrabberPadMode",
 }
 
+-- Handing the player's own race car to the AI (ADR-0017 amendment 2026-11-10). The pause menu's vehicle tab
+-- offers its AI modes only while this action is not blocked and asks again at click time
+-- (ui/pause/providers/vehicleTabInteractions.lua canUseVehicleAiModes), the radial menu builds its whole AI
+-- page only then (core/quickAccess.lua), and the action's own key runs ai.toggleTrafficMode on the seated
+-- car. So the filter alone closes all three, in both lock modes. BeamComp's AI opponents never pass through
+-- it: race/ai.lua sets their modes with queueLuaCommand on their own VE, which no input filter reaches.
+--
+-- The name is checked against the engine's template rather than taken on trust, for the node-grabber reason
+-- (an unknown name is a silent no-op). The template also holds toggleTraffic, which spawns ambient traffic
+-- and never touches a car's AI mode, so it stays open and the template is read, not adopted whole.
+local AI_MODE_TEMPLATE = "aiControls"
+local AI_MODE_ACTION = "toggleAITraffic"
+
 -- The car-selector input actions. Blocked in the full lock (no swap during countdown/racing), but left
 -- open in the swap-allowed staging mode so the player can replace the model/config (ADR-0021 amendment).
 -- spawnNewVehicle is still refused by the core_vehicles guard, so an open selector can replace but not
@@ -199,6 +217,49 @@ local SELECTOR_BACKEND = "vehicleSelector"
 --   warned    -- the "engine ignored the switch" tripwire already fired for this hide
 local selector_bar = {wanted = false, announced = false, outcome = nil, warned = false}
 
+-- The engine module behind the pause menu's vehicle tab. Every click in every view of the tab (the vehicle
+-- list, a vehicle's details, the pause home's nearby vehicles) reaches it through one public entry the Vue UI
+-- calls by name, executeVehicleTabInteractionAction(buttonId, payload), and that entry is what the lock
+-- wraps. The button's enabled state comes from canModifyVehicles() when the tab builds it, and the click
+-- handlers never ask again (bug pause-tab-open-across-race-start-keeps-car-actions). Read with rawget, like
+-- the selector module.
+local TAB_MODULE = "ui_pause_providers_vehicleTabInteractions"
+local TAB_ENTRY = "executeVehicleTabInteractionAction"
+local TAB_NOT_LOADED = TAB_MODULE .. " is not loaded yet"
+
+-- Stash key of the original entry, on the provider table: a reloaded provider is a fresh table without it.
+local ORIG_TAB_KEY = "beamcomp_orig_" .. TAB_ENTRY
+
+-- Where a button's action is written down: the provider's file local `buttonInstance`
+-- (gridSelectorUtils/buttonModule.lua), an upvalue of the entry, looked up by NAME and never by index.
+-- getButtonInfo(buttonId).meta.action is the action the tab registered the button under.
+local TAB_BUTTONS_UPVALUE = "buttonInstance"
+
+-- The tab actions the lock refuses. Clone needs no entry (core_vehicles.cloneCurrent refuses it,
+-- VEHICLE_BUTTONS), the AI modes need none (the engine refuses them itself once AI_MODE_ACTION is blocked),
+-- and Open details and Exit vehicle stay free.
+local TAB_REFUSED_ACTIONS = {
+    deleteVehicle = true,
+    resetVehicle = true,
+    repairVehicleHere = true,
+    removeAllOtherVehicles = true,
+    switchToVehicle = true,
+}
+
+-- Switch to vehicle once per local player when several sit at one machine: switchToVehicle_p0, _p1, ...
+local TAB_SEAT_SWITCH_PATTERN = "^switchToVehicle_p%d+$"
+
+-- The tab's own refresh event. The provider fires it after every vehicle spawn (onVehicleSpawned), and an
+-- open vehicle list answers it by fetching its whole payload again, built with the lock's current answer.
+local TAB_REBUILD_EVENT = "VehicleTabSpawnFinished"
+
+-- The tab's bookkeeping, the same shape as selector_bar and forgotten by a GE reload the same way:
+--   wanted    -- the lock is installed, so the entry is to be guarded and an open tab is to show it
+--   announced -- the lock state an open tab was last asked to rebuild for
+--   outcome   -- why the entry could not be guarded at the last attempt (nil = guarded), so M.step never logs
+--                the same failure twice
+local pause_tab = {wanted = false, announced = false, outcome = nil}
+
 -- Min seconds between "locked" toasts on a refused spawn/replace, so mashing the selector shows one
 -- toast, not a flood. os.clock() is monotonic CPU seconds -- precise enough to gate a toast.
 local SPAWN_BLOCK_TOAST_THROTTLE = 2.0
@@ -244,57 +305,69 @@ function M.notify(msg, kind)
     guihooks.trigger("toastrMsg", {type = kind or "warning", title = "BeamComp", msg = msg})
 end
 
--- `route` names the refused core_vehicles function in the log line; the two original guards pass none.
-local function notify_spawn_blocked(route)
+-- The lock's notice for every refused car route: the selector, its buttons and the pause tab. One text and
+-- one clock, so a refused clone and the tab click right after it show one notice, not two of the same.
+local function show_vehicle_lock_notice()
     local now = os.clock()
     if now - last_spawn_block_toast_at >= SPAWN_BLOCK_TOAST_THROTTLE then
         last_spawn_block_toast_at = now
         M.notify("Switching or spawning vehicles is locked during the race", "warning")
     end
+end
+
+-- `route` names the refused core_vehicles function in the log line; the two original guards pass none.
+local function notify_spawn_blocked(route)
+    show_vehicle_lock_notice()
     log("I", LOG_TAG, "blocked a vehicle spawn/replace during the race"
         .. (route and " (core_vehicles." .. route .. ")" or ""))
 end
 
--- The node-grabber actions to block, preferring the engine's own template over the built-in list.
--- Returns (actions, is_from_template).
+-- The action names of one engine action template, copied out, or nil when the engine offers no such template.
 --
 -- getActionTemplates hands back the RAW actionTemplates table, not a copy (core/input/actionFilter.lua), so
 -- this only ever reads it and copies the names out -- inserting into or reordering that table would change
 -- what every other subsystem blocks.
 --
--- Every step degrades instead of throwing: a missing API, a missing template, or a template of an
--- unexpected shape all fall back to NODEGRABBER_ACTIONS, because losing the grabber names must not also
--- lose the thirteen other actions that share the group. The fallback is not silent -- see
--- report_nodegrabber_block.
-local function nodegrabber_actions()
-    local from_template
+-- Every step degrades instead of throwing: a missing API, a missing template, or a template of an unexpected
+-- shape all answer nil, and each caller falls back to its built-in names with a warning.
+local function template_actions(template)
+    local found
     pcall(function()
         if type(core_input_actionFilter.getActionTemplates) ~= "function" then
             return
         end
         local templates = core_input_actionFilter.getActionTemplates()
-        if type(templates) ~= "table" or type(templates[NODEGRABBER_TEMPLATE]) ~= "table" then
+        if type(templates) ~= "table" or type(templates[template]) ~= "table" then
             return
         end
         local names = {}
-        for _, action in ipairs(templates[NODEGRABBER_TEMPLATE]) do
+        for _, action in ipairs(templates[template]) do
             if type(action) == "string" and action ~= "" then
                 names[#names + 1] = action
             end
         end
         if #names > 0 then
-            from_template = names
+            found = names
         end
     end)
+    return found
+end
+
+-- The node-grabber actions to block, preferring the engine's own template over the built-in list. Returns
+-- (actions, is_from_template). The fallback keeps the grabber names from taking the other actions that share
+-- the group down with them, and it is not silent -- see report_nodegrabber_block.
+local function nodegrabber_actions()
+    local from_template = template_actions(NODEGRABBER_TEMPLATE)
     if from_template then
         return from_template, true
     end
     return NODEGRABBER_ACTIONS, false
 end
 
--- Build the blocked-action list for the requested mode: always BLOCKED_ACTIONS plus the node-grabber
--- actions, plus the two selector actions unless replace is allowed (the swap-allowed staging mode leaves
--- the selector open -- there the player may change car, but still must not drag it off its slot, ADR-0021).
+-- Build the blocked-action list for the requested mode: always BLOCKED_ACTIONS, the node-grabber actions and
+-- the AI-mode action, plus the two selector actions unless replace is allowed (the swap-allowed staging mode
+-- leaves the selector open -- there the player may change car, but still must not drag it off its slot or
+-- hand it to the AI, ADR-0021).
 --
 -- Always a fresh array, in both modes: setGroup stores the array BY REFERENCE (actionGroups[name] =
 -- arrayValues) and serializes it across Lua reloads, so the engine must never be handed one of this
@@ -307,12 +380,34 @@ local function blocked_actions_for(allow_replace, grabber_actions)
     for _, action in ipairs(grabber_actions) do
         actions[#actions + 1] = action
     end
+    actions[#actions + 1] = AI_MODE_ACTION
     if not allow_replace then
         for _, action in ipairs(SELECTOR_ACTIONS) do
             actions[#actions + 1] = action
         end
     end
     return actions
+end
+
+-- The actions of `actions` the filter does not report as blocked. nil plus the reason when the filter state
+-- cannot be read at all.
+local function unfiltered_actions(actions)
+    if type(core_input_actionFilter.isActionBlocked) ~= "function" then
+        return nil, "core_input_actionFilter has no isActionBlocked"
+    end
+    local ok, gaps = pcall(function()
+        local found = {}
+        for _, action in ipairs(actions) do
+            if not core_input_actionFilter.isActionBlocked(action) then
+                found[#found + 1] = action
+            end
+        end
+        return found
+    end)
+    if not ok then
+        return nil, tostring(gaps)
+    end
+    return gaps
 end
 
 -- One line per lock install (ADR-0017 amendment, nodegrabber-action-names-wrong) reporting how much of the
@@ -334,29 +429,57 @@ local function report_nodegrabber_block(grabber_actions, is_from_template, allow
     if type(core_input_actionFilter.isActionBlocked) ~= "function" then
         return
     end
-    local ok, filtered, unfiltered = pcall(function()
-        local count, gaps = 0, {}
-        for _, action in ipairs(grabber_actions) do
-            if core_input_actionFilter.isActionBlocked(action) then
-                count = count + 1
-            else
-                gaps[#gaps + 1] = action
-            end
-        end
-        return count, gaps
-    end)
-    if not ok then
-        log("W", LOG_TAG, "node grabber block: could not read the filter state: " .. tostring(filtered))
+    local unfiltered, err = unfiltered_actions(grabber_actions)
+    if unfiltered == nil then
+        log("W", LOG_TAG, "node grabber block: could not read the filter state: " .. tostring(err))
         return
     end
     local summary = string.format(
         "node grabber block: %d of %d actions filtered (%s lock, names from %s)",
-        filtered, #grabber_actions, allow_replace and "swap-allowed" or "full",
+        #grabber_actions - #unfiltered, #grabber_actions, allow_replace and "swap-allowed" or "full",
         is_from_template and "the engine template" or "the built-in fallback")
     if #unfiltered == 0 then
         log("I", LOG_TAG, summary)
     else
         log("W", LOG_TAG, summary .. "; not filtered: " .. table.concat(unfiltered, ", "))
+    end
+end
+
+-- Where the AI-mode name stands against the engine's template, for the install line: the clause and whether
+-- it is the expected answer.
+local function ai_mode_name_source()
+    local template = template_actions(AI_MODE_TEMPLATE)
+    if template == nil then
+        return "engine template '" .. AI_MODE_TEMPLATE .. "' unavailable, built-in name", false
+    end
+    for _, action in ipairs(template) do
+        if action == AI_MODE_ACTION then
+            return "name in the engine template '" .. AI_MODE_TEMPLATE .. "'", true
+        end
+    end
+    return "name NOT in the engine template '" .. AI_MODE_TEMPLATE .. "' ("
+        .. table.concat(template, ", ") .. ")", false
+end
+
+-- One line per lock install for the AI-mode block, read the same way as the node-grabber line: the filter
+-- answer proves the group reached the filter, and the template clause is what proves the name is one the
+-- engine knows. Either one off is a W.
+local function report_ai_mode_block(allow_replace)
+    local source, is_known = ai_mode_name_source()
+    local unfiltered, err = unfiltered_actions({AI_MODE_ACTION})
+    local state = "filtered"
+    if unfiltered == nil then
+        state = "filter state unreadable (" .. tostring(err) .. ")"
+    elseif #unfiltered > 0 then
+        state = "NOT filtered"
+    end
+    local summary = string.format("AI modes: %s %s (%s lock, %s)", AI_MODE_ACTION, state,
+        allow_replace and "swap-allowed" or "full", source)
+    if is_known and state == "filtered" then
+        log("I", LOG_TAG, summary)
+    else
+        log("W", LOG_TAG, summary .. "; the own car can be handed to the AI, re-check the engine's"
+            .. " core/input/actionFilter.lua")
     end
 end
 
@@ -386,6 +509,7 @@ local function set_action_filter(blocked, allow_replace)
     -- this reads back is the filter state the lock just produced.
     if blocked then
         report_nodegrabber_block(grabber_actions, is_from_template, allow_replace)
+        report_ai_mode_block(allow_replace)
     end
 end
 
@@ -692,6 +816,186 @@ local function redraw_open_selector(is_hidden)
         .. ": asked an open selector to redraw (" .. SELECTOR_REDRAW_EVENT .. ")")
 end
 
+-- The tab provider the game has loaded right now, or nil. Never loads it (see TAB_MODULE).
+local function tab_provider()
+    local tab = rawget(_G, TAB_MODULE)
+    if type(tab) ~= "table" then
+        return nil
+    end
+    return tab
+end
+
+local function is_tab_guarded()
+    local tab = tab_provider()
+    return tab ~= nil and tab[ORIG_TAB_KEY] ~= nil
+end
+
+-- The provider's button map, found among the upvalues of its original entry by name. nil plus why not when
+-- the debug library is missing, the walk fails, or no upvalue of that name carries a getButtonInfo.
+local function tab_buttons(entry)
+    if type(debug) ~= "table" or type(debug.getupvalue) ~= "function" then
+        return nil, "the debug library is not available"
+    end
+    local ok, buttons = pcall(function()
+        local index = 1
+        while true do
+            local name, value = debug.getupvalue(entry, index)
+            if name == nil then
+                return nil
+            end
+            if name == TAB_BUTTONS_UPVALUE then
+                return value
+            end
+            index = index + 1
+        end
+    end)
+    if not ok then
+        return nil, "reading its upvalues failed: " .. tostring(buttons)
+    end
+    if type(buttons) ~= "table" or type(buttons.getButtonInfo) ~= "function" then
+        return nil, "the entry has no upvalue '" .. TAB_BUTTONS_UPVALUE .. "' with a getButtonInfo"
+    end
+    return buttons
+end
+
+-- The action a tab button was registered under, or nil when it cannot be read.
+local function tab_button_action(buttons, button_id)
+    local info = buttons.getButtonInfo(button_id)
+    local meta = type(info) == "table" and info.meta or nil
+    local action = type(meta) == "table" and meta.action or nil
+    if type(action) ~= "string" then
+        return nil
+    end
+    return action
+end
+
+local function is_refused_tab_action(action)
+    return TAB_REFUSED_ACTIONS[action] == true or action:find(TAB_SEAT_SWITCH_PATTERN) ~= nil
+end
+
+-- Whether the lock refuses this click. Returns (refuse, label, why): the label names the action, or the
+-- button when its action is unknown, and `why` is set when the refusal is a fail-closed one, which the log
+-- then says. Fail-closed in both unknown cases: without the button map every click is refused, and so is a
+-- button whose action cannot be read -- a button that refuses Open details costs a notice, one that lets
+-- Reset through costs the race.
+local function tab_verdict(buttons, button_id)
+    local label = "button " .. tostring(button_id)
+    if buttons == nil then
+        return true, label, "the button map is unreadable"
+    end
+    local ok, action = pcall(tab_button_action, buttons, button_id)
+    if not ok then
+        return true, label, "reading its action failed: " .. tostring(action)
+    end
+    if action == nil then
+        return true, label, "its action cannot be read"
+    end
+    return is_refused_tab_action(action), action, nil
+end
+
+-- One refused tab click: a log line every time (a click, never a frame), then the lock's notice. The line
+-- first, so a throwing notice cannot swallow it.
+local function refuse_tab_action(label, why)
+    if why then
+        log("W", LOG_TAG, "refused a pause-menu vehicle tab action (" .. label .. ", fail-closed: "
+            .. why .. ")")
+    else
+        log("I", LOG_TAG, "refused a pause-menu vehicle tab action (" .. label .. ")")
+    end
+    show_vehicle_lock_notice()
+end
+
+-- The wrapper for the tab's entry. A refused click answers nil, never false and never an error. The vehicle
+-- list and a vehicle's details fetch their payload again after a click whatever it answered (the details not
+-- after a delete), the pause home's nearby vehicles only after one that did not answer false, so nil is what
+-- lets a view the rebuild event does not reach grey out after the refused click. Once the stash is gone (the
+-- lock was lifted) a kept copy is a plain pass-through.
+local function tab_guard_for(tab, original, buttons)
+    return function(button_id, ...)
+        if tab[ORIG_TAB_KEY] == nil then
+            return original(button_id, ...)
+        end
+        local refuse, label, why = tab_verdict(buttons, button_id)
+        if not refuse then
+            return original(button_id, ...)
+        end
+        local ok, err = pcall(refuse_tab_action, label, why)
+        if not ok then
+            log("W", LOG_TAG, "refused a pause-menu vehicle tab action, but answering it failed: "
+                .. tostring(err))
+        end
+        return nil
+    end
+end
+
+-- Wrap the entry on the loaded provider. Returns (failure, unreadable): failure is nil when the entry is
+-- guarded (now or already) and says why not otherwise; unreadable says why the button map could not be read,
+-- in which case the guard refuses every click. Same stash shape as guard_partmgmt: the original once, the
+-- wrapper (re)assigned on every call, so a second install never captures our own wrapper as the "original".
+local function guard_pause_tab()
+    local tab = tab_provider()
+    if tab == nil then
+        return TAB_NOT_LOADED
+    end
+    if tab[ORIG_TAB_KEY] == nil then
+        if type(tab[TAB_ENTRY]) ~= "function" then
+            return TAB_MODULE .. " has no " .. TAB_ENTRY
+        end
+        tab[ORIG_TAB_KEY] = tab[TAB_ENTRY]
+    end
+    local original = tab[ORIG_TAB_KEY]
+    local buttons, unreadable = tab_buttons(original)
+    tab[TAB_ENTRY] = tab_guard_for(tab, original, buttons)
+    return nil, unreadable
+end
+
+-- Give the original entry back. Returns whether anything was guarded.
+local function unguard_pause_tab()
+    local tab = tab_provider()
+    if tab == nil or tab[ORIG_TAB_KEY] == nil then
+        return false
+    end
+    tab[TAB_ENTRY] = tab[ORIG_TAB_KEY]
+    tab[ORIG_TAB_KEY] = nil
+    return true
+end
+
+-- One line per outcome of a guard. A provider that is not loaded yet is expected and is caught by M.step; a
+-- missing entry and a fail-closed guard are the tripwires after a game update, and the suffix of the guarded
+-- line names where the actions come from. `context` says which guard it was.
+local function report_pause_tab(context, failure, unreadable)
+    pause_tab.outcome = failure
+    if failure == TAB_NOT_LOADED then
+        log("I", LOG_TAG, "pause-menu vehicle tab: " .. failure .. ", guarded as soon as the game loads it")
+    elseif failure then
+        log("W", LOG_TAG, "pause-menu vehicle tab NOT guarded: " .. failure
+            .. "; re-check the engine's ui/pause/providers/vehicleTabInteractions.lua")
+    elseif unreadable then
+        log("W", LOG_TAG, "pause-menu vehicle tab: guarded " .. context .. ", FAIL-CLOSED (" .. unreadable
+            .. "), every tab action is refused; re-check the engine's"
+            .. " ui/pause/providers/vehicleTabInteractions.lua")
+    else
+        log("I", LOG_TAG, "pause-menu vehicle tab: guarded " .. context
+            .. " (actions from the provider's button map)")
+    end
+end
+
+-- Ask an open tab to rebuild, so its buttons follow the lock. The vehicle list fetches its payload again on
+-- this event; a vehicle's details view and the pause home's nearby vehicles do not, and grey out after their
+-- first click, which the guard refuses. Nothing to ask while the provider is not loaded: no tab is built.
+local function rebuild_open_tab(is_locked)
+    if tab_provider() == nil or type(guihooks) ~= "table" then
+        return
+    end
+    local ok, err = pcall(guihooks.trigger, TAB_REBUILD_EVENT)
+    if not ok then
+        log("W", LOG_TAG, "pause-menu vehicle tab rebuild failed: " .. tostring(err))
+        return
+    end
+    log("I", LOG_TAG, "pause-menu vehicle tab " .. (is_locked and "locked" or "unlocked")
+        .. ": asked an open tab to rebuild (" .. TAB_REBUILD_EVENT .. ")")
+end
+
 -- Whether a mergeConfig payload changes more than tuning and paint. A whitelist on purpose: partsTree and
 -- parts are the obvious keys, but a mainPartName or model would be another car altogether, and an unknown
 -- key refused costs a notice where one let through costs the race its forced car. Anything that is not a
@@ -881,12 +1185,12 @@ local function parts_lock_reason_for(is_forced, allow_replace)
     return nil
 end
 
--- Arm the lock: block the input actions, guard the spawn/replace functions and the selector's own car
--- buttons, and hide the selector's management bar. Idempotent. With opts.allow_replace the swap-allowed
--- staging mode is installed (replace + the car selector stay open, extra spawn + everything else blocked);
--- with no opts (or false) the full fixed-car lock. Calling it again without allow_replace upgrades a
--- swap-allowed lock to full (ADR-0021/0017 amendments). The car buttons and the bar are the same in both
--- modes.
+-- Arm the lock: block the input actions, guard the spawn/replace functions, the selector's own car buttons
+-- and the pause tab's entry, and hide the selector's management bar. Idempotent. With opts.allow_replace the
+-- swap-allowed staging mode is installed (replace + the car selector stay open, extra spawn + everything else
+-- blocked); with no opts (or false) the full fixed-car lock. Calling it again without allow_replace upgrades
+-- a swap-allowed lock to full (ADR-0021/0017 amendments). The car buttons, the bar, the pause tab and the AI
+-- modes are the same in both modes.
 --
 -- A race that forces the car (M.car_is_forced, ADR-0064) overrides allow_replace for the replace only:
 -- the replace is refused from staging on, while the selector keys stay open -- the parts-selector key is
@@ -903,6 +1207,8 @@ function M.install(opts)
     report_vehicle_buttons(guard_vehicle_buttons())
     selector_bar.wanted = true
     report_selector_bar(hide_selector_bar(), "for the lock")
+    pause_tab.wanted = true
+    report_pause_tab("for the lock", guard_pause_tab())
     parts_lock_reason = reason
     if reason then
         local wrapped, missing = guard_partmgmt()
@@ -942,9 +1248,9 @@ function M.set_recover_blocked(blocked)
 end
 
 -- Lift the lock: unblock the input actions and restore the spawn/replace functions, the car buttons, the
--- selector's bar and the parts guard. Idempotent, so it is safe to call on lobby, on a fresh race start, and
--- on extension unload. Clears the hold group too -- without that, a race ending while a driver is held would
--- leave the recover keys dead in the finished free-roam window and the lobby.
+-- selector's bar, the pause tab's entry and the parts guard. Idempotent, so it is safe to call on lobby, on a
+-- fresh race start, and on extension unload. Clears the hold group too -- without that, a race ending while a
+-- driver is held would leave the recover keys dead in the finished free-roam window and the lobby.
 function M.remove()
     set_action_filter(false)
     set_hold_filter(false)
@@ -955,6 +1261,11 @@ function M.remove()
     if show_selector_bar() then
         log("I", LOG_TAG, "vehicle selector bar: given back")
     end
+    pause_tab.wanted = false
+    pause_tab.outcome = nil
+    if unguard_pause_tab() then
+        log("I", LOG_TAG, "pause-menu vehicle tab: given back")
+    end
     if unguard_partmgmt() > 0 then
         log("I", LOG_TAG, "parts lock lifted")
     end
@@ -963,13 +1274,12 @@ function M.remove()
     log("I", LOG_TAG, "in-race vehicle-action lock removed")
 end
 
--- Once per frame from init.lua's onUpdate, in every phase. Two jobs for the selector's bar, two boolean reads
--- when there is no lock and nothing to tell:
+-- The selector's half of M.step:
 --   1. While the lock stands, hide the bar on a selector module the game loaded, or reloaded, after the
 --      install. Install alone would only work when the module happened to be there first.
 --   2. When the bar's state differs from what an open selector was last asked to draw, ask it to redraw.
 --      Here and not in install/remove, so the quali re-grid's remove/install pair in one frame asks nothing.
-function M.step()
+local function step_selector_bar()
     if not selector_bar.wanted and not selector_bar.announced then
         return
     end
@@ -984,6 +1294,33 @@ function M.step()
         selector_bar.announced = is_hidden
         redraw_open_selector(is_hidden)
     end
+end
+
+-- The pause tab's half of M.step, the same two jobs:
+--   1. While the lock stands, guard the entry on a provider the game loaded, or reloaded, after the install.
+--   2. When the lock state differs from what an open tab was last asked to show, ask it to rebuild. The lock
+--      state, not the guard: the buttons grey out on the action filter, which needs no provider.
+local function step_pause_tab()
+    if not pause_tab.wanted and not pause_tab.announced then
+        return
+    end
+    if pause_tab.wanted and not is_tab_guarded() then
+        local failure, unreadable = guard_pause_tab()
+        if failure == nil or failure ~= pause_tab.outcome then
+            report_pause_tab("(the provider was loaded after the install)", failure, unreadable)
+        end
+    end
+    if pause_tab.wanted ~= pause_tab.announced then
+        pause_tab.announced = pause_tab.wanted
+        rebuild_open_tab(pause_tab.wanted)
+    end
+end
+
+-- Once per frame from init.lua's onUpdate, in every phase: the selector's bar and the pause tab, four boolean
+-- reads when there is no lock and nothing to tell.
+function M.step()
+    step_selector_bar()
+    step_pause_tab()
 end
 
 -- Whether BeamNG's binding table can be read at all right now. core_input_bindings.bindings starts life
