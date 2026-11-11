@@ -859,6 +859,9 @@ function M.prepare(payload)
         -- Resolved race mode + lap count, travel direction, and the detector's plan (ADR-0013/0018).
         mode = mode,
         laps = laps,
+        -- The track's own lap count, kept so an in-place change of the staged race (M.apply_update) resolves
+        -- a cleared Laps field exactly as this start did.
+        defaultLaps = race.meta and race.meta.defaultLaps,
         direction = direction,
         plan = plan,
         -- F1 light start (ADR-0043): "f1" = lights + free car + jump-start penalty; nil = lock countdown.
@@ -874,6 +877,57 @@ function M.prepare(payload)
         -- quali plan loops the circuit for the window; the real `plan` above drives the race afterwards.
         quali = quali_for(payload, race_checkpoints, mode, plan),
     }
+end
+
+-- Whether two resolved assist configs differ for one assist ("recover" / "repair").
+local function assist_differs(old, new, kind)
+    return old[kind .. "Enabled"] ~= new[kind .. "Enabled"]
+        or old[kind .. "HoldSeconds"] ~= new[kind .. "HoldSeconds"]
+end
+
+-- Bring a staged race in line with a raceUpdate (ADR-0037 amendment 2026-11-11): the server changed its
+-- laps, assists, start style or qualifying length without a new grid. The update carries those fields under
+-- their raceStart names, so the resolvers M.prepare ran re-run on it and rewrite `race` in place; mode,
+-- direction and grid are never part of such a change. Returns what EFFECTIVELY changed, so the driver is
+-- told about a lap count that really moved and not about one a sprint ignores:
+--   {laps = <n>?, recover = true?, repair = true?, start = true?, quali = <seconds>?}
+function M.apply_update(race, payload)
+    local changes = {}
+    if race.mode == "circuit" then
+        local laps = M.resolve_laps(payload.laps, race.defaultLaps)
+        if laps ~= race.laps then
+            race.laps = laps
+            race.plan = checkpoints.plan(race.checkpoints, race.mode, laps)
+            changes.laps = laps
+        end
+    end
+
+    local assists = resolve_assists(payload)
+    changes.recover = assist_differs(race.assists, assists, "recover") or nil
+    changes.repair = assist_differs(race.assists, assists, "repair") or nil
+    race.assists = assists
+
+    local start_mode = payload.startMode == "f1" and "f1" or nil
+    local penalty = resolve_jump_penalty(payload.jumpPenaltySeconds)
+    if start_mode ~= race.startMode or (start_mode and penalty ~= race.jumpPenaltySeconds) then
+        changes.start = true
+    end
+    race.startMode = start_mode
+    race.jumpPenaltySeconds = penalty
+
+    if race.quali then
+        local quali = quali_for(payload, race.checkpoints, race.mode, race.plan)
+        if not quali then
+            log("W", LOG_TAG, string.format("race update: no qualifying length for a qualifying race, "
+                .. "keeping %g s", race.quali.duration))
+        elseif quali.duration ~= race.quali.duration then
+            race.quali = quali
+            changes.quali = quali.duration
+        end
+    elseif type(payload.quali) == "table" then
+        log("W", LOG_TAG, "race update: qualifying length ignored, this race has no qualifying")
+    end
+    return changes
 end
 
 -- Resolve just the grid anchor for a race on this map: the base start pose + the start/finish gate

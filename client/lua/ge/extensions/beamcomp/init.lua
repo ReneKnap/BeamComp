@@ -251,7 +251,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-pwrlive-r1/2026-11-11"
+local BUILD_MARKER = "0.10.0-setupconfirm-r1/2026-11-11"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -368,8 +368,8 @@ M.state = {
     grid_edit_prop_names = nil,  -- names of the static-scenery prefabs spawned as a positioning reference during a grid edit (lobby only; cleared with the session). Distinct lifecycle from the race's prop_names
     grid_edit_checkpoints = nil,  -- the active direction's checkpoints in traversal order, CP0 first ({index, pos, normal, radius} each), drawn immediate-mode during a grid edit -- CP0 red, CP1 yellow, the rest grey -- so the grid can be placed against the start line and the route seen from the free camera
     setup_form = nil,         -- the race-setup panel's last form (JSON string), remembered across panel close/reopen within a session so the settings of the last race persist (ADR-0037). The panel autosaves it on every change, so it also survives a UI reload that never runs the panel's Close (bug setup-panel-settings-survive-ui-reload)
-    setup_built = nil,        -- the race request (the panel's JSON string, VERBATIM -- never decoded and re-encoded, which would reorder keys and turn an empty list into {}) the staged race was built from, or nil when that is not known: no race, or one this panel did not build (another admin's, a typed /race). The panel compares its form against it and points at Confirm & Build Grid when they differ (feature setup-confirm-grid-stale-hint, ADR-0037 amendment 2026-10-06). Set ONLY by setup.note_race_start; survives the panel's Close on purpose -- the grid is still standing -- and is dropped by teardown_race_world. nil after a GE Lua reload (ADR-0052), and nil means "no hint", so the reload can cost a hint but never fake one
-    setup_request = nil,      -- the panel's last Confirm & Build Grid that has not become a race yet: {json, race, overrides, validated, sends}. Tied to its race by setup.note_validation (the validateRace the server sends this client for it) and promoted into setup_built by the raceStart that carries propOwner for it; `sends` counts a double click. A newer Confirm replaces it; a refusal, another request of ours or leaving the session drops it. Deliberately NOT reset by teardown_race_world (it can still become the next race); nil after a GE Lua reload, which costs that one race its hint and nothing else (ADR-0052)
+    setup_built = nil,        -- the race request (the panel's JSON string, VERBATIM -- never decoded and re-encoded, which would reorder keys and turn an empty list into {}) the staged race was built from, or nil when that is not known: no race, or one this panel did not build (another admin's, a typed /race). The panel compares its form against it and points at Confirm & Build Grid when they differ (feature setup-confirm-grid-stale-hint, ADR-0037 amendment 2026-10-06). Set ONLY by setup.note_race_start and, after an in-place change of the staged race, setup.note_race_update; survives the panel's Close on purpose -- the grid is still standing -- and is dropped by teardown_race_world, by any in-place change another request asked for and by a grid write on this map (ADR-0037 amendment 2026-11-11). nil after a GE Lua reload (ADR-0052), and nil means "no hint", so the reload can cost a hint but never fake one
+    setup_request = nil,      -- the panel's last Confirm & Build Grid that has not become a race yet: {json, race, overrides, validated, sends}. Tied to its race by setup.note_validation (the validateRace the server sends this client for it) and promoted into setup_built by the raceStart that carries propOwner for it, or by the raceUpdate that names this client its issuer (an in-place change, ADR-0037 amendment 2026-11-11); `sends` counts a double click. A newer Confirm replaces it; a refusal, another request of ours or leaving the session drops it. Deliberately NOT reset by teardown_race_world (it can still become the next race); nil after a GE Lua reload, which costs that one race its hint and nothing else (ADR-0052)
     setup_open = false,       -- the race-setup panel is meant to be on screen: set by the admin-gated setupOpen (handle_setup_open), cleared by close_setup / on leaving the level. The ONLY thing the presence watchdog acts on, so it can reproduce an authorized open but never invent one (ADR-0016/0037). Does NOT survive a Lua reload: this extension has no onSerialize/onDeserialize, so a reload rebuilds M.state from this literal -- the panel stays on screen but is no longer watched until the next /raceui
     setup_seen = false,       -- the panel app has acked at least once since that open, so silence is a real loss and not a slow mount -- keeps the one-shot restore from being spent on a false positive
     setup_ack_gap = 0,        -- seconds since the panel app last acked it is alive; setup.ACK_STALE is the loss threshold
@@ -3687,7 +3687,8 @@ end
 -- The setup panel's championship control (ADR-0037/0040/0041): the panel serialises
 -- {action, preset, order, qualiMinutes} and calls this; we decode and relay it as a championshipCmd
 -- that routes through the same admin-gated handler as the /championship chat command. Public as
--- beamcomp_init.championship_cmd. A bad payload is dropped.
+-- beamcomp_init.championship_cmd. A bad payload is dropped. Since the panel's settings ride the race request
+-- (ADR-0037 amendment 2026-11-11), the panel sends only Reset points through here ({action = "restart"}).
 function M.championship_cmd(json)
     local ok, decoded = pcall(jsonDecode, json)
     if not ok or type(decoded) ~= "table" or type(decoded.action) ~= "string" then
@@ -3722,7 +3723,9 @@ end
 
 -- The setup panel's class-drop tournament control (ADR-0037/0042): the panel serialises {action, classes,
 -- order} and calls this; we decode and relay it as a tournamentCmd routed through the same admin-gated server
--- handler the panel uses. Public as beamcomp_init.tournament_cmd. A bad payload is dropped.
+-- handler the panel uses. Public as beamcomp_init.tournament_cmd. A bad payload is dropped. Since the panel's
+-- settings ride the race request (ADR-0037 amendment 2026-11-11), the panel sends only Reset progress through
+-- here ({action = "restart"}).
 function M.tournament_cmd(json)
     local ok, decoded = pcall(jsonDecode, json)
     if not ok or type(decoded) ~= "table" or type(decoded.action) ~= "string" then
@@ -4178,6 +4181,12 @@ local function handle_grid_list(payload)
     if not setup.accept_list("gridList", payload, #grids) then
         return
     end
+    -- An echo after a grid write on this map can change the grid a staged race is laid out on, which the
+    -- setup panel's request cannot show: the server would build such a race again (ADR-0037 amendment
+    -- 2026-11-11), so the record that greys out Confirm no longer holds.
+    if target == nil then
+        setup.forget_build("a grid on this map was saved, assigned or deleted")
+    end
     if target == "setup" then
         guihooks.trigger("BeamCompSetupGrids", {grids = grids})
         return
@@ -4562,12 +4571,162 @@ function setup.note_race_start(payload)
     setup.forget_build("this race was not built from the panel")
 end
 
+-- The staged race was changed in place, or a request of ours changed nothing (raceUpdate, ADR-0037
+-- amendment 2026-11-11). It is still the panel's grid exactly when this client asked with the panel's
+-- validated request -- the same tie note_race_start makes -- and then the record follows the race, so the
+-- note goes and Confirm greys out again. A change anybody else asked for means the record no longer
+-- describes what stands on the grid, and it is forgotten. An update that changed nothing leaves a record
+-- it does not promote standing: the race is still the one it describes.
+function setup.note_race_update(payload, ours)
+    local request = M.state.setup_request
+    if ours and payload.issuer == true and request and request.validated
+            and request.race == payload.issuedRace then
+        request.sends = request.sends - 1
+        if request.sends <= 0 then
+            M.state.setup_request = nil
+        end
+        M.state.setup_built = request.json
+        log("I", setup.LOG_TAG, string.format("staged grid remembered as changed from the panel ('%s')",
+            request.race))
+        setup.push_build()
+        return
+    end
+    if type(payload.changed) == "table" and next(payload.changed) == nil then
+        return
+    end
+    setup.forget_build("the staged race was changed by a request this panel did not send")
+end
+
 -- Push the staged grid's request on demand (UI -> GE): the panel's link-time pull. Public as
 -- beamcomp_init.request_setup_build.
 function M.request_setup_build()
     setup.push_build()
 end
 -- ===== end the setup panel's build record ==========================================================
+
+-- ===== a staged race changed in place (feature setup-confirm-applies-without-regrid) ===============
+-- A request that arrives while a race stages and changes nothing the field stands on -- laps, assists, the
+-- start style, the qualifying length, the AI's driving, the championship's points -- is applied to the
+-- staged race without a new grid (ADR-0037 amendment 2026-11-11). The server relays it to every racer as
+-- raceUpdate. Every reader of those values reads M.state.race live -- the HUD each frame, the assist keys
+-- at each press, the staging line at each repaint, the drive at the racing and qualifying entries -- so
+-- rewriting the race state is the whole apply. A table field on M (like M.caps / M.pwr): init.lua sits at
+-- 178/200 top-level locals.
+M.staged = {}
+M.staged.MSG = "raceUpdate"
+
+-- The categories the server may name in `changed`. The client derives laps, assists, start and qualifying
+-- from its own resolved race; the AI and the points it can only learn from the server.
+M.staged.KNOWN = {laps = true, assists = true, start = true, quali = true, ai_preset = true,
+    ai_params = true, points = true, champ_quali = true}
+
+-- How a points system is named in the drivers' line.
+M.staged.POINTS = {f1 = "F1", linear = "linear", quadratic = "quadratic"}
+
+-- The owner's AI settings follow the update. Nothing applies them at spawn: the AI read M.state.ai_config
+-- when they start driving (begin_driving, the quali re-grid respawn), so the merge is the whole re-apply.
+function M.staged.apply_ai(payload)
+    local config = payload.aiConfig
+    if type(config) ~= "table" then
+        return
+    end
+    if not M.state.ai_config then
+        log("W", RACE_LOG_TAG, "race update: AI settings arrived, but this client drives no AI")
+        return
+    end
+    M.state.ai_config.preset = config.preset
+    M.state.ai_config.params = config.params
+    log("I", RACE_LOG_TAG, string.format("race update: AI difficulty %s, the AI drive with it from the start",
+        tostring(config.preset or "default")))
+end
+
+-- One recover/repair assist as the drivers' line names it after a change.
+function M.staged.assist_text(name, enabled, hold)
+    if not enabled then
+        return name .. " off"
+    end
+    return string.format("%s on (hold %g s)", name, hold)
+end
+
+-- What changed, in the words of the drivers' line: the client's own effective changes (race_start.
+-- apply_update) for what it resolves itself, the server's `changed` list for the rest.
+function M.staged.describe(changes, race, payload)
+    local items = {}
+    if changes.laps then
+        items[#items + 1] = changes.laps == 1 and "1 lap" or (changes.laps .. " laps")
+    end
+    if changes.recover then
+        items[#items + 1] = M.staged.assist_text("recover", race.assists.recoverEnabled,
+            race.assists.recoverHoldSeconds)
+    end
+    if changes.repair then
+        items[#items + 1] = M.staged.assist_text("repair", race.assists.repairEnabled,
+            race.assists.repairHoldSeconds)
+    end
+    if changes.start then
+        local penalty = tonumber(race.jumpPenaltySeconds)
+        if race.startMode ~= "f1" then
+            items[#items + 1] = "countdown start"
+        elseif penalty then
+            items[#items + 1] = string.format("F1 start (jump penalty %g s)", penalty)
+        else
+            items[#items + 1] = "F1 start"
+        end
+    end
+    if changes.quali then
+        items[#items + 1] = string.format("qualifying %g min", changes.quali / 60)
+    end
+    local changed = {}
+    for _, category in ipairs(type(payload.changed) == "table" and payload.changed or {}) do
+        changed[category] = true
+        if not M.staged.KNOWN[category] then
+            log("W", RACE_LOG_TAG, "race update: unknown change '" .. tostring(category) .. "' not shown")
+        end
+    end
+    if changed.ai_preset then
+        items[#items + 1] = "AI difficulty " .. tostring(payload.aiPreset or "default")
+    end
+    if changed.ai_params then
+        items[#items + 1] = "AI driving values"
+    end
+    if changed.points then
+        items[#items + 1] = "championship points "
+            .. tostring(M.staged.POINTS[payload.points] or payload.points)
+    end
+    return items
+end
+
+-- The server's raceUpdate. The panel's record of the staged grid is settled first, whatever happens
+-- below; then the race state is rewritten and every driver is told in one line (notice.say, ADR-0057).
+function M.staged.handle(payload)
+    if type(payload) ~= "table" then
+        log("W", RACE_LOG_TAG, "race update ignored: malformed payload")
+        return
+    end
+    local race = M.state.race
+    local ours = race ~= nil and payload.race == race.serverName
+    setup.note_race_update(payload, ours)
+    if not ours then
+        log("W", RACE_LOG_TAG, "race update for '" .. tostring(payload.race)
+            .. "' ignored: this client does not hold that race")
+        return
+    end
+    local changes = race_start.apply_update(race, payload)
+    M.staged.apply_ai(payload)
+    -- The staging line names the F1 start and its penalty; repaint it now instead of up to a second later.
+    if M.state.staging then
+        M.state.staging.repaint_in = 0
+    end
+    local items = M.staged.describe(changes, race, payload)
+    if #items == 0 then
+        log("I", RACE_LOG_TAG, "race update: nothing changed on this client")
+        return
+    end
+    local line = table.concat(items, ", ")
+    log("I", RACE_LOG_TAG, "race updated in place: " .. line)
+    notice.say("Race updated: " .. line .. ".", "info", "BeamComp: " .. race.name)
+end
+-- ===== end a staged race changed in place ==========================================================
 
 -- Save the current race-setup form as a named, map-scoped preset (UI -> GE -> server, ADR-0037 amendment).
 -- The panel serialises its form minus the tournament/championship fields and passes {name, form}; GE relays
@@ -4816,15 +4975,23 @@ end
 -- presets, so a limit removed or the AI set free of it gives every driver his own car back.
 --
 -- Returns a copy where something changed and `overrides` itself otherwise; the decoded request stays as the
--- panel sent it (setup.note_request holds it). Skipped while a class-drop tournament runs: the server ignores
--- roster cars then (the class decides, ADR-0042), so a swap here would only log a change that never spawns.
+-- panel sent it (setup.note_request holds it). Skipped for a race a class-drop tournament runs: the server
+-- ignores roster cars then (the class decides, ADR-0042), so a swap here would only log a change that never
+-- spawns. Which format the race runs is the request's own (ADR-0037 amendment 2026-11-11); one that names
+-- none keeps the running one.
 function setup.limit_roster(overrides)
     local request_ai = type(overrides) == "table" and overrides.ai or nil
     if type(request_ai) ~= "table" or type(request_ai.roster) ~= "table" then
         return overrides
     end
-    local tournament = M.state.tournament
-    if tournament and tournament.active then
+    local format, tournament = overrides.format, M.state.tournament
+    local classdrop
+    if type(format) == "table" then
+        classdrop = format.mode == "classdrop"
+    else
+        classdrop = tournament ~= nil and tournament.active == true
+    end
+    if classdrop then
         return overrides
     end
     local field = ai.limit_lineup(request_ai.roster, request_ai, setup.request_policy(overrides), true)
@@ -5619,6 +5786,8 @@ local HANDLERS = {
         log("I", RACE_LOG_TAG, string.format("race props: %d vehicle(s) carry no name here", count))
     end,
     validateRace = handle_validate_race,
+    -- A staged race changed without a new grid (ADR-0037 amendment 2026-11-11); on the M.staged table.
+    [M.staged.MSG] = M.staged.handle,
     -- On-demand scenery pull for a client without the track (ADR-0046).
     trackProbe = handle_track_probe,
     trackFetch = handle_track_fetch,
