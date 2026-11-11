@@ -261,6 +261,7 @@ local session = {
     pending_race_id = nil,   -- queued race's canonical id, the default-grid lookup key (ADR-0023)
     pending_race_data = nil, -- queued race's serialized definition, relayed verbatim in raceStart (ADR-0039)
     pending_validation = nil, -- in-flight pre-flight check {race, overrides, owner_id, nonce, deadline} (ADR-0019)
+    staged_request = nil,     -- what the active race was built from {race, race_id, map, overrides, format}, set by start_race and kept in step by an in-place change; a request arriving during staging is compared with it (tour.settle_staged, ADR-0037 amendment 2026-11-11). Per race, cleared by reset_to_lobby
     validation_seq = 0,       -- monotonic nonce source so a stale/duplicate raceValidation is ignored
     cleanup_warned = false,   -- one-shot guard for the ~60 s "props/results clear soon" warning (B3)
     spawn_pending = nil,      -- set of rostered player ids whose spawnReady ack is still awaited (ADR-0006 amendment)
@@ -5486,6 +5487,7 @@ local function reset_to_lobby()
     session.grid_direction = nil
     session.grid_ramp = nil
     session.grace_deadline = nil
+    session.staged_request = nil
     -- The liveness stamps are per-race like the progress they measure: a stale one must never be read
     -- as the next race's liveness.
     stall.clear()
@@ -5932,6 +5934,15 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     grid_store.warn_over_capacity(owner_id, grid_params, #roster)
 
     session.race = race_name
+    -- What this race is built from (ADR-0037 amendment 2026-11-11): a request that arrives while it waits
+    -- on the grid is compared with this, and only one that would grid differently builds it again.
+    session.staged_request = {
+        race = race_name,
+        race_id = race_id,
+        map = map,
+        overrides = overrides,
+        format = tour.active_format(),
+    }
     session.roster = roster
     session.owner_id = owner_id
     session.progress = build_progress(slots)
@@ -7688,10 +7699,241 @@ local function handle_race_command(player_id, player_name, argument)
     begin_race_request(player_id, player_name, race_name, overrides)
 end
 
+-- ===== a race request while a race stages (feature setup-confirm-applies-without-regrid) ===========
+-- Until 2026-11-11 every Confirm during staging aborted the staged race and spawned the whole field again,
+-- costing every player his car swap and tuning to change a lap count. The server now decides, for every
+-- panel Confirm and every typed /race whoever built the grid: a request is compared with the one the
+-- staged race was built from (session.staged_request), after the validation round trip, and only one that
+-- would grid differently rebuilds. The rest is applied to the staged race in place and relayed to every
+-- racer as raceUpdate (ADR-0037 amendment 2026-11-11). Race-blind: the comparison walks opaque request
+-- tables and never reads what a value means (ADR-0005). On `tour` for the reason the format block says.
+
+tour.MSG_UPDATE = "raceUpdate"  -- server -> racers: the staged race's in-place settings, changed
+
+-- The overrides a staged race takes without a new grid (user decision 2026-11-11), each with the category
+-- it is reported under. Every path NOT listed rebuilds -- a field added later included, which is the safe
+-- default: an unknown change can cost a rebuild, never a race that runs with a field it did not grid for.
+tour.IN_PLACE = {
+    laps = "laps",
+    assists = "assists",
+    startMode = "start",
+    jumpPenaltySeconds = "start",
+    quali_duration = "quali",
+    ["ai.preset"] = "ai_preset",
+    ["ai.params"] = "ai_params",
+}
+
+-- Not walked: the footprints the issuer's client derived from car tokens that ARE compared (ADR-0051), and
+-- the format, which is compared on its own against the format the race was built under.
+tour.NOT_COMPARED = {car_size = true, ai_car_size = true, ai_roster_sizes = true, format = true}
+
+-- Every category in a fixed order, with the word the issuer's chat line uses for it.
+tour.CHANGES = {
+    {key = "laps", word = "laps"},
+    {key = "assists", word = "assists"},
+    {key = "start", word = "start"},
+    {key = "quali", word = "qualifying length"},
+    {key = "ai_preset", word = "AI difficulty"},
+    {key = "ai_params", word = "AI driving values"},
+    {key = "points", word = "points"},
+    {key = "champ_quali", word = "championship qualifying length"},
+}
+
+-- Walk two overrides tables and sort every difference into `changes`: an in-place category into
+-- changes.in_place, anything else into changes.rebuild (the first path found, for the log line).
+function tour.diff_overrides(built, incoming, prefix, changes)
+    local keys = {}
+    for key in pairs(built) do
+        keys[key] = true
+    end
+    for key in pairs(incoming) do
+        keys[key] = true
+    end
+    for key in pairs(keys) do
+        local path = prefix .. tostring(key)
+        local before, after = built[key], incoming[key]
+        if not tour.NOT_COMPARED[path] and not tour.same(before, after) then
+            local category = tour.IN_PLACE[path]
+            if category then
+                changes.in_place[category] = true
+            elseif type(before) == "table" and type(after) == "table" then
+                tour.diff_overrides(before, after, path .. ".", changes)
+            else
+                changes.rebuild = changes.rebuild or path
+            end
+        end
+    end
+end
+
+-- Sort a format difference into `changes`. An absent requested format claims nothing. A mode switch, the
+-- championship's grid order and anything about a class-drop rebuild (the classes decide the cars); the
+-- championship's points and qualifying length apply in place.
+function tour.format_changes(built, requested, changes)
+    if not requested or tour.same(built, requested) then
+        return
+    end
+    if requested.mode ~= "championship" or built.mode ~= "championship" or requested.order ~= built.order then
+        changes.rebuild = changes.rebuild or "format"
+        return
+    end
+    if requested.preset ~= built.preset then
+        changes.in_place.points = true
+    end
+    if requested.quali_seconds ~= built.quali_seconds then
+        changes.in_place.champ_quali = true
+    end
+end
+
+-- What a request changes against the race staged now: changes.rebuild names the first difference that
+-- needs a new grid, else changes.in_place holds the categories (empty = nothing changed). A grid record
+-- that resolves differently from the one the race was laid out on rebuilds too -- a grid saved or
+-- re-assigned during staging is not part of the request, and the field would stand on it differently.
+function tour.staged_changes(race_name, overrides, map, race_id)
+    local staged = session.staged_request
+    local changes = {in_place = {}}
+    if not staged then
+        changes.rebuild = "no staged request"
+        return changes
+    end
+    if (race_id or race_name) ~= (staged.race_id or staged.race) or map ~= staged.map then
+        changes.rebuild = "race"
+        return changes
+    end
+    tour.diff_overrides(staged.overrides, overrides, "", changes)
+    tour.format_changes(staged.format, overrides.format, changes)
+    if not changes.rebuild then
+        local record = resolve_grid(map, race_id or race_name, overrides.grid)
+        if not tour.same(record, session.grid_record) then
+            changes.rebuild = "grid record"
+        end
+    end
+    return changes
+end
+
+-- The category keys a change set holds and the issuer's words for them, both in tour.CHANGES order.
+function tour.changed_list(in_place)
+    local keys, words = {}, {}
+    for _, change in ipairs(tour.CHANGES) do
+        if in_place[change.key] then
+            keys[#keys + 1] = change.key
+            words[#words + 1] = change.word
+        end
+    end
+    return keys, words
+end
+
+-- One racer's raceUpdate. Every in-place setting of the staged race rides under its raceStart name -- the
+-- whole truth, so a client re-runs the resolvers its raceStart went through and a repeated update changes
+-- nothing. `changed` names what the server changed, for the parts no client can derive itself (the AI
+-- settings only the owner holds, the points). The one who asked carries `issuer`, which is what promotes
+-- his setup panel's record of the staged race (init.lua setup.note_race_update).
+function tour.update_payload(player_id, issuer_id, race_name, overrides, changed)
+    local assists = overrides.assists
+    local ai = overrides.ai
+    local is_issuer = player_id == issuer_id
+    return {
+        race = session.race,
+        issuer = is_issuer or nil,
+        issuedRace = is_issuer and race_name or nil,
+        laps = overrides.laps,
+        recoverEnabled = assists.recoverEnabled,
+        recoverHoldSeconds = assists.recoverHoldSeconds,
+        repairEnabled = assists.repairEnabled,
+        repairHoldSeconds = assists.repairHoldSeconds,
+        startMode = session.start_mode,
+        jumpPenaltySeconds = session.start_mode and session.jump_penalty_seconds or nil,
+        quali = session.quali and {duration = session.quali.duration} or nil,
+        -- Owner-only, like raceStart's aiConfig: the owner alone drives the AI (ADR-0036).
+        aiConfig = (player_id == session.owner_id and ai) and {preset = ai.preset, params = ai.params} or nil,
+        aiPreset = ai and ai.preset or nil,
+        points = champ.is_active() and session.championship.points_preset or nil,
+        changed = changed,
+    }
+end
+
+-- Send raceUpdate to every connected racer, and to the issuer when he is not one of them. `everyone` false
+-- reaches the issuer alone: nothing changed, and the message only answers his panel.
+function tour.send_update(issuer_id, race_name, overrides, changed, everyone)
+    local players = MP.GetPlayers() or {}
+    local reached_issuer = false
+    if everyone then
+        for id in pairs(session.progress or {}) do
+            if not is_ai_id(id) and players[id] then
+                send_event(id, tour.MSG_UPDATE,
+                    tour.update_payload(id, issuer_id, race_name, overrides, changed))
+                reached_issuer = reached_issuer or id == issuer_id
+            end
+        end
+    end
+    if not reached_issuer then
+        send_event(issuer_id, tour.MSG_UPDATE,
+            tour.update_payload(issuer_id, issuer_id, race_name, overrides, changed))
+    end
+end
+
+-- Apply a request's in-place changes to the staged race. The server's own copies first -- the start
+-- style, the jump penalty and the qualifying length are read again at the countdown, at a jump and at the
+-- qualifying entry, the championship at the finish -- then the record the next request is compared with,
+-- then every racer. The race's owner and its preparer stay who they were: an in-place change moves no
+-- props and no AI to the one who asked for it.
+function tour.apply_in_place(issuer_id, race_name, overrides, in_place)
+    -- The championship through the same apply a rebuild uses: it brings what RUNS in line with the request,
+    -- so a championship a typed /championship stopped since the build is started again instead of a
+    -- setting being written onto nothing. Its grid order is the staged one (tour.format_changes).
+    if in_place.points or in_place.champ_quali then
+        tour.apply_format(overrides.format, issuer_id)
+    end
+    session.start_mode = overrides.startMode
+    session.jump_penalty_seconds = overrides.jumpPenaltySeconds or f1.DEFAULT_PENALTY
+    if session.quali then
+        session.quali.duration = tonumber(quali.length_for(overrides)) or PHASE_DURATIONS.quali_default
+    end
+    session.staged_request.overrides = overrides
+    session.staged_request.format = tour.active_format()
+    local changed, words = tour.changed_list(in_place)
+    tour.send_update(issuer_id, race_name, overrides, changed, true)
+    MP.SendChatMessage(issuer_id, "BeamComp: changed " .. table.concat(words, ", ")
+        .. ", the grid stays as it was built")
+    log_info("beamcomp.race", string.format("staged race '%s' changed in place by id %s: %s",
+        tostring(session.race), tostring(issuer_id), table.concat(changed, ", ")))
+end
+
+-- A validated request that arrived while a race stages. Returns true when it was settled without a new
+-- grid -- nothing changed, or every change applies in place -- and false when it needs one, in which case
+-- the caller goes on exactly as it did before this feature.
+function tour.settle_staged(race_name, issuer_id, overrides, map, race_id)
+    local changes = tour.staged_changes(race_name, overrides, map, race_id)
+    if changes.rebuild then
+        log_info("beamcomp.race", string.format("staged race '%s' is built again for id %s: %s changed",
+            tostring(session.race), tostring(issuer_id), changes.rebuild))
+        return false
+    end
+    if next(changes.in_place) == nil then
+        tour.send_update(issuer_id, race_name, overrides, {}, false)
+        MP.SendChatMessage(issuer_id,
+            "BeamComp: nothing changed. To put the cars back on the grid, cancel the race and build it "
+            .. "again.")
+        log_info("beamcomp.race", string.format("staged race '%s': the request of id %s changes nothing",
+            tostring(session.race), tostring(issuer_id)))
+        return true
+    end
+    tour.apply_in_place(issuer_id, race_name, overrides, changes.in_place)
+    return true
+end
+-- ===== end a race request while a race stages =======================================================
+
 -- Start (or, mid-race, queue) a race whose options the issuer's client has validated (ADR-0019). The
 -- phase is re-checked here, not at request time, since the race may have ended while the check was in
 -- flight: from lobby/finished start now; from an active phase queue + run the brief abort window.
 local function commit_validated_race(race_name, owner_id, overrides, map, race_id, race_data)
+    -- During staging the request is compared with the staged race first: a change the field does not
+    -- feel is applied to it in place, and an unchanged request changes nothing. Only one that would grid
+    -- differently goes on to the abort window and the rebuild below. Ahead of the track probe: a race that
+    -- stays staged has distributed its track already.
+    if session.phase == PHASE.staging
+            and tour.settle_staged(race_name, owner_id, overrides, map, race_id) then
+        return
+    end
     -- Prefetch the track for anyone who lacks it (ADR-0046). Fired here, at the earliest moment the race
     -- is known to be going ahead: a client can pull the scenery during the spawning phase instead of
     -- receiving it inside its raceStart -- and when this race is QUEUED behind a running one (below), an
