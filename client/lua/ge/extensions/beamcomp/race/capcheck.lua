@@ -20,6 +20,10 @@
 -- Two loop guards, both needed because "no answer = over" would otherwise cycle on a broken read: our own
 -- car replace rides init.lua's one-cycle revert skip (revert_pending), and after our own setup revert the
 -- next reload that is neither the snapshot nor the rejected setup is adopted without a check ("own").
+--
+-- race/pwrlive.lua (the pwr start order's live measurement) runs each of its measurements on this module's
+-- clock (new / begin / step / on_answer / take) and shares the VE request and answer. init.lua's
+-- on_live_spec tells the two apart by token: pwrlive's are negative, so the tokens here must never be.
 
 local M = {}
 

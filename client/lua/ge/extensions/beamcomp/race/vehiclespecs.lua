@@ -504,9 +504,10 @@ end
 -- the car's partConfig against its model's configs and returns that config's info entry. That describes the
 -- PRESET the car was spawned from, not the car: after a parts or tuning change partConfig is the serialized
 -- config, which still names the old .pc, so the new engine is never seen (bug
--- caps-race-part-swap-skips-power-check). The vehicle limit therefore measures the car live instead (the VE
--- extension's read_live_spec); this read only feeds the pwr start order and the limit's log line. Number or
--- nil. pcall-guarded.
+-- caps-race-part-swap-skips-power-check). The vehicle limit and the pwr start order therefore measure the
+-- car live instead (the VE extension's read_live_spec); this read only feeds the pwr order's stand-in
+-- report, which stands when the live measurement does not answer (race/pwrlive.lua), and the limit's log
+-- line. Number or nil. pcall-guarded.
 function M.metadata_power(veh)
     if not veh then
         return nil

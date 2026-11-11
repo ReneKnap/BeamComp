@@ -90,6 +90,11 @@ M.gridcam = require("beamcomp/race/gridcam")
 -- top-level local, and both are readable from the console (beamcomp_init.caps / beamcomp_init.capcheck).
 M.capcheck = require("beamcomp/race/capcheck")
 M.caps = {}
+-- The live power-to-weight the pwr start order sorts by (ADR-0033 amendment 2026-11-11): race/pwrlive.lua is
+-- the pure bookkeeping, M.pwr below (after the vehicle limit block) the engine-facing half -- the clientInfo
+-- car report, the measurement requests, the outcomes. Table fields for the same reason as the two above.
+M.pwrlive = require("beamcomp/race/pwrlive")
+M.pwr = {}
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -246,7 +251,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-pausetab-r1/2026-11-10"
+local BUILD_MARKER = "0.10.0-pwrlive-r1/2026-11-11"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -338,6 +343,7 @@ M.state = {
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the live vehicle limit check (ADR-0032) and, from the countdown on, the parts lock (lock.race_has_caps, ADR-0064 amendment); nil in Modes 1/2 (no cap)
     race_forced_car = false,  -- whether the active race forces this player's car (payload.car: car=<model[:config]>, random, host, or a class-drop class with a car). Read by race/lock.lua through lock.car_is_forced on every install: true locks the parts and the staging swap, tuning and paint stay free (ADR-0064). Set at raceStart; the literal's false is also the teardown value (ADR-0052)
     caps_check = nil,         -- the vehicle limit check of the own race car (race/capcheck.lua M.new: the last setup within the limit to revert to, the one live measurement in flight, our revert awaiting its reload), Mode 3 only, or nil (ADR-0032 amendment 2026-11-04). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052): the reload tears the race down with it, and a late VE answer finds nothing to land in
+    pwr_check = nil,          -- the live power-to-weight measurements of the cars this client reports for the pwr start order (race/pwrlive.lua M.new: per vehicle id the stand-in clientInfo with the metadata pwr, the setup it describes, the measurement in flight), every race and every mode, or nil (ADR-0033 amendment 2026-11-11). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052) like caps_check: the reload ends the race, the stand-in reports already sent stand, and a late answer finds nothing to land in
     revert_pending = false,   -- one-shot: set when an over-cap revert is issued, so the NEXT consumed replace (our own revert) is marked as the trusted revert cycle; any other replace is a new player swap (ADR-0032)
     staging_swap_reverting = false,  -- true only for the restage cycle that our revert started, so its known-compliant car is adopted without re-gating; recomputed from revert_pending at each consume (prevents a revert loop, ADR-0032)
     ai_cars = nil,            -- host only: spawned AI cars {id, slot, label, veh_id} to freeze/drive/score/clear (ADR-0036), or nil
@@ -761,6 +767,7 @@ local function handle_race_start(payload)
         M.state.race_caps = nil
         M.state.race_forced_car = false
         M.state.caps_check = nil
+        M.state.pwr_check = nil
         M.state.revert_pending = false
         M.state.staging_swap_reverting = false
         M.state.detection = nil
@@ -1010,6 +1017,9 @@ local function handle_race_start(payload)
     M.state.race_caps = (not policy.car and (policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg))
         and {maxhp = policy.maxhp, maxpwr = policy.maxpwr, maxkg = policy.maxkg, minkg = policy.minkg} or nil
     M.state.caps_check = M.state.race_caps and M.caps.new_state() or nil
+    -- The live pwr measurements start empty with every race, in every mode: the start order is
+    -- server-internal (ADR-0033 §1), so this client cannot tell an order=pwr race from any other (M.pwr).
+    M.state.pwr_check = M.pwr.new_state()
     -- Whether this race forces the car, for the race lock's parts guard (ADR-0064). All four forced modes
     -- (a model, random, host, a class-drop class with a car) arrive in this one field, so the lock never
     -- needs to know which. Decided on the policy, not on the car that ends up on the slot: a car=host whose
@@ -1117,23 +1127,18 @@ local function handle_race_start(payload)
     -- == session.race), not the resolved race.meta.name, so the server's stale-ack guard matches.
     send_to_server("spawnReady", {race = payload.race})
 
-    -- Report the vehicle metadata so the server can record what car was driven (ADR-0027). A dedicated
-    -- message, not piggybacked on the ack above, so the spawnReady contract stays narrow. Echo
-    -- payload.race like the ack so the server's race-guard matches. Sent unconditionally;
-    -- collect_client_info degrades every field to nil on a spawn hiccup. The player identity rides a
-    -- separate clientIdentity message (at connect), since it is connection-scoped, not per-race (ADR-0054).
-    local client_info = vehicles.collect_client_info(race_car)
-    send_to_server("clientInfo", {
-        race = payload.race,
-        vehicle = client_info.vehicle,
-        -- Power-to-weight for the start-order pwr mode (ADR-0033); nil when unreadable. The server stores
-        -- it per player and only sorts by it -- it never reads the vehicle (race-blind, ADR-0005).
-        pwr = client_info.pwr,
-        -- Grid footprint in metres for the size-aware slot reservation (ADR-0051); same form as pwr --
-        -- numbers the server does arithmetic on, never a vehicle it reads.
-        carLength = client_info.car_length,
-        carWidth = client_info.car_width,
-    })
+    -- Report the car (M.pwr.car_report: what was driven, its pwr, its footprint). A dedicated message, not
+    -- piggybacked on the ack above, so the spawnReady contract stays narrow. Echo payload.race like the ack
+    -- so the server's race-guard matches. Sent unconditionally; every field degrades to nil on a spawn
+    -- hiccup. The player identity rides a separate clientIdentity message (at connect), since it is
+    -- connection-scoped, not per-race (ADR-0054).
+    local own_report = M.pwr.car_report(race_car, payload.race)
+    send_to_server("clientInfo", own_report)
+    -- Its pwr is the preset's metadata: the stand-in until the live measurement of the kept car replaces it.
+    -- A freshly spawned car is measured when its restage adopts it, once its jbeam has loaded.
+    if race_car and not M.state.restage_pending then
+        M.pwr.measure(race_car, own_report, "start")
+    end
 
     -- Host only: spawn the AI opponents the server assigned this client (ADR-0036). Only the owner's
     -- raceStart carries aiSlots, so non-owners skip this entirely -- they just receive the synced cars and
@@ -1180,14 +1185,10 @@ local function handle_race_start(payload)
                     -- nil pwr just leaves the AI in its provisional back-of-grid slot. The footprint
                     -- rides along (ADR-0051) so an AI bus reserves the slot behind it too -- this is the
                     -- only report that sees a RANDOMLY rolled AI car, which no pre-spawn read can know.
-                    local ai_info = vehicles.collect_client_info(veh)
-                    send_to_server("clientInfo", {
-                        race = payload.race,
-                        aiId = car.id,
-                        pwr = ai_info.pwr,
-                        carLength = ai_info.car_length,
-                        carWidth = ai_info.car_width,
-                    })
+                    -- Measured live like the own car, so the whole field sorts by one source.
+                    local ai_report = M.pwr.car_report(veh, payload.race, car.id)
+                    send_to_server("clientInfo", ai_report)
+                    M.pwr.measure(veh, ai_report, "spawn")
                 end
             end
             M.state.ai_cars = cars
@@ -1366,6 +1367,7 @@ local function teardown_race_world()
     M.state.race_caps = nil
     M.state.race_forced_car = false
     M.state.caps_check = nil
+    M.state.pwr_check = nil
     M.state.revert_pending = false
     M.state.staging_swap_reverting = false
     -- Release the start freeze so the preserved car is drivable (no-op if already free / car gone).
@@ -1769,6 +1771,8 @@ local function handle_race_phase(payload)
 
     M.state.phase = phase
     log("I", RACE_LOG_TAG, "race phase -> " .. phase)
+    -- Past staging this race's pwr grid is set; a live pwr landing after that no longer counts (M.pwr).
+    M.pwr.note_phase(phase)
 
     -- Feed the admin setup panel the current phase so it can show/hide the race-stop controls (ADR-0038
     -- amendment). Pushed on every transition; the panel also pulls via request_race_phase on link/open.
@@ -2033,10 +2037,12 @@ local function handle_race_phase(payload)
         -- amendments, B3). Release the in-race lock and hand the recover/repair keys back to vanilla
         -- now, so players can drive, switch vehicles, recover, and roam the track while results show.
         -- Everything else (race state, props, standings, HUD) lives on until the lobby teardown -- except
-        -- the vehicle limit check: free roam is free, so nothing is measured or reverted from here on.
+        -- the vehicle limit check: free roam is free, so nothing is measured or reverted from here on. The
+        -- pwr measurements go too; the grid they were for is long set.
         lock.remove()
         disarm_assist_ve()
         M.state.caps_check = nil
+        M.state.pwr_check = nil
     elseif phase == "lobby" then
         -- Race over (back to lobby): despawn the track props/cones and drop all race state, but leave
         -- the player's vehicle exactly where it is -- never despawn or move it (only unfrozen, so a
@@ -2197,21 +2203,16 @@ function quali.respawn_ai_for_regrid(ai_slots)
     ai.set_frozen(cars, true)
     -- The AI cars are RE-SPAWNED here, not teleported, so a chat-path field without a fixed roster car
     -- re-rolls its random cars. Re-report each one's footprint and pwr (ADR-0051 / ADR-0033) so the
-    -- reservation and the power order describe the cars that are actually on the race grid.
+    -- reservation and the power order describe the cars that are actually on the race grid. The pwr is not
+    -- measured live here: this runs after the staging -> countdown seam, where any start order is already
+    -- set (and order=quali never reads pwr), so every answer would come too late (M.pwr).
     local race_name = M.state.race.serverName
     for _, car in ipairs(cars) do
         local veh = be and be:getObjectByID(car.veh_id)
         if veh then
             ai.suppress(veh)
             if race_name then
-                local ai_info = vehicles.collect_client_info(veh)
-                send_to_server("clientInfo", {
-                    race = race_name,
-                    aiId = car.id,
-                    pwr = ai_info.pwr,
-                    carLength = ai_info.car_length,
-                    carWidth = ai_info.car_width,
-                })
+                send_to_server("clientInfo", M.pwr.car_report(veh, race_name, car.id))
             end
         end
     end
@@ -6761,8 +6762,10 @@ function M.onVehicleSpawned(vehicleId)
     -- car -- see onVehicleResetted, the primary hook.
     rearm_own_car_on_reload(vehicleId)
     -- The same respawn may carry a parts or tuning change: under a vehicle limit the race car is looked at
-    -- next frame (M.caps.process_reload), when the new VE exists to be measured.
+    -- next frame (M.caps.process_reload), when the new VE exists to be measured, and so is its pwr while the
+    -- grid can still change (M.pwr.process_reload), in every race.
     M.caps.note_reload(vehicleId)
+    M.pwr.note_reload(vehicleId)
     -- Host: a vehicle appearing while we own this race's props may BE a prop -- either one the prefab load
     -- just created, or BeamMP re-spawning one under a new id ~5 s later (memory
     -- beammp-respawns-prefab-vehicles-under-new-ids). Re-arm the derivation; onUpdate re-runs the diff and
@@ -6786,6 +6789,7 @@ end
 function M.onVehicleResetted(vehicleId)
     rearm_own_car_on_reload(vehicleId)
     M.caps.note_reload(vehicleId)
+    M.pwr.note_reload(vehicleId)
 end
 
 -- BeamNG fires this GE hook (lua/vehicle/ai.lua queues onAiRouteDone(<id>) when a car stops at the end of
@@ -8770,22 +8774,192 @@ function M.caps.gate(own)
     return M.caps.judge(own, pending)
 end
 
--- The VE's answer to a measurement request (lua/vehicle/extensions/beamcomp/init.lua measure_spec). Public
--- as beamcomp_init.on_live_spec, the name the VE calls through queueGameEngineLua. An answer nobody waits
--- for any more (replaced, given up, another race) is dropped with a line. `parts` is the weight's breakdown
--- (capcheck.reading_from_answer).
-function M.on_live_spec(vehicle_id, token, power, weight, engines, reason, parts)
+-- A VE answer for the vehicle limit check (routed here by M.on_live_spec). An answer nobody waits for any
+-- more (replaced, given up, another race) is dropped with a line.
+function M.caps.on_answer(vehicle_id, token, reading)
     local state = M.state.caps_check
-    if not state then
-        return
-    end
-    local reading = M.capcheck.reading_from_answer(power, weight, engines, reason, parts)
-    if not M.capcheck.on_answer(state, vehicle_id, token, reading) then
+    if state and not M.capcheck.on_answer(state, vehicle_id, token, reading) then
         log("I", RACE_LOG_TAG, "vehicle limit: dropped a live spec answer nobody waits for (token "
             .. tostring(token) .. ")")
     end
 end
 -- ===== end vehicle limit check ==========================================================
+
+-- ===== the live power-to-weight of the reported cars (ADR-0033 amendment 2026-11-11) =====
+-- The engine-facing half of race/pwrlive.lua. order=pwr sorts the grid at the staging -> countdown seam by
+-- the last pwr each car reported, and the preset's metadata does not know a rebuilt or tuned car. So every
+-- car this client reports is measured with the vehicle limit's live reading: the own race car at race start
+-- (a kept car), at its restage (a staging swap or a fresh car) and after every parts or tuning respawn while
+-- the grid can still change, and on the race owner each AI car after its spawn. Each measurement follows the
+-- clientInfo with the metadata pwr (the stand-in); a live value replaces it, no live value leaves it standing
+-- with a W line. Every race measures, because the start order is server-internal (ADR-0033 §1): one VE read
+-- and one extra clientInfo per car.
+
+-- A fresh set of measurements for one race. The token seed comes from the clock (pwrlive.new turns it
+-- negative), so an answer to the previous race's last request can never match one this race waits for.
+function M.pwr.new_state()
+    return M.pwrlive.new(math.floor(os.clock() * 1000))
+end
+
+-- The clientInfo describing `veh` in race `race`: the car driven (ADR-0027), its power-to-weight for the pwr
+-- start order (ADR-0033) and its grid footprint in metres for the slot reservation (ADR-0051). Numbers and an
+-- opaque descriptor the server only stores, sorts and adds up, never a vehicle it reads (race-blind,
+-- ADR-0005). With `ai_id` it is an AI car's proxy report (ADR-0036 Etappe B), keyed by aiId and carrying no
+-- vehicle. `veh` may be nil: every field then degrades to nil. The pwr in it is the preset's metadata
+-- (vehicles.collect_client_info), the stand-in M.pwr.measure then replaces.
+function M.pwr.car_report(veh, race, ai_id)
+    local info = vehicles.collect_client_info(veh)
+    return {
+        race = race,
+        aiId = ai_id,
+        vehicle = ai_id == nil and info.vehicle or nil,
+        pwr = info.pwr,
+        carLength = info.car_length,
+        carWidth = info.car_width,
+    }
+end
+
+-- Measure `veh` live for `report`, the clientInfo just sent with its stand-in pwr; `purpose` names the
+-- trigger in the log. Nothing is asked once the grid is set: an answer from then on counts as none
+-- (ADR-0033 amendment 2026-11-11). The own car's setup fingerprint (`fingerprint`, read here when not given)
+-- is what tells its next parts or tuning respawn from a reset; an AI car is never respawned on its config and
+-- keeps none.
+function M.pwr.measure(veh, report, purpose, fingerprint)
+    local state = M.state.pwr_check
+    if not state or not veh then
+        return
+    end
+    local label = vehicles.setup_label(veh)
+    if not M.pwrlive.grid_open(state) then
+        log("I", RACE_LOG_TAG, M.pwrlive.describe_unmeasured(label, purpose, report, M.state.phase))
+        return
+    end
+    if fingerprint == nil and report.aiId == nil then
+        local _, setup = vehicles.capture_setup(veh)
+        fingerprint = M.capcheck.fingerprint(setup)
+    end
+    M.pwrlive.begin(state, veh:getId(), purpose, report, fingerprint, label)
+end
+
+-- The race entered `phase` (handle_race_phase). From the first phase past staging on, the grid is set for
+-- this race: nothing more is measured, and an answer still out counts as none.
+function M.pwr.note_phase(phase)
+    if M.state.pwr_check then
+        M.pwrlive.note_phase(M.state.pwr_check, phase)
+    end
+end
+
+-- Forget the measurement of vehicle `veh_id`: a replace put another car on that id, and the restage that
+-- adopts it measures that one.
+function M.pwr.cancel(veh_id)
+    if M.state.pwr_check and veh_id ~= nil then
+        M.pwrlive.cancel(M.state.pwr_check, veh_id)
+    end
+end
+
+-- The race car was respawned or reset (onVehicleSpawned / onVehicleResetted). Looked at next frame, when the
+-- respawned car's VE exists to be measured; the hooks fire before it does.
+function M.pwr.note_reload(vehicle_id)
+    local state = M.state.pwr_check
+    if state and M.state.race and M.state.race_car_id ~= nil
+            and tostring(vehicle_id) == tostring(M.state.race_car_id) then
+        state.reload_due = true
+    end
+end
+
+-- Look at the race car after a respawn or reset while the grid can still change. A parts or tuning change
+-- (a setup other than the one last reported) is reported again with its metadata stand-in, so no answer
+-- means the preset's numbers rather than the previous setup's live ones, and measured. A reset, a repair or
+-- a paint change costs nothing, and while a restage owns the car its adoption measures it.
+function M.pwr.process_reload()
+    local state = M.state.pwr_check
+    state.reload_due = false
+    local race_name = M.state.race and M.state.race.serverName
+    if not race_name or not M.pwrlive.grid_open(state) or M.caps.restaging() then
+        return
+    end
+    local veh = M.caps.race_car()
+    if not veh then
+        return
+    end
+    local _, setup = vehicles.capture_setup(veh)
+    local fingerprint = M.capcheck.fingerprint(setup)
+    if not M.pwrlive.setup_changed(state, veh:getId(), fingerprint) then
+        return
+    end
+    local report = M.pwr.car_report(veh, race_name)
+    send_to_server("clientInfo", report)
+    M.pwr.measure(veh, report, "config", fingerprint)
+end
+
+-- Send the requests that are due (first ones and resends).
+function M.pwr.pump(dt)
+    for _, due in ipairs(M.pwrlive.step(M.state.pwr_check, dt)) do
+        local veh = be and be:getObjectByID(due.veh_id)
+        local sent, err = vehicles.request_live_spec(veh, due.token)
+        if not sent then
+            log("W", RACE_LOG_TAG, "pwr: could not ask vehicle " .. tostring(due.veh_id)
+                .. " for its live power and weight: " .. tostring(err))
+        end
+    end
+end
+
+-- Carry out one finished measurement: the live report while the grid can still change; otherwise the stand-in
+-- stays, and a W line names the car and why.
+function M.pwr.settle(car, reading)
+    local pwr, why = M.pwrlive.pwr_of(reading)
+    if not pwr then
+        log("W", RACE_LOG_TAG, M.pwrlive.describe_fallback(car, why))
+        return
+    end
+    if not M.pwrlive.grid_open(M.state.pwr_check) then
+        log("W", RACE_LOG_TAG, M.pwrlive.describe_late(car, pwr, M.state.phase))
+        return
+    end
+    send_to_server("clientInfo", M.pwrlive.live_report(car.report, pwr))
+    log("I", RACE_LOG_TAG, M.pwrlive.describe_live(car, reading, pwr))
+end
+
+-- The per-frame step (onUpdate, any phase while a race runs). Sim time: a paused game measures nothing.
+function M.pwr.step(dt_sim)
+    local state = M.state.pwr_check
+    if not state or not M.state.race then
+        return
+    end
+    if state.reload_due then
+        M.pwr.process_reload()
+    end
+    M.pwr.pump(dt_sim)
+    for _, finished in ipairs(M.pwrlive.take_finished(state)) do
+        M.pwr.settle(finished.car, finished.reading)
+    end
+end
+
+-- A VE answer for a pwr measurement (routed here by M.on_live_spec); one nobody waits for is dropped with
+-- a line.
+function M.pwr.on_answer(vehicle_id, token, reading)
+    local state = M.state.pwr_check
+    if state and not M.pwrlive.on_answer(state, vehicle_id, token, reading) then
+        log("I", RACE_LOG_TAG, "pwr: dropped a live spec answer nobody waits for (token " .. tostring(token)
+            .. ")")
+    end
+end
+-- ===== end live power-to-weight =========================================================
+
+-- The VE's answer to a measurement request (lua/vehicle/extensions/beamcomp/init.lua measure_spec). Public
+-- as beamcomp_init.on_live_spec, the name the VE calls through queueGameEngineLua. One request and one answer
+-- serve two consumers, told apart by token so neither can take the other's answer: a negative token is a pwr
+-- measurement's (pwrlive.owns_token), any other the vehicle limit check's. `parts` is the weight's breakdown;
+-- the answer is parsed once, the same way for both (capcheck.reading_from_answer: an older vehicle extension
+-- without it is no weight for either).
+function M.on_live_spec(vehicle_id, token, power, weight, engines, reason, parts)
+    local reading = M.capcheck.reading_from_answer(power, weight, engines, reason, parts)
+    if M.pwrlive.owns_token(token) then
+        M.pwr.on_answer(vehicle_id, token, reading)
+    else
+        M.caps.on_answer(vehicle_id, token, reading)
+    end
+end
 
 -- Re-stage the staging car to its grid slot, front-anchored, once its jbeam has loaded. Two arming
 -- paths share this one deferred placement:
@@ -8847,6 +9021,8 @@ local function restage_swapped_car(dt_real)
         if M.state.caps_check then
             M.capcheck.cancel(M.state.caps_check)
         end
+        -- The same holds for a pwr measurement of it; the adoption below reports and measures the new car.
+        M.pwr.cancel(M.state.race_car_id)
         log("I", RACE_LOG_TAG, "staging vehicle replace detected; re-staging")
     end
 
@@ -8986,17 +9162,13 @@ local function restage_swapped_car(dt_real)
     -- reservation behind it has to be able to appear AND disappear again -- and this is the one point
     -- where the swapped car's jbeam is loaded, which is what makes the read reliable. It also brings the
     -- reported pwr (ADR-0033) and the recorded car (ADR-0027) in line with the car actually staged;
-    -- until now both still described the car this client first spawned with.
+    -- until now both still described the car this client first spawned with. The pwr in it is the stand-in
+    -- the live measurement started here replaces (M.pwr), for a swap and a fresh race-start car alike.
     local race_name = M.state.race and M.state.race.serverName
     if race_name then
-        local swapped_info = vehicles.collect_client_info(own)
-        send_to_server("clientInfo", {
-            race = race_name,
-            vehicle = swapped_info.vehicle,
-            pwr = swapped_info.pwr,
-            carLength = swapped_info.car_length,
-            carWidth = swapped_info.car_width,
-        })
+        local staged_report = M.pwr.car_report(own, race_name)
+        send_to_server("clientInfo", staged_report)
+        M.pwr.measure(own, staged_report, "restage")
     end
     M.state.restage_pending = false
     log("I", RACE_LOG_TAG, "staging car adopted at its grid slot as race car " .. tostring(own_id))
@@ -9186,6 +9358,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- frame. One nil check in every other race and outside one.
     if M.state.caps_check then
         M.caps.step(dtSim)
+    end
+    -- Every race: send and time the live pwr measurements of the cars this client reports, look at the race
+    -- car after a respawn, and report what came back (ADR-0033 amendment 2026-11-11). Before the restage
+    -- below, so a replace that is about to be consumed already counts as a restage owning the car
+    -- (M.caps.restaging reads lock.replace_seen). One nil check outside a race.
+    if M.state.pwr_check then
+        M.pwr.step(dtSim)
     end
     -- Phase-independent: keep the server's picture of this client's car footprint current, so the next
     -- race can reserve grid space for it from the very first slot assignment (ADR-0051 round 2). The
