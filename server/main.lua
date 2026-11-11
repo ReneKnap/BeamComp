@@ -5323,7 +5323,14 @@ local function regrid_by_pwr()
             send_event(entry.id, MSG_REGRID, payload)
         end
     end
-    log_info("beamcomp.race", string.format("pwr re-grid: %d ranked, %d unranked", #ranked, #unranked))
+    -- Every ranked id with the pwr it was sorted by, in grid order, so a live test reads from this line alone
+    -- whether the field sorted by the live numbers (ADR-0033 amendment 2026-11-11).
+    local ranked_pwr = {}
+    for _, entry in ipairs(ranked) do
+        ranked_pwr[#ranked_pwr + 1] = string.format("%s=%.4f", tostring(entry.id), entry.pwr)
+    end
+    log_info("beamcomp.race", string.format("pwr re-grid (%s on pole): %d ranked, %d unranked; %s",
+        rev and "weakest" or "strongest", #ranked, #unranked, table.concat(ranked_pwr, " ")))
 end
 
 
@@ -7621,17 +7628,21 @@ local function handle_client_info(player_id, payload)
     }
     -- The footprint rides this line too, so the ADR-0051 reservation can be diagnosed from the server
     -- console alone: an early (pre-spawn) report shows a size with no vehicle, and a car that reserves
-    -- nothing shows "size=unknown".
+    -- nothing shows "size=unknown". So do the pwr and the phase the report arrived in: a car's metadata
+    -- stand-in and its live replacement follow each other here, and a replacement that lands in the
+    -- countdown came after regrid_by_pwr had sorted (ADR-0033 amendment 2026-11-11).
     local reported = session.identities[target_id]
     log_info("beamcomp.records", string.format(
-        "clientInfo id=%s vehicle=%s/%s modified=%s size=%s",
+        "clientInfo id=%s vehicle=%s/%s modified=%s size=%s pwr=%s phase=%s",
         tostring(target_id),
         tostring(vehicle and vehicle.model),
         tostring(vehicle and vehicle.type),
         tostring(vehicle and vehicle.modified),
         (reported.car_length and reported.car_width)
             and string.format("%.2fx%.2f m", reported.car_length, reported.car_width)
-            or "unknown"))
+            or "unknown",
+        reported.pwr and string.format("%.4f", reported.pwr) or "none",
+        tostring(session.phase)))
 
     -- One-shot per-driver car channel (ADR-0029 amendment, bug partconfig-blob-bloats-standings): the car
     -- descriptor is STATIC per driver per race, so ship it ONCE here (when first known / on change) instead
