@@ -398,23 +398,24 @@
       </label>
       <div class="bc-row">
         <span bc-setup-tip="tip('orderMode')">Start order</span>
-        <!-- While a championship (ADR-0040) or class-drop tournament (ADR-0042) is active it sets the grid,
-             so the per-race picker is disabled and the race request omits order= (see prepareRace) -- the
-             server then applies the active format's order. -->
-        <div class="bc-dd" ng-if="!championship.active && !tournament.active" bc-setup-tip="tip('orderMode')">
+        <!-- While the Tournament section is set to a championship (ADR-0040) or a class-drop (ADR-0042),
+             that format sets the grid, so the per-race picker is replaced and the race request omits order=
+             (see raceRequest). The FORM's mode decides, not the running one: the request is what the next
+             Confirm runs (ADR-0037 amendment 2026-11-11). -->
+        <div class="bc-dd" ng-if="form.tourMode === 'off'" bc-setup-tip="tip('orderMode')">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('orderMode')">{{labelFor('orderMode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'orderMode'">
             <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.orderMode" ng-class="{sel: o.v === form.orderMode}"
               ng-click="pick('orderMode', o.v)">{{o.label}}</div>
           </div>
         </div>
-        <span class="bc-champ-status bc-order-locked" ng-if="championship.active" bc-setup-tip="tip('orderLockedChampionship')">by championship ({{championship.order}})</span>
-        <span class="bc-champ-status bc-order-locked" ng-if="!championship.active && tournament.active" bc-setup-tip="tip('orderLockedTournament')">by tournament (class handicap)</span>
+        <span class="bc-champ-status bc-order-locked" ng-if="form.tourMode === 'championship'" bc-setup-tip="tip('orderLockedChampionship')">by championship ({{form.champOrder}})</span>
+        <span class="bc-champ-status bc-order-locked" ng-if="form.tourMode === 'classdrop'" bc-setup-tip="tip('orderLockedTournament')">by tournament (class handicap)</span>
       </div>
       <!-- Qualifying's own start order (ADR-0044 amendment): only for order=quali. The base order used
            INSIDE the quali -- random (default) or the previous race's finishing order. In a staged sprint
            quali the spawn slot then predicts the launch sequence (P2 launches first, P3 next, ...). -->
-      <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">
+      <div class="bc-row" ng-if="form.tourMode === 'off' && form.orderMode === 'quali'">
         <span bc-setup-tip="tip('qualiStart')">Qualifying start</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit bc-setup-tip="tip('qualiStart')" ng-click="toggle('qualiStart')">{{labelFor('qualiStart')}}</button>
@@ -426,7 +427,7 @@
       </div>
       <!-- Qualifying length (ADR-0041): only for order=quali; a short session sets the grid by best lap.
            A free minute value plus preset quick-buttons. -->
-      <div class="bc-row" ng-if="!championship.active && !tournament.active && form.orderMode === 'quali'">
+      <div class="bc-row" ng-if="form.tourMode === 'off' && form.orderMode === 'quali'">
         <span bc-setup-tip="tip('qualiMinutes')">Qualifying length</span>
         <span class="bc-quali-len">
           <input type="number" min="1" max="30" ng-model="form.qualiMinutes" bc-setup-tip="tip('qualiMinutes')"> min
@@ -435,7 +436,7 @@
         </span>
       </div>
       <label class="bc-row bc-check"
-             ng-if="!championship.active && !tournament.active && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
+             ng-if="form.tourMode === 'off' && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
         <input type="checkbox" ng-model="form.orderRev"><span bc-setup-tip="tip('orderRev')">Reverse order (handicap)</span>
       </label>
       <div class="bc-row">
@@ -730,8 +731,10 @@
     </div>
 
     <!-- Tournament (ADR-0042): one of two mutually-exclusive multi-race formats -- the points championship
-         (ADR-0040) or the class-drop handicap. The mode selector reflects the active format; mutations are
-         admin-gated server-side. Sits directly above the Presets section (the panel's last section). -->
+         (ADR-0040) or the class-drop handicap. Every setting here, the Mode selector included, waits in the
+         form and applies with Confirm & Build Grid (ADR-0037 amendment 2026-11-11); the Status rows show
+         what the server runs. The form follows a server change only where nothing of the admin's is
+         pending (syncFormatFromServer). Sits directly above the Presets section (the panel's last section). -->
     <div class="bc-section">
       <div class="bc-section-title">Tournament</div>
       <div class="bc-row" bc-setup-tip="tip('tourMode')">
@@ -740,7 +743,7 @@
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourMode')">{{labelFor('tourMode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'tourMode'">
             <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.tourMode" ng-class="{sel: o.v === form.tourMode}"
-              ng-click="pickTourMode(o.v)">{{o.label}}</div>
+              ng-click="pick('tourMode', o.v)">{{o.label}}</div>
           </div>
         </div>
       </div>
@@ -758,7 +761,7 @@
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('champPreset')">{{labelFor('champPreset')}}</button>
             <div class="bc-dd-list" ng-if="open === 'champPreset'">
               <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.champPreset" ng-class="{sel: o.v === form.champPreset}"
-                ng-click="pickChamp('champPreset', o.v)">{{o.label}}</div>
+                ng-click="pick('champPreset', o.v)">{{o.label}}</div>
             </div>
           </div>
         </div>
@@ -768,7 +771,7 @@
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('champOrder')">{{labelFor('champOrder')}}</button>
             <div class="bc-dd-list" ng-if="open === 'champOrder'">
               <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.champOrder" ng-class="{sel: o.v === form.champOrder}"
-                ng-click="pickChamp('champOrder', o.v)">{{o.label}}</div>
+                ng-click="pick('champOrder', o.v)">{{o.label}}</div>
             </div>
           </div>
         </div>
@@ -776,14 +779,14 @@
         <div class="bc-row" ng-if="form.champOrder === 'quali'">
           <span bc-setup-tip="tip('champQualiMinutes')">Qualifying length</span>
           <span class="bc-quali-len">
-            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes" bc-setup-tip="tip('champQualiMinutes')"
-              ng-blur="championshipLive()" ng-keydown="$event.keyCode === 13 && championshipLive()"> min
+            <input type="number" min="1" max="30" ng-model="form.champQualiMinutes" bc-setup-tip="tip('champQualiMinutes')"> min
             <button type="button" class="bc-preset" ng-repeat="m in opts.qualiPresets"
-              ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m; championshipLive()">{{m}}</button>
+              ng-class="{sel: form.champQualiMinutes === m}" ng-click="form.champQualiMinutes = m">{{m}}</button>
           </span>
         </div>
-        <!-- No Start/Apply: the Mode selector activates the championship and every option live-applies. The one
-             button restarts the standings while it stays active; Mode=off fully stops it. -->
+        <!-- No Start/Apply of its own: the settings above ride Confirm & Build Grid. The one immediate button
+             restarts the standings of the championship that runs, with its own settings; Mode off ends it
+             at the next Confirm. -->
         <div class="bc-row bc-champ-actions" ng-if="championship.active">
           <button class="bc-refresh bc-champ-reset" ng-click="championshipRestart()" bc-setup-tip="tip('champReset')">Reset points</button>
         </div>
@@ -831,13 +834,11 @@
           </div>
           <label class="bc-row" ng-if="cls.kind === 'cap'" bc-setup-tip="tip('classMaxhp')">
             <span>Max hp</span>
-            <input type="number" min="0" ng-model="cls.maxhp" placeholder="off"
-              ng-blur="tournamentLive()" ng-keydown="$event.keyCode === 13 && tournamentLive()">
+            <input type="number" min="0" ng-model="cls.maxhp" placeholder="off">
           </label>
           <label class="bc-row" ng-if="cls.kind === 'cap'" bc-setup-tip="tip('classMaxpwr')">
             <span>Max hp/kg</span>
-            <input type="number" min="0" step="0.001" ng-model="cls.maxpwr" placeholder="off"
-              ng-blur="tournamentLive()" ng-keydown="$event.keyCode === 13 && tournamentLive()">
+            <input type="number" min="0" step="0.001" ng-model="cls.maxpwr" placeholder="off">
           </label>
         </div>
         <div class="bc-row">
@@ -849,12 +850,13 @@
             <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('tourOrder')">{{labelFor('tourOrder')}}</button>
             <div class="bc-dd-list" ng-if="open === 'tourOrder'">
               <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.tourOrder" ng-class="{sel: o.v === form.tourOrder}"
-                ng-click="pickTour('tourOrder', o.v)">{{o.label}}</div>
+                ng-click="pick('tourOrder', o.v)">{{o.label}}</div>
             </div>
           </div>
         </div>
-        <!-- No Start/Apply: selecting the mode + a valid class list activates it, and every edit live-applies.
-             The one button restarts progression while it stays active; Mode=off fully stops it. -->
+        <!-- No Start/Apply of its own: the classes and the order ride Confirm & Build Grid, which refuses a
+             class-drop with fewer than two valid classes. The one immediate button restarts the progression
+             of the tournament that runs, with its own classes; Mode off ends it at the next Confirm. -->
         <div class="bc-row bc-champ-actions" ng-if="tournament.active">
           <button class="bc-refresh bc-champ-reset" ng-click="tournamentRestart()" bc-setup-tip="tip('tourReset')">Reset progress</button>
         </div>

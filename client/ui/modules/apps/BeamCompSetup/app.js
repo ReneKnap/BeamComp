@@ -200,13 +200,15 @@ angular.module('beamng.apps')
       + 'limit.',
     minkg: 'A car lighter than this is swapped for one that fits. Empty means no limit.',
     maxkg: 'A car heavier than this is swapped for one that fits. Empty means no limit.',
-    orderMode: 'Who starts where on the grid. A running championship or class-drop overwrites this.',
+    // The picker shows only while Tournament mode is off, and then the next Confirm runs no format that
+    // could replace it (ADR-0037 amendment 2026-11-11).
+    orderMode: 'Who starts where on the grid.',
     // These two sit on the text that REPLACES the picker, so "this picker does nothing" described a
     // control the player cannot see. They now say who decides instead, and how to take it back.
-    orderLockedChampionship: 'The running championship builds the grid from its points table. Set '
-      + 'Tournament mode to off to choose the order yourself again.',
-    orderLockedTournament: 'The running class-drop builds the grid from each driver\'s class. Set '
-      + 'Tournament mode to off to choose the order yourself again.',
+    orderLockedChampionship: 'The championship builds the grid from its points table. Set Tournament mode '
+      + 'to off to choose the order yourself.',
+    orderLockedTournament: 'The class-drop builds the grid from each driver\'s class. Set Tournament mode '
+      + 'to off to choose the order yourself.',
     qualiStart: 'The order drivers go out in for qualifying.',
     // The range is the server's quali.MIN_SECONDS/MAX_SECONDS pair (60 s / 1800 s), the same clamp the
     // field's own min/max mirror. A fixed pair of numbers, so it belongs in the string -- a function
@@ -337,15 +339,19 @@ angular.module('beamng.apps')
       + 'together.',
     aiAvoid: 'Let them steer around other cars instead of driving into them.',
     // --- Tournament ---
-    tourMode: 'Run several races as one contest. Only one format at a time and switching to off ends the '
-      + 'contest that is running.',
+    // Every setting of this section waits for Confirm (ADR-0037 amendment 2026-11-11). Said once, here,
+    // rather than on every control of the section.
+    tourMode: 'Run several races as one contest, one format at a time. Changes here apply with Confirm & '
+      + 'Build Grid, and off then ends the contest that is running.',
     champStatus: 'The championship running on the server right now.',
     champPreset: 'How finishing places turn into points.',
     champOrder: 'How the next grid is built from the points table.',
-    // Same clamp as qualiMinutes -- the panel command is rebuilt into a /championship quali=<n> and lands
-    // on quali.clamp too (server champ.handle_cmd -> champ.parse_args).
+    // Same clamp as qualiMinutes -- the request's format lands on quali.clamp too (server
+    // tour.sanitize_format), in whole minutes like /championship quali=<n>.
     champQualiMinutes: 'How long qualifying runs before each championship race, from 1 to 30 minutes.',
-    champReset: 'Set every score back to zero. The championship keeps running. To stop it, set Mode to off.',
+    // The two Reset buttons are the section's only immediate controls, and they restart what RUNS, with
+    // its own settings, never with the ones waiting for Confirm.
+    champReset: 'Set every score back to zero now. The championship keeps running with the settings it has.',
     tourStatus: 'The class-drop tournament running on the server right now.',
     classHead: 'One class of the class drop tournament, fastest at the top. Win a race and you drop a class; '
       + 'win in the slowest class and you win the tournament.',
@@ -358,8 +364,8 @@ angular.module('beamng.apps')
     classMaxpwr: 'Horsepower-per-kilo limit for this class.',
     addClass: 'Add another class below the current ones, up to six.',
     tourOrder: 'How the grid is built for each tournament race.',
-    tourReset: 'Put everyone back in the fastest class and start the class drop tournament again. The '
-      + 'tournament keeps running, to stop it, set Mode to off.',
+    tourReset: 'Put everyone back in the fastest class now and start the class drop tournament again, with '
+      + 'the classes it has.',
     // --- Players ---
     players: 'Everyone on the server right now. "guest name" marks a player on a BeamMP guest name, which '
       + 'changes every game start. They can set their own with "/name <name>" in chat.',
@@ -447,19 +453,24 @@ angular.module('beamng.apps')
       aiBindLimit: true,
       champPreset: 'f1', champOrder: 'reversed', champQualiMinutes: 5,
       tourMode: 'off', tourClasses: defaultTourClasses(), tourOrder: 'random',
+      // The server format (serverFormat's shape) the Tournament section was last in line with, or null for
+      // never, which reads as off. It is what tells a pending edit from a server change (see
+      // syncFormatFromServer). Rides the session blob; never a preset (PRESET_EXCLUDE_KEYS).
+      tourBase: null,
     };
   }
 
-  // A saved preset persists the ENTIRE form -- nothing is excluded anymore (ADR-0037 amendment 2026-07-18,
-  // R2). This covers the multi-race-format choice + its settings (tourMode, champPreset/champOrder/
+  // A saved preset persists the whole form but tourBase (ADR-0037 amendments 2026-07-18 R2 and 2026-11-11).
+  // This covers the multi-race-format choice + its settings (tourMode, champPreset/champOrder/
   // champQualiMinutes, tourClasses/tourOrder) AND the full AI setup including the named roster
   // (aiRoster = [{name, car, carLabel, color, ...}]; the ai* scalars were already saved). Load is
   // PRE-FILL ONLY -- applyStoredForm sets scope.form directly (angular.extend), so it restores the format
   // fields and the roster verbatim WITHOUT firing any live command (championshipCmd/tournamentCmd), roll or
   // spawn: a loaded non-empty roster is the saved field itself and spawns at race start exactly as saved.
-  // The live .active state stays server-driven. Kept as a (currently empty) list so a future must-exclude
-  // field has an obvious home.
-  var PRESET_EXCLUDE_KEYS = [];
+  // The live .active state stays server-driven. The one exclusion is tourBase: it records what the SERVER
+  // ran when this form last lined up with it, which says nothing about a saved setup, and a preset that
+  // carried it could make its own tournament settings look like a server change the form follows.
+  var PRESET_EXCLUDE_KEYS = ['tourBase'];
 
   // Reduce a roster to only its meaningful, persistable fields. Once the roster list has RENDERED, Angular's
   // ng-repeat stamps a tracking id ($$hashKey) onto every entry, and the per-AI editor sets a transient
@@ -800,8 +811,8 @@ angular.module('beamng.apps')
       // know it. Deliberately not on `form`: it must never ride into the session blob or a preset.
       var builtRequest = null;
       // Whether GE has told this panel the multi-race state at least once. Until then
-      // championship/tournament.active read false whatever the server runs, and the race request would
-      // carry an order= the built one does not.
+      // championship/tournament.active read false whatever the server runs, so the Tournament section
+      // cannot be lined up with it yet (syncFormatFromServer).
       var formatsHeard = { championship: false, tournament: false };
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
@@ -1056,6 +1067,8 @@ angular.module('beamng.apps')
           // real fire is that restored form: a harmless write-back of exactly what GE just handed us,
           // normalised over freshForm.
           autosaveArmed = true;
+          // The restored Tournament section is now the one to line up with the running format.
+          syncFormatFromServer();
         });
       });
 
@@ -1063,9 +1076,15 @@ angular.module('beamng.apps')
       // loaded preset behaves identically -- pre-filling the format selector + settings without auto-starting
       // (applyStoredForm never fires a championship/tournament command). Old presets predating format
       // persistence lack those keys and fall back to freshForm defaults (tourMode 'off').
+      //
+      // The form's tourBase survives the load (a preset carries none): it still names what the server runs,
+      // so the loaded tournament settings stay a pending edit until Confirm, like every other loaded field,
+      // instead of being overwritten by the next format push.
       scope.$on('BeamCompSetupPresetData', function (event, payload) {
         scope.$evalAsync(function () {
+          var base = scope.form.tourBase;
           applyStoredForm(payload && payload.form);
+          scope.form.tourBase = base;
         });
       });
 
@@ -1455,13 +1474,17 @@ angular.module('beamng.apps')
       // The race request Confirm & Build Grid sends, in the {race, overrides} shape the server's startRace
       // takes (ADR-0037). The ONE builder of it: prepareRace sends what this returns and gridStale compares
       // what this returns, so the button and the note can never disagree about what a press would send.
-      // While a championship (ADR-0040) or a class-drop tournament (ADR-0042) is active, order= is omitted
-      // so the server applies the active format's grid order -- an explicit per-race order would win. A
-      // comparison that skipped this would call every grid of a running championship stale.
+      // It carries the Tournament section as overrides.format (ADR-0037 amendment 2026-11-11), which the
+      // server applies before it builds the race. While that format is a championship (ADR-0040) or a
+      // class-drop (ADR-0042), order= and its qualifying length are omitted so the server grids by the
+      // format -- an explicit per-race order would win. The FORM's mode decides, not what the server runs
+      // now: the request is what the next race will run.
       function raceRequest() {
         var overrides = buildOverrides(scope.form);
-        if (scope.championship.active || scope.tournament.active) {
+        overrides.format = buildFormat(scope.form);
+        if (overrides.format.mode !== 'off') {
           delete overrides.order;
+          delete overrides.qualiMinutes;
         }
         return { race: scope.form.race, overrides: overrides };
       }
@@ -1493,8 +1516,8 @@ angular.module('beamng.apps')
       //   * no built request -- the staged grid was not built here (another admin, a typed /race) and is
       //     not this panel's to describe;
       //   * the restore has not landed, or the championship / tournament state has not been heard -- the
-      //     form is still freshForm() and `active` still reads false, and either would make a correct
-      //     grid look stale until those pushes arrive.
+      //     form is still freshForm(), or its Tournament section is about to be lined up with the running
+      //     format (syncFormatFromServer), and either would misdescribe a grid until those pushes arrive.
       // angular.equals compares structure, not text: key order does not matter, an absent key equals an
       // undefined one (JSON drops both on the way out), and $-prefixed keys are ignored.
       scope.gridStale = function () {
@@ -1660,8 +1683,6 @@ angular.module('beamng.apps')
         flushAutosave();
       });
 
-      // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
-      // Sync the section's dropdowns to the active settings so the controls reflect reality, not stale form.
       // GE pushes the race phase on every transition and on request (request_race_phase). Gates the
       // race-stop controls so they appear only while a race is active (ADR-0038 amendment), and Start Race
       // so it appears only while a race is staging.
@@ -1679,50 +1700,129 @@ angular.module('beamng.apps')
         });
       });
 
+      // ----- The Tournament section (ADR-0040/0042; rides Confirm since the ADR-0037 amendment 2026-11-11) --
+      // Every setting of the section -- the Mode selector included -- waits in the form and goes to the server
+      // inside the race request (raceRequest -> overrides.format), which applies it before it builds the race.
+      // Nothing here sends a command on pick, blur or Enter. Without a race being built a change simply waits,
+      // and the running format keeps scoring with what it has; the Status rows show what the server runs.
+      // The typed /championship command still applies at once. The two Reset buttons are the exception:
+      // they restart what RUNS, with its own settings (the server rebuilds the restart from its state).
+
+      // The section as the request carries it, in the shape the server's tour.sanitize_format reads. Empty
+      // class rows are left out: the server drops them anyway, and keeping them would make a blank row look
+      // like a change of the class list.
+      function buildFormat(form) {
+        if (form.tourMode === 'championship') {
+          return { mode: 'championship', preset: form.champPreset, order: form.champOrder,
+            qualiMinutes: num(form.champQualiMinutes) };
+        }
+        if (form.tourMode === 'classdrop') {
+          var classes = buildTourClasses(form).filter(function (spec) {
+            return Object.keys(spec).length > 0;
+          });
+          return { mode: 'classdrop', classes: classes, order: form.tourOrder };
+        }
+        return { mode: 'off' };
+      }
+
+      // One class of the tournament broadcast as a request spec ({car} / {maxhp} / {maxpwr}).
+      function classSpecOf(c) {
+        if (c && c.car) {
+          return { car: c.car };
+        }
+        if (c && num(c.maxhp) !== undefined) {
+          return { maxhp: num(c.maxhp) };
+        }
+        if (c && num(c.maxpwr) !== undefined) {
+          return { maxpwr: num(c.maxpwr) };
+        }
+        return {};
+      }
+
+      // The format the server runs, from its two broadcasts, in buildFormat's shape -- so "the form asks for
+      // what runs" is one angular.equals.
+      function serverFormat() {
+        var c = scope.championship || {};
+        if (c.active) {
+          return { mode: 'championship', preset: c.preset, order: c.order, qualiMinutes: c.qualiMinutes };
+        }
+        var t = scope.tournament || {};
+        if (t.active) {
+          return { mode: 'classdrop', classes: asArray(t.classes).map(classSpecOf),
+            order: t.order || 'random' };
+        }
+        return { mode: 'off' };
+      }
+
+      // A request class spec as a form row, the opposite of buildTourClasses.
+      function classRowOf(spec) {
+        if (spec.car) {
+          var car = String(spec.car);
+          var colon = car.indexOf(':');
+          return colon === -1 ? carClass(car, '') : carClass(car.slice(0, colon), car.slice(colon + 1));
+        }
+        var row = defaultClass();
+        if (spec.maxhp !== undefined) {
+          row.maxhp = spec.maxhp;
+        } else if (spec.maxpwr !== undefined) {
+          row.maxpwr = spec.maxpwr;
+        }
+        return row;
+      }
+
+      // Write a server format into the section, exactly as the server states it, so that afterwards the
+      // section equals the new base and the next server change can be followed again. Off switches only the
+      // mode: the settings of the other two stay what the admin last set there.
+      function seedFormat(format) {
+        scope.form.tourMode = format.mode;
+        if (format.mode === 'championship') {
+          scope.form.champPreset = format.preset;
+          scope.form.champOrder = format.order;
+          // null, not undefined, for a length the broadcast does not name: JSON drops an undefined field,
+          // and the restore would refill the fresh default -- a change nobody made, after every reopen.
+          scope.form.champQualiMinutes = format.qualiMinutes === undefined ? null : format.qualiMinutes;
+        } else if (format.mode === 'classdrop') {
+          scope.form.tourClasses = format.classes.map(classRowOf);
+          scope.form.tourOrder = format.order;
+          prefetchConfigs(classModels(scope.form.tourClasses));
+        }
+      }
+
+      // Line the section up with the running format WITHOUT overwriting a pending edit. form.tourBase names
+      // the server format the section last matched (null = never = off). When the server has moved on since,
+      // the section follows it only if it still equals that base -- nothing of the admin's is waiting -- and
+      // the base moves on either way. A standings broadcast after a race carries the same settings, so it
+      // changes nothing; this panel's own Confirm arrives as a format the form already holds. Waits for the
+      // restore and both broadcasts, so it never compares freshForm() against a format it has not heard.
+      function syncFormatFromServer() {
+        if (!autosaveArmed || !formatsHeard.championship || !formatsHeard.tournament) {
+          return;
+        }
+        var server = serverFormat();
+        var base = scope.form.tourBase || { mode: 'off' };
+        if (angular.equals(server, base)) {
+          return;
+        }
+        if (angular.equals(buildFormat(scope.form), base)) {
+          seedFormat(server);
+        }
+        scope.form.tourBase = server;
+      }
+
+      // Championship state (ADR-0040): GE pushes the current table + settings on open and on every change.
+      // The Status row reads it; the form follows it only through syncFormatFromServer.
       scope.$on('BeamCompChampionship', function (event, payload) {
         scope.$evalAsync(function () {
           scope.championship = payload || { active: false };
           formatsHeard.championship = true;
-          if (scope.championship.active) {
-            scope.form.tourMode = 'championship';  // reflect the active format in the mode selector (ADR-0042)
-            scope.form.champPreset = scope.championship.preset || scope.form.champPreset;
-            scope.form.champOrder = scope.championship.order || scope.form.champOrder;
-            // champQualiMinutes is UI-owned and kept session-long -- do NOT overwrite it from the snapshot
-            // (which would reset the admin's chosen length to the server default each broadcast). The value
-            // is sent on Start/Apply; the field persists for the directive's life.
-          }
+          syncFormatFromServer();
         });
       });
 
-      // Championship controls (ADR-0040): relay a structured command through GE -> server, which routes it
-      // through the same admin-gated handler as /championship. start begins one; set changes settings live
-      // on an active championship; reset ends it + announces the winner.
-      function championshipCmd(action) {
-        geLuaArg('championship_cmd', JSON.stringify({
-          action: action, preset: scope.form.champPreset, order: scope.form.champOrder,
-          // Qualifying length (minutes) used when the championship grid is "quali" (ADR-0041).
-          qualiMinutes: num(scope.form.champQualiMinutes),
-        }));
-      }
-      // Live-apply: every championship option change applies at once. Sends 'start' if not yet active (which
-      // also captures a change made in the brief window before the activate broadcast returns -- harmless
-      // pre-race, it overwrites empty standings), else 'set'. The Mode selector + live-apply replace the old
-      // Start/Apply buttons.
-      scope.championshipLive = function () {
-        championshipCmd(scope.championship.active ? 'set' : 'start');
-      };
-      // Preset/grid dropdown pick: set the field, close the dropdown, live-apply.
-      scope.pickChamp = function (field, value) {
-        scope.form[field] = value;
-        scope.open = null;
-        scope.championshipLive();
-      };
-      // "Reset points": clear the standings but keep the championship active -- re-sending 'start' overwrites
-      // with a fresh empty table while it stays on. Distinct from Mode=off, which fully stops it.
-      scope.championshipRestart = function () { championshipCmd('start'); };
-      // Full stop -- used by Mode=off (pickTourMode).
-      scope.championshipReset = function () {
-        geLuaArg('championship_cmd', JSON.stringify({ action: 'reset' }));
+      // "Reset points": zero the standings of the championship that runs, which keeps running with its own
+      // settings. The server rebuilds the restart from its state, so nothing pending can ride along.
+      scope.championshipRestart = function () {
+        geLuaArg('championship_cmd', JSON.stringify({ action: 'restart' }));
       };
 
       // Everyone on the server (ADR-0054): GE pushes the list when the panel opens and whenever it
@@ -1777,14 +1877,12 @@ angular.module('beamng.apps')
       };
 
       // Class-drop tournament state (ADR-0042): GE pushes the table + classes on open and on every change.
-      // When a tournament is active, reflect it in the mode selector so the panel opens on the right section.
+      // The Status row reads it; the form follows it only through syncFormatFromServer.
       scope.$on('BeamCompTournament', function (event, payload) {
         scope.$evalAsync(function () {
           scope.tournament = payload || { active: false };
           formatsHeard.tournament = true;
-          if (scope.tournament.active) {
-            scope.form.tourMode = 'classdrop';
-          }
+          syncFormatFromServer();
         });
       });
 
@@ -1797,17 +1895,14 @@ angular.module('beamng.apps')
         if (scope.form.tourClasses.length < 6) {
           scope.form.tourClasses.push(defaultClass());
         }
-        scope.tournamentLive();
       };
       scope.removeClass = function (i) {
         if (scope.form.tourClasses.length > 2) {
           scope.form.tourClasses.splice(i, 1);
         }
-        scope.tournamentLive();
       };
       scope.setClassKind = function (i, kind) {
         scope.form.tourClasses[i].kind = kind;
-        scope.tournamentLive();
       };
       // Takes the class object (not an index): the car/config options are NESTED ng-repeats, so $index there
       // is the option index, not the class row -- passing `cls` directly avoids the shadowing bug.
@@ -1818,12 +1913,10 @@ angular.module('beamng.apps')
         if (model) {
           geLuaArg('request_car_configs', model);
         }
-        scope.tournamentLive();
       };
       scope.pickClassConfig = function (cls, config) {
         cls.config = config;
         scope.open = null;
-        scope.tournamentLive();
       };
       // Config dropdown options for one class's selected car model, from the per-model cache (ADR-0042).
       scope.classConfigOpts = function (cls) {
@@ -1843,22 +1936,6 @@ angular.module('beamng.apps')
           }
         }
         return cls.config || 'stock';
-      };
-      // Tournament mode selector (ADR-0042): picking "off" actually stops the active format (a real off
-      // switch), not just hides the section -- otherwise the next broadcast would flip the mode back.
-      scope.pickTourMode = function (mode) {
-        scope.form.tourMode = mode;
-        scope.open = null;
-        if (mode === 'off') {
-          if (scope.tournament.active) { scope.tournamentReset(); }
-          if (scope.championship.active) { scope.championshipReset(); }
-        } else if (mode === 'championship') {
-          if (!scope.championship.active) { championshipCmd('start'); }
-        } else if (mode === 'classdrop') {
-          // Class-drop needs >=2 valid classes to start; start now if the config already qualifies, else the
-          // editor is armed and the first valid live-apply (a class edit) starts it.
-          if (!scope.tournament.active && tourConfigValid()) { tournamentCmd('start'); }
-        }
       };
       // Resolve a model key to its dropdown display name (Brand + Name) from the option list
       // rebuildRaceCarOpts builds; falls back to the raw key so a not-yet-loaded model still shows text.
@@ -1896,50 +1973,10 @@ angular.module('beamng.apps')
         });
       }
 
-      // Tournament controls (ADR-0042): relay a structured command through GE -> server, routed through the
-      // same admin-gated handler. start begins one (ending any championship); set changes classes/order live;
-      // reset ends it + announces the winner.
-      function tournamentCmd(action) {
-        geLuaArg('tournament_cmd', JSON.stringify({
-          action: action,
-          classes: buildTourClasses(scope.form),
-          order: scope.form.tourOrder,
-        }));
-      }
-      // True when the class list has >=2 configured classes (mirrors the server's sanitize threshold), so a
-      // class-drop tournament can actually start.
-      function tourConfigValid() {
-        var n = 0;
-        (scope.form.tourClasses || []).forEach(function (c) {
-          if (c.kind === 'cap') {
-            if (num(c.maxhp) !== undefined || num(c.maxpwr) !== undefined) { n++; }
-          } else if (c.car) {
-            n++;
-          }
-        });
-        return n >= 2;
-      }
-      // Live-apply: a class/order change applies at once -- 'set' on an active tournament, else 'start' once
-      // the config is valid, so class-drop activates as soon as >=2 classes are configured.
-      scope.tournamentLive = function () {
-        if (scope.tournament.active) {
-          tournamentCmd('set');
-        } else if (tourConfigValid()) {
-          tournamentCmd('start');
-        }
-      };
-      // Order dropdown pick: set the field, close the dropdown, live-apply.
-      scope.pickTour = function (field, value) {
-        scope.form[field] = value;
-        scope.open = null;
-        scope.tournamentLive();
-      };
-      // "Reset progress": everyone back to class 1 but the tournament stays on -- re-send 'start' with the
-      // current classes (fresh progression, still active). Distinct from Mode=off, which fully stops it.
-      scope.tournamentRestart = function () { tournamentCmd('start'); };
-      // Full stop -- used by Mode=off (pickTourMode).
-      scope.tournamentReset = function () {
-        geLuaArg('tournament_cmd', JSON.stringify({ action: 'reset' }));
+      // "Reset progress": everyone back to class 1 of the tournament that runs, with its own classes and
+      // order. The server rebuilds the restart from its state, so nothing pending can ride along.
+      scope.tournamentRestart = function () {
+        geLuaArg('tournament_cmd', JSON.stringify({ action: 'restart' }));
       };
 
       // ----- Named AI roster (ADR-0047; live since the 2026-07-29 amendment) ------------------------
@@ -2211,10 +2248,11 @@ angular.module('beamng.apps')
       var limitTimer = null;
 
       // The preview question for the current form, or null when there is nothing to ask: AI off, no lineup,
-      // or a class-drop running (the classes decide the AI cars then, and the server ignores the lineup's).
+      // or a class-drop set for the race (the classes decide the AI cars then, and the server ignores the
+      // lineup's). The form's mode, not the running one: it is the format the next Confirm runs.
       function limitPreviewRequest() {
         var roster = scope.form.aiRoster || [];
-        if (!scope.form.aiEnabled || !roster.length || scope.tournament.active) {
+        if (!scope.form.aiEnabled || !roster.length || scope.form.tourMode === 'classdrop') {
           return null;
         }
         var spec = rosterRollSpec();
