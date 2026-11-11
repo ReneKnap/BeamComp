@@ -1980,8 +1980,9 @@ function M.collect_client_info(veh)
     -- Power-to-weight (hp/kg) of the race car, for the start-order pwr mode (ADR-0033). Read client-side
     -- here so the server stays vehicle-blind (ADR-0005); nil when power or weight is unreadable, in which
     -- case the player sorts to the back of a pwr grid. These are the METADATA numbers of the preset the car
-    -- was spawned from, so a rebuilt car sorts by its preset (known, not part of the vehicle limit's live
-    -- read).
+    -- was spawned from, blind to a parts or tuning change: only the STAND-IN, which init.lua's M.pwr replaces
+    -- with the car's live measurement once it answers (race/pwrlive.lua, ADR-0033 amendment 2026-11-11) and
+    -- which stands when it does not.
     local power = vehiclespecs.metadata_power(veh)
     local weight = vehiclespecs.metadata_weight(veh)
     if type(power) == "number" and type(weight) == "number" and weight > 0 then

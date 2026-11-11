@@ -26,7 +26,8 @@
 -- computed the shipped metadata; the weight is the car with every fuel tank full and nobody on board, the
 -- quantity the shipped "Weight" states for a stock preset. The metadata describes the preset a car was
 -- spawned from, never the car after a parts or tuning change, so this is the only reading the limit can
--- trust.
+-- trust. The pwr start order sorts by the same reading (ADR-0033 amendment 2026-11-11); GE routes each answer
+-- to its consumer by the token.
 
 local M = {}
 
