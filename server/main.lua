@@ -3133,6 +3133,28 @@ function champ.reset()
     session.championship = nil
 end
 
+-- End the championship and tell everyone who won it. Shared by /championship stop and a race request that
+-- sets the format to off (tour.apply_format), so both read the same.
+function champ.stop()
+    local winner = champ.winner_text()
+    champ.reset()
+    champ.broadcast()
+    broadcast_chat(winner and ("BeamComp: championship over, winner: " .. winner)
+        or "BeamComp: championship reset")
+end
+
+-- The /championship argument that restarts the RUNNING championship with the settings it runs with
+-- ("Reset points", ADR-0040 amendment 2026-11-11), or "reset" when none runs, which answers "no
+-- championship active". Built from the live state, so the panel's pending settings can never ride along.
+function champ.restart_argument()
+    local state = session.championship
+    if not state then
+        return "reset"
+    end
+    return string.format("start points=%s order=%s quali=%d", state.points_preset,
+        champ.order_label(state.order), math.floor(state.quali_seconds / 60))
+end
+
 -- Live preset / grid-order changes on an active championship (ADR-0040). No-ops when none is active.
 function champ.set_preset(preset)
     if champ.is_active() and preset then
@@ -3630,6 +3652,17 @@ end
 -- Clamp a requested quali length (seconds) into the sane bounds (ADR-0041).
 function quali.clamp(seconds)
     return math.max(quali.MIN_SECONDS, math.min(quali.MAX_SECONDS, seconds))
+end
+
+-- The qualifying length a race request runs (ADR-0041): an explicit per-race quali= wins, else a running
+-- championship supplies its own, else nil and quali.begin takes the default. Shared by start_race and the
+-- in-place change of a staged race, so the two cannot disagree about which length applies.
+function quali.length_for(overrides)
+    local seconds = overrides.quali_duration
+    if not seconds and champ.is_active() then
+        seconds = session.championship.quali_seconds
+    end
+    return seconds
 end
 
 -- The qualifying's OWN start-order modes (ADR-0044 amendment, quali-start-order): the base order used
@@ -5023,6 +5056,16 @@ function tour.winner_text()
     return state and state.winner or nil
 end
 
+-- End the tournament and tell everyone who won it. Shared by the panel's tournamentCmd reset and a race
+-- request that sets the format to off (tour.apply_format), so both read the same.
+function tour.stop()
+    local winner = tour.winner_text()
+    tour.reset()
+    tour.broadcast()
+    broadcast_chat(winner and ("BeamComp: tournament over, winner: " .. winner)
+        or "BeamComp: tournament reset")
+end
+
 -- Live changes to a running tournament (ADR-0042). New class specs apply to subsequent spawns only -- a driver
 -- keeps their class_index, only the car for that index changes (non-retroactive, like a championship preset
 -- change). A nil argument leaves that setting unchanged; invalid classes are ignored. No-op when none active.
@@ -5235,6 +5278,9 @@ function tour.snapshot()
         classCount = #state.classes,
         raceCount = state.race_count,
         classes = classes,
+        -- The grid order's mode, so the setup panel can line its form up with the running tournament
+        -- (ADR-0042 amendment 2026-11-11).
+        order = state.order and state.order.mode or nil,
         rows = rows,
     }
 end
@@ -5818,6 +5864,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     runlog.capture(true)
     session.runs_logged = nil
     session.race_event = runlog.next_event_id()
+    -- The tournament format this request asks for (ADR-0037 amendment 2026-11-11) before anything below
+    -- reads it: the start order, the qualifying length, the slot reservation and each driver's class car
+    -- all follow the format, so it is applied here and not when the request arrived. A race queued behind
+    -- a running one therefore changes the format only when it starts; nil leaves the format as it is.
+    tour.apply_format(overrides.format, owner_id)
     -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
@@ -5835,14 +5886,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- Length precedence: an explicit per-race quali= wins; else a championship driving the quali grid
     -- supplies its configured length; else the default.
     if effective_order and effective_order.mode == "quali" then
-        local quali_seconds = overrides.quali_duration
-        if not quali_seconds and champ.is_active() then
-            quali_seconds = session.championship.quali_seconds
-        end
         -- Staged sprint variant (ADR-0044) when the issuer's client reported this race as a sprint
         -- (meta.closed=false, captured onto overrides.staged_quali in handle_race_validation); circuit
         -- keeps the ADR-0041 all-at-once best-lap quali. A championship quali grid is always circuit here.
-        quali.begin(quali_seconds, overrides.staged_quali)
+        quali.begin(quali.length_for(overrides), overrides.staged_quali)
     else
         quali.clear()
     end
@@ -7374,6 +7421,160 @@ local function parse_race_args(argument)
     return name, overrides, bad_token
 end
 
+-- ===== the tournament format in the race request (feature setup-confirm-applies-without-regrid) ====
+-- The setup panel's Tournament section no longer sends live commands: the format it shows rides in the
+-- race request as overrides.format and is applied by start_race, before the race it belongs to is built
+-- (ADR-0037 amendment 2026-11-11). One request is also what lets the staging comparison see a format
+-- change. The functions hang off `tour` (main.lua sits at 196/200 top-level locals) and live here, below
+-- resolve_keyword, which the sanitizer needs; start_race reaches them as table fields at run time.
+
+-- Deep structural equality of two relayed values: tables key by key in both directions, anything else
+-- by ==. The server compares opaque request tables with it and never reads what they mean (ADR-0005).
+function tour.same(a, b)
+    if a == b then
+        return true
+    end
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    for key, value in pairs(a) do
+        if not tour.same(value, b[key]) then
+            return false
+        end
+    end
+    for key in pairs(b) do
+        if a[key] == nil then
+            return false
+        end
+    end
+    return true
+end
+
+-- The format a race request asks for, normalised to the shape champ.start / tour.start store it in (see
+-- tour.active_format), or nil when it names none -- a typed /race, an older panel. nil means "leave the
+-- format as it is", never "off". The championship's minutes are floored like champ.handle_cmd always did.
+-- A classdrop whose class list does not validate keeps classes = nil, which begin_race_request refuses.
+function tour.sanitize_format(raw)
+    if type(raw) ~= "table" then
+        return nil
+    end
+    if raw.mode == "off" then
+        return {mode = "off"}
+    end
+    if raw.mode == "championship" then
+        local order = raw.order
+        if order ~= "normal" and order ~= "quali" then
+            order = "reversed"
+        end
+        local minutes = tonumber(raw.qualiMinutes)
+        return {
+            mode = "championship",
+            preset = type(raw.preset) == "string" and resolve_keyword(raw.preset:lower(), champ.PRESETS)
+                or champ.DEFAULT_PRESET,
+            order = order,
+            quali_seconds = minutes and quali.clamp(math.floor(minutes) * 60)
+                or PHASE_DURATIONS.quali_default,
+        }
+    end
+    if raw.mode == "classdrop" then
+        return {
+            mode = "classdrop",
+            classes = tour.sanitize_classes(raw.classes),
+            order = tour.order(raw.order),
+        }
+    end
+    return nil
+end
+
+-- The format the server runs right now, in tour.sanitize_format's shape: what a staged race is built
+-- under, and what a staging-time request is compared with.
+function tour.active_format()
+    if champ.is_active() then
+        local state = session.championship
+        return {
+            mode = "championship",
+            preset = state.points_preset,
+            order = champ.order_label(state.order),
+            quali_seconds = state.quali_seconds,
+        }
+    end
+    if tour.is_active() then
+        return {mode = "classdrop", classes = session.tournament.classes, order = session.tournament.order}
+    end
+    return {mode = "off"}
+end
+
+-- Start the championship a request asks for, or bring the running one in line with it. Starting ends a
+-- class-drop tournament (mutual exclusion, ADR-0042); a changed setting keeps the standings (ADR-0040
+-- decision 2). The chat lines are the ones /championship start and a live setting have always sent.
+function tour.apply_championship(format, issuer_id)
+    if not champ.is_active() then
+        tour.reset()
+        champ.start(format.preset, format.order, format.quali_seconds)
+        champ.broadcast()
+        tour.broadcast()
+        broadcast_chat(string.format("BeamComp: championship started (points=%s, grid=%s)",
+            format.preset, format.order))
+        log_info("beamcomp.champ", "championship started by the race request of id " .. tostring(issuer_id))
+        return
+    end
+    if tour.same(tour.active_format(), format) then
+        return
+    end
+    champ.set_preset(format.preset)
+    champ.set_order(format.order)
+    champ.set_quali(format.quali_seconds)
+    champ.broadcast()
+    MP.SendChatMessage(issuer_id, string.format("BeamComp: championship updated (points=%s, grid=%s)",
+        format.preset, format.order))
+end
+
+-- Start the class-drop tournament a request asks for, or bring the running one in line with it. Starting
+-- ends a championship (mutual exclusion, ADR-0042); new classes keep every driver's class index.
+function tour.apply_classdrop(format, issuer_id)
+    if not tour.is_active() then
+        champ.reset()
+        local count = tour.start(format.classes, format.order)
+        if not count then
+            log_info("beamcomp.tour", "race request of id " .. tostring(issuer_id)
+                .. " named too few valid classes; no tournament started")
+            return
+        end
+        champ.broadcast()
+        tour.broadcast()
+        broadcast_chat(string.format("BeamComp: class-drop tournament started (%d classes)", count))
+        log_info("beamcomp.tour", "tournament started by the race request of id " .. tostring(issuer_id))
+        return
+    end
+    if tour.same(tour.active_format(), format) then
+        return
+    end
+    tour.set(format.classes, format.order)
+    tour.broadcast()
+    MP.SendChatMessage(issuer_id, "BeamComp: tournament updated")
+end
+
+-- Make the running format the one a race request asks for. Called at the top of start_race; nil = the
+-- request names no format and nothing happens.
+function tour.apply_format(format, issuer_id)
+    if not format then
+        return
+    end
+    if format.mode == "championship" then
+        tour.apply_championship(format, issuer_id)
+    elseif format.mode == "classdrop" then
+        tour.apply_classdrop(format, issuer_id)
+    else
+        if champ.is_active() then
+            champ.stop()
+        end
+        if tour.is_active() then
+            tour.stop()
+        end
+    end
+end
+-- ===== end the tournament format in the race request ==============================================
+
 -- Admin-gate, apply the vehicle-policy precedence bookkeeping, log, and launch the issuer-client
 -- validation handshake for a race request. Shared by the /race chat command and the settings-UI
 -- startRace event (ADR-0037): both produce the same `overrides` shape (parse_race_args output), relayed
@@ -7383,6 +7584,18 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
     if not is_race_admin(player_name, player_id) then
         access.refuse(player_id, "start races")
         log_info("beamcomp.race", "denied race request from " .. tostring(player_name) .. " (not a race admin)")
+        return
+    end
+
+    -- A class-drop the request asks for has to be startable before anything is built for it: refused here
+    -- with the line the panel's live start used to answer, so a race never runs under a format that
+    -- silently failed to start (ADR-0042 amendment 2026-11-11).
+    local format = overrides.format
+    if format and format.mode == "classdrop" and not format.classes then
+        MP.SendChatMessage(player_id, string.format(
+            "BeamComp: need at least %d valid classes to start a tournament", tour.MIN_CLASSES))
+        log_info("beamcomp.race", "race request from " .. tostring(player_name)
+            .. " refused: the class-drop has too few valid classes")
         return
     end
 
@@ -7405,7 +7618,7 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         order_echo = " order=" .. overrides.order.mode .. (overrides.order.rev and ":rev" or "")
     end
     log_info("beamcomp.race", string.format(
-        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s%s%s",
+        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
@@ -7422,7 +7635,8 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         overrides.ai and (" ai=" .. overrides.ai.count
             .. (overrides.ai.explicit and "" or "(default)")
             .. (overrides.ai.preset and (" " .. overrides.ai.preset) or "")
-            .. (overrides.ai.bindLimit == false and " ailimit=off" or "")) or ""))
+            .. (overrides.ai.bindLimit == false and " ailimit=off" or "")) or "",
+        format and (" format=" .. format.mode) or ""))
 
     -- Race-blind, so we cannot vet the options against geometry here (ADR-0005). Ask the issuer's
     -- client to validate first (ADR-0019): nothing starts until it answers raceValidation ok. The nonce
@@ -8555,11 +8769,7 @@ function champ.handle_command(player_id, player_name, argument)
             MP.SendChatMessage(player_id, "BeamComp: no championship active")
             return
         end
-        local winner = champ.winner_text()
-        champ.reset()
-        champ.broadcast()
-        broadcast_chat(winner and ("BeamComp: championship over, winner: " .. winner)
-            or "BeamComp: championship reset")
+        champ.stop()
         log_info("beamcomp.champ", "championship reset by " .. player_name)
         return
     end
@@ -9819,6 +10029,10 @@ local function sanitize_overrides(raw)
         overrides.jumpPenaltySeconds = math.max(0, jump_penalty)
     end
 
+    -- The panel's Tournament section (ADR-0037 amendment 2026-11-11): applied by start_race, compared by
+    -- the staging comparison. Absent or unknown = nil = leave the running format alone.
+    overrides.format = tour.sanitize_format(raw.format)
+
     -- AI opponents (ADR-0036): present only when a count is given. Count clamped to [1, MAX_AI]; preset
     -- resolved against the known set; vehicle + raw driving params relayed verbatim to the owner. explicit
     -- defaults true (the UI carries a count) but may be set false to take the race's content-default count.
@@ -9930,6 +10144,12 @@ function champ.handle_cmd(player_id, payload)
     if not player_name then
         return
     end
+    -- "Reset points" (ADR-0040 amendment 2026-11-11) restarts what RUNS, rebuilt from the live state; every
+    -- panel setting rides the race request now and never reaches this command.
+    if payload.action == "restart" then
+        champ.handle_command(player_id, player_name, champ.restart_argument())
+        return
+    end
     local parts = {payload.action}
     if type(payload.preset) == "string" then
         parts[#parts + 1] = "points=" .. payload.preset
@@ -9944,8 +10164,8 @@ function champ.handle_cmd(player_id, payload)
 end
 
 -- Handle the setup panel's tournamentCmd (ADR-0042) -- the only entry point, since class-drop is panel-only
--- (no chat command). action start/set/reset; classes is the ordered fast->slow spec list (each {car} or a
--- {maxhp}/{maxpwr} cap), order the grid choice. Mutations are admin-gated (ADR-0016). Starting a tournament
+-- (no chat command). action start/set/reset/restart; classes is the ordered fast->slow spec list (each
+-- {car} or a {maxhp}/{maxpwr} cap), order the grid choice. Mutations are admin-gated (ADR-0016). Starting a tournament
 -- ends any active points-championship -- the two formats are mutually exclusive (champ is in scope here, so
 -- the cross-reset lives at the call site, not inside tour.start).
 function tour.handle_cmd(player_id, payload)
@@ -9983,12 +10203,25 @@ function tour.handle_cmd(player_id, payload)
             MP.SendChatMessage(player_id, "BeamComp: no tournament active")
             return
         end
-        local winner = tour.winner_text()
-        tour.reset()
-        tour.broadcast()
-        broadcast_chat(winner and ("BeamComp: tournament over, winner: " .. winner)
-            or "BeamComp: tournament reset")
+        tour.stop()
         log_info("beamcomp.tour", "tournament reset by " .. player_name)
+        return
+    end
+
+    -- "Reset progress" (ADR-0042 amendment 2026-11-11): everyone back to class 1 of the tournament that
+    -- RUNS, with the classes and order it runs with. The panel's pending settings ride Confirm instead,
+    -- so they can never reach a restart.
+    if action == "restart" then
+        if not tour.is_active() then
+            MP.SendChatMessage(player_id, "BeamComp: no tournament active")
+            return
+        end
+        local state = session.tournament
+        local count = tour.start(state.classes, state.order)
+        tour.broadcast()
+        broadcast_chat(string.format("BeamComp: class-drop tournament started (%d classes)", count))
+        log_info("beamcomp.tour", string.format("tournament restarted by %s (%d classes)",
+            player_name, count))
         return
     end
 
