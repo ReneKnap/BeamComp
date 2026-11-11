@@ -383,8 +383,21 @@ angular.module('beamng.apps')
     presetRow: 'Load this setup.',
     presetDelete: 'Delete this saved setup.',
     // --- Footer ---
-    prepare: 'Apply every setting and put the cars on the grid. Drivers are held there until you press '
-      + 'Start Race.',
+    // While cars wait on the grid, the server rebuilds it only for a change the field would feel (ADR-0037
+    // amendment 2026-11-11), and the greyed-out button says why it is grey and how to put the cars back.
+    prepare: function (scope) {
+      if (scope.confirmIdle()) {
+        return 'The grid stands with these settings. To put the cars back on their slots, cancel the race '
+          + 'and build it again.';
+      }
+      var text = 'Apply every setting and put the cars on the grid. Drivers are held there until you press '
+        + 'Start Race.';
+      if (scope.phase === 'staging') {
+        text += ' A change to laps, assists, the start, the qualifying length, the AI difficulty or driving '
+          + 'values, or the points keeps the cars where they stand.';
+      }
+      return text;
+    },
     startRace: 'The countdown runs and the race starts.',
     close: 'Hide this panel. Your settings stay and come back when you open it again.',
     cancelRace: 'Throw the race away: nobody is scored, and the cars and props are removed. Use this when '
@@ -1510,7 +1523,8 @@ angular.module('beamng.apps')
       //
       // A pure function of the form, the built request, the phase and the multi-race state, read by the
       // template: nothing ACTS on its answer, so applyStoredForm swapping the whole form (a preset load, a
-      // UI reload) can only re-ask it, never set anything off. Every unknown answers false:
+      // UI reload) can only re-ask it, never set anything off. Every unknown answers false -- and leaves
+      // Confirm enabled (confirmIdle), the one direction that cannot claim anything false about a grid:
       //   * not staging -- in the lobby nothing is built, and from the countdown on a Confirm would abort
       //     the running race, which is no place to lure anyone;
       //   * no built request -- the staged grid was not built here (another admin, a typed /race) and is
@@ -1520,14 +1534,26 @@ angular.module('beamng.apps')
       //     format (syncFormatFromServer), and either would misdescribe a grid until those pushes arrive.
       // angular.equals compares structure, not text: key order does not matter, an absent key equals an
       // undefined one (JSON drops both on the way out), and $-prefixed keys are ignored.
-      scope.gridStale = function () {
+      //
+      // Answers true (the request is the built one), false (it differs) or null (not known).
+      function stagedRequestMatches() {
         if (scope.phase !== 'staging' || !builtRequest || !scope.form.race) {
-          return false;
+          return null;
         }
         if (!autosaveArmed || !formatsHeard.championship || !formatsHeard.tournament) {
-          return false;
+          return null;
         }
-        return !angular.equals(raceRequest(), builtRequest);
+        return angular.equals(raceRequest(), builtRequest);
+      }
+      scope.gridStale = function () {
+        return stagedRequestMatches() === false;
+      };
+
+      // Whether Confirm would send exactly what the staged grid was built from (ADR-0037 amendment
+      // 2026-11-11): the server would change nothing, so the button greys out. Unknown is no claim and leaves
+      // it enabled -- a grid this panel did not build, a GE Lua reload, the link-time window.
+      scope.confirmIdle = function () {
+        return stagedRequestMatches() === true;
       };
 
       // The request the staged grid was built from, as GE remembers it (init.lua setup.note_race_start):

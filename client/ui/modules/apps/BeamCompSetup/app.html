@@ -928,8 +928,11 @@
          that does not fit WRAPS and makes the row two lines tall. Measured worst case for this one (360px
          panel min-width, all three buttons showing): 118px of label in a 155px button.
          Start Race follows the server's phase, not this panel's own press: a grid is waiting exactly while
-         the race is staging, whoever built it, and the button never lingers into the lobby. -->
-    <button class="bc-prepare" ng-class="{'bc-stale': gridStale()}" ng-disabled="!form.race" ng-click="prepareRace()" bc-setup-tip="tip('prepare')">Confirm &amp; Build Grid</button>
+         the race is staging, whoever built it, and the button never lingers into the lobby.
+         Confirm greys out while this panel knows its request is the one the staged grid was built from
+         (confirmIdle): the server would change nothing (ADR-0037 amendment 2026-11-11). The tip, which a
+         disabled button still shows, says why and how to put the cars back. -->
+    <button class="bc-prepare" ng-class="{'bc-stale': gridStale()}" ng-disabled="!form.race || confirmIdle()" ng-click="prepareRace()" bc-setup-tip="tip('prepare')">Confirm &amp; Build Grid</button>
     <button class="bc-start" ng-if="phase === 'staging'" ng-click="startRaceGo()" bc-setup-tip="tip('startRace')">Start Race</button>
     <button class="bc-close" ng-click="close()" bc-setup-tip="tip('close')">Close</button>
   </div>
