@@ -2063,10 +2063,10 @@ function M.pool_names()
             seen[driver.name] = true
         end
     end
-    -- Case-insensitive, mirroring the roster list's own display sort (nameSortKey in BeamCompSetup), so the
-    -- picker and the rows it fills read in the same order. This is a DISPLAY sort only: the roll/draw chain
-    -- walks `drivers` directly, so the file order that defines the pool itself is untouched. The exact-tie
-    -- fallback keeps the comparator a strict ordering for names differing only in case.
+    -- Case-insensitive, so a name is found where the reader looks for it. This sorts the PICKER only: the
+    -- lineup rows run in slot order (ADR-0047 amendment 2026-11-11), and the roll/draw chain walks `drivers`
+    -- directly, so the file order that defines the pool itself is untouched. The exact-tie fallback keeps
+    -- the comparator a strict ordering for names differing only in case.
     table.sort(names, function(a, b)
         local lower_a, lower_b = a:lower(), b:lower()
         if lower_a == lower_b then

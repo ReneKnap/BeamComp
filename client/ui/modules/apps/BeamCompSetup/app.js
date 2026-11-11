@@ -2116,9 +2116,9 @@ angular.module('beamng.apps')
       // that driver's car + colour from the file via the GE pinned resolve (pick_ai_name). The reply
       // (BeamCompAiRosterName) always overwrites this row's car/carLabel/colour with the pinned driver's --
       // default AI-car mode -> preferred car + colour; random mode -> a rolled car + the preferred colour --
-      // so the name determines car+colour on pick (Q2/Q3). The DATA index rides along (the list is
-      // display-sorted, so $index is not the data slot), like the reroll calls. Options already exclude names
-      // taken by other entries, so no duplicate is possible.
+      // so the name determines car+colour on pick (Q2/Q3). The entry's data index rides along
+      // (rosterIndexOf), like the reroll calls. Options already exclude names taken by other entries, so no
+      // duplicate is possible.
       scope.pickRosterName = function (e, name) {
         scope.open = null;
         if (!e) { return; }
@@ -2131,17 +2131,12 @@ angular.module('beamng.apps')
         geLuaArg('pick_ai_name', JSON.stringify(spec));
       };
 
-      // The DATA index of an entry in form.aiRoster. The list is displayed alphabetically (orderBy in the
-      // ng-repeat, R3) so the repeat's $index is the sorted position, NOT the data slot -- but the roll/save
-      // GE calls and the "#n" slot label need the real array index (it maps to spawn/grid slots), so they go
-      // through this instead of $index.
+      // The DATA index of an entry in form.aiRoster, which is its spawn and grid slot. The list shows the
+      // roster in this order (ADR-0047 amendment 2026-11-11), so it equals the repeat's $index; the "#n"
+      // label and every GE call still ask this one function, so none of them depends on how the list is
+      // drawn.
       scope.rosterIndexOf = function (e) {
         return (scope.form.aiRoster || []).indexOf(e);
-      };
-      // orderBy key for the alphabetical DISPLAY sort (R3): case-insensitive by name. Display only -- orderBy
-      // returns a sorted view, the underlying form.aiRoster order (and the sent roster) is untouched.
-      scope.nameSortKey = function (e) {
-        return (e && e.name ? e.name : '').toLowerCase();
       };
 
       // Every roster roll carries a monotonic token that GE echoes back untouched. The replies arrive
@@ -2643,7 +2638,7 @@ angular.module('beamng.apps')
 
       // Re-draw one entry's name from the pool (unique against the rest). If the drawn name carries a
       // preferred car that applies under the current settings, the GE sends the car along (decision 4).
-      // Takes the entry object (the list is sorted for display, so $index is not the data slot).
+      // Takes the entry object and sends its data index (rosterIndexOf).
       scope.rerollRosterName = function (e) {
         var i = scope.rosterIndexOf(e);
         if (i < 0) { return; }
@@ -2671,7 +2666,7 @@ angular.module('beamng.apps')
 
       // Re-roll one entry's car through the spawn chain. A manual override by intent, so the GE bypasses
       // the name's preferred car here (it would pin the button to a single result). Takes the entry object
-      // (the list is sorted for display, so $index is not the data slot).
+      // and sends its data index (rosterIndexOf).
       scope.rerollRosterCar = function (e) {
         var i = scope.rosterIndexOf(e);
         if (i < 0) { return; }
