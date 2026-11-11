@@ -1012,7 +1012,7 @@ angular.module('beamng.apps')
         // means the same thing after a load as it does after a click; and a restored roster whose car is
         // no longer a race car gets that ONE car re-rolled (see repairRosterCars).
         syncAiLive();
-        fieldRosterIfEmpty();
+        fieldRosterIfEmpty('restored form without a lineup');
         repairRosterCars();
       }
 
@@ -2152,20 +2152,24 @@ angular.module('beamng.apps')
       // dropped, so the count field may briefly read higher than the roster until the next blur/Enter.)
       var rosterRollToken = 0;
 
-      function sendRosterRoll(spec) {
+      // `why` names the panel path that asked, for GE's log line and nothing else (bug
+      // ai-roster-car-roll-rerolls-all-cars): a roll over the whole lineup that nobody asked for has to say
+      // which trigger sent it, and for the live settings which field moved from what to what.
+      function sendRosterRoll(spec, why) {
         rosterRollToken += 1;
         spec.token = rosterRollToken;
+        spec.why = why;
         geLuaArg('roll_ai_roster', JSON.stringify(spec));
       }
 
       // A completely fresh roster: aiCount new entries with new names, cars and colours, replacing
       // whatever is there. Nothing excluded -- this IS the reset.
-      function rollFreshRoster() {
+      function rollFreshRoster(why) {
         var spec = rosterRollSpec();
         spec.count = clampAiCount();
         spec.mode = 'create';
         spec.exclude = [];
-        sendRosterRoll(spec);
+        sendRosterRoll(spec, why);
       }
 
       // Re-roll the CARS of the existing entries, keeping their names (and with them their spawn/grid
@@ -2173,7 +2177,7 @@ angular.module('beamng.apps')
       // a fresh roll uses -- so switching the AI car back to "default" hands every driver their preferred
       // car again (ADR-0048), which a per-entry re-roll (a manual override by definition) would not.
       // Cars set by hand via Change… are NOT protected: a live re-roll overwrites them, by decision.
-      function rerollRosterCars() {
+      function rerollRosterCars(why) {
         var names = rosterNames();
         if (!names.length) {
           return;
@@ -2181,24 +2185,24 @@ angular.module('beamng.apps')
         var spec = rosterRollSpec();
         spec.mode = 'cars';
         spec.names = names;
-        sendRosterRoll(spec);
+        sendRosterRoll(spec, why);
       }
 
       // Field a roster because AI was just enabled (by a tick or by a restored form) -- but ONLY when
       // there is none. An existing roster is a possibly hand-tuned field that a mis-click on the checkbox
       // must not destroy; Roll all is the deliberate way to replace it.
-      function fieldRosterIfEmpty() {
+      function fieldRosterIfEmpty(why) {
         if (!scope.form.aiEnabled || (scope.form.aiRoster || []).length) {
           return;
         }
-        rollFreshRoster();
+        rollFreshRoster(why);
       }
 
       // Roll all: the former Create/Re-create, now living inside the expanded editor as the explicit
       // "give me a new field" action. A scope METHOD for the same reason toggleRoster is one -- the button
       // renders under an ng-if, i.e. on a child scope.
       scope.rollAllRoster = function () {
-        rollFreshRoster();
+        rollFreshRoster('Roll all');
       };
 
       // ----- The live settings ------------------------------------------------------------------------
@@ -2239,6 +2243,16 @@ angular.module('beamng.apps')
         aiLive = aiLiveState();
       }
 
+      // The live fields that differ between two aiLiveState snapshots, as `car "" -> "random"`, for the
+      // roll's log line: which field moved, and from what, is the evidence a stray re-roll needs.
+      function aiLiveChanges(prev, now) {
+        return Object.keys(now).filter(function (key) {
+          return now[key] !== prev[key];
+        }).map(function (key) {
+          return key + ' ' + JSON.stringify(prev[key]) + ' -> ' + JSON.stringify(now[key]);
+        }).join(', ');
+      }
+
       scope.$watch(aiLiveState, function (now) {
         var prev = aiLive;
         aiLive = now;
@@ -2246,7 +2260,7 @@ angular.module('beamng.apps')
           return;  // the watcher's registration run (oldVal === newVal): nothing has changed yet
         }
         if (now.enabled && !prev.enabled) {
-          fieldRosterIfEmpty();
+          fieldRosterIfEmpty('AI opponents ticked');
           return;
         }
         if (!now.enabled) {
@@ -2255,7 +2269,7 @@ angular.module('beamng.apps')
         if (now.car !== prev.car || now.randomTrim !== prev.randomTrim
             || now.noBigCars !== prev.noBigCars || now.playerCar !== prev.playerCar
             || now.playerConfig !== prev.playerConfig) {
-          rerollRosterCars();
+          rerollRosterCars('live setting: ' + aiLiveChanges(prev, now));
         }
       }, true);
 
@@ -2456,7 +2470,7 @@ angular.module('beamng.apps')
         spec.exclude = rosterNames();
         // Keep the new entries' colours distinct from the kept ones too (ADR-0047 round 3).
         spec.excludeColors = rosterColors();
-        sendRosterRoll(spec);
+        sendRosterRoll(spec, 'count ' + roster.length + ' -> ' + count);
       }
 
       var rosterCountTimer = null;
@@ -2663,6 +2677,8 @@ angular.module('beamng.apps')
         if (i < 0) { return; }
         var spec = rosterRollSpec();
         spec.index = i;
+        // For GE's log line only, so it names the driver whose Roll was pressed.
+        spec.name = e.name;
         geLuaArg('reroll_ai_car', JSON.stringify(spec));
       };
       scope.$on('BeamCompAiRosterCar', function (event, payload) {
