@@ -184,6 +184,45 @@ local function get_model(model)
     return data
 end
 
+-- (public) The config KEY out of whatever a caller was handed: a plain preset name, a .pc path, or a table
+-- carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves to the
+-- model's default config downstream (the right answer: that is what would spawn).
+--
+-- With `model` known this applies the ENGINE'S OWN rule, taken verbatim from core/vehicles.lua
+-- getVehicleDetails: `config_key = pc_file:match("vehicles/<model>/(.*).pc")` -- the path RELATIVE to the
+-- model folder, which keeps a config living in a SUBFOLDER keyed the way core_vehicles keys it. The
+-- basename fallback below is for a caller that has no model to match against.
+--
+-- Plain find rather than a pattern, so a model key never has to be escaped. Lives here, not in
+-- race/vehicles.lua where it started, because the car list's predicate (M.list_allows) needs the same key
+-- and must not grow a second copy of the rule (CLAUDE.md "Vehicle metadata boxes lie", trap 1).
+function M.config_key(config, model)
+    if type(config) == "table" then
+        config = config.linkedPCFile
+    end
+    if type(config) ~= "string" or config == "" then
+        return nil
+    end
+    if type(model) == "string" and model ~= "" then
+        local prefix = "vehicles/" .. model .. "/"
+        local at = config:find(prefix, 1, true)
+        if at then
+            local relative = config:sub(at + #prefix):gsub("%.pc$", "")
+            if relative ~= "" then
+                return relative
+            end
+        end
+    end
+    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
+    -- the config key core_vehicles indexes its configs by.
+    local key = config:match("([^/]+)$") or config
+    key = key:gsub("%.pc$", "")
+    if key == "" then
+        return nil
+    end
+    return key
+end
+
 -- PRIVATE raw enumeration: every installed vehicle model key, sorted, unfiltered -- props, trailers,
 -- traffic fillers and debug rigs included. Empty when the model list is unavailable.
 --
@@ -610,11 +649,13 @@ end
 
 -- The strongest compliant config of `model` under the caps, as {config, power}, or nil. "Strongest" =
 -- highest power at or under the caps (the best legal trim); configs with unreadable power rank lowest and
--- only win when nothing has a readable power (then the lowest config key, deterministically).
-local function strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
+-- only win when nothing has a readable power (then the lowest config key, deterministically). `car_list`
+-- (M.car_list, optional) leaves out every config it does not allow.
+local function strongest_compliant(model, max_power, max_pwr, max_weight, weight_range, car_list)
     local best
     for _, entry in ipairs(M.list_configs(model)) do
-        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, weight_range) then
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, weight_range)
+                and M.list_allows(car_list, model, entry.config) then
             if not best then
                 best = entry
             else
@@ -642,16 +683,22 @@ end
 -- player's over-cap car is a CAR, never a cone, trailer or traffic filler that happened to sort early.
 -- The own-model bias is unaffected -- an own model is tried first whatever its Type, and a player sitting
 -- in a non-car reaches here only after is_owned_race_car has already dropped it.
-function M.find_compliant(own_model, max_power, max_pwr, max_weight, weight_range)
+--
+-- `car_list` (a relayed car list, ADR-0066, optional) narrows the search the same way at every step: the own
+-- model's strongest trim the list allows, then the other models' (their order is the caps' order, not the
+-- file's). Two callers: race/vehicles.lua cap_substitute_spec (the player substitute, list included) and the
+-- class-drop cap branch of race/ai.lua resolve_ai_vehicle (no list: the classes decide there).
+function M.find_compliant(own_model, max_power, max_pwr, max_weight, weight_range, car_list)
+    car_list = M.car_list(car_list)
     if type(own_model) == "string" and own_model ~= "" then
-        local own = strongest_compliant(own_model, max_power, max_pwr, max_weight, weight_range)
+        local own = strongest_compliant(own_model, max_power, max_pwr, max_weight, weight_range, car_list)
         if own then
             return {model = own_model, config = own.config}
         end
     end
     for _, model in ipairs(M.list_car_models()) do
         if model ~= own_model then
-            local pick = strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
+            local pick = strongest_compliant(model, max_power, max_pwr, max_weight, weight_range, car_list)
             if pick then
                 return {model = model, config = pick.config}
             end
@@ -666,7 +713,9 @@ end
 -- random path has no "own" car to try first. Strongest compliant config within a model wins, models
 -- alphabetically. Returns
 -- {model, config} or nil. max_weight is include-on-unreadable via is_compliant, exactly like find_compliant;
--- the strict weight_range (maxkg/minkg) is exclude-on-unreadable, also via is_compliant.
+-- the strict weight_range (maxkg/minkg) is exclude-on-unreadable, also via is_compliant. It knows no car list
+-- on purpose: it is the step after the listed pool came up empty (race/ai.lua resolve_random_spec), so the
+-- list is the first preference to give way, the caps the second.
 function M.find_compliant_car(max_power, max_pwr, max_weight, weight_range)
     for _, model in ipairs(M.list_car_models()) do
         local pick = strongest_compliant(model, max_power, max_pwr, max_weight, weight_range)
@@ -699,6 +748,176 @@ function M.token_specs(model, config)
     return read_numeric(info, POWER_FIELDS), listed_weight(model, key, info)
 end
 
+-- ===== car lists (feature car-list-restriction, ADR-0066) ==========================================
+-- A named whitelist or blacklist of cars from the server's car list file, relayed in every raceStart as
+-- {name, mode, cars} (cars = "model" or "model:config" strings). One predicate, M.list_allows, answers "may
+-- this car race" for every reader: the random draw, the substitute search, the AI lineup and the player's own
+-- car (race/vehicles.lua car_on_list), the way every cap check goes through is_compliant.
+--
+-- Models and config keys compare case-insensitively: both are file names on a case-insensitive file system,
+-- and the admin types them by hand. A pick is always made from the installed configs, so the engine's own
+-- key is what spawns, never the spelling in the file.
+
+-- "model[:config]" as a lowercased model and a lowercased config (nil for a whole model), or nil.
+local function list_entry(token)
+    if type(token) ~= "string" then
+        return nil
+    end
+    local model, config = token:match("^%s*([^:%s]+):([^:%s]+)%s*$")
+    if not model then
+        model = token:match("^%s*([^:%s]+)%s*$")
+    end
+    if not model then
+        return nil
+    end
+    return model:lower(), config and config:lower() or nil
+end
+
+-- (public) A relayed car list as the lookup every check reads, or nil when there is none or it is unusable
+-- (no name, a mode that is neither whitelist nor blacklist). The lookup keeps `name`, `mode` and `cars` (the
+-- entries as written, for the log) and adds `models` (lowercased model -> true) and `variants` (lowercased
+-- model -> {lowercased config -> true}). Idempotent: handing it its own result returns that result.
+function M.car_list(raw)
+    if type(raw) ~= "table" then
+        return nil
+    end
+    if raw.models and raw.variants then
+        return raw
+    end
+    local named = type(raw.name) == "string" and raw.name ~= ""
+    if not named or (raw.mode ~= "whitelist" and raw.mode ~= "blacklist") then
+        return nil
+    end
+    local list = {name = raw.name, mode = raw.mode, cars = {}, models = {}, variants = {}}
+    for _, token in ipairs(type(raw.cars) == "table" and raw.cars or {}) do
+        local model, config = list_entry(token)
+        if model then
+            list.cars[#list.cars + 1] = token
+            if config then
+                list.variants[model] = list.variants[model] or {}
+                list.variants[model][config] = true
+            else
+                list.models[model] = true
+            end
+        end
+    end
+    return list
+end
+
+-- The lowercased config key `config` stands for on `model`: a key or a .pc path through M.config_key, nil
+-- (a bare model) as the config it spawns as (default_pc, like token_specs), false as unknown.
+local function list_variant(model, config)
+    if config == false then
+        return nil
+    end
+    local key
+    if config == nil then
+        local data = get_model(model)
+        local info = data and data.model
+        key = type(info) == "table" and info.default_pc or nil
+    else
+        key = M.config_key(config, model)
+    end
+    return type(key) == "string" and key:lower() or nil
+end
+
+-- (public) THE car list predicate: whether `list` lets `model` with `config` race. Whitelist: the model is
+-- listed whole, or this exact variant is listed. Blacklist: neither. `config` is a config key or a .pc path
+-- (normalized to the key here: a live partConfig is a path, CLAUDE.md "Vehicle metadata boxes lie"), nil for
+-- what a bare model spawns as (its default_pc), or false for a car whose variant is unknown -- only a
+-- whole-model entry can match that one. No list allows everything.
+function M.list_allows(list, model, config)
+    list = M.car_list(list)
+    if not list then
+        return true
+    end
+    local listed = false
+    if type(model) == "string" and model ~= "" then
+        local key = model:lower()
+        listed = list.models[key] == true
+        local variants = list.variants[key]
+        if not listed and variants then
+            local variant = list_variant(model, config)
+            listed = variant ~= nil and variants[variant] == true
+        end
+    end
+    if list.mode == "whitelist" then
+        return listed
+    end
+    return not listed
+end
+
+-- (public) Whether `list` judges `model` by its version: it names versions of the model but not the model
+-- as a whole, so one version of it may race and another not. The notices then say "this version of", rather
+-- than tell a player his model is not allowed while putting him in another version of it.
+function M.list_judges_version(list, model)
+    list = M.car_list(list)
+    if not list or type(model) ~= "string" then
+        return false
+    end
+    local key = model:lower()
+    return not list.models[key] and list.variants[key] ~= nil
+end
+
+-- (public) How `list` resolves against the cars installed here, for the per-race tripwire line and the "no
+-- allowed car on this client" rule: {found = entries that name an installed race car (a listed variant also
+-- needs its config), total, missing = the entries that do not (a typo or a missing mod, the server cannot
+-- tell the two apart), any_allowed = whether at least one installed race car may race}.
+function M.car_list_report(list)
+    list = M.car_list(list)
+    local report = {found = 0, total = 0, missing = {}, any_allowed = list == nil}
+    if not list then
+        return report
+    end
+    local models = M.list_car_models()
+    local installed = {}
+    for _, model in ipairs(models) do
+        installed[model:lower()] = model
+    end
+    report.total = #list.cars
+    for _, token in ipairs(list.cars) do
+        local model, config = list_entry(token)
+        local real = installed[model]
+        local found = real ~= nil
+        if found and config then
+            found = false
+            for _, entry in ipairs(M.list_configs(real)) do
+                if entry.config:lower() == config then
+                    found = true
+                    break
+                end
+            end
+        end
+        if found then
+            report.found = report.found + 1
+        else
+            report.missing[#report.missing + 1] = token
+        end
+    end
+    if list.mode == "whitelist" then
+        report.any_allowed = report.found > 0
+        return report
+    end
+    for _, model in ipairs(models) do
+        if M.list_allows(list, model, false) then
+            local configs = M.list_configs(model)
+            if #configs == 0 then
+                report.any_allowed = true
+            end
+            for _, entry in ipairs(configs) do
+                if M.list_allows(list, model, entry.config) then
+                    report.any_allowed = true
+                    break
+                end
+            end
+            if report.any_allowed then
+                break
+            end
+        end
+    end
+    return report
+end
+
 -- Which bounds of a vehicle limit (`limit` = {max_power?, max_pwr?, weight_range?}) a car with `power` and
 -- `weight` breaks, as a list of {axis, limit, value}: axis "maxhp", "maxpwr", "minkg" or "maxkg", value the
 -- car's own number on that axis (nil when unreadable, which counts as broken). nil when the car fits.
@@ -728,6 +947,22 @@ function M.limit_breaks(power, weight, limit)
     return broken
 end
 
+-- Which restrictions of `limit` ({max_power?, max_pwr?, weight_range?, car_list?}, ai.limit_spec) the car a
+-- "model[:config]" token spawns as breaks: the bounds limit_breaks names, judged on the token's listed
+-- power and weight (token_specs), plus {axis = "list", limit = <list name>} when the car list does not allow
+-- it. nil when the car may race. The one judgement of an AI's own car (race/ai.lua M.limit_lineup).
+function M.car_breaks(model, config, limit)
+    local power, weight = M.token_specs(model, config)
+    local broken = M.limit_breaks(power, weight, limit) or {}
+    if limit.car_list and not M.list_allows(limit.car_list, model, config) then
+        broken[#broken + 1] = {axis = "list", limit = M.car_list(limit.car_list).name}
+    end
+    if #broken == 0 then
+        return nil
+    end
+    return broken
+end
+
 -- Every car that fits `limit`, in the order an AI whose own car of `model` is over it is offered them
 -- (feature ai-cars-follow-vehicle-limit, race/ai.lua M.limit_lineup): first the fitting configs of `model`
 -- itself, strongest first (power descending, unreadable power last, then config key), then one car per
@@ -735,16 +970,18 @@ end
 -- round. That is the player substitute's search order (find_compliant: keep the brand, then the other models)
 -- with a start that depends on the car, so two AI over the limit in different cars do not both land on the
 -- alphabetically first one. `max_weight` is the AI's own lenient big-car ceiling, nil for none. `models` is
--- M.list_car_models(), passed in so a caller sizing a whole field reads the list once. Returns a list of
+-- M.list_car_models(), passed in so a caller sizing a whole field reads the list once. A car list in
+-- `limit.car_list` (ADR-0066) leaves out every car it does not allow, at every step. Returns a list of
 -- {model, config}, empty when nothing installed fits.
 function M.limit_candidates(model, limit, max_weight, models)
     models = models or M.list_car_models()
+    local car_list = M.car_list(limit.car_list)
     local candidates = {}
     if not M.is_known_non_car(model) then
         local own = {}
         for _, entry in ipairs(M.list_configs(model)) do
             if M.is_compliant(entry.power, entry.weight, limit.max_power, limit.max_pwr, max_weight,
-                    limit.weight_range) then
+                    limit.weight_range) and M.list_allows(car_list, model, entry.config) then
                 own[#own + 1] = entry
             end
         end
@@ -770,7 +1007,7 @@ function M.limit_candidates(model, limit, max_weight, models)
         local other = models[((start - 1 + step) % #models) + 1]
         if other ~= model then
             local pick = strongest_compliant(other, limit.max_power, limit.max_pwr, max_weight,
-                limit.weight_range)
+                limit.weight_range, car_list)
             if pick then
                 candidates[#candidates + 1] = {model = other, config = pick.config}
             end
@@ -782,11 +1019,13 @@ end
 -- The config keys of `model` whose power/weight satisfy the caps (its legal trims), as an array; empty when
 -- the model has no compliant config. Reuses is_compliant, so an unreadable power/weight under a set cap is
 -- non-compliant (excluded), per ADR-0032 -- no new rule. `max_weight` (lenient) and `weight_range`
--- (strict maxkg/minkg) additionally exclude over-/under-weight trims. Backs the random AI selector (random_compliant).
-local function compliant_configs(model, max_power, max_pwr, max_weight, weight_range)
+-- (strict maxkg/minkg) additionally exclude over-/under-weight trims, and `car_list` (M.car_list, optional)
+-- every config it does not allow. Backs the random AI selector (random_compliant).
+local function compliant_configs(model, max_power, max_pwr, max_weight, weight_range, car_list)
     local keys = {}
     for _, entry in ipairs(M.list_configs(model)) do
-        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, weight_range) then
+        if M.is_compliant(entry.power, entry.weight, max_power, max_pwr, max_weight, weight_range)
+                and M.list_allows(car_list, model, entry.config) then
             keys[#keys + 1] = entry.config
         end
     end
@@ -802,11 +1041,13 @@ end
 -- trailer or traffic filler. Owner-local -> math.random is fine (only the owner spawns AI, no
 -- cross-client determinism, like ai.lua's
 -- random_stock_model). `max_weight` (lenient) and `weight_range` (strict maxkg/minkg) additionally exclude
--- over-/under-weight trims from the pool.
-function M.random_compliant(max_power, max_pwr, max_weight, weight_range)
+-- over-/under-weight trims from the pool, and `car_list` (a relayed car list, ADR-0066) every car it does not
+-- allow: a whole-model entry offers its compliant trims, a listed variant itself.
+function M.random_compliant(max_power, max_pwr, max_weight, weight_range, car_list)
+    car_list = M.car_list(car_list)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
-        local configs = compliant_configs(model, max_power, max_pwr, max_weight, weight_range)
+        local configs = compliant_configs(model, max_power, max_pwr, max_weight, weight_range, car_list)
         if #configs > 0 then
             pool[#pool + 1] = {model = model, configs = configs}
         end
@@ -833,17 +1074,29 @@ end
 -- caps nil every car that has a config qualifies => uniform random, effectively the unconstrained stock
 -- pick. Draws from list_car_models so an AI never spawns as a prop, trailer or traffic filler.
 -- Owner-local -> math.random is fine (mirrors random_compliant).
-function M.random_stock_compliant(max_power, max_pwr, max_weight, weight_range)
+--
+-- With `car_list` (ADR-0066) a model qualifies through the configs the list allows, and it spawns stock when
+-- the list allows its stock trim (a whole-model entry, or a blacklist that leaves default_pc alone); else it
+-- spawns as one of the listed variants that qualify, exactly that variant. Without a list the pool, the draw
+-- and its one math.random call are what they were.
+function M.random_stock_compliant(max_power, max_pwr, max_weight, weight_range, car_list)
+    car_list = M.car_list(car_list)
     local pool = {}
     for _, model in ipairs(M.list_car_models()) do
-        if #compliant_configs(model, max_power, max_pwr, max_weight, weight_range) > 0 then
-            pool[#pool + 1] = model
+        local configs = compliant_configs(model, max_power, max_pwr, max_weight, weight_range, car_list)
+        if #configs > 0 then
+            local stock_allowed = M.list_allows(car_list, model, nil)
+            pool[#pool + 1] = {model = model, variants = not stock_allowed and configs or nil}
         end
     end
     if #pool == 0 then
         return nil
     end
-    return {model = pool[math.random(#pool)], config = nil}
+    local choice = pool[math.random(#pool)]
+    if choice.variants then
+        return {model = choice.model, config = choice.variants[math.random(#choice.variants)]}
+    end
+    return {model = choice.model, config = nil}
 end
 
 -- Build the random-vehicle spec (for M.random_vehicle) from a relayed PLAYER vehicle policy (ADR-0032
@@ -852,7 +1105,8 @@ end
 -- cannot drift. The player caps compose: max_power/max_pwr from maxhp/maxpwr, the strict weight_range from
 -- minkg/maxkg. The two axes default ON when the field is nil (a typed /race car=random; the panel sends
 -- explicit booleans): random_trim from policy.randomTrim, and the big-car curb-weight ceiling from
--- policy.noBigCars. The AI caller adds its own best-effort fallback on an empty pool (never a prop).
+-- policy.noBigCars. The car list (policy.carList, ADR-0066) narrows the pool like the caps. The AI caller
+-- adds its own best-effort fallback on an empty pool (never a prop).
 function M.random_spec_from_policy(policy)
     policy = type(policy) == "table" and policy or {}
     local random_trim = policy.randomTrim
@@ -869,6 +1123,7 @@ function M.random_spec_from_policy(policy)
         weight_range = M.weight_range(policy.minkg, policy.maxkg),
         max_weight = no_big_cars and M.BIG_CAR_MAX_WEIGHT or nil,
         random_trim = random_trim,
+        car_list = M.car_list(policy.carList),
     }
 end
 
@@ -879,7 +1134,8 @@ end
 --   * max_weight (kg) -- the lenient big-car curb-weight ceiling (noBigCars);
 --   * weight_range ({min?, max?} kg) -- the strict maxkg/minkg range (build with M.weight_range);
 --   * random_trim (bool) -- true = a random compliant TRIM (random_compliant), false/nil = the stock/default
---     trim (random_stock_compliant).
+--     trim (random_stock_compliant);
+--   * car_list (a relayed car list, ADR-0066) -- only the cars it allows.
 -- All caps nil is an unconstrained pool (both selectors treat nil caps as "no limit"), so this one call
 -- covers both the capped and the uncapped case -- no separate branch. Returns {model, config} or nil when NO
 -- installed car qualifies (an impossible cap, or no cars installed). The CALLER owns the ultimate fallback,
@@ -889,9 +1145,11 @@ end
 function M.random_vehicle(spec)
     spec = type(spec) == "table" and spec or {}
     if spec.random_trim then
-        return M.random_compliant(spec.max_power, spec.max_pwr, spec.max_weight, spec.weight_range)
+        return M.random_compliant(spec.max_power, spec.max_pwr, spec.max_weight, spec.weight_range,
+            spec.car_list)
     end
-    return M.random_stock_compliant(spec.max_power, spec.max_pwr, spec.max_weight, spec.weight_range)
+    return M.random_stock_compliant(spec.max_power, spec.max_pwr, spec.max_weight, spec.weight_range,
+        spec.car_list)
 end
 
 return M
