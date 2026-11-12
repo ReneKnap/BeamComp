@@ -396,6 +396,18 @@
         <span>Max kg</span>
         <input type="number" min="0" ng-model="form.maxkg" placeholder="off">
       </label>
+      <!-- Car list (ADR-0066): a whitelist or blacklist from the server's car list file, picked by name. The
+           server sends the lists with every /raceui; the panel only selects one. -->
+      <div class="bc-row" ng-if="showRestrictions() && form.restrictVehicles" bc-setup-tip="tip('carList')">
+        <span>Car list</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carList')">{{labelFor('carList')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'carList'">
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.carList" ng-class="{sel: o.v === form.carList}"
+              ng-click="pick('carList', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
       <div class="bc-row">
         <span bc-setup-tip="tip('orderMode')">Start order</span>
         <!-- While the Tournament section is set to a championship (ADR-0040) or a class-drop (ADR-0042),
@@ -534,8 +546,9 @@
              (covet:base forced against a bare covet row), and a line reading "other than Ibishu Covet"
              above rows that all say Ibishu Covet would look like the warning was the broken part. -->
         <div class="bc-warn" ng-if="rosterIgnoresForcedCar()">AI lineup holds a different car than Car (all) forces.</div>
-        <!-- Whether the vehicle limit reaches the AI cars (feature ai-cars-follow-vehicle-limit). Shown only
-             while a limit is set, because without one it decides nothing. Off, the AI keep their own cars. -->
+        <!-- Whether the vehicle limit and the car list reach the AI cars (feature
+             ai-cars-follow-vehicle-limit, ADR-0066). Shown only while either is set, because without one it
+             decides nothing. Off, the AI keep their own cars. -->
         <label class="bc-row bc-check" ng-if="aiLimitShown()" bc-setup-tip="tip('aiBindLimit')"><input type="checkbox" ng-model="form.aiBindLimit"><span>Bind AI to the limit</span></label>
         <!-- Composable random-AI axes: only meaningful when the AI car is "random". Trim toggles stock vs
              random config variant; Exclude big vehicles drops buses/trucks/vans by curb weight. -->
