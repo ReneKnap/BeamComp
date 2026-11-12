@@ -575,14 +575,16 @@
                 bc-setup-tip="tip('rollAll')">Roll all</button>
             </span>
           </div>
-          <!-- Compact all-AI editor (ADR-0047 amendment R2/R3): every AI is listed; each expands its own
+          <!-- Compact all-AI editor (ADR-0047 amendment R2): every AI is listed; each expands its own
                Car/Type/Colour panel via e._open. e._open is an OBJECT property, so the write is safe from
                this ng-repeat child scope (the round-2 trap is a *primitive* scope write). The name is PICKED
                from the pool dropdown (no free typing) or rolled; picks/rolls mutate the entry object.
-               orderBy sorts the DISPLAY alphabetically (R3) -- form.aiRoster (the spawn/grid slot order) is
-               untouched, so $index here is the sorted position; the roll/save calls and the "#n" slot label
-               use rosterIndexOf(e) (the real data index) instead. -->
-          <div class="bc-roster-entry" ng-repeat="e in form.aiRoster | orderBy:nameSortKey">
+               The list runs in SLOT order, form.aiRoster as it stands, so "#1" is the top row (ADR-0047
+               amendment 2026-11-11). It used to sort by name, and a renamed driver then jumped to his new
+               place and pushed every row in between along, which read as the whole lineup changing. Every
+               slot number and every GE call asks rosterIndexOf(e) rather than $index, so the slot a row
+               names never depends on how the list is drawn. -->
+          <div class="bc-roster-entry" ng-repeat="e in form.aiRoster">
             <div class="bc-row">
               <span bc-setup-tip="tip('rosterName')">#{{rosterIndexOf(e) + 1}} Name</span>
               <div class="bc-dd">

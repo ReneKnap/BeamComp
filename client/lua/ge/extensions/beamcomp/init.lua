@@ -251,7 +251,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-setupconfirm-r1/2026-11-11"
+local BUILD_MARKER = "0.10.0-rosterroll-r2/2026-11-11"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -4434,8 +4434,12 @@ end
 
 -- Push the remembered race-setup form to the panel (UI -> GE, ADR-0037): the panel pulls it once on link to
 -- restore the last settings; nil when nothing has been stored this session (the panel keeps its defaults).
+-- Every open panel restores this push, not only the one that asked, so the line below marks each moment
+-- the lineup on screen can be replaced by the stored form.
 -- Public as beamcomp_init.request_setup_form.
 function M.request_setup_form()
+    log("I", setup.LOG_TAG, "setup panel linked and pulled its form ("
+        .. (M.state.setup_form and "restoring the stored one" or "nothing stored") .. ")")
     guihooks.trigger("BeamCompSetupForm", {form = M.state.setup_form})
 end
 
@@ -4830,6 +4834,10 @@ end
 -- `token` is the panel's request id, echoed back untouched: these replies ride guihooks with no correlation,
 -- and the panel now rolls automatically on a settings change, so overlapping rolls and a reply landing after
 -- the admin unticked the box are real. The panel applies only its newest request's reply.
+--
+-- Each roll writes one line naming its mode, token and the panel path that asked (`why`): a roll over the
+-- whole lineup that the admin did not ask for is visible here, with the field that set it off (bug
+-- ai-roster-car-roll-rerolls-all-cars). One per request, and only an admin's action sends one, never a frame.
 -- Result pushed via BeamCompAiRoster. Public as beamcomp_init.roll_ai_roster.
 function M.roll_ai_roster(json)
     local ok, request = pcall(jsonDecode, json)
@@ -4837,24 +4845,32 @@ function M.roll_ai_roster(json)
         log("W", RACE_LOG_TAG, "roll_ai_roster: bad payload")
         return
     end
+    local entries
     if request.mode == "cars" then
-        guihooks.trigger("BeamCompAiRoster", {
-            token = request.token,
-            mode = "cars",
-            entries = setup.roster_cars(request.names, request.ai, request.policy),
-        })
-        return
+        entries = setup.roster_cars(request.names, request.ai, request.policy)
+    else
+        local count = math.max(1, math.min(16, math.floor(tonumber(request.count) or 1)))
+        -- excludeColors keeps an extend distinct from the kept entries' colours (ADR-0047 round 3); nil on
+        -- a fresh create (nothing to exclude).
+        entries = ai.roll_roster_entries(count, request.exclude, request.ai, request.policy,
+            request.excludeColors)
     end
-    local count = math.max(1, math.min(16, math.floor(tonumber(request.count) or 1)))
-    -- excludeColors keeps an extend distinct from the kept entries' colours (ADR-0047 round 3); nil on a
-    -- fresh create (nothing to exclude).
-    local entries = ai.roll_roster_entries(count, request.exclude, request.ai, request.policy,
-        request.excludeColors)
+    local mode = (request.mode == "cars" or request.mode == "extend") and request.mode or "create"
+    log("I", setup.LOG_TAG, string.format(
+        "AI lineup roll '%s' (token %s, AI car '%s', drivers: %d), asked by %s",
+        mode, tostring(request.token), setup.ai_car_mode(request.ai), #entries,
+        type(request.why) == "string" and request.why or "an older panel"))
     guihooks.trigger("BeamCompAiRoster", {
         token = request.token,
-        mode = request.mode == "extend" and "extend" or "create",
+        mode = mode,
         entries = entries,
     })
+end
+
+-- The AI car mode a roll request names, for the roll log lines: "default" when the panel sends none.
+function setup.ai_car_mode(config)
+    local car = type(config) == "table" and config.car or nil
+    return (type(car) == "string" and car ~= "") and car or "default"
 end
 
 -- Re-draw one roster entry's name (UI -> GE, ADR-0047): payload {index, exclude, ai, policy}. When the
@@ -4909,9 +4925,10 @@ function M.pick_ai_name(json)
     })
 end
 
--- Re-roll one roster entry's car (UI -> GE, ADR-0047): payload {index, ai, policy}. An explicit re-roll
--- is a manual override, so it deliberately bypasses the name's preferred car (which would pin the button
--- to one result). Result pushed via BeamCompAiRosterCar. Public as beamcomp_init.reroll_ai_car.
+-- Re-roll one roster entry's car (UI -> GE, ADR-0047): payload {index, name?, ai, policy}. An explicit
+-- re-roll is a manual override, so it deliberately bypasses the name's preferred car (which would pin the
+-- button to one result). `name` only feeds the log line, which names the driver whose Roll was pressed and
+-- the car it drew. Result pushed via BeamCompAiRosterCar. Public as beamcomp_init.reroll_ai_car.
 function M.reroll_ai_car(json)
     local ok, request = pcall(jsonDecode, json)
     if not ok or type(request) ~= "table" or tonumber(request.index) == nil then
@@ -4920,6 +4937,8 @@ function M.reroll_ai_car(json)
     end
     local index = tonumber(request.index)
     local car = ai.roll_roster_car(request.ai, request.policy, index + 1)
+    log("I", setup.LOG_TAG, string.format("AI car roll for #%d '%s' (AI car '%s'): %s", index + 1,
+        tostring(request.name), setup.ai_car_mode(request.ai), tostring(car)))
     guihooks.trigger("BeamCompAiRosterCar", {index = index, car = car, carLabel = ai.car_label(car)})
 end
 

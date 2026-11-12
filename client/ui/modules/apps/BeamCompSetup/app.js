@@ -1012,7 +1012,7 @@ angular.module('beamng.apps')
         // means the same thing after a load as it does after a click; and a restored roster whose car is
         // no longer a race car gets that ONE car re-rolled (see repairRosterCars).
         syncAiLive();
-        fieldRosterIfEmpty();
+        fieldRosterIfEmpty('restored form without a lineup');
         repairRosterCars();
       }
 
@@ -2116,9 +2116,9 @@ angular.module('beamng.apps')
       // that driver's car + colour from the file via the GE pinned resolve (pick_ai_name). The reply
       // (BeamCompAiRosterName) always overwrites this row's car/carLabel/colour with the pinned driver's --
       // default AI-car mode -> preferred car + colour; random mode -> a rolled car + the preferred colour --
-      // so the name determines car+colour on pick (Q2/Q3). The DATA index rides along (the list is
-      // display-sorted, so $index is not the data slot), like the reroll calls. Options already exclude names
-      // taken by other entries, so no duplicate is possible.
+      // so the name determines car+colour on pick (Q2/Q3). The entry's data index rides along
+      // (rosterIndexOf), like the reroll calls. Options already exclude names taken by other entries, so no
+      // duplicate is possible.
       scope.pickRosterName = function (e, name) {
         scope.open = null;
         if (!e) { return; }
@@ -2131,17 +2131,12 @@ angular.module('beamng.apps')
         geLuaArg('pick_ai_name', JSON.stringify(spec));
       };
 
-      // The DATA index of an entry in form.aiRoster. The list is displayed alphabetically (orderBy in the
-      // ng-repeat, R3) so the repeat's $index is the sorted position, NOT the data slot -- but the roll/save
-      // GE calls and the "#n" slot label need the real array index (it maps to spawn/grid slots), so they go
-      // through this instead of $index.
+      // The DATA index of an entry in form.aiRoster, which is its spawn and grid slot. The list shows the
+      // roster in this order (ADR-0047 amendment 2026-11-11), so it equals the repeat's $index; the "#n"
+      // label and every GE call still ask this one function, so none of them depends on how the list is
+      // drawn.
       scope.rosterIndexOf = function (e) {
         return (scope.form.aiRoster || []).indexOf(e);
-      };
-      // orderBy key for the alphabetical DISPLAY sort (R3): case-insensitive by name. Display only -- orderBy
-      // returns a sorted view, the underlying form.aiRoster order (and the sent roster) is untouched.
-      scope.nameSortKey = function (e) {
-        return (e && e.name ? e.name : '').toLowerCase();
       };
 
       // Every roster roll carries a monotonic token that GE echoes back untouched. The replies arrive
@@ -2152,20 +2147,24 @@ angular.module('beamng.apps')
       // dropped, so the count field may briefly read higher than the roster until the next blur/Enter.)
       var rosterRollToken = 0;
 
-      function sendRosterRoll(spec) {
+      // `why` names the panel path that asked, for GE's log line and nothing else (bug
+      // ai-roster-car-roll-rerolls-all-cars): a roll over the whole lineup that nobody asked for has to say
+      // which trigger sent it, and for the live settings which field moved from what to what.
+      function sendRosterRoll(spec, why) {
         rosterRollToken += 1;
         spec.token = rosterRollToken;
+        spec.why = why;
         geLuaArg('roll_ai_roster', JSON.stringify(spec));
       }
 
       // A completely fresh roster: aiCount new entries with new names, cars and colours, replacing
       // whatever is there. Nothing excluded -- this IS the reset.
-      function rollFreshRoster() {
+      function rollFreshRoster(why) {
         var spec = rosterRollSpec();
         spec.count = clampAiCount();
         spec.mode = 'create';
         spec.exclude = [];
-        sendRosterRoll(spec);
+        sendRosterRoll(spec, why);
       }
 
       // Re-roll the CARS of the existing entries, keeping their names (and with them their spawn/grid
@@ -2173,7 +2172,7 @@ angular.module('beamng.apps')
       // a fresh roll uses -- so switching the AI car back to "default" hands every driver their preferred
       // car again (ADR-0048), which a per-entry re-roll (a manual override by definition) would not.
       // Cars set by hand via Change… are NOT protected: a live re-roll overwrites them, by decision.
-      function rerollRosterCars() {
+      function rerollRosterCars(why) {
         var names = rosterNames();
         if (!names.length) {
           return;
@@ -2181,24 +2180,24 @@ angular.module('beamng.apps')
         var spec = rosterRollSpec();
         spec.mode = 'cars';
         spec.names = names;
-        sendRosterRoll(spec);
+        sendRosterRoll(spec, why);
       }
 
       // Field a roster because AI was just enabled (by a tick or by a restored form) -- but ONLY when
       // there is none. An existing roster is a possibly hand-tuned field that a mis-click on the checkbox
       // must not destroy; Roll all is the deliberate way to replace it.
-      function fieldRosterIfEmpty() {
+      function fieldRosterIfEmpty(why) {
         if (!scope.form.aiEnabled || (scope.form.aiRoster || []).length) {
           return;
         }
-        rollFreshRoster();
+        rollFreshRoster(why);
       }
 
       // Roll all: the former Create/Re-create, now living inside the expanded editor as the explicit
       // "give me a new field" action. A scope METHOD for the same reason toggleRoster is one -- the button
       // renders under an ng-if, i.e. on a child scope.
       scope.rollAllRoster = function () {
-        rollFreshRoster();
+        rollFreshRoster('Roll all');
       };
 
       // ----- The live settings ------------------------------------------------------------------------
@@ -2239,6 +2238,16 @@ angular.module('beamng.apps')
         aiLive = aiLiveState();
       }
 
+      // The live fields that differ between two aiLiveState snapshots, as `car "" -> "random"`, for the
+      // roll's log line: which field moved, and from what, is the evidence a stray re-roll needs.
+      function aiLiveChanges(prev, now) {
+        return Object.keys(now).filter(function (key) {
+          return now[key] !== prev[key];
+        }).map(function (key) {
+          return key + ' ' + JSON.stringify(prev[key]) + ' -> ' + JSON.stringify(now[key]);
+        }).join(', ');
+      }
+
       scope.$watch(aiLiveState, function (now) {
         var prev = aiLive;
         aiLive = now;
@@ -2246,7 +2255,7 @@ angular.module('beamng.apps')
           return;  // the watcher's registration run (oldVal === newVal): nothing has changed yet
         }
         if (now.enabled && !prev.enabled) {
-          fieldRosterIfEmpty();
+          fieldRosterIfEmpty('AI opponents ticked');
           return;
         }
         if (!now.enabled) {
@@ -2255,7 +2264,7 @@ angular.module('beamng.apps')
         if (now.car !== prev.car || now.randomTrim !== prev.randomTrim
             || now.noBigCars !== prev.noBigCars || now.playerCar !== prev.playerCar
             || now.playerConfig !== prev.playerConfig) {
-          rerollRosterCars();
+          rerollRosterCars('live setting: ' + aiLiveChanges(prev, now));
         }
       }, true);
 
@@ -2456,7 +2465,7 @@ angular.module('beamng.apps')
         spec.exclude = rosterNames();
         // Keep the new entries' colours distinct from the kept ones too (ADR-0047 round 3).
         spec.excludeColors = rosterColors();
-        sendRosterRoll(spec);
+        sendRosterRoll(spec, 'count ' + roster.length + ' -> ' + count);
       }
 
       var rosterCountTimer = null;
@@ -2629,7 +2638,7 @@ angular.module('beamng.apps')
 
       // Re-draw one entry's name from the pool (unique against the rest). If the drawn name carries a
       // preferred car that applies under the current settings, the GE sends the car along (decision 4).
-      // Takes the entry object (the list is sorted for display, so $index is not the data slot).
+      // Takes the entry object and sends its data index (rosterIndexOf).
       scope.rerollRosterName = function (e) {
         var i = scope.rosterIndexOf(e);
         if (i < 0) { return; }
@@ -2657,12 +2666,14 @@ angular.module('beamng.apps')
 
       // Re-roll one entry's car through the spawn chain. A manual override by intent, so the GE bypasses
       // the name's preferred car here (it would pin the button to a single result). Takes the entry object
-      // (the list is sorted for display, so $index is not the data slot).
+      // and sends its data index (rosterIndexOf).
       scope.rerollRosterCar = function (e) {
         var i = scope.rosterIndexOf(e);
         if (i < 0) { return; }
         var spec = rosterRollSpec();
         spec.index = i;
+        // For GE's log line only, so it names the driver whose Roll was pressed.
+        spec.name = e.name;
         geLuaArg('reroll_ai_car', JSON.stringify(spec));
       };
       scope.$on('BeamCompAiRosterCar', function (event, payload) {
