@@ -170,13 +170,33 @@ qualiRaceRespawnSettleSeconds = 35
 
 </details>
 
+### Car lists
+
+`Resources/Server/BeamComp/beamcomp.carlists.ini` holds lists of cars you write by hand. In the race
+panel, **Vehicle restrictions** then offers **Car list**: a whitelist lets only its cars race, a blacklist
+every car except its own. It applies to random cars, to the cars players bring, and to the AI. A car that
+is not allowed is swapped for one that is.
+
+```ini
+[Street cars]
+mode = whitelist
+pessima
+covet
+etk800:846_340_A
+```
+
+A model on its own means all of its versions, `model:version` just that one. `/cars` in chat shows the
+models, `/cars <model>` the versions. The file is read again every time the panel opens and every time a
+race starts, so it needs no restart. A line that cannot be read is skipped with a warning naming it.
+
 ### Updating
 
-Copy the new `Resources` over the old one like a fresh install, but keep your own copies of three files
+Copy the new `Resources` over the old one like a fresh install, but keep your own copies of four files
 in `Resources/Server/BeamComp/`:
 
 ```
 beamcomp.config.ini      your password and settings
+beamcomp.carlists.ini    your car lists
 beamcomp.grids.json      your grids
 beamcomp.presets.json    your saved setups
 ```

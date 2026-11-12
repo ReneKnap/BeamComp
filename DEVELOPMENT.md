@@ -61,8 +61,9 @@ are deliberately **not** vendored into this repository; point the tooling at an 
 The server folder is wiped and recopied on every run, but the plugin's own runtime data is carried
 across first:
 
-- **Preserved:** `beamcomp.grids.json`, `beamcomp.presets.json`, `beamcomp.runs.jsonl`. Each preserve
-  step is guarded, so deploying to a fresh target is fine.
+- **Preserved:** `beamcomp.grids.json`, `beamcomp.presets.json`, `beamcomp.runs.jsonl`,
+  `beamcomp.carlists.ini`. Each preserve step is guarded, so deploying to a fresh target is fine. The car
+  list file ships as a template with comments only; a target that has its own keeps it.
   **`server/beamcomp.grids.json` is authored content, not an empty seed.** It holds 251 races on 13
   maps with a grid and a default assignment, and it ships. Because the deploy preserves an existing target file, a server
   that already has grids keeps its own and therefore never receives newly shipped ones; only a fresh
