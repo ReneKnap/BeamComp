@@ -95,6 +95,11 @@ M.caps = {}
 -- car report, the measurement requests, the outcomes. Table fields for the same reason as the two above.
 M.pwrlive = require("beamcomp/race/pwrlive")
 M.pwr = {}
+-- The car list of the race (feature car-list-restriction, ADR-0066): M.carlist (defined beside the vehicle
+-- limit block) checks the own car's IDENTITY against the list the raceStart relayed, at race start and on a
+-- staging swap; vehiclespecs holds the one predicate. Table fields for the same reason as the two above.
+M.vehiclespecs = require("beamcomp/race/vehiclespecs")
+M.carlist = {}
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -251,7 +256,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-rosterroll-r2/2026-11-11"
+local BUILD_MARKER = "0.10.0-carlist-r1/2026-11-12"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -341,6 +346,9 @@ M.state = {
     dash_refresh_pending = false,  -- a stock dashboard/tacho rebind is queued; step_dashboard_refresh fires it once the (re)seated car's VE is ready (bug default-dashboard-ui-missing-at-race-start)
     dash_refresh_wait = 0,         -- seconds left in the readiness-settle window before the queued stock-dashboard rebind fires
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the live vehicle limit check (ADR-0032) and, from the countdown on, the parts lock (lock.race_has_caps, ADR-0064 amendment); nil in Modes 1/2 (no cap)
+    race_car_list = nil,      -- the car list (ADR-0066) this client's own car is held to in the active race, as vehiclespecs.car_list: keep-own modes only (no car policy, like race_caps), nil without one or when it allows no car installed here (M.carlist.resolve). Read by the staging swap gate. Set at raceStart, reset by a rejected start and teardown_race_world; safe to lose on a GE Lua reload (ADR-0052), the reload ends the race
+    car_list_snapshot = nil,  -- the last own car the car list allowed, as vehicles.capture_setup's spec: what an off-list staging swap is put back to when the vehicle limit has no snapshot of its own (M.carlist.revert_target). Same lifetime as race_car_list
+    car_lists = nil,          -- every car list the server named on its last setupOpen (ADR-0066), {name, mode, cars} in file order, for the setup panel and the Confirm that holds the AI lineup to one (M.carlist.named); nil = unknown (older server, GE Lua reload), cleared by setup.clear like server_defaults
     race_forced_car = false,  -- whether the active race forces this player's car (payload.car: car=<model[:config]>, random, host, or a class-drop class with a car). Read by race/lock.lua through lock.car_is_forced on every install: true locks the parts and the staging swap, tuning and paint stay free (ADR-0064). Set at raceStart; the literal's false is also the teardown value (ADR-0052)
     caps_check = nil,         -- the vehicle limit check of the own race car (race/capcheck.lua M.new: the last setup within the limit to revert to, the one live measurement in flight, our revert awaiting its reload), Mode 3 only, or nil (ADR-0032 amendment 2026-11-04). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052): the reload tears the race down with it, and a late VE answer finds nothing to land in
     pwr_check = nil,          -- the live power-to-weight measurements of the cars this client reports for the pwr start order (race/pwrlive.lua M.new: per vehicle id the stand-in clientInfo with the metadata pwr, the setup it describes, the measurement in flight), every race and every mode, or nil (ADR-0033 amendment 2026-11-11). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052) like caps_check: the reload ends the race, the stand-in reports already sent stand, and a late answer finds nothing to land in
@@ -765,6 +773,8 @@ local function handle_race_start(payload)
         M.state.race = nil
         M.state.race_car_id = nil
         M.state.race_caps = nil
+        M.state.race_car_list = nil
+        M.state.car_list_snapshot = nil
         M.state.race_forced_car = false
         M.state.caps_check = nil
         M.state.pwr_check = nil
@@ -1009,6 +1019,15 @@ local function handle_race_start(payload)
         -- where nothing should happen at all.
         hostCarIsOwn = payload.propOwner == true,
     }
+    -- The race's car list (ADR-0066), relayed by the server as {name, mode, cars}, as THIS client races it:
+    -- nil under a fixed car, and nil when the list allows no car installed here (this client then races
+    -- without it, with a notice). It narrows the random draw, the own car's check and substitute, and on
+    -- the owner the AI lineup, all through this one policy field. The staging swap gate holds the own car
+    -- to it in the keep-own modes only, like race_caps: under car=random the staging swap is refused anyway
+    -- (ADR-0064).
+    policy.carList = M.carlist.resolve(payload.carList, policy)
+    M.state.race_car_list = (not policy.car) and policy.carList or nil
+    M.state.car_list_snapshot = nil
     -- Remember the Mode-3 caps for the live vehicle limit check (ADR-0032 amendment 2026-11-04): the own car,
     -- every staging swap and every parts or tuning respawn is measured against them, and from the countdown
     -- on they lock the parts (lock.race_has_caps). Mode 3 only -- a fixed car (Mode 2, car=) or no policy
@@ -1054,7 +1073,8 @@ local function handle_race_start(payload)
     -- plus, on the host, the AI field) counts whether its footprint could be read from metadata before
     -- the spawn. Closed by log_bbox_report at the end of this handler with a single verdict line.
     vehicles.begin_bbox_report()
-    local race_car, respawn_err, degraded = vehicles.respawn_own_at(race.myPose, own_car, policy)
+    local race_car, respawn_err, degraded, list_note = vehicles.respawn_own_at(race.myPose, own_car, policy)
+    M.carlist.after_start(list_note, degraded, race.name)
     if degraded then
         -- No-suitable-car fallback (ADR-0032 §5 superseded): the resolver spawned the fixed default car
         -- because no cap-compliant / random-pool car was available (a Mode-3 cap with no compliant car, or
@@ -1099,6 +1119,11 @@ local function handle_race_start(payload)
             -- restage, once its jbeam has loaded. Only this fresh-spawn path carries a plate -- a staging
             -- swap (lock.consume_replace) is the player's own pick and keeps the plate it spawned with.
             M.state.restage_plate = own_plate
+        end
+        if M.state.race_car_list and own_car_id and race_car:getId() == own_car_id then
+            -- The list allowed the own car (respawn_own_at kept it): it is what an off-list staging swap goes
+            -- back to. A fresh car becomes it at its restage.
+            M.carlist.remember(race_car)
         end
         if M.state.race_caps then
             if own_car_id and race_car:getId() == own_car_id then
@@ -1365,6 +1390,8 @@ local function teardown_race_world()
     M.state.restage_pending = false
     M.state.restage_plate = nil
     M.state.race_caps = nil
+    M.state.race_car_list = nil
+    M.state.car_list_snapshot = nil
     M.state.race_forced_car = false
     M.state.caps_check = nil
     M.state.pwr_check = nil
@@ -3861,6 +3888,9 @@ function setup.clear()
     -- as the next server's. Costs nothing -- handle_setup_open re-asserts them before the push that
     -- carries them, so a reopen never flashes the unknown state.
     M.state.server_defaults = nil
+    -- The car lists are this server's too (ADR-0066): another server's list must never be offered or held
+    -- against an AI lineup here.
+    M.state.car_lists = nil
     -- Same reason, and here it matters more than for the numbers: BeamMP hands out player ids per
     -- server, so an id kept from the last one would match a stranger's row on the next.
     M.state.own_player_id = nil
@@ -4282,6 +4312,10 @@ local function push_setup_data(include_deprecated)
         -- included: the panel must read an absent table as "unknown" and fall back to a neutral
         -- "default", never keep showing a number GE can no longer vouch for.
         serverDefaults = M.state.server_defaults,
+        -- The server's car lists (ADR-0066), {name, mode, cars}, absent when unknown -- the same rule as
+        -- serverDefaults. The panel offers the names and hands the content back with every lineup roll and
+        -- preview, so GE judges the AI lineup by exactly the list the panel shows.
+        carLists = M.state.car_lists,
         -- Whether drivers carry a name over their car (ADR-0062) -- a SERVER setting the panel can flip,
         -- not a local preference, so it rides the dataset the panel already pulls on link. Unknown reads
         -- as on, exactly as the policy itself does.
@@ -4306,6 +4340,10 @@ local function handle_setup_open(payload)
     -- a server that names no defaults must not leave the previous server's numbers standing.
     local defaults = type(payload) == "table" and payload.serverDefaults or nil
     M.state.server_defaults = type(defaults) == "table" and defaults or nil
+    -- The server's car lists (ADR-0066), read from its file for this very open. The whole truth again: a
+    -- payload without them leaves none, so the panel shows only "off" and the stored name.
+    local lists = type(payload) == "table" and payload.carLists or nil
+    M.state.car_lists = type(lists) == "table" and lists or nil
     -- Which row of the player list is this client (identity.own_id). The server names it here because
     -- the list itself goes out as one broadcast to everybody; a payload without it leaves the field nil
     -- and the fallback answers instead.
@@ -4976,7 +5014,9 @@ end
 -- the vehicle limit. Two callers of that one rule live here: the panel's live preview and the Confirm that
 -- sends the lineup. Both hang off the `setup` namespace table -- init.lua sits at 178/200 top-level locals.
 
--- The player policy slice of a race request's overrides, as ai.limit_spec reads it.
+-- The player policy slice of a race request's overrides, as ai.limit_spec reads it. The request names its car
+-- list (ADR-0066); the content is the one the server sent with this panel's open (M.carlist.named). The
+-- server reads its file again at the race start, and the spawn holds the field to that.
 function setup.request_policy(overrides)
     return {
         car = overrides.car,
@@ -4984,6 +5024,7 @@ function setup.request_policy(overrides)
         maxpwr = overrides.maxpwr,
         maxkg = overrides.maxkg,
         minkg = overrides.minkg,
+        carList = M.carlist.named(overrides.carList),
     }
 end
 
@@ -8857,7 +8898,8 @@ function M.caps.substitute(veh, judged)
     local caps = M.state.race_caps
     local reading = judged.reading or {}
     local outgoing = tostring(veh.JBeam)
-    local spec, degraded = vehicles.cap_substitute_spec(veh.JBeam, caps)
+    -- With the car list too (ADR-0066): a car over the limit is never swapped for one off the list.
+    local spec, degraded = vehicles.cap_substitute_spec(veh.JBeam, M.carlist.substitute_policy())
     local plate = vehicles.read_plate(veh)
     local detail = M.capcheck.limit_detail(outgoing, reading.power, reading.weight, caps)
     local replaced, err = vehicles.replace_spec(veh, spec)
@@ -8972,6 +9014,155 @@ function M.caps.on_answer(vehicle_id, token, reading)
     end
 end
 -- ===== end vehicle limit check ==========================================================
+
+-- ===== the car list of the own race car (feature car-list-restriction, ADR-0066) ========
+-- A race's car list restricts the own car like the vehicle limit, but by which car it IS
+-- (vehicles.car_on_list: the model and the preset it was spawned from), so it needs no measurement and no
+-- state machine. It is judged at race start (vehicles.respawn_own_at replaces an own car the list does not
+-- allow) and on a staging swap (the restage gate, ahead of the limit's). A parts or tuning respawn keeps the
+-- car's preset, so the list never judges it again; the limit goes on measuring those.
+
+-- The list a raceStart relayed, as this client races it (vehiclespecs.car_list), or nil: no list, a fixed car
+-- (the server drops the list there, and the check here keeps a stray one out), an unreadable one, or a list
+-- that allows no car installed here. Then this client races without it -- the caps still apply -- and the
+-- player is told. One line per race names the list, its mode, how many entries are installed cars and the
+-- ones that are not (a typo or a missing mod; the server cannot tell the two apart).
+function M.carlist.resolve(raw, policy)
+    if raw == nil then
+        return nil
+    end
+    if type(policy.car) == "string" and policy.car ~= "" and policy.car ~= "random" then
+        return nil
+    end
+    local list = M.vehiclespecs.car_list(raw)
+    if not list then
+        log("W", RACE_LOG_TAG, "car list: the race start carries one this client cannot read; racing "
+            .. "without it")
+        return nil
+    end
+    local report = M.vehiclespecs.car_list_report(list)
+    log("I", RACE_LOG_TAG, string.format("car list '%s' (%s): %d of %d entries are installed cars%s",
+        list.name, list.mode, report.found, report.total,
+        #report.missing > 0 and ("; not found: '" .. table.concat(report.missing, "', '") .. "'") or ""))
+    if not report.any_allowed then
+        log("W", RACE_LOG_TAG, string.format("car list '%s' (%s) allows no car installed here; this client "
+            .. "races without it", list.name, list.mode))
+        notice.say("The car list '" .. list.name .. "' allows no car you have installed, so you race without "
+            .. "it.", "warning")
+        return nil
+    end
+    return list
+end
+
+-- One of the server's car lists (M.state.car_lists, from its last setupOpen) by name, or nil.
+function M.carlist.named(name)
+    if type(name) ~= "string" or type(M.state.car_lists) ~= "table" then
+        return nil
+    end
+    for _, list in ipairs(M.state.car_lists) do
+        if type(list) == "table" and list.name == name then
+            return list
+        end
+    end
+    return nil
+end
+
+-- Why `model` may not race under `list`, in the player's words: "<model> is not on the car list '<name>'.",
+-- or "This version of <model> …" when the list names versions of that model (vehiclespecs
+-- list_judges_version), so he is not told his model is banned while he is put in another version of it.
+function M.carlist.reason(model, list)
+    local subject = tostring(model)
+    if M.vehiclespecs.list_judges_version(list, model) then
+        subject = "This version of " .. subject
+    end
+    return subject .. " is not on the car list '" .. list.name .. "'."
+end
+
+-- Tell the player that the car list replaced his car at race start (respawn_own_at's fourth value). A
+-- degraded start says "No suitable car" already, and a player who had no own car lost nothing.
+function M.carlist.after_start(note, degraded, race_name)
+    if type(note) ~= "table" or not note.replaced or degraded then
+        return
+    end
+    notice.say("Car replaced. " .. M.carlist.reason(note.replaced, note.list), "warning",
+        "BeamComp: " .. tostring(race_name))
+end
+
+-- Make the car standing there now the one an off-list staging swap goes back to.
+function M.carlist.remember(veh)
+    M.state.car_list_snapshot = vehicles.capture_setup(veh)
+end
+
+-- The car an off-list staging swap goes back to: the vehicle limit's last setup within it when there is
+-- one (newer, and allowed by the list too: the list gate passes every car before the limit gate sees it),
+-- else the last car the list allowed.
+function M.carlist.revert_target()
+    local check = M.state.caps_check
+    local snapshot = check and check.snapshot
+    return (snapshot and snapshot.spec) or M.state.car_list_snapshot
+end
+
+-- The policy a substitute is searched with: the race's vehicle limit and its car list together.
+function M.carlist.substitute_policy()
+    local caps = M.state.race_caps or {}
+    return {
+        maxhp = caps.maxhp,
+        maxpwr = caps.maxpwr,
+        maxkg = caps.maxkg,
+        minkg = caps.minkg,
+        carList = M.state.race_car_list,
+    }
+end
+
+-- A staging swap into a car the list does not allow: put the last allowed car back, else replace it with the
+-- first car the list allows (within the limit), in staging only -- the swap-allowed lock passes a replace
+-- through there, and revert_pending makes the next restage adopt our car without judging it again. Past
+-- staging the full lock refuses the replace, so the car stays, with a notice and a W line. Returns whether a
+-- replace went out, so the restage leaves the car to that cycle.
+function M.carlist.reject(veh)
+    local list = M.state.race_car_list
+    local label = vehicles.identity_label(veh)
+    local reason = M.carlist.reason(veh.JBeam, list)
+    if M.state.phase ~= "staging" then
+        notice.say(reason, "warning")
+        log("W", RACE_LOG_TAG, string.format("car list: '%s' is not on the list '%s' and stays in %s, "
+            .. "nothing can be replaced there", label, list.name, tostring(M.state.phase)))
+        return false
+    end
+    local target = M.carlist.revert_target()
+    if target then
+        local reverted, err = vehicles.replace_spec(veh, target)
+        if reverted then
+            M.state.revert_pending = true
+            notice.say("Can't stage that car. " .. reason, "warning")
+            log("I", RACE_LOG_TAG, string.format("car list: '%s' is not on the list '%s'; put the last "
+                .. "allowed car back", label, list.name))
+            return true
+        end
+        log("W", RACE_LOG_TAG, "car list: could not put the last allowed car back: " .. tostring(err))
+    end
+    local spec, degraded = vehicles.cap_substitute_spec(veh.JBeam, M.carlist.substitute_policy())
+    local plate = vehicles.read_plate(veh)
+    local replaced, err = vehicles.replace_spec(veh, spec)
+    if not replaced then
+        notice.say(reason, "warning")
+        log("W", RACE_LOG_TAG, string.format("car list: could not replace '%s': %s", label, tostring(err)))
+        return false
+    end
+    M.state.revert_pending = true
+    M.state.restage_plate = plate
+    if degraded then
+        notice.say("No suitable car available, spawning the default car", "warning")
+        log("W", RACE_LOG_TAG, string.format("car list: no car on the list '%s' meets the limit; replaced "
+            .. "'%s' with the default '%s'", list.name, label, tostring(spec.model)))
+        return true
+    end
+    notice.say("Car replaced. " .. reason, "warning")
+    log("I", RACE_LOG_TAG, string.format("car list: '%s' is not on the list '%s'; replaced it with '%s:%s', "
+        .. "the first car it allows", label, list.name, tostring(spec.model), tostring(spec.config)))
+    return true
+end
+-- ===== end car list =====================================================================
 
 -- ===== the live power-to-weight of the reported cars (ADR-0033 amendment 2026-11-11) =====
 -- The engine-facing half of race/pwrlive.lua. order=pwr sorts the grid at the staging -> countdown seam by
@@ -9273,10 +9464,21 @@ local function restage_swapped_car(dt_real)
     -- own revert and substitute and the fresh race-start car are adopted unchecked. Reverting, not a
     -- pre-intercept, is the documented behavior (ADR-0032): the over-limit car is briefly visible while its
     -- jbeam loads.
+    --
+    -- The car list gate (ADR-0066) comes first: which car it is needs no measurement, and a car the list does
+    -- not allow is put back (M.carlist.reject) before the limit would spend a measurement on it. Our own
+    -- revert or substitute (staging_swap_reverting) passes both gates.
     local caps = M.state.race_caps
-    local staged_ok = true  -- whether the car about to be adopted is within the limit (always without caps)
+    local car_list = M.state.race_car_list
+    local staged_ok = true  -- whether the car about to be adopted is allowed (always without caps and list)
     local measured = nil    -- the measurement it passed, which becomes the setup to go back to
-    if caps and not M.state.staging_swap_reverting then
+    if car_list and not M.state.staging_swap_reverting and not vehicles.car_on_list(own, car_list) then
+        staged_ok = false
+        if M.carlist.reject(own) then
+            return
+        end
+    end
+    if caps and staged_ok and not M.state.staging_swap_reverting then
         local judged = M.caps.gate(own)
         if not judged then
             return
@@ -9298,6 +9500,9 @@ local function restage_swapped_car(dt_real)
     M.state.staging_swap_reverting = false
     if caps and staged_ok then
         M.caps.remember(own, measured)
+    end
+    if car_list and staged_ok then
+        M.carlist.remember(own)
     end
 
     -- Adopt the staging car: re-point the bounce target, re-place front-anchored to its now-correct
