@@ -186,8 +186,9 @@ etk800:846_340_A
 ```
 
 A model on its own means all of its versions, `model:version` just that one. `/cars` in chat shows the
-models, `/cars <model>` the versions. The file is read again every time the panel opens and every time a
-race starts, so it needs no restart. A line that cannot be read is skipped with a warning naming it.
+models, `/cars <model>` the versions. The file is read again whenever the race panel or its Car list opens
+and at every race start, so it needs no restart. A line that cannot be read is skipped with a warning naming
+it.
 
 ### Updating
 

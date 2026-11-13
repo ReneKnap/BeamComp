@@ -1014,8 +1014,9 @@ end
 -- read is skipped with its line number and everything else still applies; a list without a valid mode is
 -- skipped whole. Race-blind (ADR-0005): names, modes and strings, never a check that a model exists.
 --
--- Read on every /raceui and at every race start, never cached, so a hand edit needs no restart. On cfg for
--- the 200-local ceiling.
+-- Read on every /raceui, on every request of the setup panel (cfg.handle_car_lists_request: when it links and
+-- when its Car list dropdown opens) and at every race start, never cached, so a hand edit needs no restart.
+-- On cfg for the 200-local ceiling.
 cfg.CAR_LISTS_CANDIDATE_PATHS = {
     "Resources/Server/BeamComp/beamcomp.carlists.ini",
     "beamcomp.carlists.ini",
@@ -6041,6 +6042,21 @@ function cfg.race_car_list(overrides, owner_id)
     return cfg.car_list_content(list)
 end
 
+-- The setup panel asks for the car lists itself (ADR-0066 amendment 2026-11-13): when it links -- a panel
+-- restored from the player's layout at join, or one that outlived a GE Lua reload, never saw a setupOpen --
+-- and every time its Car list dropdown opens, so a hand edit shows without /raceui. Each request reads the
+-- file again and answers the asker only; nothing watches the file and nothing is broadcast. Not admin-gated,
+-- like the grid and preset list requests: the lists are read-only names and car strings, and every raceStart
+-- carries the chosen one to every client anyway. Dispatched from handle_client_event.
+cfg.MSG_CAR_LISTS_REQ = "carListsReq"  -- client -> server: send me the car lists
+cfg.MSG_CAR_LISTS = "carLists"         -- server -> the asker: {lists = [{name, mode, cars}]}
+
+function cfg.handle_car_lists_request(player_id)
+    local lists = cfg.car_list_payload(cfg.read_car_lists())
+    grid_store.deliver("beamcomp.cfg", cfg.MSG_CAR_LISTS, {lists = lists}, {player_id},
+        string.format("car lists (%d list(s)), request", #lists))
+end
+
 -- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster + relayed
 -- overrides), and enter the spawning phase. The client resolves and parses the race name locally
 -- (ADR-0005) and decides the actual mode/laps/direction; `overrides` carries the admin's verbatim
@@ -10776,6 +10792,8 @@ local function handle_client_event(player_id, data)
         grid_store.handle_preset_fetch(player_id, decoded.payload)
     elseif decoded.type == grid_store.MSG_PRESET_LIST_REQ then
         grid_store.handle_preset_list_request(player_id, decoded.payload)
+    elseif decoded.type == cfg.MSG_CAR_LISTS_REQ then
+        cfg.handle_car_lists_request(player_id)
     elseif decoded.type == MSG_START_RACE then
         handle_start_race(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_GO then

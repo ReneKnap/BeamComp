@@ -1095,9 +1095,13 @@ angular.module('beamng.apps')
           // to the neutral "default". Keeping the last number would hide exactly that and show a figure
           // nothing stands behind any more.
           scope.data.serverDefaults = (payload && payload.serverDefaults) || null;
-          // The server's car lists (ADR-0066), by the same rule: absent means unknown, never "what I saw
-          // last". An empty Lua list arrives as {}, which asArray turns into the known empty list.
-          scope.data.carLists = (payload && payload.carLists) ? asArray(payload.carLists) : null;
+          // The server's car lists (ADR-0066). Unlike serverDefaults a push without them keeps what the
+          // panel knows: the panel asks the server for them itself (requestCarLists), so a GE that lost them
+          // on a Lua reload must not blank a set the server sent this panel. An empty Lua list arrives as {},
+          // which asArray turns into the known empty list.
+          if (payload && payload.carLists) {
+            scope.data.carLists = asArray(payload.carLists);
+          }
           rebuildCarListOpts();
           // The server's driver-name switch. Absent reads as ON, not as "keep what I had": GE sends it
           // on every push, so a missing field means an older GE, and on rather than off is the reading
@@ -1179,6 +1183,21 @@ angular.module('beamng.apps')
         });
       });
 
+      // The server's car lists, read from its file for this panel's own request (requestCarLists: at link
+      // and every time the Car list dropdown opens). A reply without a list says nothing and leaves the
+      // known set; a list, empty included, is the server's current truth. A name the form holds that the
+      // fresh answer lacks keeps reading "(not on the server)" (rebuildCarListOpts). The dropdown is this
+      // panel's own markup, so an open list redraws with the answer at once.
+      scope.$on('BeamCompCarLists', function (event, payload) {
+        scope.$evalAsync(function () {
+          if (!payload || !payload.lists || typeof payload.lists !== 'object') {
+            return;
+          }
+          scope.data.carLists = asArray(payload.lists);
+          rebuildCarListOpts();
+        });
+      });
+
       // One race's track metadata, answering a requestRaceMeta (ADR-0013 amendment). `closed` decides
       // sprint vs circuit, so it is only cached when GE actually reported a boolean -- a race GE could not
       // parse leaves the entry absent, and "absent" means unknown, never "open". `defaultLaps` rides the
@@ -1217,6 +1236,21 @@ angular.module('beamng.apps')
       // Custom-dropdown plumbing (native <select> does not open in the CEF overlay).
       scope.toggle = function (field) {
         scope.open = (scope.open === field) ? null : field;
+      };
+
+      // Ask the server for its car lists (ADR-0066 amendment 2026-11-13). It reads its file again and
+      // answers this panel only, by BeamCompCarLists. `why` names the trigger for GE's log line.
+      function requestCarLists(why) {
+        geLuaArg('request_car_lists', why);
+      }
+
+      // The Car list dropdown asks the server every time it opens, so a list written into the file while
+      // the panel was open is there on the next click.
+      scope.toggleCarList = function () {
+        scope.toggle('carList');
+        if (scope.open === 'carList') {
+          requestCarLists('the Car list dropdown');
+        }
       };
 
       scope.labelFor = function (field) {
@@ -2908,6 +2942,9 @@ angular.module('beamng.apps')
       geCall('request_setup_build');
       geCall('request_race_phase');
       geCall('request_players');
+      // The car lists straight from the server (ADR-0066 amendment 2026-11-13): a panel restored at join, or
+      // one that outlived a GE Lua reload, never saw the setupOpen that carries them.
+      requestCarLists('the setup panel linking');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars

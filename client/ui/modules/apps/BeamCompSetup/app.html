@@ -397,11 +397,12 @@
         <input type="number" min="0" ng-model="form.maxkg" placeholder="off">
       </label>
       <!-- Car list (ADR-0066): a whitelist or blacklist from the server's car list file, picked by name. The
-           server sends the lists with every /raceui; the panel only selects one. -->
+           server sends the lists with every /raceui, and the panel asks for them again when it links and
+           every time this dropdown opens (toggleCarList); the panel only selects one. -->
       <div class="bc-row" ng-if="showRestrictions() && form.restrictVehicles" bc-setup-tip="tip('carList')">
         <span>Car list</span>
         <div class="bc-dd">
-          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('carList')">{{labelFor('carList')}}</button>
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggleCarList()">{{labelFor('carList')}}</button>
           <div class="bc-dd-list" ng-if="open === 'carList'">
             <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.carList" ng-class="{sel: o.v === form.carList}"
               ng-click="pick('carList', o.v)">{{o.label}}</div>

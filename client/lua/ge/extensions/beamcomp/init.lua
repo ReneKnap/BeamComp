@@ -256,7 +256,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-carlist-r1/2026-11-12"
+local BUILD_MARKER = "0.10.0-carlist-r2/2026-11-13"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -348,7 +348,7 @@ M.state = {
     race_caps = nil,          -- Mode-3 caps {maxhp, maxpwr, maxkg, minkg} for the active race, gating the live vehicle limit check (ADR-0032) and, from the countdown on, the parts lock (lock.race_has_caps, ADR-0064 amendment); nil in Modes 1/2 (no cap)
     race_car_list = nil,      -- the car list (ADR-0066) this client's own car is held to in the active race, as vehiclespecs.car_list: keep-own modes only (no car policy, like race_caps), nil without one or when it allows no car installed here (M.carlist.resolve). Read by the staging swap gate. Set at raceStart, reset by a rejected start and teardown_race_world; safe to lose on a GE Lua reload (ADR-0052), the reload ends the race
     car_list_snapshot = nil,  -- the last own car the car list allowed, as vehicles.capture_setup's spec: what an off-list staging swap is put back to when the vehicle limit has no snapshot of its own (M.carlist.revert_target). Same lifetime as race_car_list
-    car_lists = nil,          -- every car list the server named on its last setupOpen (ADR-0066), {name, mode, cars} in file order, for the setup panel and the Confirm that holds the AI lineup to one (M.carlist.named); nil = unknown (older server, GE Lua reload), cleared by setup.clear like server_defaults
+    car_lists = nil,          -- every car list the server named on its last setupOpen or carLists reply (ADR-0066), {name, mode, cars} in file order, for the setup panel and the Confirm that holds the AI lineup to one (M.carlist.named); nil = unknown (older server, GE Lua reload), cleared by setup.clear like server_defaults
     race_forced_car = false,  -- whether the active race forces this player's car (payload.car: car=<model[:config]>, random, host, or a class-drop class with a car). Read by race/lock.lua through lock.car_is_forced on every install: true locks the parts and the staging swap, tuning and paint stay free (ADR-0064). Set at raceStart; the literal's false is also the teardown value (ADR-0052)
     caps_check = nil,         -- the vehicle limit check of the own race car (race/capcheck.lua M.new: the last setup within the limit to revert to, the one live measurement in flight, our revert awaiting its reload), Mode 3 only, or nil (ADR-0032 amendment 2026-11-04). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052): the reload tears the race down with it, and a late VE answer finds nothing to land in
     pwr_check = nil,          -- the live power-to-weight measurements of the cars this client reports for the pwr start order (race/pwrlive.lua M.new: per vehicle id the stand-in clientInfo with the metadata pwr, the setup it describes, the measurement in flight), every race and every mode, or nil (ADR-0033 amendment 2026-11-11). Built at raceStart, dropped at `finished`, by a rejected start and by teardown_race_world. Safe to lose on a GE Lua reload (ADR-0052) like caps_check: the reload ends the race, the stand-in reports already sent stand, and a late answer finds nothing to land in
@@ -4312,9 +4312,10 @@ local function push_setup_data(include_deprecated)
         -- included: the panel must read an absent table as "unknown" and fall back to a neutral
         -- "default", never keep showing a number GE can no longer vouch for.
         serverDefaults = M.state.server_defaults,
-        -- The server's car lists (ADR-0066), {name, mode, cars}, absent when unknown -- the same rule as
-        -- serverDefaults. The panel offers the names and hands the content back with every lineup roll and
-        -- preview, so GE judges the AI lineup by exactly the list the panel shows.
+        -- The server's car lists (ADR-0066), {name, mode, cars}, absent when GE does not know them. The
+        -- panel offers the names and hands the content back with every lineup roll and preview, so GE
+        -- judges the AI lineup by exactly the list the panel shows. Since the panel asks the server itself
+        -- (M.request_car_lists), a push without them leaves the panel's set alone instead of blanking it.
         carLists = M.state.car_lists,
         -- Whether drivers carry a name over their car (ADR-0062) -- a SERVER setting the panel can flip,
         -- not a local preference, so it rides the dataset the panel already pulls on link. Unknown reads
@@ -5896,6 +5897,12 @@ local HANDLERS = {
             .. (M.state.setup_may_open and "mine to open" or "not mine to open"))
     end,
     gridSetupOpen = handle_grid_setup_open,
+    -- The car lists the setup panel asked for (ADR-0066 amendment 2026-11-13). Inline for the same reason
+    -- as controlsOpen: the handler lives on M.carlist, defined further down, and a table field costs no
+    -- top-level local.
+    carLists = function(payload)
+        M.carlist.handle_lists(payload)
+    end,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -9054,7 +9061,32 @@ function M.carlist.resolve(raw, policy)
     return list
 end
 
--- One of the server's car lists (M.state.car_lists, from its last setupOpen) by name, or nil.
+-- Ask the server for its car lists (ADR-0066 amendment 2026-11-13). The setup panel asks when it links and
+-- every time its Car list dropdown opens (`why` says which, for the line), so a panel that never saw a
+-- setupOpen (restored at join, or after a GE Lua reload) still offers the lists, and a hand edit of the
+-- file shows at the next open of the dropdown. The server reads its file again and answers this client
+-- only. Public as beamcomp_init.request_car_lists.
+function M.request_car_lists(why)
+    log("I", LOG_TAG, "requesting carListsReq, asked by " .. (type(why) == "string" and why or "the panel"))
+    send_to_server("carListsReq", {})
+end
+
+-- The server's answer: its car lists as it read them for this request, the whole truth again (an empty
+-- list included). They replace what GE holds -- Confirm's AI lineup rule reads them -- and go to the panel.
+-- A reply without a list table says nothing and changes nothing, so a known set is never wiped by it.
+function M.carlist.handle_lists(payload)
+    local lists = type(payload) == "table" and payload.lists or nil
+    if type(lists) ~= "table" then
+        log("W", LOG_TAG, "carLists without a list table: ignored, the panel keeps what it knows")
+        return
+    end
+    log("I", LOG_TAG, string.format("carLists received: %d list(s)", #lists))
+    M.state.car_lists = lists
+    guihooks.trigger("BeamCompCarLists", {lists = lists})
+end
+
+-- One of the server's car lists (M.state.car_lists, from its last setupOpen or carLists reply) by name, or
+-- nil.
 function M.carlist.named(name)
     if type(name) ~= "string" or type(M.state.car_lists) ~= "table" then
         return nil
