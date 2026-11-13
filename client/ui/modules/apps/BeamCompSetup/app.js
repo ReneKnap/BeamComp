@@ -200,6 +200,11 @@ angular.module('beamng.apps')
       + 'limit.',
     minkg: 'A car lighter than this is swapped for one that fits. Empty means no limit.',
     maxkg: 'A car heavier than this is swapped for one that fits. Empty means no limit.',
+    // The lists come from the server's car list file (ADR-0066); the panel only picks one. Nobody is turned
+    // away here either: a car the list does not allow is swapped (race/vehicles.lua respawn_for_list, the
+    // staging gate, ai.limit_lineup).
+    carList: 'Only the cars of a list from the server\'s car list file may race, or every car but those. '
+      + 'A car that is not allowed is swapped for one that is.',
     // The picker shows only while Tournament mode is off, and then the next Confirm runs no format that
     // could replace it (ADR-0037 amendment 2026-11-11).
     orderMode: 'Who starts where on the grid.',
@@ -304,8 +309,9 @@ angular.module('beamng.apps')
       + 'otherwise gives each driver the car that belongs to their name.',
     aiRandomTrim: 'Give each AI car a random factory version instead of the standard one.',
     aiNoBigCars: 'Leave buses, trucks and vans out of the AI draw (it goes by weight).',
-    // Shown only while a vehicle limit is set. Off, the AI keep their cars over it (race/ai.lua limit_spec).
-    aiBindLimit: 'Swaps an AI car that is over the vehicle limit for one that fits.',
+    // Shown only while a vehicle limit or a car list is set. Off, the AI keep their cars (race/ai.lua
+    // limit_spec).
+    aiBindLimit: 'Swaps an AI car the vehicle restrictions do not allow for one they do.',
     rosterToggle: 'Show the drivers, so you can change them one by one.',
     rollAll: 'Draw a whole new set of drivers: new names, cars colors and grid position.',
     rosterName: 'Pick this driver from the name list. A name brings its own car and color with it.',
@@ -315,10 +321,12 @@ angular.module('beamng.apps')
     rosterCarShown: 'The car this driver starts in, with their color.',
     rosterChange: 'Open this driver\'s car, version and color. Changes are only for this session.',
     rosterTypeShown: 'The factory version this car spawns as.',
-    // The three rows of a driver whose own car is over the vehicle limit (race/ai.lua limit_lineup).
-    rosterOwnCar: 'This driver\'s own car. It is over the vehicle limit, so he races the car above.',
-    rosterRacesIn: 'The car this driver races, because his own car is over the vehicle limit.',
-    rosterNoFit: 'No installed car meets the vehicle limit, so this driver keeps his own car.',
+    // The three rows of a driver whose own car the vehicle limit or the car list does not allow (race/ai.lua
+    // limit_lineup). The row itself names which of the two it is.
+    rosterOwnCar: 'This driver\'s own car. The vehicle restrictions do not allow it, so he races the car '
+      + 'above.',
+    rosterRacesIn: 'The car this driver races, because the vehicle restrictions do not allow his own.',
+    rosterNoFit: 'No installed car meets the vehicle restrictions, so this driver keeps his own car.',
     rosterCar: 'The car for this one driver.',
     rosterCarRoll: 'Draw a different car for this driver.',
     rosterConfig: 'The factory version of this driver\'s car.',
@@ -436,6 +444,9 @@ angular.module('beamng.apps')
     return {
       race: '', mode: '', laps: '', reverse: false, force: false, includeDeprecated: false,
       carModel: '', carConfig: '', maxhp: '', maxpwr: '', maxkg: '', minkg: '', restrictVehicles: false,
+      // The NAME of a car list from the server's car list file (ADR-0066), '' for off. A name, not the list:
+      // the server reads its file again at race start, so a preset survives an edit of the list.
+      carList: '',
       // Composable player random-car axes (carModel='random'): a random compliant trim, and exclude
       // big/heavy vehicles. Both default ON (parity with the AI freshForm defaults), sent as explicit
       // booleans so a saved preset round-trips the admin's choice.
@@ -647,20 +658,35 @@ angular.module('beamng.apps')
     if (num(form.minkg) !== undefined) { target.minkg = num(form.minkg); }
   }
 
+  // The car list a form names, as the {name, mode, cars} the server sent (ADR-0066), or undefined when the
+  // name is not among `carLists` (unknown lists, an older server, a name the file no longer has).
+  function carListContent(form, carLists) {
+    var name = form.carList;
+    if (!name) {
+      return undefined;
+    }
+    return asArray(carLists).filter(function (list) { return list && list.name === name; })[0];
+  }
+
   // The player vehicle-policy slice the GE roster roll expects (ADR-0047): mirrors buildOverrides'
   // car/caps relay exactly, so a rolled roster car obeys precisely what the race would send (fixed car
-  // wins and drops the caps; car=random composes them; the restriction toggle gates the caps).
-  function buildRosterPolicy(form) {
+  // wins and drops the caps; car=random composes them; the restriction toggle gates the caps). The car list
+  // goes as its CONTENT, the one place it does: GE rolls and previews the AI lineup with it, and only the
+  // panel holds the lists the server sent (`carLists`).
+  function buildRosterPolicy(form, carLists) {
     var policy = {};
+    var restricted = form.restrictVehicles && (!form.carModel || form.carModel === 'random');
     if (form.carModel === 'random') {
       policy.car = 'random';
       policy.randomTrim = !!form.carRandomTrim;
       policy.noBigCars = !!form.carNoBigCars;
-      if (form.restrictVehicles) { capsInto(form, policy); }
     } else if (form.carModel) {
       policy.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
-    } else if (form.restrictVehicles) {
+    }
+    if (restricted) {
       capsInto(form, policy);
+      var list = carListContent(form, carLists);
+      if (list) { policy.carList = list; }
     }
     return policy;
   }
@@ -706,9 +732,12 @@ angular.module('beamng.apps')
     // composes with the caps (the client draws from the cap-compliant pool), so relay them too. Otherwise the
     // optional power/weight caps apply on their own. The "Vehicle restrictions" toggle gates whether the caps
     // apply, so an unchecked restriction sends nothing even if a stale value lingers in a field.
+    // The car list (ADR-0066) rides beside the caps, by NAME: the server resolves it against its file at race
+    // start.
     if (form.carModel === 'random') {
       o.car = 'random';
       if (form.restrictVehicles) { capsInto(form, o); }
+      if (form.restrictVehicles && form.carList) { o.carList = form.carList; }
       // The two composable axes, explicit booleans (like the AI axes): randomTrim false = stock/default trim,
       // true = a random compliant trim; noBigCars true excludes big/heavy vehicles (curb-weight ceiling).
       o.randomTrim = !!form.carRandomTrim;
@@ -717,6 +746,7 @@ angular.module('beamng.apps')
       o.car = form.carConfig ? (form.carModel + ':' + form.carConfig) : form.carModel;
     } else if (form.restrictVehicles) {
       capsInto(form, o);
+      if (form.carList) { o.carList = form.carList; }
     }
 
     // AI gate (ADR-0047 + the 2026-07-29 live amendment): the "AI opponents" checkbox is the gate. An `ai`
@@ -767,8 +797,9 @@ angular.module('beamng.apps')
       // names the command and no key: a guessed key would be worse than none.
       // serverDefaults = the defaults the SERVER owns, keyed by field ({jumpPenalty: 15}), relayed by GE
       // from the server's setupOpen. The one bag for all of them -- see scope.serverHint.
+      // carLists = the server's car lists (ADR-0066) as {name, mode, cars}, null while unknown.
       scope.data = { races: [], cars: [], grids: [], configs: [], presets: [], aiPalette: [], aiPoolNames: [],
-        aiDefaults: null, assistHoldDefault: null, assistKeys: {}, serverDefaults: null };
+        aiDefaults: null, assistHoldDefault: null, assistKeys: {}, serverDefaults: null, carLists: null };
       // raceId -> {closed, defaultLaps} for races GE has described, filled lazily as races are selected
       // (see raceMeta below). A race that is absent here has NOT been reported as open -- it has not been
       // asked about yet, or GE could not parse it -- and the panel must not act as if it knew.
@@ -784,7 +815,7 @@ angular.module('beamng.apps')
       scope.presetSaveOpen = false;  // the Save name row is revealed
       scope.armedPreset = '';        // name of the preset whose row delete is armed for its confirming click
       scope.opts = angular.extend({ race: [], carModel: [], classCar: [], carConfig: [], grid: [],
-        aiCar: [], rosterCar: [], preset: [] }, STATIC_OPTS);
+        aiCar: [], rosterCar: [], preset: [], carList: [{ v: '', label: 'off' }] }, STATIC_OPTS);
       scope.rosterOpen = false;  // the roster list is collapsed by default (ADR-0047)
       scope.championship = { active: false };  // latest server-broadcast championship state (ADR-0040)
       scope.tournament = { active: false };    // latest server-broadcast class-drop tournament state (ADR-0042)
@@ -937,6 +968,20 @@ angular.module('beamng.apps')
       function rebuildPresetOpts() {
         scope.opts.preset = (scope.data.presets || []).map(function (p) { return { v: p, label: p }; });
       }
+      // The Car list dropdown (ADR-0066): off, then every list the server sent, each naming its mode. A
+      // stored name the server does not have stays pickable and says so; the race then runs without it.
+      // While the lists are unknown it is listed bare, since the panel cannot tell either way.
+      function rebuildCarListOpts() {
+        var lists = scope.data.carLists;
+        var opts = [{ v: '', label: 'off' }].concat(asArray(lists).map(function (l) {
+          return { v: l.name, label: l.name + ' (' + l.mode + ')' };
+        }));
+        var stored = scope.form.carList;
+        if (stored && !opts.some(function (o) { return o.v === stored; })) {
+          opts.push({ v: stored, label: lists ? stored + ' (not on the server)' : stored });
+        }
+        scope.opts.carList = opts;
+      }
 
       // Serialise the current form into the JSON blob GE remembers for the session (store_setup_form) or
       // the server persists as a preset -- the write counterpart of applyStoredForm below. angular.toJson
@@ -985,9 +1030,11 @@ angular.module('beamng.apps')
         // value, so a saved restriction is never silently hidden-but-inactive (and older presets that predate
         // the restrictVehicles flag still show their caps).
         if (num(scope.form.maxhp) !== undefined || num(scope.form.maxpwr) !== undefined
-            || num(scope.form.maxkg) !== undefined || num(scope.form.minkg) !== undefined) {
+            || num(scope.form.maxkg) !== undefined || num(scope.form.minkg) !== undefined
+            || scope.form.carList) {
           scope.form.restrictVehicles = true;
         }
+        rebuildCarListOpts();
         // The restored race decides which grids are offered, and a stored grid of another race (or one
         // deleted meanwhile) has to go -- but only once a grid list is actually on hand (see
         // rebuildGridOpts); otherwise the pending list push does it.
@@ -1048,6 +1095,14 @@ angular.module('beamng.apps')
           // to the neutral "default". Keeping the last number would hide exactly that and show a figure
           // nothing stands behind any more.
           scope.data.serverDefaults = (payload && payload.serverDefaults) || null;
+          // The server's car lists (ADR-0066). Unlike serverDefaults a push without them keeps what the
+          // panel knows: the panel asks the server for them itself (requestCarLists), so a GE that lost them
+          // on a Lua reload must not blank a set the server sent this panel. An empty Lua list arrives as {},
+          // which asArray turns into the known empty list.
+          if (payload && payload.carLists) {
+            scope.data.carLists = asArray(payload.carLists);
+          }
+          rebuildCarListOpts();
           // The server's driver-name switch. Absent reads as ON, not as "keep what I had": GE sends it
           // on every push, so a missing field means an older GE, and on rather than off is the reading
           // that cannot make a panel claim the server is hiding names when it is not.
@@ -1128,6 +1183,21 @@ angular.module('beamng.apps')
         });
       });
 
+      // The server's car lists, read from its file for this panel's own request (requestCarLists: at link
+      // and every time the Car list dropdown opens). A reply without a list says nothing and leaves the
+      // known set; a list, empty included, is the server's current truth. A name the form holds that the
+      // fresh answer lacks keeps reading "(not on the server)" (rebuildCarListOpts). The dropdown is this
+      // panel's own markup, so an open list redraws with the answer at once.
+      scope.$on('BeamCompCarLists', function (event, payload) {
+        scope.$evalAsync(function () {
+          if (!payload || !payload.lists || typeof payload.lists !== 'object') {
+            return;
+          }
+          scope.data.carLists = asArray(payload.lists);
+          rebuildCarListOpts();
+        });
+      });
+
       // One race's track metadata, answering a requestRaceMeta (ADR-0013 amendment). `closed` decides
       // sprint vs circuit, so it is only cached when GE actually reported a boolean -- a race GE could not
       // parse leaves the entry absent, and "absent" means unknown, never "open". `defaultLaps` rides the
@@ -1168,6 +1238,21 @@ angular.module('beamng.apps')
         scope.open = (scope.open === field) ? null : field;
       };
 
+      // Ask the server for its car lists (ADR-0066 amendment 2026-11-13). It reads its file again and
+      // answers this panel only, by BeamCompCarLists. `why` names the trigger for GE's log line.
+      function requestCarLists(why) {
+        geLuaArg('request_car_lists', why);
+      }
+
+      // The Car list dropdown asks the server every time it opens, so a list written into the file while
+      // the panel was open is there on the next click.
+      scope.toggleCarList = function () {
+        scope.toggle('carList');
+        if (scope.open === 'carList') {
+          requestCarLists('the Car list dropdown');
+        }
+      };
+
       scope.labelFor = function (field) {
         var list = scope.opts[field] || [];
         var value = scope.form[field];
@@ -1201,7 +1286,12 @@ angular.module('beamng.apps')
       // race the replacements the lineup lists instead (feature ai-cars-follow-vehicle-limit).
       scope.aiCarHeadLabel = function () {
         var label = aiCarLabel(scope.form.aiCar, scope.labelFor('aiCar'));
-        return scope.aiCarOverLimit() ? label + ' (over the limit)' : label;
+        var rec = aiCarRestriction();
+        if (!rec) {
+          return label;
+        }
+        return label + (rec.breaks.length === 1 && rec.breaks[0] === 'list' ? ' (not on the list)'
+          : ' (over the limit)');
       };
 
       // Whether the AI have been given a car of their own that overrides a forced Car (all). An explicit
@@ -2028,7 +2118,7 @@ angular.module('beamng.apps')
         var spec = { ai: { randomTrim: !!scope.form.aiRandomTrim, noBigCars: !!scope.form.aiNoBigCars,
           bindLimit: !!scope.form.aiBindLimit } };
         if (scope.form.aiCar) { spec.ai.car = scope.form.aiCar; }
-        spec.policy = buildRosterPolicy(scope.form);
+        spec.policy = buildRosterPolicy(scope.form, scope.data.carLists);
         return spec;
       }
 
@@ -2363,8 +2453,21 @@ angular.module('beamng.apps')
       scope.limitSwapped = function (e) {
         return !!swapOf(e);
       };
-      function limitBreaksLabel(rec) {
-        return rec.breaks.map(function (axis) { return LIMIT_AXIS_LABELS[axis] || axis; }).join(', ');
+      // Why a driver's own car may not race: "over Max hp, Max kg" for the vehicle limit, 'not on the list
+      // "Street"' for the car list (ADR-0066), both when it is both. The list is the one the form names, the
+      // one the preview was asked with.
+      function limitReasonText(rec) {
+        var caps = rec.breaks.filter(function (axis) { return axis !== 'list'; });
+        var parts = [];
+        if (caps.length) {
+          parts.push('over ' + caps.map(function (axis) {
+            return LIMIT_AXIS_LABELS[axis] || axis;
+          }).join(', '));
+        }
+        if (rec.breaks.indexOf('list') !== -1) {
+          parts.push('not on the list "' + scope.form.carList + '"');
+        }
+        return parts.join(', ');
       }
 
       // The car and type a driver RACES, which the collapsed row shows: the replacement while his own car is
@@ -2379,7 +2482,7 @@ angular.module('beamng.apps')
       };
       scope.limitOwnCarText = function (e) {
         var rec = scope.limitOf(e);
-        return rec ? rec.originLabel + ' (over ' + limitBreaksLabel(rec) + ')' : '';
+        return rec ? rec.originLabel + ' (' + limitReasonText(rec) + ')' : '';
       };
       scope.limitRaceCarText = function (e) {
         var rec = swapOf(e);
@@ -2393,15 +2496,21 @@ angular.module('beamng.apps')
       };
       scope.limitNoFitText = function (e) {
         var rec = scope.limitOf(e);
-        return rec ? 'over ' + limitBreaksLabel(rec) + ', no car fits' : '';
+        return rec ? limitReasonText(rec) + ', no car fits' : '';
       };
 
       // The one line under "AI lineup" that says the limit swaps cars, so a collapsed lineup cannot hide it.
+      // A swap the car list (ADR-0066) takes part in says "vehicle restrictions"; one by the caps alone keeps
+      // its "vehicle limit" wording.
       scope.aiLimitNote = function () {
         var swapped = 0;
         var unmet = 0;
+        var listed = false;
         (scope.form.aiRoster || []).forEach(function (e) {
           var rec = scope.limitOf(e);
+          if (rec && rec.breaks.indexOf('list') !== -1) {
+            listed = true;
+          }
           if (rec && rec.unmet) {
             unmet += 1;
           } else if (rec) {
@@ -2409,36 +2518,50 @@ angular.module('beamng.apps')
           }
         });
         var parts = [];
-        if (swapped) {
+        if (swapped && listed) {
+          parts.push(swapped === 1
+            ? '1 AI car is not allowed by the vehicle restrictions and is swapped for one that is.'
+            : swapped + ' AI cars are not allowed by the vehicle restrictions and are swapped for ones that '
+              + 'are.');
+        } else if (swapped) {
           parts.push(swapped === 1
             ? '1 AI car is over the vehicle limit and is swapped for one that fits.'
             : swapped + ' AI cars are over the vehicle limit and are swapped for ones that fit.');
         }
         if (unmet) {
-          parts.push('No car meets the vehicle limit, so '
+          parts.push('No car meets the vehicle ' + (listed ? 'restrictions' : 'limit') + ', so '
             + (unmet === 1 ? '1 AI keeps its car.' : unmet + ' AI keep their cars.'));
         }
         return parts.join(' ');
       };
 
-      // Whether the explicit AI car is one the limit swaps -- the AI car head then says so.
-      scope.aiCarOverLimit = function () {
+      // The preview record of the explicit AI car when the vehicle restrictions swap it, else null -- the AI
+      // car head then says so, and why.
+      function aiCarRestriction() {
         var car = scope.form.aiCar;
         if (!car || car === 'random' || car === 'host') {
-          return false;
+          return null;
         }
-        return (scope.form.aiRoster || []).some(function (e) {
+        var found = null;
+        (scope.form.aiRoster || []).forEach(function (e) {
           var rec = scope.limitOf(e);
-          return !!rec && rec.origin === car;
+          if (!found && rec && rec.origin === car) {
+            found = rec;
+          }
         });
+        return found;
+      }
+      scope.aiCarOverLimit = function () {
+        return !!aiCarRestriction();
       };
 
-      // The "Bind AI to the limit" toggle shows while a vehicle limit is set: without one it decides nothing.
+      // The "Bind AI to the limit" toggle shows while a vehicle limit or a car list is set: without either it
+      // decides nothing.
       scope.aiLimitShown = function () {
         var form = scope.form;
         return scope.showRestrictions() && !!form.restrictVehicles
           && (num(form.maxhp) !== undefined || num(form.maxpwr) !== undefined
-            || num(form.maxkg) !== undefined || num(form.minkg) !== undefined);
+            || num(form.maxkg) !== undefined || num(form.minkg) !== undefined || !!form.carList);
       };
 
       // ----- The AI count, live on a debounce (round 2) -----------------------------------------------
@@ -2819,6 +2942,9 @@ angular.module('beamng.apps')
       geCall('request_setup_build');
       geCall('request_race_phase');
       geCall('request_players');
+      // The car lists straight from the server (ADR-0066 amendment 2026-11-13): a panel restored at join, or
+      // one that outlived a GE Lua reload, never saw the setupOpen that carries them.
+      requestCarLists('the setup panel linking');
       // Prefetch configs for the fresh-form default tournament classes (ADR-0042): the per-class config
       // dropdown options resolve from configsByModel, so without this the default etk800 rows show an empty
       // option list until their model is re-picked. UX only -- the tournament still starts with these cars

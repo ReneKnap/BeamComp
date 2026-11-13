@@ -29,6 +29,8 @@
 --                 range, kg) = per-player caps that keep a compliant car or substitute one (Mode 3); the caps
 --                 AND together; none = keep own car (Mode 1). A FIXED car= wins (drops all caps); car=random
 --                 keeps them. The two random axes (randomTrim/noBigCars) are panel-only, relayed verbatim.
+--                 So is the car list (carList, ADR-0066): a name from beamcomp.carlists.ini, resolved to
+--                 its content at race start and relayed beside the caps; a fixed car drops it too.
 --                 AI opponents (ADR-0036): ai <n> [preset] adds n host-driven AI (no count = content
 --                 default, [1..16]); preset easy|medium|hard, aicar=/aiaggr=/aiskill=/airubber=/aiavoid=
 --                 configure their vehicle + driving. airoute=snap|direct picks the AI line (snap =
@@ -997,6 +999,164 @@ local function read_config()
     end
     return nil, nil
 end
+
+-- ===== car lists (feature car-list-restriction, ADR-0066) ==========================================
+-- Named whitelists and blacklists of cars, written by hand in beamcomp.carlists.ini next to the settings
+-- file. The panel offers them under Vehicle restrictions; the race request names one, and the race start
+-- relays its content to every client, which checks its own car against it (ADR-0032 amendment 2026-11-12).
+--
+-- The format follows cfg.parse_ini's rules and its tolerance, a line at a time:
+--   [Street cars]        opens a list; the name is everything between the brackets, trimmed
+--   mode = whitelist     or blacklist, anywhere in the block, case-insensitive
+--   pessima              a car: every version of the model
+--   etk800:846_340_A     one version of it, model and config key
+-- `#` and `;` start a comment only at the START of a line, the settings file's rule. A line that cannot be
+-- read is skipped with its line number and everything else still applies; a list without a valid mode is
+-- skipped whole. Race-blind (ADR-0005): names, modes and strings, never a check that a model exists.
+--
+-- Read on every /raceui, on every request of the setup panel (cfg.handle_car_lists_request: when it links and
+-- when its Car list dropdown opens) and at every race start, never cached, so a hand edit needs no restart.
+-- On cfg for the 200-local ceiling.
+cfg.CAR_LISTS_CANDIDATE_PATHS = {
+    "Resources/Server/BeamComp/beamcomp.carlists.ini",
+    "beamcomp.carlists.ini",
+}
+cfg.CAR_LIST_MODES = {whitelist = true, blacklist = true}
+-- Bounds against a pathological file: the panel's open payload carries every list, and a list rides every
+-- player's raceStart. A real list is a few dozen cars.
+cfg.MAX_CAR_LISTS = 32
+cfg.MAX_LIST_CARS = 300
+
+-- Whether `text` reads as a car: `model` or `model:config`, both parts non-empty, no space and no second
+-- colon. The space rule is what turns a mid-line "# comment" into a warning instead of a car nobody has.
+function cfg.is_car_entry(text)
+    return text:match("^[^%s:]+$") ~= nil or text:match("^[^%s:]+:[^%s:]+$") ~= nil
+end
+
+-- Parse the car list file into {order = {names in file order}, lists = {[name] = {name, mode, cars}}}.
+-- `cars` keeps each entry as written, once (a repeat is dropped, case-insensitively). A second list with a
+-- name already used replaces the first, like a repeated key in the settings file.
+function cfg.parse_car_lists(contents, path)
+    local parsed = {order = {}, lists = {}}
+    local block = nil
+    local number = 0
+    -- An editor that saves "UTF-8 with BOM" puts three bytes in front of the first line, and the first list's
+    -- "[" would then not start its line. The bytes are no text anybody wrote, so they go.
+    contents = contents:gsub("^\239\187\191", "")
+    local function warn(line, text)
+        log_info("beamcomp.cfg", "  " .. path .. " line " .. line .. ": " .. text)
+    end
+    local function close_block()
+        if not block or block.unreadable then
+            block = nil
+            return
+        end
+        local name = block.name
+        if not block.mode then
+            warn(block.line, "list '" .. name .. "' has no 'mode = whitelist' or 'mode = blacklist'; "
+                .. "skipping the whole list")
+        elseif #block.cars == 0 then
+            warn(block.line, "list '" .. name .. "' names no car; skipping it")
+        elseif parsed.lists[name] then
+            warn(block.line, "a list named '" .. name .. "' starts at line " .. parsed.lists[name].line
+                .. " as well; this one replaces it")
+            parsed.lists[name] = {name = name, mode = block.mode, cars = block.cars, line = block.line}
+        elseif #parsed.order >= cfg.MAX_CAR_LISTS then
+            warn(block.line, "more than " .. cfg.MAX_CAR_LISTS .. " lists; skipping '" .. name .. "'")
+        else
+            parsed.order[#parsed.order + 1] = name
+            parsed.lists[name] = {name = name, mode = block.mode, cars = block.cars, line = block.line}
+        end
+        block = nil
+    end
+    for raw_line in (contents .. "\n"):gmatch("(.-)\n") do
+        number = number + 1
+        local line = access.trim(raw_line)
+        local first = line:sub(1, 1)
+        local key, value = line:match("^([^=]*)=(.*)$")
+        if line == "" or first == "#" or first == ";" then
+            -- blank or a comment
+        elseif first == "[" then
+            close_block()
+            local name = line:match("^%[(.*)%]$")
+            name = name and access.trim(name)
+            if not name or name == "" then
+                warn(number, "cannot read this list name (expected '[name]'); skipping the list below it")
+                block = {unreadable = true}
+            else
+                block = {name = name, line = number, cars = {}, seen = {}}
+            end
+        elseif not block then
+            warn(number, "this line is outside a list (start one with '[name]'); skipping it")
+        elseif block.unreadable then
+            -- the list's header was unreadable and said so once
+        elseif key then
+            key = access.trim(key):lower()
+            value = access.trim(value):lower()
+            if key ~= "mode" then
+                warn(number, "unknown setting '" .. key .. "' (a list only knows 'mode'); skipping it")
+            elseif not cfg.CAR_LIST_MODES[value] then
+                warn(number, "mode is '" .. value .. "', which is not whitelist or blacklist; skipping it")
+            else
+                if block.mode then
+                    warn(number, "mode is set more than once in list '" .. block.name
+                        .. "'; the last one wins")
+                end
+                block.mode = value
+            end
+        elseif not cfg.is_car_entry(line) then
+            warn(number, "cannot read this car (expected 'model' or 'model:config', no spaces); skipping it")
+        elseif not block.seen[line:lower()] then
+            block.seen[line:lower()] = true
+            if #block.cars < cfg.MAX_LIST_CARS then
+                block.cars[#block.cars + 1] = line
+            elseif not block.full then
+                block.full = true
+                warn(number, "list '" .. block.name .. "' has more than " .. cfg.MAX_LIST_CARS
+                    .. " cars; skipping this one and every car after it")
+            end
+        end
+    end
+    close_block()
+    return parsed
+end
+
+-- Read the car list file from the first candidate path that opens, every time it is called. Returns the
+-- parsed lists and the path, or an empty set and nil when there is no file. One line per read names what
+-- it found, so a list missing from the panel can be traced to the file the server actually read.
+--
+-- io.open(path, "r"), never "a": an append-mode probe CREATES the file (ADR-0053 layer 0).
+function cfg.read_car_lists()
+    for _, path in ipairs(cfg.CAR_LISTS_CANDIDATE_PATHS) do
+        local file = io.open(path, "r")
+        if file then
+            local contents = file:read("*a") or ""
+            file:close()
+            local parsed = cfg.parse_car_lists(contents, path)
+            log_info("beamcomp.cfg", string.format("car lists: %d read from %s%s", #parsed.order, path,
+                #parsed.order > 0 and (" (" .. table.concat(parsed.order, ", ") .. ")") or ""))
+            return parsed, path
+        end
+    end
+    log_info("beamcomp.cfg", "car lists: no beamcomp.carlists.ini found")
+    return {order = {}, lists = {}}, nil
+end
+
+-- The relayed form of one list: {name, mode, cars}, the shape every client reads (race/vehiclespecs.lua
+-- car_list).
+function cfg.car_list_content(list)
+    return {name = list.name, mode = list.mode, cars = list.cars}
+end
+
+-- Every list in file order, for the setup panel's open payload.
+function cfg.car_list_payload(parsed)
+    local payload = {}
+    for _, name in ipairs(parsed.order) do
+        payload[#payload + 1] = cfg.car_list_content(parsed.lists[name])
+    end
+    return payload
+end
+-- ===== end car lists ===============================================================================
 
 -- Populate the race-admin allowlist from the plugin config (ADR-0016). An empty list, a missing file,
 -- or a parse error all leave the gate inactive so the existing open behaviour is preserved (opt-in);
@@ -2745,8 +2905,11 @@ end
 --     AI: the owner swaps an AI car over the limit (feature ai-cars-follow-vehicle-limit), so like the
 --     lobby car above it may not be the car on the grid. A roster car needs no such rule -- the panel
 --     sends the car each AI races, already held to the limit.
-function grid_fit.seed_known(overrides, ai_count)
+-- `car_list` is the race's resolved car list (cfg.race_car_list), or nil. It restricts like a cap: a lobby
+-- car or an AI car it does not allow is swapped, so it counts as one here.
+function grid_fit.seed_known(overrides, ai_count, car_list)
     local capped = overrides.maxhp or overrides.maxpwr or overrides.maxkg or overrides.minkg
+        or car_list ~= nil
     local ai_bound = capped and session.tournament == nil
         and not (overrides.ai and overrides.ai.bindLimit == false)
     local ai_car_size = not ai_bound and overrides.ai_car_size or nil
@@ -5852,6 +6015,48 @@ local function maybe_end_race()
     end
 end
 
+-- The car list the race named (feature car-list-restriction, ADR-0066), resolved against the file as it is
+-- NOW, as the {name, mode, cars} content every client checks its own car against -- or nil when there is
+-- none to relay: no list named, a FIXED car (it wins over the list exactly as over the caps, ADR-0032;
+-- begin_race_request already drops the name then), or a class-drop tournament, whose classes decide every
+-- car (ADR-0042). A name the file no longer has (renamed or deleted since a preset saved it) never refuses
+-- the race: it runs without a list and the issuer is told. Defined here, after `tour`, which it reads.
+--
+-- Never written back onto `overrides`: the staged request is compared with the next Confirm's race-blind
+-- (tour.settle_staged), and content riding on one side only would rebuild the grid on every Confirm.
+function cfg.race_car_list(overrides, owner_id)
+    local name = overrides.carList
+    if type(name) ~= "string" or (overrides.car and overrides.car ~= "random") or tour.is_active() then
+        return nil
+    end
+    local list = cfg.read_car_lists().lists[name]
+    if not list then
+        MP.SendChatMessage(owner_id, "BeamComp: the car list '" .. name .. "' does not exist on this server, "
+            .. "so this race runs without it")
+        log_info("beamcomp.race", "car list '" .. name .. "' is not in the car list file; the race runs "
+            .. "without it")
+        return nil
+    end
+    log_info("beamcomp.race", string.format("car list '%s' (%s, %d car(s)) applies to this race", name,
+        list.mode, #list.cars))
+    return cfg.car_list_content(list)
+end
+
+-- The setup panel asks for the car lists itself (ADR-0066 amendment 2026-11-13): when it links -- a panel
+-- restored from the player's layout at join, or one that outlived a GE Lua reload, never saw a setupOpen --
+-- and every time its Car list dropdown opens, so a hand edit shows without /raceui. Each request reads the
+-- file again and answers the asker only; nothing watches the file and nothing is broadcast. Not admin-gated,
+-- like the grid and preset list requests: the lists are read-only names and car strings, and every raceStart
+-- carries the chosen one to every client anyway. Dispatched from handle_client_event.
+cfg.MSG_CAR_LISTS_REQ = "carListsReq"  -- client -> server: send me the car lists
+cfg.MSG_CAR_LISTS = "carLists"         -- server -> the asker: {lists = [{name, mode, cars}]}
+
+function cfg.handle_car_lists_request(player_id)
+    local lists = cfg.car_list_payload(cfg.read_car_lists())
+    grid_store.deliver("beamcomp.cfg", cfg.MSG_CAR_LISTS, {lists = lists}, {player_id},
+        string.format("car lists (%d list(s)), request", #lists))
+end
+
 -- Begin a fresh race: assign slots, send each player its raceStart (slot + grid roster + relayed
 -- overrides), and enter the spawning phase. The client resolves and parses the race name locally
 -- (ADR-0005) and decides the actual mode/laps/direction; `overrides` carries the admin's verbatim
@@ -5871,6 +6076,8 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- all follow the format, so it is applied here and not when the request arrived. A race queued behind
     -- a running one therefore changes the format only when it starts; nil leaves the format as it is.
     tour.apply_format(overrides.format, owner_id)
+    -- The car list, after the format: a class-drop it just started leaves the cars to its classes.
+    local car_list = cfg.race_car_list(overrides, owner_id)
     -- Resolve the grid start order (ADR-0033/0040/0041): entry/random/last/championship are applied to the
     -- slot assignment now; pwr and quali are provisional here and re-gridded later (pwr after staging, quali
     -- after the qualifying session). While a championship is active its stored order grids the race unless
@@ -5919,7 +6126,7 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     session.identities = nil
     -- Seed every footprint that is ALREADY known (ADR-0051 round 2) -- the lobby cars, the fixed car and
     -- the rostered AI cars -- so this first slot assignment can reserve rather than only correct later.
-    grid_fit.seed_known(overrides, overrides.ai and overrides.ai.count)
+    grid_fit.seed_known(overrides, overrides.ai and overrides.ai.count, car_list)
     -- The requested AI opponents become synthetic participant slots (ADR-0036), so the roster, grid
     -- layout, and standings include them like any participant; the owner spawns + drives them. They mix
     -- into a random order and sort by reported pwr; otherwise they take the back of the grid.
@@ -6006,7 +6213,7 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
             -- byte-for-byte as before. policy_for degrades to keep-own (Mode 1) for a missing/empty class spec.
             local policy = (tour.is_active() and tour.policy_for(entry.id))
                 or {car = overrides.car, maxhp = overrides.maxhp, maxpwr = overrides.maxpwr,
-                    maxkg = overrides.maxkg, minkg = overrides.minkg}
+                    maxkg = overrides.maxkg, minkg = overrides.minkg, carList = car_list}
             send_event(entry.id, MSG_RACE_START, {
                 race = race_name,
                 slot = entry.slot,
@@ -6060,6 +6267,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 maxpwr = policy.maxpwr,
                 maxkg = policy.maxkg,
                 minkg = policy.minkg,
+                -- The race's car list (ADR-0066) as {name, mode, cars}, relayed verbatim beside the caps:
+                -- every client checks its own car, its random draw and (on the owner) the AI against it.
+                -- nil without one, under a fixed car and for a class-drop driver (his class's policy).
+                carList = policy.carList,
                 -- car=random composable axes (ADR-0032 amendment): the random trim + big-car exclusion for a
                 -- car=random player, relayed verbatim and resolved client-side. A GLOBAL admin choice (not
                 -- per-class), so read from overrides, not the per-recipient policy (a tournament fills policy
@@ -7622,6 +7833,12 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         overrides.minkg = nil
         MP.SendChatMessage(player_id, "BeamComp: car= is set, so maxhp/maxpwr/maxkg/minkg are ignored")
     end
+    -- The car list (ADR-0066) follows the same precedence. Only the panel sends one, and the panel hides it
+    -- under a fixed car, so this is a defensive drop with a log line rather than a chat line.
+    if overrides.car and overrides.car ~= "random" and overrides.carList then
+        log_info("beamcomp.race", "car= is set, so the car list '" .. overrides.carList .. "' is ignored")
+        overrides.carList = nil
+    end
 
     local assists = overrides.assists
     local order_echo = ""
@@ -7629,7 +7846,7 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         order_echo = " order=" .. overrides.order.mode .. (overrides.order.rev and ":rev" or "")
     end
     log_info("beamcomp.race", string.format(
-        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s%s%s%s",
+        "race '%s' by %s (phase %s)%s%s%s%s recover=%s repair=%s%s%s%s%s%s%s%s%s%s",
         race_name, player_name, session.phase,
         overrides.mode and (" mode=" .. overrides.mode) or "",
         overrides.laps and (" laps=" .. overrides.laps) or "",
@@ -7642,6 +7859,7 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         overrides.maxpwr and (" maxpwr=" .. overrides.maxpwr) or "",
         overrides.maxkg and (" maxkg=" .. overrides.maxkg) or "",
         overrides.minkg and (" minkg=" .. overrides.minkg) or "",
+        overrides.carList and (" carlist='" .. overrides.carList .. "'") or "",
         order_echo,
         overrides.ai and (" ai=" .. overrides.ai.count
             .. (overrides.ai.explicit and "" or "(default)")
@@ -9145,6 +9363,11 @@ function access.open_setup(player_id)
         -- Deliberately not a key of serverDefaults: that table is the panel's grey "N (default)" hints
         -- and is relayed verbatim, while this is an identity fact the client resolves against.
         yourPlayerId = player_id,
+        -- Every car list in the car list file (ADR-0066), read again for this open so a hand edit shows
+        -- without a restart: {name, mode, cars} in file order. The panel offers the names under Vehicle
+        -- restrictions; the content is what this admin's GE previews and rolls the AI lineup with. Not a
+        -- key of serverDefaults: it changes between two opens.
+        carLists = cfg.car_list_payload(cfg.read_car_lists()),
     })
     -- Seed the panel with the current championship + tournament state (ADR-0040/0042) so its tournament
     -- section reflects reality on open; subsequent changes arrive via the broadcasts.
@@ -10222,6 +10445,9 @@ local function sanitize_overrides(raw)
         maxkg = tonumber(raw.maxkg),
         minkg = tonumber(raw.minkg),
         grid = (type(raw.grid) == "string" and raw.grid ~= "") and raw.grid or nil,
+        -- The name of a car list from the car list file (ADR-0066), resolved at race start
+        -- (cfg.race_car_list). Panel only; there is no /race token for it.
+        carList = (type(raw.carList) == "string" and raw.carList ~= "") and raw.carList or nil,
         -- F1 light start (ADR-0043): only "f1" survives; nil = the default lock countdown.
         startMode = (raw.startMode == "f1") and "f1" or nil,
     }
@@ -10566,6 +10792,8 @@ local function handle_client_event(player_id, data)
         grid_store.handle_preset_fetch(player_id, decoded.payload)
     elseif decoded.type == grid_store.MSG_PRESET_LIST_REQ then
         grid_store.handle_preset_list_request(player_id, decoded.payload)
+    elseif decoded.type == cfg.MSG_CAR_LISTS_REQ then
+        cfg.handle_car_lists_request(player_id)
     elseif decoded.type == MSG_START_RACE then
         handle_start_race(player_id, decoded.payload)
     elseif decoded.type == MSG_RACE_GO then

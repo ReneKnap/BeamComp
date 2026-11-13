@@ -14,7 +14,8 @@
 
   Runtime data the plugin writes into the server folder (named grids, saved
   presets, the per-run records log) is copied out before the folder is wiped and
-  put back afterwards, so a redeploy never resets it to the empty repo seed.
+  put back afterwards, so a redeploy never resets it to the empty repo seed. The
+  operator's hand-written car lists (beamcomp.carlists.ini) are kept the same way.
 
   A leftover beamcomp.records.json from the retired aggregate format (ADR-0050)
   is archived to <Target>\BeamComp-Archive\ -- deliberately a sibling of
@@ -192,6 +193,17 @@ try {
         Copy-Item -LiteralPath $presetsTarget -Destination $presetsBackup -Force
     }
 
+    # beamcomp.carlists.ini is the operator's own car lists (ADR-0066), written by hand on the server. Unlike
+    # the three files above the plugin never writes it, but the repo ships a comments-only template of it, and
+    # the server copy below would put that template over the operator's lists on every deploy. Preserve an
+    # existing one identically; a fresh target gets the template.
+    $carListsTarget = Join-Path $serverOut 'beamcomp.carlists.ini'
+    $carListsBackup = $null
+    if (Test-Path -LiteralPath $carListsTarget) {
+        $carListsBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("beamcomp_carlists_" + [Guid]::NewGuid().ToString('N') + ".ini")
+        Copy-Item -LiteralPath $carListsTarget -Destination $carListsBackup -Force
+    }
+
     if (Test-Path -LiteralPath $serverOut) { Remove-Item -LiteralPath $serverOut -Recurse -Force }
     New-Dir $serverOut
     Copy-Item -Path (Join-Path $serverDir '*') -Destination $serverOut -Recurse -Force
@@ -218,6 +230,12 @@ try {
         Copy-Item -LiteralPath $presetsBackup -Destination $presetsTarget -Force
         Remove-Item -LiteralPath $presetsBackup -Force
         Write-Host "  preserved existing beamcomp.presets.json (saved race-setup presets kept)"
+    }
+
+    if ($null -ne $carListsBackup) {
+        Copy-Item -LiteralPath $carListsBackup -Destination $carListsTarget -Force
+        Remove-Item -LiteralPath $carListsBackup -Force
+        Write-Host "  preserved existing beamcomp.carlists.ini (hand-written car lists kept)"
     }
 
     Write-Host "BeamComp deployed to: $resourcesDir"

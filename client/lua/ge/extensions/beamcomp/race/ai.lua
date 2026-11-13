@@ -160,13 +160,15 @@ end
 -- deterministic cars-only find_compliant_car, then a random stock car -- so an AI slot ALWAYS gets a real
 -- car even when no car passes the filters, and no branch can ever return a prop/trailer or nothing. Shared
 -- by random_ai_vehicle (explicit aicar=random) and the default-AI-inherits-car=random branch in
--- resolve_ai_vehicle, so the two never drift. Returns (model, config).
+-- resolve_ai_vehicle, so the two never drift. A car list in the spec (ADR-0066) is the first thing the
+-- fallback gives up: find_compliant_car knows only the caps. Returns (model, config).
 local function resolve_random_spec(spec)
     local pick = vehiclespecs.random_vehicle(spec)
     if pick then
         return pick.model, pick.config
     end
-    log("W", LOG_TAG, "no compliant car for random AI; using best-effort fallback")
+    log("W", LOG_TAG, "no compliant car for random AI" .. (spec.car_list
+        and (" on the car list '" .. spec.car_list.name .. "'") or "") .. "; using best-effort fallback")
     local fallback = vehiclespecs.find_compliant_car(spec.max_power, spec.max_pwr, spec.max_weight,
         spec.weight_range)
     if fallback then
@@ -176,17 +178,19 @@ local function resolve_random_spec(spec)
 end
 
 -- The vehicle limit the AI cars are held to (feature ai-cars-follow-vehicle-limit), as
--- {max_power?, max_pwr?, weight_range?} for vehiclespecs, or nil when none binds them. `config` is the AI
--- config (relayed aiConfig, or the panel's ai slice), `policy` the player vehicle policy. The ONE answer to
--- "does the limit reach the AI", read by every random roll here and by M.limit_lineup. None binds them when:
+-- {max_power?, max_pwr?, weight_range?, car_list?} for vehiclespecs, or nil when none binds them. `car_list`
+-- is the race's car list (policy.carList, ADR-0066): it restricts the AI exactly like the caps and through
+-- the same answer. `config` is the AI config (relayed aiConfig, or the panel's ai slice), `policy` the player
+-- vehicle policy. The ONE answer to "does the limit reach the AI", read by every random roll here and by
+-- M.limit_lineup. None binds them when:
 --   * the AI were set free of it (config.bindLimit == false, the panel toggle or /race ailimit=off). Absent
 --     means on, so an older client or a typed /race without the parameter binds them;
 --   * a class-drop tournament runs (config.classDrop): the classes decide every car (ADR-0042), and the
 --     owner's policy is then HIS class's, which must not reach the AI's class cars;
 --   * the players are forced into a FIXED car (a concrete model or "host"): the car wins over the caps
 --     (ADR-0032 section 2), and the server drops them anyway. car=random is not a fixed car, so the caps
---     compose with it;
---   * there are no caps.
+--     compose with it. The server drops the car list there too;
+--   * there are no caps and no car list.
 function M.limit_spec(config, policy)
     config = type(config) == "table" and config or {}
     policy = type(policy) == "table" and policy or {}
@@ -199,10 +203,11 @@ function M.limit_spec(config, policy)
     local range = vehiclespecs.weight_range(policy.minkg, policy.maxkg)
     local max_power = type(policy.maxhp) == "number" and policy.maxhp or nil
     local max_pwr = type(policy.maxpwr) == "number" and policy.maxpwr or nil
-    if not (max_power or max_pwr or range) then
+    local car_list = vehiclespecs.car_list(policy.carList)
+    if not (max_power or max_pwr or range or car_list) then
         return nil
     end
-    return {max_power = max_power, max_pwr = max_pwr, weight_range = range}
+    return {max_power = max_power, max_pwr = max_pwr, weight_range = range, car_list = car_list}
 end
 
 -- A random AI vehicle {model, config} for an EXPLICIT aicar=random, filter-aware (ADR-0032/0037). Composes
@@ -232,6 +237,7 @@ local function random_ai_vehicle(policy, config)
         weight_range = limit and limit.weight_range or nil,
         max_weight = config.noBigCars and vehiclespecs.BIG_CAR_MAX_WEIGHT or nil,
         random_trim = random_trim,
+        car_list = limit and limit.car_list or nil,
     })
 end
 
@@ -317,10 +323,11 @@ local function resolve_ai_vehicle(config, content_defaults, policy, index, slot_
         -- random axes via the SAME spec the player uses (random_spec_from_policy) -- so player and inheriting
         -- AI never drift. Empty pool -> the AI best-effort fallback (resolve_random_spec), never a prop or
         -- nothing. Branched BEFORE the split_car_token below so "random" is never spawned as a model name.
-        -- AI set free of the vehicle limit (M.limit_spec) roll from the player's pool minus his caps.
+        -- AI set free of the vehicle limit (M.limit_spec) roll from the player's pool minus his caps and his
+        -- car list.
         local spec = vehiclespecs.random_spec_from_policy(policy)
         if not M.limit_spec(config, policy) then
-            spec.max_power, spec.max_pwr, spec.weight_range = nil, nil, nil
+            spec.max_power, spec.max_pwr, spec.weight_range, spec.car_list = nil, nil, nil, nil
         end
         return resolve_random_spec(spec)
     elseif policy.car == "host" then
@@ -365,19 +372,32 @@ local function car_token(model, vehicle_config)
     return model
 end
 
--- The broken bounds of a vehicle limit as one log fragment: "maxhp 200: 240 hp, minkg 1200: unknown".
+-- Why a car may not race, as one log fragment. The caps keep the wording they always had, "is over the
+-- vehicle limit (maxhp 200: 240 hp, minkg 1200: unknown)"; the car list (ADR-0066) says "is not on the car
+-- list 'Street'"; a car that breaks both gets both, joined with "and".
 local function breaks_text(breaks)
     local units = {maxhp = "hp", maxpwr = "hp/kg", minkg = "kg", maxkg = "kg"}
-    local parts = {}
+    local caps, list = {}, nil
     for _, broken in ipairs(breaks) do
-        local value = "unknown"
-        if type(broken.value) == "number" then
-            value = string.format(broken.axis == "maxpwr" and "%.3f %s" or "%g %s", broken.value,
-                units[broken.axis])
+        if broken.axis == "list" then
+            list = broken.limit
+        else
+            local value = "unknown"
+            if type(broken.value) == "number" then
+                value = string.format(broken.axis == "maxpwr" and "%.3f %s" or "%g %s", broken.value,
+                    units[broken.axis])
+            end
+            caps[#caps + 1] = string.format("%s %s: %s", broken.axis, tostring(broken.limit), value)
         end
-        parts[#parts + 1] = string.format("%s %s: %s", broken.axis, tostring(broken.limit), value)
     end
-    return table.concat(parts, ", ")
+    local reasons = {}
+    if #caps > 0 then
+        reasons[#reasons + 1] = "is over the vehicle limit (" .. table.concat(caps, ", ") .. ")"
+    end
+    if list then
+        reasons[#reasons + 1] = "is not on the car list '" .. tostring(list) .. "'"
+    end
+    return table.concat(reasons, " and ")
 end
 
 -- One beamcomp.race line per AI the lineup touched (requirement 7 of the feature): who, which number/slot,
@@ -387,11 +407,11 @@ local function log_limit_result(entry, position, result)
     local who = string.format("AI '%s' (#%d%s)", tostring(entry.label or entry.name),
         entry.number or position, entry.slot ~= nil and (", slot " .. tostring(entry.slot)) or "")
     if result.replaced then
-        log("I", "beamcomp.race", string.format("%s: '%s' is over the vehicle limit (%s) -> '%s'", who,
+        log("I", "beamcomp.race", string.format("%s: '%s' %s -> '%s'", who,
             tostring(result.origin), breaks_text(result.breaks), tostring(result.car)))
     else
         log("W", "beamcomp.race", string.format(
-            "%s: '%s' is over the vehicle limit (%s), and no installed car fits it; the AI keeps its car",
+            "%s: '%s' %s, and no installed car fits it; the AI keeps its car",
             who, tostring(result.origin), breaks_text(result.breaks)))
     end
 end
@@ -408,8 +428,8 @@ end
 --
 -- Per entry, in order:
 --   * no limit binds the AI, the entry is exempt (the host's car), or it names no car or a sentinel: kept;
---   * its own car fits (vehiclespecs.token_specs + limit_breaks; a bare model is judged by the config it
---     spawns as): kept, untouched;
+--   * its own car fits (vehiclespecs.car_breaks: the listed power and weight against the caps, and the car
+--     list; a bare model is judged by the config it spawns as): kept, untouched;
 --   * otherwise it takes the next candidate of its MODEL's sequence (vehiclespecs.limit_candidates: the
 --     model's own fitting trims, strongest first, then one car per further model from its place in the car
 --     list on, wrapping). The first AI of a model gets candidate 1, the second candidate 2 and so on,
@@ -432,8 +452,7 @@ function M.limit_lineup(entries, config, policy, say)
         field[number] = result
         local model, vehicle_config = split_car_token(token)
         if limit and model and not entry.exempt and token ~= "host" and token ~= "random" then
-            local power, weight = vehiclespecs.token_specs(model, vehicle_config)
-            result.breaks = vehiclespecs.limit_breaks(power, weight, limit)
+            result.breaks = vehiclespecs.car_breaks(model, vehicle_config, limit)
         end
         if result.breaks then
             local sequence = sequences[model]

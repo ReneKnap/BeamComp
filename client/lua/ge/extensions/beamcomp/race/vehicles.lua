@@ -418,42 +418,9 @@ local function pose_orientation(pose)
     return quat(pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w)
 end
 
--- The config KEY out of whatever a caller was handed: a plain preset name, a .pc path, or a table
--- carrying linkedPCFile -- core_vehicles accepts all three. nil for anything else, which resolves to the
--- model's default config downstream (the right answer: that is what would spawn).
---
--- With `model` known this applies the ENGINE'S OWN rule, taken verbatim from core/vehicles.lua
--- getVehicleDetails: `config_key = pc_file:match("vehicles/<model>/(.*).pc")` -- the path RELATIVE to the
--- model folder, which keeps a config living in a SUBFOLDER keyed the way core_vehicles keys it. The
--- basename fallback below is for a caller that has no model to match against.
---
--- Plain find rather than a pattern, so a model key never has to be escaped.
-local function config_key(config, model)
-    if type(config) == "table" then
-        config = config.linkedPCFile
-    end
-    if type(config) ~= "string" or config == "" then
-        return nil
-    end
-    if type(model) == "string" and model ~= "" then
-        local prefix = "vehicles/" .. model .. "/"
-        local at = config:find(prefix, 1, true)
-        if at then
-            local relative = config:sub(at + #prefix):gsub("%.pc$", "")
-            if relative ~= "" then
-                return relative
-            end
-        end
-    end
-    -- The VFS uses forward slashes throughout, so stripping those is enough to get from a .pc path to
-    -- the config key core_vehicles indexes its configs by.
-    local key = config:match("([^/]+)$") or config
-    key = key:gsub("%.pc$", "")
-    if key == "" then
-        return nil
-    end
-    return key
-end
+-- The config KEY out of whatever a caller was handed (a preset name, a .pc path, a table with linkedPCFile),
+-- by the engine's own rule. It lives in vehiclespecs since the car list's predicate needs the same key.
+local config_key = vehiclespecs.config_key
 
 -- The (model, config-key) pair identifying which stock config's metadata box describes `veh`, read off
 -- the vehicle itself the way capture_spec does -- so a placement path can reach the box without a new
@@ -499,6 +466,66 @@ end
 function M.is_stock_setup(veh)
     local _, config = model_config_of(veh)
     return config ~= nil
+end
+
+-- Whether `part_config` reads as a config path or name rather than a serialized config (whose text starts
+-- with "{" and spans lines). Unlike is_preset_variant there is no length limit: a deep subfolder path is
+-- long.
+local function is_config_path(part_config)
+    return type(part_config) == "string" and part_config ~= "" and not part_config:find("[{\r\n]")
+end
+
+-- (public) Which car `veh` IS for the car list (ADR-0066): its model and the config key of the preset it was
+-- spawned from, or false when that is unknown. A preset's partConfig is its .pc path (normalized the
+-- engine's way, config_key). After a parts or tuning change partConfig is the serialized config, and the
+-- config's own partConfigFilename still names that preset (core/vehicle/partmgmt.lua merges a change into
+-- the loaded config and respawns with it), so a rebuilt car keeps the identity it started with and the list
+-- never re-judges it for a tuning change. A car built from nothing, with no file behind it, reads false: only
+-- a whole-model entry can then match it. nil model when the car cannot be read. pcall-guarded.
+function M.car_identity(veh)
+    if not veh then
+        return nil
+    end
+    local ok, model, part_config, veh_id = pcall(function()
+        return veh.JBeam, veh.partConfig, veh:getId()
+    end)
+    if not ok or type(model) ~= "string" or model == "" then
+        return nil
+    end
+    if is_config_path(part_config) then
+        return model, config_key(part_config, model) or false
+    end
+    local read, config = pcall(function()
+        return core_vehicle_partmgmt.getConfigOfVehicle(veh_id)
+    end)
+    local filename = read and type(config) == "table" and config.partConfigFilename or nil
+    if is_config_path(filename) then
+        return model, config_key(filename, model) or false
+    end
+    return model, false
+end
+
+-- (public) Whether the car list `list` (a relayed car list, vehiclespecs.car_list) lets `veh` race, judged on
+-- its identity (M.car_identity). True without a list. A car whose model cannot be read is not on any list.
+function M.car_on_list(veh, list)
+    if not vehiclespecs.car_list(list) then
+        return true
+    end
+    local model, config = M.car_identity(veh)
+    if not model then
+        return false
+    end
+    return vehiclespecs.list_allows(list, model, config)
+end
+
+-- (public) "<model>" or "<model>:<config key>" naming `veh` the way a car list writes it, for the log lines
+-- of a list decision. "unknown" when the car cannot be read.
+function M.identity_label(veh)
+    local model, config = M.car_identity(veh)
+    if not model then
+        return "unknown"
+    end
+    return config and (model .. ":" .. config) or model
 end
 
 -- (public) The metadata power (hp) and the listed weight (kg, correction table included) of the preset
@@ -1319,11 +1346,14 @@ end
 -- search -- the own model's strongest legal trim first, then other models (find_compliant) -- or, when no
 -- installed car meets the limit, the fixed default car even though it is over it, so the player still
 -- races. The candidates are stock configs, for which the metadata IS what the car measures. Shared by the
--- race start without an own car (respawn_for_cap) and the staging substitute of an own car measured over the
--- limit (init.lua caps.substitute).
+-- race start without an own car (respawn_for_cap), the race start of an own car the car list does not allow
+-- (respawn_for_list), and the staging substitutes of the vehicle limit and the car list (init.lua
+-- caps.substitute, carlist.reject). `caps` is the policy: maxhp, maxpwr, maxkg, minkg and carList (ADR-0066),
+-- which narrows every step of the search; a list and a limit that leave no car in common end on the default
+-- car like a limit nothing meets.
 function M.cap_substitute_spec(own_model, caps)
     local range = vehiclespecs.weight_range(caps.minkg, caps.maxkg)
-    local pick = vehiclespecs.find_compliant(own_model, caps.maxhp, caps.maxpwr, nil, range)
+    local pick = vehiclespecs.find_compliant(own_model, caps.maxhp, caps.maxpwr, nil, range, caps.carList)
     if pick then
         return {model = pick.model, config = pick.config}, false
     end
@@ -1355,12 +1385,45 @@ local function respawn_for_cap(pose, own_car, policy)
     return spawn_fixed(pose, spec.model, spec.config)
 end
 
+-- The own car the car list does not allow, or no own car at all, under a list (ADR-0066): put the player in
+-- the first car the list allows, within the vehicle limit when there is one (cap_substitute_spec: his own
+-- model's strongest allowed trim first, then the other models), fresh and in stock paint like the cap
+-- substitute; the caller's restage carries his plate over. When nothing allowed meets the limit, the
+-- best-effort default car, like a limit nothing meets. Decided at the start and synchronously, unlike the
+-- limit: which car it is never needs a measurement. Returns the race car plus, as respawn_own_at's fourth
+-- value, {list, replaced} with the list (vehiclespecs.car_list) and the model that was not allowed (nil
+-- without an own car), or (nil, reason) on a spawn failure, or (car, nil, true, note) for the default.
+local function respawn_for_list(pose, own_car, policy)
+    local list = vehiclespecs.car_list(policy.carList)
+    local origin = own_car and M.identity_label(own_car) or nil
+    local note = {list = list, replaced = own_car and tostring(own_car.JBeam) or nil}
+    local spec, degraded = M.cap_substitute_spec(own_car and own_car.JBeam or nil, policy)
+    if degraded then
+        log("W", LOG_TAG, string.format(
+            "no car on the car list '%s' meets the limit; spawning the default '%s'", list.name,
+            DEFAULT_VEHICLE_MODEL))
+        local veh, reason = spawn_default_degraded(pose)
+        return veh, reason, veh and true or nil, note
+    end
+    if origin then
+        log("I", LOG_TAG, string.format("own car '%s' is not on the car list '%s'; spawning '%s:%s', the "
+            .. "first car it allows", origin, list.name, tostring(spec.model), tostring(spec.config)))
+    else
+        log("I", LOG_TAG, string.format(
+            "no own car; spawning '%s:%s', the first car the car list '%s' allows", tostring(spec.model),
+            tostring(spec.config), list.name))
+    end
+    local veh, reason = spawn_fixed(pose, spec.model, spec.config)
+    return veh, reason, nil, note
+end
+
 -- car=random (ADR-0032 amendment): roll a per-player random car locally at race start, composing with the
 -- active caps (the deliberate exception to the car-wins precedence -- unlike a FIXED car=, the caps still
 -- apply here). The pool pick is the SHARED composition vehiclespecs.random_vehicle, identical to the AI
 -- random path (random_ai_vehicle), so the two never drift. Two composable axes, defaults ON when the field
 -- is nil (a typed /race car=random; the panel sends explicit booleans): randomTrim (a random compliant trim
--- vs. the stock/default trim) and noBigCars (the BIG_CAR_MAX_WEIGHT curb-weight ceiling). An empty
+-- vs. the stock/default trim) and noBigCars (the BIG_CAR_MAX_WEIGHT curb-weight ceiling). A car list
+-- (policy.carList, ADR-0066) narrows the pool like the caps. An empty
 -- cap-composed pool degrades to the fixed default car (never a prop) and signals the caller to warn; the
 -- player still races. Returns the spawned car, (nil, reason) on a spawn failure, or (car, nil, true) when it
 -- degraded to the default because no suitable car was available.
@@ -1414,7 +1477,7 @@ end
 
 -- Place this client's own car at `pose` (the grid start the server assigned), per the relayed vehicle
 -- policy (ADR-0032; `policy` = {car, maxhp, maxpwr, maxkg, minkg, randomTrim, noBigCars, hostCar,
--- hostCarIsOwn}, all nil = Mode 1).
+-- hostCarIsOwn, carList}, all nil = Mode 1).
 -- Modes:
 --   * Mode 1 (no policy) -- ADR-0007: keep the seated owned car (repair + teleport), else fresh-spawn one.
 --   * car=random -- a per-player random car composing with the active caps (ADR-0032 amendment); the two
@@ -1429,9 +1492,14 @@ end
 --   * Mode 3 (maxhp/maxpwr/maxkg/minkg) -- keep the own car for its live check (the caller measures it and
 --     substitutes it in staging when it is over), else the first car within the limit, else the best-effort
 --     default car (ADR-0032 §5 superseded -- no more abort).
+--   * a car list (carList, ADR-0066) in Mode 1 or 3 -- an own car it does not allow, or none, is replaced
+--     right here by the first car it allows (respawn_for_list); an allowed one goes on as above. A fixed car
+--     never reaches this (the server drops the list there, and the branches above return first); car=random
+--     draws from the list inside respawn_random.
 -- Returns the resolved race car (the caller enters + freezes it), (nil, reason) on a failure, or
 -- (car, nil, true) where the third value flags "degraded to the default because no suitable car was
--- available" (car=random empty pool, or the Mode-3 no-compliant-car case) so the caller warns then races.
+-- available" (car=random empty pool, or the Mode-3 no-compliant-car case) so the caller warns then races. A
+-- fourth value {list, replaced} says the car list replaced the own car (respawn_for_list), for the notice.
 -- BeamMP propagates the despawn ('Od:'), spawn ('Os:'), and a kept car's teleport (owned-vehicle sync).
 function M.respawn_own_at(pose, own_car, policy)
     if type(getOwnMap) ~= "function" or not be then
@@ -1456,6 +1524,10 @@ function M.respawn_own_at(pose, own_car, policy)
             return nil, "invalid car= '" .. tostring(policy.car) .. "'"
         end
         return spawn_forced(pose, model, config, own_car)
+    end
+
+    if vehiclespecs.car_list(policy.carList) and not (own_car and M.car_on_list(own_car, policy.carList)) then
+        return respawn_for_list(pose, own_car, policy)
     end
 
     if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
@@ -1843,14 +1915,18 @@ end
 --   * a FIXED car (car=model[:config], Mode 2, or a class-drop class car, ADR-0042) -- exactly that
 --     config's metadata box;
 --   * KEEP-OWN (Mode 1: no fixed car and no caps) -- the car the player is already sitting in.
--- A cap-driven substitute (Mode 3) and car=random are only decided at spawn time, so they come back
--- nil, nil and are reported after the spawn like every other car.
+-- A cap-driven substitute (Mode 3), the car list's substitute of an own car it does not allow (ADR-0066) and
+-- car=random are only decided at spawn time, so they come back nil, nil and are reported after the spawn like
+-- every other car.
 function M.planned_size(policy, own_car)
     policy = policy or {}
     if policy.car then
         return M.token_size(policy.car)
     end
     if policy.maxhp or policy.maxpwr or policy.maxkg or policy.minkg then
+        return nil, nil
+    end
+    if not M.car_on_list(own_car, policy.carList) then
         return nil, nil
     end
     return M.car_size(own_car)
