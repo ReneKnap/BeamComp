@@ -16,6 +16,7 @@
 local M = {}
 
 local quickrace = require("beamcomp/race/quickrace")
+local dragstrip = require("beamcomp/race/dragstrip")
 
 local LOG_TAG = "beamcomp.race"
 local RACE_PATH_MODULE = "/lua/ge/extensions/gameplay/race/path"
@@ -268,10 +269,14 @@ end
 -- Sprint-normalized sources (rallyStage/crawl) are pinned to meta.closed = false regardless of their
 -- authored geometry (feature: parse-rally-and-crawl-stages). Quickrace props are the track's nested
 -- barrier prefabs (statics, all clients) plus the track prefab itself as a host-only cone source
--- (coneFiles, ADR-0025). Returns the table, or nil plus a reason string on failure.
+-- (coneFiles, ADR-0025). A drag strip is not a race path at all and has its own builder (race/dragstrip,
+-- ADR-0067), which returns the same model. Returns the table, or nil plus a reason string on failure.
 function M.parse(locator)
     if type(locator) ~= "table" or not locator.raceFile or locator.raceFile == "" then
         return nil, "no race file given"
+    end
+    if locator.format == dragstrip.FORMAT then
+        return dragstrip.parse(locator)
     end
 
     local race_file = locator.raceFile
