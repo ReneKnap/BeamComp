@@ -41,6 +41,7 @@ chat line, so nobody else sees what you typed.
 /race <name> car=<model>             everyone in the same car
 /race <name> car=host                everyone in the car you are sitting in
 /race <name> maxhp=300 order=random  power limit, random grid order
+/race drag:hirochiStrip seed=quali   a drag race, seeded by a qualifying pass
 ```
 
 `/races` gives you the names to put there. Before anything spawns, your own game checks the race and
@@ -61,8 +62,12 @@ Options can come in any order, and each word option also takes a short form, suc
 | `force` | Starts anyway when the track cannot do what you picked: laps on a track that is not a loop, or `reverse` without a reverse route. |
 | `grid=<name>` | Lines up on this saved grid instead of the race's default one. |
 | `all` | Also finds races from the game's Time Trial menu by name. |
+| `seed=random` | On a drag strip: draws the first round of the bracket. This is the default. |
+| `seed=quali` | On a drag strip: everyone makes one timed pass alone first, and the bracket is seeded by it. |
 
 A name can start with `map:` or `menu:` to say which of the two lists you mean, when a race is in both.
+`drag:` picks a drag strip. On a drag strip the laps, `sprint`, `circuit`, `reverse`, the start order,
+qualifying, `lights` and the assists do not apply.
 
 ### Cars
 
