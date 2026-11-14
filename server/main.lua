@@ -21,7 +21,7 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] [aiaggr=/aiskill=/airubber=<0..1>] [all]
+--   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] [aiaggr=/aiskill=/airubber=<0..1>] [seed=random|quali] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 car=random = a per-player random car composing with the caps (the exception to car-wins);
@@ -110,6 +110,27 @@ function f1.countdown_duration()
     return f1.LIGHT_COUNT * f1.LIGHT_STEP + f1.HOLD_MIN + math.random() * (f1.HOLD_MAX - f1.HOLD_MIN)
 end
 
+-- The drag race bracket namespace (ADR-0067). Declared up here, beside `f1`, so start_race, the tick, the
+-- start command, the disconnect and the event dispatch -- all of which only CALL into it -- can see it; its
+-- functions are defined below finalize_race (search "the drag race bracket"). The constants are its
+-- configuration, editable like PHASE_DURATIONS.
+local drag = {}
+drag.MSG_STAGE = "dragStage"     -- server -> all: a heat goes onto the strip {heat, label, qual, entrants}
+drag.MSG_TREE = "dragTree"       -- server -> all: the tree starts {heat, amberDelay, greenAfter, limit}
+drag.MSG_HOLD = "dragHold"       -- server -> all: the heat's drivers go back to the queue {heat}
+drag.MSG_HEAT = "dragHeat"       -- server -> all: the heat snapshot with every run and the result
+drag.MSG_BRACKET = "dragBracket" -- server -> all: the bracket snapshot
+drag.MSG_RUN = "dragRun"         -- client -> server: one car's run, partial (a red light) or final
+drag.DEFAULT_HEAT = 2      -- cars per heat without a saved grid: one per lane
+drag.STAGE_SETTLE = 3.0    -- seconds from a heat's staging to its tree: the teleport settles
+drag.AMBER_MIN = 2.0       -- the ambers come 2 to 3 s after the tree starts, the game's own .400 tree
+drag.AMBER_MAX = 3.0
+drag.GREEN_AFTER = 0.4     -- green after the ambers: a Pro tree
+drag.RUN_LIMIT = 45.0      -- seconds after green a run may last
+drag.REPORT_SLACK = 5.0    -- the server waits this much longer for the last reports
+drag.RESULT_SHOW = 6.0     -- the timeslip stands before the cars go back to the queue
+drag.HOLD_GAP = 2.0        -- from the return to the queue to the next heat
+
 -- The one place the release version lives. scripts/package.ps1 reads this line to name the download,
 -- so the number a user sees on the zip is the number the server reports back with /beamcomp. Bump it
 -- here and nowhere else -- except the three ui/modules/apps/*/app.json, which BeamNG reads directly.
@@ -191,6 +212,7 @@ local PHASE = {
     qualifying = "qualifying",      -- time-boxed qualifying session before the race (ADR-0041); reuses racing machinery
     quali_results = "qualiResults", -- short classification pause after qualifying, before the race countdown (ADR-0041)
     racing = "racing",
+    drag = "drag",                  -- the heats of a drag race bracket, one after another (ADR-0067)
     finished = "finished",
 }
 
@@ -288,6 +310,7 @@ local session = {
     runs_logged = nil,        -- whether this race's runs already went into the run log (ADR-0050). Set by runlog.capture, cleared per race, so the finish seam and the two abort paths cannot log the same race twice. Stays nil for the WHOLE race while statistics are off (ADR-0053): runlog.capture returns before it would set this, so the guard reads a consistent "nothing was logged" instead of a half-armed state
     prop_map = nil,           -- the active race owner's last propMap payload (ADR-0062), kept verbatim and never read: it is replayed to a client the moment this server can reach it, so a mid-race joiner and a mid-race GE Lua reload do not end up with the only tagged props in the session. Per race, cleared by reset_to_lobby
     race_event = nil,         -- id shared by every logged run of THIS race instance (ADR-0050), so field size, start slot and finishing position can be related across rows; assigned in start_race
+    drag = nil,               -- the drag race bracket (ADR-0067, the `drag` namespace) or nil; per race, opened by start_race, cleared by reset_to_lobby
 }
 
 -- Race-command permissions / plugin settings (ADR-0016, format superseded by ADR-0056). The race-admin
@@ -2754,7 +2777,9 @@ end
 -- the LAST car onto the final slot of the current size. A monotone walk terminates too and was measured
 -- against this one, but it made 394 of 4620 already-working grids looser, so it is not what ships.
 function grid_fit.assign(ordered)
-    if #ordered == 0 then
+    -- A drag race's slots are its waiting queue, two columns ten metres apart, not a size-aware grid
+    -- (ADR-0067): nothing to reserve.
+    if #ordered == 0 or session.drag then
         return nil
     end
     local sizes = grid_fit.sizes()
@@ -3132,6 +3157,10 @@ local function build_standings(final)
         if a.dnf ~= b.dnf then
             return not a.dnf  -- non-DNF ranks ahead of DNF (ADR-0014)
         end
+        -- A settled drag race ranks by its bracket placement (ADR-0067, drag.settle).
+        if a.place ~= b.place then
+            return (a.place or math.huge) < (b.place or math.huge)
+        end
         if a.completed ~= b.completed then
             return a.completed > b.completed
         end
@@ -3186,6 +3215,10 @@ local function build_standings(final)
             -- keeps a standings broadcast size-independent of the car.
             -- Synthetic host-driven AI slot (ADR-0036), so the HUD can tag it; nil for real players.
             ai = record.ai or nil,
+            -- A settled drag race (ADR-0067): the round the driver reached and his best 1/4 mile ET, for the
+            -- results card. nil for every other race.
+            drag_round = record.drag_round,
+            drag_best = record.drag_best,
         }
     end
     return entries
@@ -5674,6 +5707,8 @@ local function reset_to_lobby()
     -- session.quali (ADR-0041) is per-event, so unlike last_order/championship it is cleared here -- a
     -- qualifying belongs to one race event and must not bleed into the next.
     session.quali = nil
+    -- The drag bracket (ADR-0067) belongs to its race the same way.
+    session.drag = nil
     -- session.last_order (ADR-0033), session.championship (ADR-0040) and session.tournament (ADR-0042)
     -- deliberately persist across the lobby -- they are the cross-race order sources / series state and must
     -- outlive a single race.
@@ -6085,6 +6120,11 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- While a class-drop tournament is active its stored order grids the race too (ADR-0042); it defaults to
     -- random since the car class is the handicap. champ/tour are mutually exclusive, so at most one applies.
     local effective_order = overrides.order or champ.active_order() or tour.active_order()
+    -- A drag race (ADR-0067) seeds its own bracket: the queue is drawn at random whatever order a championship
+    -- would impose. Its other ignored options were dropped with the verdict (handle_race_validation).
+    if overrides.drag then
+        effective_order = {mode = "random", rev = false}
+    end
     session.order = effective_order
     -- F1 light start for this race (ADR-0043), relayed opaquely (race-blind). nil = the default lock
     -- countdown. The penalty seconds default when the option is on but no value was given.
@@ -6120,6 +6160,9 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     session.grid_record = grid_params
     session.grid_direction = overrides.direction
     session.grid_ramp = quali.is_staged() or nil
+    -- The drag event shell (ADR-0067), before the slots are handed out: its heat size is this grid's preview
+    -- count, and the slot reservation stays out of a drag race (grid_fit.assign).
+    drag.prepare(overrides, grid_params)
     -- Drop any identity/vehicle reports from a prior race so a re-issue (abort path, no reset_to_lobby)
     -- starts clean; each player re-reports clientInfo on the new spawn (ADR-0027). Cleared BEFORE the slot
     -- assignment: a stale footprint from the last race must never reserve a slot on this grid (ADR-0051).
@@ -6134,11 +6177,15 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
         champ.order_identities(), overrides.ai and overrides.ai.count)
     local roster = build_roster(slots)
     local assists = overrides.assists
+    drag.set_field(slots)
     -- One heads-up to the issuer when the field outgrew what this grid was authored for (ADR-0023
     -- amendment 2026-08-02). Reading that one meta number is the server's only exception to relaying a
     -- grid record verbatim; everything below this line is unchanged -- same layout, same poses, same
-    -- gridParams on the wire.
-    grid_store.warn_over_capacity(owner_id, grid_params, #roster)
+    -- gridParams on the wire. On a drag strip that number is the cars per heat, which the field is meant to
+    -- outgrow.
+    if not drag.is_active() then
+        grid_store.warn_over_capacity(owner_id, grid_params, #roster)
+    end
 
     session.race = race_name
     -- What this race is built from (ADR-0037 amendment 2026-11-11): a request that arrives while it waits
@@ -6311,6 +6358,10 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 -- (the client drops the policy when it leaves a level, so one server's setting can never
                 -- travel to the next).
                 showDriverNames = cfg.show_driver_names == true,
+                -- A drag race (ADR-0067): the cars per heat and the seeding. The client lays out the strip's
+                -- lanes and its waiting queue from it. nil for every other race.
+                drag = session.drag and {heatSize = session.drag.heat_size, seeding = session.drag.seeding}
+                    or nil,
             })
         end
     end
@@ -7134,13 +7185,18 @@ end
 -- run into the records, remember the order, and switch phase. No despawn -- finished keeps cars/props up (B3).
 -- Shared by the finish-grace expiry (tick) and the /raceend force-finish (ADR-0038).
 local function finalize_race(reason)
+    -- A drag race (ADR-0067) is classified by its bracket: the placement goes into the progress records first,
+    -- so the DNF pass and everything below rank by it. Its times are not checkpoint runs, so no records.
+    local drag_race = drag.settle()
     dnf_active_players(reason)
-    -- Snapshot pre-run per-car section bests BEFORE capture folds this run in, so the Race section can show
-    -- "vs your/anyone's previous best lap with the car"; then capture (this run now counts) and send the
-    -- current-inclusive records (ADR-0030).
-    local prerun = snapshot_prerun_section_bests()
-    capture_records()
-    send_race_records(prerun)
+    if not drag_race then
+        -- Snapshot pre-run per-car section bests BEFORE capture folds this run in, so the Race section can
+        -- show "vs your/anyone's previous best lap with the car"; then capture (this run now counts) and send
+        -- the current-inclusive records (ADR-0030).
+        local prerun = snapshot_prerun_section_bests()
+        capture_records()
+        send_race_records(prerun)
+    end
     -- Remember the finishing order so the next race's order=last can grid by it (ADR-0033).
     capture_finishing_order()
     -- Fold this race into the championship table and push the updated standings (ADR-0040); both no-ops
@@ -7161,6 +7217,669 @@ local function finalize_race(reason)
     broadcast_standings(true)
     enter_phase(PHASE.finished, PHASE_DURATIONS.finished_hold)
 end
+
+-- ===== the drag race bracket (ADR-0067) ====================================================
+-- A drag race is a knockout bracket of heats on one of the game's strips. The server owns the field, the
+-- seeds, the rounds and the current heat, and paces the heats on its tick; it reads nothing but participant
+-- ids and the numbers each client reports for its own car (the owner for every AI). The strip, the tree and
+-- the timing stay on the clients (ADR-0005). The namespace table is declared at the top of the chunk, beside
+-- `f1`, so every function above that only CALLS into it (start_race, the tick, the disconnect, the dispatch)
+-- can see it; the functions themselves live here, below finalize_race, where every local they read exists.
+--
+-- One heat:
+--   dragStage (who runs, on which lane slot) -> STAGE_SETTLE -> dragTree (amber delay, green after, run
+--   limit) -> dragRun reports -> decide (drag.order_heat) -> dragHeat + dragBracket -> RESULT_SHOW ->
+--   dragHold (back to the queue) -> HOLD_GAP -> the next heat. A heat with one driver is a bye and runs
+--   nothing.
+
+-- (pure) The round-1 bracket positions for a field of `count` seeds and heats of `heat_size`: the standard
+-- serpentine expansion, so the top seeds meet as late as possible (two per heat: 1-8, 4-5, 2-7, 3-6). Returns
+-- the position list (seed numbers in heat order; a seed above `count` is an empty place) and the bracket
+-- size.
+function drag.positions(count, heat_size)
+    local positions = {1}
+    local size = 1
+    while size < count do
+        local expanded = {}
+        for _, seed in ipairs(positions) do
+            for k = 0, heat_size - 1 do
+                expanded[#expanded + 1] = k * size + ((k % 2 == 0) and seed or (size + 1 - seed))
+            end
+        end
+        positions = expanded
+        size = size * heat_size
+    end
+    return positions, size
+end
+
+-- (pure) How many rounds a field of `count` needs with heats of `heat_size`: one at least, so a one-driver
+-- event still runs its pass.
+function drag.round_count(count, heat_size)
+    local rounds, size = 0, 1
+    while size < count do
+        size = size * heat_size
+        rounds = rounds + 1
+    end
+    return math.max(1, rounds)
+end
+
+-- (pure) The order of one finished heat, best first (ADR-0067 §3). `runs` maps id -> sanitized report, `out`
+-- the drivers who left, `seed_of` id -> seed. The rule, in order:
+--   1. a clean start beats a red light;
+--   2. among clean starters a finisher beats a non-finisher; finishers by total time from green (R/T + ET),
+--      non-finishers by distance covered;
+--   3. among red lights the later jump first (the reaction closest to zero): when everybody jumps, the one
+--      who left first loses;
+--   4. a driver who left, or whose run never arrived, last;
+--   5. ties by seed.
+function drag.order_heat(entrants, runs, out, seed_of)
+    local function class_of(id)
+        local run = runs[id]
+        if out[id] or not run or not run.final then
+            return 4
+        end
+        if run.redLight then
+            return 3
+        end
+        return run.finished and 1 or 2
+    end
+    local ordered = {}
+    for _, id in ipairs(entrants) do
+        ordered[#ordered + 1] = id
+    end
+    table.sort(ordered, function(a, b)
+        local class_a, class_b = class_of(a), class_of(b)
+        if class_a ~= class_b then
+            return class_a < class_b
+        end
+        local run_a, run_b = runs[a], runs[b]
+        if class_a == 1 and run_a.total ~= run_b.total then
+            return run_a.total < run_b.total
+        end
+        if class_a == 2 and run_a.distance ~= run_b.distance then
+            return run_a.distance > run_b.distance
+        end
+        if class_a == 3 and (run_a.rt or 0) ~= (run_b.rt or 0) then
+            return (run_a.rt or 0) > (run_b.rt or 0)
+        end
+        return (seed_of[a] or math.huge) < (seed_of[b] or math.huge)
+    end)
+    return ordered
+end
+
+function drag.is_active()
+    return session.drag ~= nil
+end
+
+-- A seeding value from the panel or a seed= token, or nil when it names none.
+function drag.normalize_seeding(value)
+    if value == "quali" or value == "random" then
+        return value
+    end
+    return nil
+end
+
+-- The cars per heat of a drag race: the resolved grid's preview count (the one documented read of a grid
+-- record, ADR-0023 amendment 2026-08-02), else the strip's two lanes; clamped so a heat races at least two.
+function drag.heat_size_of(record)
+    local count = grid_store.usable_preview_count(record) or drag.DEFAULT_HEAT
+    return math.max(2, math.min(grid_store.PREVIEW_COUNT_MAX, count))
+end
+
+-- Open the drag event shell for a race the issuer's client reported as a drag strip (start_race, BEFORE the
+-- slots are handed out, so the slot reservation sees it and stays out). nil for every other race.
+function drag.prepare(overrides, grid_record)
+    if not overrides.drag then
+        session.drag = nil
+        return
+    end
+    session.drag = {
+        heat_size = drag.heat_size_of(grid_record),
+        seeding = overrides.seeding or "random",
+        field = {},
+        seed_of = {},
+        stage = nil,       -- nil (staging) -> "quali" -> "bracket" -> "done"
+        rounds = {},       -- rounds[r] = {heats = {heat, ...}}, built a round at a time
+        round = 0,
+        round_count = 0,
+        qual = nil,        -- {order = {ids}, index = n, heats = {heat, ...}} while seeding by qualifying
+        cur = nil,         -- the heat on the strip: {heat, seq, step, at, deadline}
+        seq = 0,
+        best = {},         -- id -> best 1/4 mile ET of the event
+        reached = {},      -- id -> the highest round the driver lined up in (a bye counts)
+        out = {},          -- id -> true once the driver left the server
+        champion = nil,
+        settled = false,
+    }
+end
+
+-- The field in queue order, from the slots start_race handed out.
+function drag.set_field(slots)
+    local state = session.drag
+    if not state then
+        return
+    end
+    local ordered = {}
+    for _, entry in ipairs(slots) do
+        ordered[#ordered + 1] = entry
+    end
+    table.sort(ordered, function(a, b) return a.slot < b.slot end)
+    for _, entry in ipairs(ordered) do
+        state.field[#state.field + 1] = entry.id
+    end
+    -- One driver has nobody to be seeded against: his event is a single pass.
+    if #state.field <= 1 then
+        state.seeding = "random"
+    end
+end
+
+-- The name a participant shows under (players by their identity, AI by their roster name).
+function drag.name_of(id)
+    if is_ai_id(id) then
+        return grid_store.ai_display_name(id)
+    end
+    local record = session.progress and session.progress[id]
+    return resolve_identity(id) or (record and record.name) or tostring(id)
+end
+
+-- The label of round `round` of `count`.
+function drag.round_label(round, count)
+    if round == count then
+        return "Final"
+    end
+    if round == count - 1 then
+        return "Semifinal"
+    end
+    return "Round " .. round
+end
+
+-- Seed the field and build round 1. `seeds` is the field in seed order.
+function drag.open_bracket(seeds)
+    local state = session.drag
+    state.stage = "bracket"
+    for index, id in ipairs(seeds) do
+        state.seed_of[id] = index
+    end
+    state.round_count = drag.round_count(#seeds, state.heat_size)
+    local positions = drag.positions(#seeds, state.heat_size)
+    local heats = {}
+    for first = 1, #positions, state.heat_size do
+        local entrants = {}
+        for place = first, first + state.heat_size - 1 do
+            local seed = positions[place]
+            if seed and seeds[seed] then
+                entrants[#entrants + 1] = seeds[seed]
+            end
+        end
+        heats[#heats + 1] = {entrants = entrants}
+    end
+    state.round = 1
+    state.rounds = {{heats = heats}}
+    log_info("beamcomp.drag", string.format(
+        "bracket: %d driver(s), %d per heat, %d round(s), %d heat(s) in round 1",
+        #seeds, state.heat_size, state.round_count, #heats))
+end
+
+-- Round `round + 1` from the winners of round `round`, `heat_size` heats into one.
+function drag.next_round()
+    local state = session.drag
+    local previous = state.rounds[state.round].heats
+    local heats = {}
+    for first = 1, #previous, state.heat_size do
+        local entrants = {}
+        for index = first, math.min(#previous, first + state.heat_size - 1) do
+            local winner = previous[index].winner
+            if winner then
+                entrants[#entrants + 1] = winner
+            end
+        end
+        heats[#heats + 1] = {entrants = entrants}
+    end
+    state.round = state.round + 1
+    state.rounds[state.round] = {heats = heats}
+end
+
+-- The seeds after the qualifying runs: the timed drivers by ET, then the untimed ones in queue order.
+function drag.qualifying_seeds()
+    local state = session.drag
+    local timed, untimed = {}, {}
+    for _, id in ipairs(state.field) do
+        if state.best[id] then
+            timed[#timed + 1] = id
+        else
+            untimed[#untimed + 1] = id
+        end
+    end
+    table.sort(timed, function(a, b) return state.best[a] < state.best[b] end)
+    for _, id in ipairs(untimed) do
+        timed[#timed + 1] = id
+    end
+    return timed
+end
+
+-- The next heat to run, or nil when the event is over. Resolves byes and builds rounds on the way.
+function drag.next_heat()
+    local state = session.drag
+    if state.stage == "quali" then
+        local qual = state.qual
+        while qual.index < #qual.order do
+            qual.index = qual.index + 1
+            local id = qual.order[qual.index]
+            if not state.out[id] then
+                local heat = {entrants = {id}, qual = true, round = 0,
+                    label = string.format("Qualifying run %d of %d", qual.index, #qual.order)}
+                qual.heats[#qual.heats + 1] = heat
+                return heat
+            end
+        end
+        drag.open_bracket(drag.qualifying_seeds())
+        drag.broadcast_bracket()
+    end
+    while state.stage == "bracket" do
+        local heats = state.rounds[state.round].heats
+        for index, heat in ipairs(heats) do
+            if not heat.done then
+                local present = {}
+                for _, id in ipairs(heat.entrants) do
+                    if not state.out[id] then
+                        present[#present + 1] = id
+                    end
+                end
+                heat.entrants = present
+                heat.round = state.round
+                local round_label = drag.round_label(state.round, state.round_count)
+                heat.label = (#heats > 1) and string.format("%s, heat %d of %d", round_label, index, #heats)
+                    or round_label
+                for _, id in ipairs(present) do
+                    state.reached[id] = math.max(state.reached[id] or 0, state.round)
+                end
+                local solo = #state.field == 1
+                if #present >= 2 or (solo and #present == 1) then
+                    return heat
+                end
+                heat.done = true
+                heat.bye = true
+                heat.winner = present[1]
+                if heat.winner then
+                    log_info("beamcomp.drag", string.format("%s: bye for %s", heat.label,
+                        drag.name_of(heat.winner)))
+                end
+            end
+        end
+        if state.round >= state.round_count then
+            state.stage = "done"
+            state.champion = heats[1] and heats[1].winner or nil
+            return nil
+        end
+        drag.next_round()
+        drag.broadcast_bracket()
+    end
+    return nil
+end
+
+-- One entrant as the clients see it.
+function drag.entrant_payload(heat, id, lane)
+    local state = session.drag
+    local record = session.progress and session.progress[id]
+    return {
+        id = id,
+        slot = record and record.slot,
+        lane = lane,
+        name = drag.name_of(id),
+        seed = state.seed_of[id],
+        ai = is_ai_id(id) or nil,
+        run = heat.runs and heat.runs[id] or nil,
+        result = heat.results and heat.results[id] or nil,
+    }
+end
+
+-- The heat snapshot (dragHeat): every client's HUD draws the heat, its tree states and its timeslips from it.
+function drag.heat_payload(cur)
+    local heat = cur.heat
+    local entrants = {}
+    for lane, id in ipairs(heat.entrants) do
+        entrants[#entrants + 1] = drag.entrant_payload(heat, id, lane - 1)
+    end
+    return {race = session.race, heat = cur.seq, label = heat.label, qual = heat.qual or nil,
+        done = heat.done or nil, winner = heat.winner, entrants = entrants}
+end
+
+-- The bracket snapshot (dragBracket): rounds built so far, the qualifying times, the field size.
+function drag.bracket_payload()
+    local state = session.drag
+    local rounds = {}
+    for round, block in ipairs(state.rounds) do
+        local heats = {}
+        for _, heat in ipairs(block.heats) do
+            local entrants = {}
+            for _, id in ipairs(heat.entrants) do
+                entrants[#entrants + 1] = {id = id, name = drag.name_of(id), seed = state.seed_of[id]}
+            end
+            heats[#heats + 1] = {entrants = entrants, winner = heat.winner, bye = heat.bye or nil,
+                done = heat.done or nil, current = (state.cur and state.cur.heat == heat) or nil}
+        end
+        rounds[#rounds + 1] = {label = drag.round_label(round, state.round_count), heats = heats}
+    end
+    local qual = nil
+    if state.qual then
+        qual = {}
+        for _, id in ipairs(state.qual.order) do
+            qual[#qual + 1] = {id = id, name = drag.name_of(id), et = state.best[id],
+                ran = state.qual.ran[id] or nil}
+        end
+    end
+    return {race = session.race, heatSize = state.heat_size, seeding = state.seeding, stage = state.stage,
+        drivers = #state.field, roundCount = state.round_count, rounds = rounds, qual = qual,
+        champion = state.champion}
+end
+
+function drag.broadcast_bracket()
+    broadcast_event(drag.MSG_BRACKET, drag.bracket_payload())
+end
+
+-- Put a heat on the strip: lanes by seed, the better seed on slot 1.
+function drag.begin_heat(heat)
+    local state = session.drag
+    table.sort(heat.entrants, function(a, b)
+        return (state.seed_of[a] or math.huge) < (state.seed_of[b] or math.huge)
+    end)
+    heat.runs = {}
+    state.seq = state.seq + 1
+    state.cur = {heat = heat, seq = state.seq, step = "stage", at = now()}
+    local entrants = {}
+    local names = {}
+    for lane, id in ipairs(heat.entrants) do
+        entrants[#entrants + 1] = drag.entrant_payload(heat, id, lane - 1)
+        names[#names + 1] = drag.name_of(id)
+    end
+    log_info("beamcomp.drag", string.format("heat %d (%s): %s", state.seq, heat.label,
+        table.concat(names, " vs ")))
+    broadcast_event(drag.MSG_STAGE, {race = session.race, heat = state.seq, label = heat.label,
+        qual = heat.qual or nil, entrants = entrants})
+    broadcast_event(drag.MSG_HEAT, drag.heat_payload(state.cur))
+    drag.broadcast_bracket()
+end
+
+-- Whether every driver of the heat on the strip has sent his final report or left.
+function drag.all_reported(cur)
+    local state = session.drag
+    for _, id in ipairs(cur.heat.entrants) do
+        local run = cur.heat.runs[id]
+        if not state.out[id] and not (run and run.final) then
+            return false
+        end
+    end
+    return true
+end
+
+-- Decide the heat on the strip and tell everybody.
+function drag.decide(cur)
+    local state = session.drag
+    local heat = cur.heat
+    heat.order = drag.order_heat(heat.entrants, heat.runs, state.out, state.seed_of)
+    heat.done = true
+    heat.results = {}
+    for _, id in ipairs(heat.entrants) do
+        local run = heat.runs[id]
+        if run and run.finished and run.et and (not state.best[id] or run.et < state.best[id]) then
+            state.best[id] = run.et
+        end
+    end
+    for place, id in ipairs(heat.order) do
+        local run = heat.runs[id]
+        local result
+        if heat.qual then
+            result = (run and run.finished) and "time" or "noTime"
+        elseif place == 1 then
+            result = "win"
+        elseif run and run.final and run.redLight then
+            result = "red"
+        else
+            result = "loss"
+        end
+        heat.results[id] = result
+    end
+    heat.winner = (not heat.qual) and heat.order[1] or nil
+    if heat.qual then
+        state.qual.ran[heat.entrants[1]] = true
+    end
+    local parts = {}
+    for _, id in ipairs(heat.order) do
+        local run = heat.runs[id]
+        parts[#parts + 1] = string.format("%s %s%s", drag.name_of(id), heat.results[id],
+            (run and run.total) and string.format(" %.3f", run.total) or "")
+    end
+    log_info("beamcomp.drag", string.format("heat %d (%s) decided: %s", cur.seq, heat.label,
+        table.concat(parts, ", ")))
+    broadcast_event(drag.MSG_HEAT, drag.heat_payload(cur))
+    drag.broadcast_bracket()
+end
+
+-- Advance the drag event one tick (phase `drag`).
+function drag.step()
+    local state = session.drag
+    if not state or state.stage == "done" then
+        return
+    end
+    local cur = state.cur
+    if not cur then
+        local heat = drag.next_heat()
+        if heat then
+            drag.begin_heat(heat)
+        else
+            drag.finish()
+        end
+        return
+    end
+    local elapsed = now() - cur.at
+    if cur.step == "stage" and elapsed >= drag.STAGE_SETTLE then
+        local amber = drag.AMBER_MIN + math.random() * (drag.AMBER_MAX - drag.AMBER_MIN)
+        broadcast_event(drag.MSG_TREE, {race = session.race, heat = cur.seq, amberDelay = amber,
+            greenAfter = drag.GREEN_AFTER, limit = drag.RUN_LIMIT})
+        cur.step = "run"
+        cur.at = now()
+        cur.deadline = cur.at + amber + drag.GREEN_AFTER + drag.RUN_LIMIT + drag.REPORT_SLACK
+    elseif cur.step == "run" and (drag.all_reported(cur) or now() >= cur.deadline) then
+        drag.decide(cur)
+        cur.step = "result"
+        cur.at = now()
+    elseif cur.step == "result" and elapsed >= drag.RESULT_SHOW then
+        broadcast_event(drag.MSG_HOLD, {race = session.race, heat = cur.seq})
+        cur.step = "hold"
+        cur.at = now()
+    elseif cur.step == "hold" and elapsed >= drag.HOLD_GAP then
+        state.cur = nil
+    end
+end
+
+-- /go on a staged drag race: no countdown (the ADR-0044 precedent), the heats start.
+function drag.start()
+    local state = session.drag
+    enter_phase(PHASE.drag, nil)
+    if state.seeding == "quali" then
+        state.stage = "quali"
+        local order = {}
+        for _, id in ipairs(state.field) do
+            order[#order + 1] = id
+        end
+        state.qual = {order = order, index = 0, heats = {}, ran = {}}
+    else
+        drag.open_bracket(state.field)
+    end
+    log_info("beamcomp.drag", string.format("drag race started: %d driver(s), %d per heat, seeding %s",
+        #state.field, state.heat_size, state.seeding))
+    drag.broadcast_bracket()
+end
+
+-- A sanitized number, or nil when it is not a finite one inside [low, high].
+function drag.number(value, low, high)
+    local number = tonumber(value)
+    if not number or number ~= number or number < low or number > high then
+        return nil
+    end
+    return number
+end
+
+-- The timer table of a report (splits or speeds), relayed to every client: at most 16 string keys with a finite
+-- number each, so a report cannot carry anything else to them. The keys are the strip's timer ids, which the
+-- server does not know (ADR-0005).
+function drag.timer_table(raw)
+    if type(raw) ~= "table" then
+        return nil
+    end
+    local clean, count = {}, 0
+    for key, value in pairs(raw) do
+        local number = drag.number(value, -10000, 100000)
+        if type(key) == "string" and #key <= 32 and number and count < 16 then
+            clean[key] = number
+            count = count + 1
+        end
+    end
+    return clean
+end
+
+-- A client's report of one run (dragRun): its own car, or an AI the race owner drives (aiId).
+function drag.handle_run(player_id, payload)
+    local state = session.drag
+    local cur = state and state.cur
+    if session.phase ~= PHASE.drag or not cur or cur.step ~= "run" or type(payload) ~= "table"
+        or payload.heat ~= cur.seq or payload.race ~= session.race then
+        return
+    end
+    local id = player_id
+    if payload.aiId ~= nil then
+        if player_id ~= session.owner_id or not is_ai_id(payload.aiId) then
+            return
+        end
+        id = payload.aiId
+    end
+    local entrant = false
+    for _, entry in ipairs(cur.heat.entrants) do
+        entrant = entrant or entry == id
+    end
+    local previous = cur.heat.runs[id]
+    if not entrant or (previous and previous.final) then
+        return
+    end
+    local et = drag.number(payload.et, 0, 600)
+    local total = drag.number(payload.total, 0, 600)
+    local run = {
+        final = payload.final == true,
+        redLight = payload.redLight == true,
+        rt = drag.number(payload.rt, -60, 600),
+        et = et,
+        total = total,
+        finished = payload.finished == true and et ~= nil and total ~= nil,
+        distance = drag.number(payload.distance, -10000, 100000) or 0,
+        reason = type(payload.reason) == "string" and payload.reason:sub(1, 16) or nil,
+        splits = drag.timer_table(payload.splits),
+        speeds = drag.timer_table(payload.speeds),
+    }
+    cur.heat.runs[id] = run
+    log_info("beamcomp.drag", string.format("heat %d: %s %s%s%s", cur.seq, drag.name_of(id),
+        run.final and "final" or "partial", run.redLight and " red light" or "",
+        run.total and string.format(" %.3f (rt %.3f)", run.total, run.rt or 0) or ""))
+    broadcast_event(drag.MSG_HEAT, drag.heat_payload(cur))
+end
+
+-- Drivers who left the server (the leaver, and every AI when he was the owner): out of the bracket. A heat
+-- they were waiting for runs without them; a heat left with one driver is a bye, so his opponent advances.
+function drag.drop_drivers(ids)
+    local state = session.drag
+    if not state or state.stage == "done" then
+        return
+    end
+    local dropped = {}
+    for _, id in ipairs(ids) do
+        if not state.out[id] then
+            for _, entry in ipairs(state.field) do
+                if entry == id then
+                    state.out[id] = true
+                    dropped[#dropped + 1] = drag.name_of(id)
+                end
+            end
+        end
+    end
+    if #dropped > 0 then
+        log_info("beamcomp.drag", "out of the bracket (left): " .. table.concat(dropped, ", "))
+        drag.broadcast_bracket()
+    end
+end
+
+-- (pure over the state) The final placement, best first: the winner, then by the round reached, then by best
+-- ET, then by seed.
+function drag.placement()
+    local state = session.drag
+    local level = {}
+    for _, id in ipairs(state.field) do
+        level[id] = state.reached[id] or 0
+    end
+    if state.champion then
+        level[state.champion] = state.round_count + 1
+    end
+    local ordered = {}
+    for _, id in ipairs(state.field) do
+        ordered[#ordered + 1] = id
+    end
+    local rank = {}
+    for index, id in ipairs(state.field) do
+        rank[id] = state.seed_of[id] or (#state.field + index)
+    end
+    table.sort(ordered, function(a, b)
+        if level[a] ~= level[b] then
+            return level[a] > level[b]
+        end
+        local best_a, best_b = state.best[a], state.best[b]
+        if best_a ~= best_b then
+            if best_a == nil or best_b == nil then
+                return best_b == nil
+            end
+            return best_a < best_b
+        end
+        return rank[a] < rank[b]
+    end)
+    return ordered
+end
+
+-- Write the placement into the progress records, so build_standings, the results card, order=last and the
+-- championship all rank by it (finalize_race). Returns true when this race was a drag race. Idempotent.
+function drag.settle()
+    local state = session.drag
+    if not state then
+        return false
+    end
+    if state.settled or not session.progress then
+        return true
+    end
+    state.settled = true
+    for place, id in ipairs(drag.placement()) do
+        local record = session.progress[id]
+        if record then
+            record.place = place
+            record.drag_round = state.reached[id] or 0
+            record.drag_best = state.best[id]
+            record.total_time = state.best[id] or 0
+            if not record.dnf then
+                record.finished = true
+            end
+        end
+    end
+    return true
+end
+
+-- The bracket is complete: name the winner and settle the race.
+function drag.finish()
+    local state = session.drag
+    state.stage = "done"
+    drag.broadcast_bracket()
+    if state.champion then
+        broadcast_chat("BeamComp: " .. drag.name_of(state.champion) .. " wins the drag race")
+    end
+    log_info("beamcomp.drag", "drag race complete; winner "
+        .. tostring(state.champion and drag.name_of(state.champion)))
+    finalize_race("drag race complete")
+end
+-- ===== end the drag race bracket ===========================================================
 
 local function tick()
     expire_stale_validation()
@@ -7206,6 +7925,12 @@ local function tick()
         else
             quali.advance_qualifying()
         end
+        return
+    end
+
+    -- A drag race runs its heats on server time (ADR-0067): open-ended, paced by its own steps.
+    if phase == PHASE.drag then
+        drag.step()
         return
     end
 
@@ -7269,7 +7994,8 @@ local RACE_USAGE =
     .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
     .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
     .. "[ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] "
-    .. "[aiaggr=/aiskill=/airubber=<0..1>] [aiavoid=on|off] [airoute=snap|direct] [all]"
+    .. "[aiaggr=/aiskill=/airubber=<0..1>] [aiavoid=on|off] [airoute=snap|direct] "
+    .. "[seed=random|quali] [all]"
 
 -- Opt-in recover/repair assist hold time (ADR-0017): the seconds the player must hold the key before
 -- the assist fires. Used when a "recover"/"repair" token carries no explicit ":secs", and as the
@@ -7601,6 +8327,13 @@ local function parse_race_args(argument)
             -- `lights`. Stored as a number; a non-numeric value falls to bad_token.
             overrides.jumpPenaltySeconds = tonumber(token:match("^[Jj][Uu][Mm][Pp][Pp][Ee][Nn][Aa][Ll][Tt][Yy]=(.+)$"))
             if not overrides.jumpPenaltySeconds and not bad_token then
+                bad_token = token
+            end
+        elseif token:match("^[Ss][Ee][Ee][Dd]=.+$") then
+            -- seed=random|quali picks a drag race's seeding (ADR-0067); read only on a drag strip. An unknown
+            -- value falls to bad_token.
+            overrides.seeding = drag.normalize_seeding(token:match("^[Ss][Ee][Ee][Dd]=(.+)$"):lower())
+            if not overrides.seeding and not bad_token then
                 bad_token = token
             end
         else
@@ -8202,6 +8935,32 @@ local function handle_race_validation(player_id, payload)
         -- issuer's client reports whether an order=quali on this race is the staged sprint variant (sprint =
         -- meta.closed false, or a sprint mode override). Captured verbatim; only read when order=quali.
         overrides.staged_quali = payload.stagedQuali == true
+        -- A drag strip (ADR-0067), as the issuer's client reports it: the race runs as a bracket of heats. The
+        -- mission-race options it ignores are dropped here, before a staging-time request is compared with the
+        -- staged one (tour.settle_staged): a typed /race carries the assists on, and comparing that would
+        -- switch them on in place for a drag race.
+        overrides.drag = payload.drag == true
+        if overrides.drag then
+            overrides.mode = nil
+            overrides.laps = nil
+            overrides.direction = nil
+            overrides.order = nil
+            overrides.quali_duration = nil
+            overrides.startMode = nil
+            overrides.jumpPenaltySeconds = nil
+            overrides.assists = {recoverEnabled = false, repairEnabled = false}
+            overrides.seeding = overrides.seeding or "random"
+        end
+        -- The bracket is the drag race's own tournament: a class-drop around it is refused, a championship
+        -- scores it. The class-drop runs when the request asks for one, or names no format while one runs.
+        local format = overrides.format
+        if overrides.drag and ((format and format.mode == "classdrop") or (not format and tour.is_active())) then
+            MP.SendChatMessage(pending.owner_id,
+                "BeamComp: a class-drop tournament cannot run a drag race, end the tournament first")
+            log_info("beamcomp.race", string.format("/race '%s' refused: drag race inside a class-drop",
+                pending.race))
+            return
+        end
         -- The footprints of the already-decided cars (ADR-0051 round 2), resolved by the issuer's client
         -- from the tokens we relayed. Kept on overrides so they ride into start_race -- including a race
         -- queued behind a running one -- and are seeded before the slots are handed out.
@@ -9274,6 +10033,10 @@ local function handle_start_command(player_id, player_name)
         broadcast_standings()
         quali.start_session()
         MP.SendChatMessage(player_id, "BeamComp: qualifying started")
+    elseif drag.is_active() then
+        -- A drag race (ADR-0067) has no countdown either: its heats start, each with its own tree.
+        drag.start()
+        MP.SendChatMessage(player_id, "BeamComp: drag race started")
     else
         enter_countdown_from_staging()
         MP.SendChatMessage(player_id, "BeamComp: countdown started")
@@ -9571,7 +10334,7 @@ local function on_player_disconnect(player_id)
     local phase = session.phase
     local gone = {player_id}
     if owner_left and session.progress and (phase == PHASE.countdown or phase == PHASE.qualifying
-            or phase == PHASE.quali_results or phase == PHASE.racing) then
+            or phase == PHASE.quali_results or phase == PHASE.racing or phase == PHASE.drag) then
         local ai_ids = {}
         for id in pairs(session.progress) do
             if is_ai_id(id) then
@@ -9634,6 +10397,11 @@ local function on_player_disconnect(player_id)
     -- finished/dnf skips the DNF above but must still be dropped from the queue. No-op in every other
     -- phase and in a circuit quali (the purge guards itself).
     quali.purge_drivers(gone)
+    -- A drag race drops them from its bracket, already while it stages: the heats they were waiting for run
+    -- without them, and a heat left with one driver is a bye (ADR-0067).
+    if drag.is_active() then
+        drag.drop_drivers(gone)
+    end
 end
 
 -- Split a chat message into its leading command token and the trimmed remainder.
@@ -10450,6 +11218,8 @@ local function sanitize_overrides(raw)
         carList = (type(raw.carList) == "string" and raw.carList ~= "") and raw.carList or nil,
         -- F1 light start (ADR-0043): only "f1" survives; nil = the default lock countdown.
         startMode = (raw.startMode == "f1") and "f1" or nil,
+        -- A drag race's seeding (ADR-0067): "random" or "quali"; nil = random. Read only on a drag strip.
+        seeding = drag.normalize_seeding(raw.seeding),
     }
 
     -- car=random composable player-policy axes (ADR-0032 amendment): opaque booleans relayed verbatim to the
@@ -10722,6 +11492,8 @@ local function handle_client_event(player_id, data)
 
     if decoded.type == MSG_CHECKPOINT then
         handle_checkpoint_report(player_id, decoded.payload)
+    elseif decoded.type == drag.MSG_RUN then
+        drag.handle_run(player_id, decoded.payload)
     elseif decoded.type == MSG_AI_MAP then
         handle_ai_map(player_id, decoded.payload)
     elseif decoded.type == MSG_AI_ROUTE_NOTICE then
