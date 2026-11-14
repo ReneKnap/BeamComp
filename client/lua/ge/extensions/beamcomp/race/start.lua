@@ -26,6 +26,12 @@ local MAX_LAPS = 1000
 -- Metres within which two grid poses count as the same place (M.pose_matches).
 local POSE_MATCH_TOLERANCE = 1e-3
 
+-- The cars per drag heat (ADR-0067 §2): the server sends the grid's preview count, clamped to the same bounds
+-- (grid_store.PREVIEW_COUNT_MAX); the strip's own lane count is the fallback. Re-clamped here because the
+-- number lays out poses.
+local DRAG_MIN_HEAT = 2
+local DRAG_MAX_HEAT = 32
+
 -- The start grid's default 15 m setback behind the line (it clears CP0's volume so a circuit's lap-1
 -- clock starts on a real line crossing, ADR-0022) now lives in race/grid as the default offsetForward.
 -- A race with a server-stored custom grid relays its own params in raceStart.gridParams (ADR-0023);
@@ -294,6 +300,11 @@ local function resolve_direction(payload)
     return payload.direction == "reverse" and "reverse" or "forward"
 end
 
+-- The drag facts of a parsed race (ADR-0067), or nil for every other race.
+local function drag_facts(race)
+    return race.meta and race.meta.drag or nil
+end
+
 -- The checkpoints in `direction`'s traversal order (ADR-0018): the parser's list as-is, or reversed --
 -- order and gate normals -- for a reverse race. CP0 is always element 1.
 local function direction_checkpoints(race, direction)
@@ -484,6 +495,48 @@ local function reverse_route(route_points, direction)
     return reversed
 end
 
+-- A drag race's two layouts (ADR-0067 §2), on the race's own start pose and axis:
+--   lanes -- the grid: `heat_size` slots from the relayed grid (forward block) or the strip's default one
+--            slot per lane on the stage waypoints. A heat's drivers are put here for their run.
+--   queue -- one pose per participant, two columns behind the deepest lane slot. Everybody spawns and waits
+--            here; it is `gridPoses` on the race state, so the spawn, the AI spawn and a re-layout read it
+--            unchanged.
+-- Returns lane poses, queue poses, the queue layout (for M.layout_for) and the heat size.
+local function drag_layouts(facts, payload, base_pose, gate_normal, count)
+    local requested = type(payload.drag) == "table" and tonumber(payload.drag.heatSize) or nil
+    local heat_size = math.max(DRAG_MIN_HEAT, math.min(DRAG_MAX_HEAT,
+        math.floor(requested or facts.defaultSlots or DRAG_MIN_HEAT)))
+    local lane_layout = {
+        pos = base_pose.pos,
+        rot = base_pose.rot,
+        gateNormal = gate_normal,
+        segments = grid.block_to_segments(grid_params_for(payload.gridParams, "forward")
+            or facts.defaultParams),
+    }
+    local lanes = M.layout_for(lane_layout, heat_size)
+
+    local deepest = 0
+    for _, pose in ipairs(lanes or {}) do
+        local behind = (base_pose.pos.x - pose.pos.x) * facts.axis.x
+            + (base_pose.pos.y - pose.pos.y) * facts.axis.y
+        deepest = math.max(deepest, behind)
+    end
+    local queue = facts.queue
+    local queue_layout = {
+        pos = base_pose.pos,
+        rot = base_pose.rot,
+        gateNormal = gate_normal,
+        segments = grid.block_to_segments({
+            offsetForward = deepest + queue.setback,
+            offsetLateral = facts.defaultParams.offsetLateral,
+            rowGap = queue.rowGap,
+            colGap = queue.colGap,
+            columns = queue.columns,
+        }),
+    }
+    return lanes, M.layout_for(queue_layout, count), queue_layout, heat_size
+end
+
 -- Resolve a race payload to its parsed model + locator, or nil plus a reason. Shared by the pre-flight
 -- check (M.validate) and the actual start (M.prepare): both need the same map-scoped discovery + parse
 -- (ADR-0005) and the same not-found / wrong-map / ambiguous / parse-error reasons.
@@ -608,7 +661,10 @@ function M.validate(payload)
     if not race then
         return {ok = false, reason = err}
     end
-    if not payload.force then
+    -- A drag strip runs forward, once, as a bracket (ADR-0067): mode, laps and direction do not apply to it,
+    -- so they are not checked against its geometry either -- the server drops them for a drag race.
+    local drag = drag_facts(race) ~= nil
+    if not payload.force and not drag then
         if payload.direction == "reverse" and not (race.meta and race.meta.reversible) then
             return {ok = false, reason = "not reversible, add 'force' to reverse it anyway"}
         end
@@ -652,6 +708,9 @@ function M.validate(payload)
         aiDefaults = race.meta and race.meta.aiDefaults,
         raceData = race_data,
         stagedQuali = staged_quali,
+        -- Whether this race is a drag strip (ADR-0067): the server runs it as a bracket of heats. The one
+        -- fact the race-blind server needs to know about it, reported here like stagedQuali.
+        drag = drag or nil,
     }
 end
 
@@ -751,7 +810,8 @@ function M.prepare(payload)
         return nil, err
     end
 
-    local direction = resolve_direction(payload)
+    local facts = drag_facts(race)
+    local direction = facts and "forward" or resolve_direction(payload)
 
     -- Reverse drives the checkpoints backward (ADR-0018): derive the reversed list (order + negated
     -- gate normals) before anything else, so the start pose, the plan, the detector and the in-world
@@ -767,6 +827,9 @@ function M.prepare(payload)
     local my_slot = payload.slot or 0
 
     local mode, laps = resolve_mode(race, payload)
+    if facts then
+        mode, laps = "sprint", 1
+    end
 
     -- Lay the grid out behind the line along the travel axis taken from the start/finish gate normal
     -- (CP0 = race_checkpoints[1], already reversed for a reverse race) so the field sits behind the line
@@ -802,7 +865,24 @@ function M.prepare(payload)
         ramp = ((mode == "sprint") and (type(payload.quali) == "table")) or nil,
     }
     local layout_count = M.layout_extent(roster, my_slot)
-    local poses, ramp_pose = M.layout_for(grid_layout, layout_count)
+    local poses, ramp_pose, drag
+    if facts then
+        -- A drag race (ADR-0067): everybody spawns and waits in the queue; the grid is the start line a
+        -- heat's drivers are moved onto.
+        local lanes, queue, queue_layout, heat_size = drag_layouts(facts, payload, base_pose, gate_normal,
+            layout_count)
+        poses, grid_layout = queue, queue_layout
+        drag = {
+            facts = facts,
+            heatSize = heat_size,
+            seeding = type(payload.drag) == "table" and payload.drag.seeding or nil,
+            lanePoses = lanes,
+        }
+        log("I", LOG_TAG, string.format("drag race '%s': %d car(s) per heat, %d queue pose(s), seeding %s",
+            tostring(locator.id), heat_size, #(queue or {}), tostring(drag.seeding)))
+    else
+        poses, ramp_pose = M.layout_for(grid_layout, layout_count)
+    end
     local my_pose = poses and poses[my_slot + 1]
     if not my_pose then
         return nil, "invalid slot " .. tostring(my_slot)
@@ -875,7 +955,11 @@ function M.prepare(payload)
         aiDefaults = race.meta and race.meta.aiDefaults,
         -- Qualifying event descriptor (ADR-0041): {duration, plan, mode} for order=quali, else nil. The
         -- quali plan loops the circuit for the window; the real `plan` above drives the race afterwards.
-        quali = quali_for(payload, race_checkpoints, mode, plan),
+        -- Never for a drag race, whose qualifying is a seeding pass of its own (ADR-0067).
+        quali = (not facts) and quali_for(payload, race_checkpoints, mode, plan) or nil,
+        -- A drag race (ADR-0067): {facts, heatSize, seeding, lanePoses}; nil for every other race. gridPoses
+        -- above is its waiting queue.
+        drag = drag,
     }
 end
 
@@ -998,12 +1082,18 @@ function M.anchor(race_name, direction)
         end
     end
 
+    -- A drag strip (ADR-0067) brings its own default grid, one slot per lane on the stage waypoints, which
+    -- the editor's New seeds instead of the generic default. nil for every other race.
+    local facts = drag_facts(race)
     return {
         base_pose = base_pose,
         gate_normal = gate_normal,
         raceId = locator.id,
         prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
         checkpoints = route,
+        drag = facts ~= nil or nil,
+        default_params = facts and facts.defaultParams or nil,
+        default_preview_count = facts and facts.defaultSlots or nil,
     }
 end
 

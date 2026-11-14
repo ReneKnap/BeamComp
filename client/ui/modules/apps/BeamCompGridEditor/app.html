@@ -214,8 +214,8 @@
         race's grids first; below the divider are the map's other grids, to copy one over.</div>
     </div>
 
-    <!-- Direction -->
-    <div class="bc-section" ng-if="state.active">
+    <!-- Direction. A drag strip runs forward only (ADR-0067), so the section is not there for one. -->
+    <div class="bc-section" ng-if="state.active && !state.drag">
       <div class="bc-section-title">Direction</div>
       <div class="bc-seg" bc-grid-tip="tip('direction')">
         <button ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
@@ -336,9 +336,10 @@
       </div>
       <!-- The number is saved WITH the grid and has two jobs since the ADR-0023 amendment 2026-08-02, so
            the label names both: it is the previewed field, and it is the size above which the race start
-           warns the admin who started the race. It still never feeds the layout. -->
-      <div class="bc-row" bc-grid-tip="tip('previewCount')">
-        <span>Preview / warn above</span>
+           warns the admin who started the race. It still never feeds the layout. On a drag strip it is the
+           number of cars per heat (ADR-0067), and the label says so. -->
+      <div class="bc-row" bc-grid-tip="tip(state.drag ? 'previewCountDrag' : 'previewCount')">
+        <span>{{state.drag ? 'Cars per heat' : 'Preview / warn above'}}</span>
         <div class="bc-step">
           <button bc-grid-hold="stepPreview(-1)" bc-grid-hold-end="endHold()">&minus;</button>
           <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-change="previewTyped()"
