@@ -364,6 +364,134 @@ angular.module('beamng.apps')
     return slice;
   }
 
+  // ===== the drag race (ADR-0067) =====
+  // GE pushes raw numbers on `hud.drag` (init.lua M.drag.snapshot); the panel's view is built once per push
+  // here, so the template only binds. Times are seconds to the thousandth, speeds m/s turned into km/h or
+  // mph by the game's own unit setting.
+  var DRAG_RESULT_TEXT = { win: 'Win', loss: 'Loss', red: 'Red light', time: 'Time', noTime: 'No time' };
+
+  function dragSeconds(s) {
+    return (s === null || s === undefined) ? '--' : s.toFixed(3);
+  }
+
+  function dragSpeed(v, imperial) {
+    if (v === null || v === undefined) {
+      return '--';
+    }
+    return imperial ? (v * 2.23694).toFixed(1) + ' mph' : (v * 3.6).toFixed(1) + ' km/h';
+  }
+
+  // The tree columns of the heat on the strip: one per car, its ambers and green following the lights
+  // unless that car has a red light, which stays lit.
+  function dragTreeColumns(heat, lights) {
+    return asArray(heat.entrants).map(function (e) {
+      return {
+        name: e.name,
+        lane: e.laneName || '',
+        mine: !!e.mine,
+        amber: !e.red && lights === 'amber',
+        green: !e.red && lights === 'green',
+        red: !!e.red,
+      };
+    });
+  }
+
+  // The timeslip of a decided heat: R/T, then the strip's timers in its own order, then each car's result.
+  function dragTimeslip(heat, timers, imperial) {
+    var cars = asArray(heat.entrants);
+    var runOf = function (e) { return e.run || {}; };
+    var rows = [{ label: 'R/T', cells: cars.map(function (e) { return dragSeconds(runOf(e).rt); }) }];
+    timers.forEach(function (t) {
+      if (t.kind === 'distance' && t.distance >= 0.5) {
+        rows.push({ label: t.short || t.label, cells: cars.map(function (e) {
+          return dragSeconds((runOf(e).splits || {})[t.id]);
+        }) });
+      } else if (t.kind === 'speed') {
+        rows.push({ label: t.label, cells: cars.map(function (e) {
+          return dragSpeed((runOf(e).speeds || {})[t.id], imperial);
+        }) });
+      }
+    });
+    return {
+      label: heat.label,
+      names: cars.map(function (e) { return e.name; }),
+      rows: rows,
+      results: cars.map(function (e) {
+        return { text: DRAG_RESULT_TEXT[e.result] || '', kind: e.result || '' };
+      }),
+    };
+  }
+
+  // The bracket as text lines per round: "A vs B" with the winner marked, "A, bye" for a bye.
+  function dragRounds(bracket) {
+    return asArray(bracket.rounds).map(function (round) {
+      return {
+        label: round.label,
+        heats: asArray(round.heats).map(function (heat) {
+          var cars = asArray(heat.entrants);
+          var names = cars.map(function (e) { return e.name; });
+          var winner = null;
+          cars.forEach(function (e) {
+            if (heat.winner !== null && heat.winner !== undefined && String(e.id) === String(heat.winner)) {
+              winner = e.name;
+            }
+          });
+          return {
+            text: heat.bye ? (names[0] || 'Nobody') + ', bye' : names.join(' vs '),
+            winner: heat.bye ? null : winner,
+            current: !!heat.current,
+            done: !!heat.done,
+          };
+        }),
+      };
+    });
+  }
+
+  function buildDragView(drag) {
+    var lights = drag.lights || 'dark';
+    var heat = drag.heat || null;
+    var view = { title: drag.title, heat: null, holdHint: false, slip: null, rounds: [], qual: [],
+      roundCount: 0, champion: null };
+    if (heat) {
+      var columns = dragTreeColumns(heat, lights);
+      view.heat = { label: heat.label, columns: columns };
+      view.holdHint = !heat.done && lights !== 'green'
+        && columns.some(function (c) { return c.mine && !c.red; });
+    }
+    if (drag.last) {
+      view.slip = dragTimeslip(drag.last, asArray(drag.timers), !!drag.imperial);
+    }
+    if (drag.bracket) {
+      view.rounds = dragRounds(drag.bracket);
+      view.qual = asArray(drag.bracket.qual).map(function (q) {
+        return { name: q.name, time: q.et !== null && q.et !== undefined ? dragSeconds(q.et)
+          : (q.ran ? 'No time' : '') };
+      });
+      view.roundCount = drag.bracket.roundCount || 0;
+      view.champion = drag.bracket.champion;
+    }
+    return view;
+  }
+
+  // The round a driver reached, for the drag results card: "Winner", "Final", "Semifinal", "Round n".
+  function dragReached(entry, view) {
+    var round = entry.dragRound || 0;
+    var count = view ? view.roundCount : 0;
+    if (round === 0 || count === 0) {
+      return '--';
+    }
+    if (entry.position === 1 && view.champion !== null && view.champion !== undefined && round === count) {
+      return 'Winner';
+    }
+    if (round === count) {
+      return 'Final';
+    }
+    if (round === count - 1) {
+      return 'Semifinal';
+    }
+    return 'Round ' + round;
+  }
+
   return {
     templateUrl: '/ui/modules/apps/BeamCompHud/app.html',
     replace: true,
@@ -750,9 +878,16 @@ angular.module('beamng.apps')
         return value != null ? formatTime(value) : '--';
       };
 
+      scope.dragReached = function (entry) {
+        return dragReached(entry, scope.dragView);
+      };
+
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
           scope.hud = data || {active: false, entries: []};
+          // The drag race's panel and results card (ADR-0067). Kept through the finished phase, where the
+          // results card reads the round count and the winner from it; null for every other race.
+          scope.dragView = scope.hud.drag ? buildDragView(scope.hud.drag) : null;
           // The three list fields on this snapshot, normalised before anything reads them. `entries` is
           // the one that fired: it is empty for the whole abort window of a race started while another
           // runs, and GE pushes through here about four times a frame while that lasts. The sub-tables

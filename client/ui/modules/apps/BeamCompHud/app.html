@@ -900,6 +900,107 @@
       opacity: 0.85;
       font-size: 0.9em;
     }
+    /* The drag race (ADR-0067): the heat on the strip with its tree, the last timeslip, and the bracket. */
+    .beamcomp-hud .bc-drag-title {
+      font-weight: bold;
+      font-size: 30px;
+      line-height: 1.1;
+      text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9);
+    }
+    .beamcomp-hud .bc-drag-panel,
+    .beamcomp-hud .bc-drag-slip,
+    .beamcomp-hud .bc-drag-bracket {
+      display: block;
+      margin-top: 12px;
+      text-align: left;
+    }
+    .beamcomp-hud .bc-drag-tree {
+      display: flex;
+      gap: 18px;
+    }
+    .beamcomp-hud .bc-drag-col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      min-width: 5em;
+    }
+    .beamcomp-hud .bc-drag-col.bc-local .bc-drag-name {
+      color: #3fd96b;
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-drag-lamp {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 2px solid rgba(0, 0, 0, 0.6);
+      background: #2b2b2b;
+    }
+    .beamcomp-hud .bc-drag-lamp.bc-amber.on {
+      background: #ffb000;
+      box-shadow: 0 0 12px 3px rgba(255, 176, 0, 0.8);
+    }
+    .beamcomp-hud .bc-drag-lamp.bc-green.on {
+      background: #3fd96b;
+      box-shadow: 0 0 12px 3px rgba(63, 217, 107, 0.8);
+    }
+    .beamcomp-hud .bc-drag-lamp.bc-red.on {
+      background: #ff2a2a;
+      box-shadow: 0 0 12px 3px rgba(255, 42, 42, 0.8);
+    }
+    .beamcomp-hud .bc-drag-name {
+      max-width: 8em;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+    }
+    .beamcomp-hud .bc-drag-lane,
+    .beamcomp-hud .bc-drag-sub {
+      font-size: 12px;
+      opacity: 0.75;
+    }
+    .beamcomp-hud .bc-drag-hint {
+      margin-top: 8px;
+      font-weight: bold;
+      color: #f2c744;
+    }
+    .beamcomp-hud table.bc-drag-table {
+      table-layout: auto;
+      font-size: 14px;
+    }
+    .beamcomp-hud table.bc-drag-table td {
+      padding: 1px 8px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .beamcomp-hud table.bc-drag-table td.bc-tb-label {
+      text-align: left;
+      opacity: 0.7;
+    }
+    .beamcomp-hud .bc-drag-win {
+      color: #3fd96b;
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-drag-red {
+      color: #ff4a4a;
+      font-weight: bold;
+    }
+    .beamcomp-hud .bc-drag-bracket {
+      max-width: 22em;
+      font-size: 14px;
+    }
+    .beamcomp-hud .bc-drag-round {
+      font-weight: bold;
+      margin-top: 6px;
+      opacity: 0.85;
+    }
+    .beamcomp-hud .bc-drag-heat.bc-current {
+      color: #f2c744;
+    }
+    .beamcomp-hud .bc-drag-heat.bc-done {
+      opacity: 0.7;
+    }
   </style>
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
@@ -947,6 +1048,60 @@
             <td class="bc-tb-value">{{formatTime(hud.localEntry.bestLap)}}</td>
           </tr>
         </table>
+      </div>
+    </div>
+  </div>
+  <!-- Drag race (ADR-0067). Left: the heat on the strip with a tree column per car (shown always, so the lights
+       are readable from any seat; the strip's own tree lights up too), then the timeslip of the last decided
+       heat. Right: the bracket (and the qualifying times while seeding by qualifying). Nothing here takes a
+       click; the panels keep pointer-events:auto from .bc-panel only so a long bracket scrolls. -->
+  <div ng-if="hud.phase === 'drag' && dragView">
+    <div class="bc-tl">
+      <div class="bc-drag-title">{{dragView.heat ? dragView.heat.label : dragView.title}}</div>
+      <div class="bc-panel bc-drag-panel" ng-if="dragView.heat">
+        <div class="bc-drag-tree">
+          <div class="bc-drag-col" ng-repeat="c in dragView.heat.columns" ng-class="{'bc-local': c.mine}">
+            <div class="bc-drag-lamp bc-amber" ng-class="{on: c.amber}"></div>
+            <div class="bc-drag-lamp bc-amber" ng-class="{on: c.amber}"></div>
+            <div class="bc-drag-lamp bc-amber" ng-class="{on: c.amber}"></div>
+            <div class="bc-drag-lamp bc-green" ng-class="{on: c.green}"></div>
+            <div class="bc-drag-lamp bc-red" ng-class="{on: c.red}"></div>
+            <div class="bc-drag-name">{{c.name}}</div>
+            <div class="bc-drag-lane">{{c.lane}}</div>
+          </div>
+        </div>
+        <div class="bc-drag-hint" ng-if="dragView.holdHint">Hold the brake until green</div>
+      </div>
+      <div class="bc-panel bc-drag-slip" ng-if="dragView.slip">
+        <div class="bc-drag-sub">{{dragView.slip.label}}</div>
+        <table class="bc-standings bc-drag-table">
+          <tr class="bc-results-head">
+            <td class="bc-tb-label"></td>
+            <td ng-repeat="name in dragView.slip.names track by $index">{{name}}</td>
+          </tr>
+          <tr ng-repeat="row in dragView.slip.rows">
+            <td class="bc-tb-label">{{row.label}}</td>
+            <td ng-repeat="cell in row.cells track by $index">{{cell}}</td>
+          </tr>
+          <tr>
+            <td class="bc-tb-label"></td>
+            <td ng-repeat="r in dragView.slip.results track by $index" ng-class="'bc-drag-' + r.kind">{{r.text}}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    <div class="bc-tr">
+      <div class="bc-panel bc-drag-bracket" ng-if="dragView.rounds.length || dragView.qual.length">
+        <div class="bc-scroll">
+          <div ng-if="dragView.qual.length">
+            <div class="bc-drag-round">Qualifying</div>
+            <div class="bc-drag-heat" ng-repeat="q in dragView.qual">{{q.name}}<span ng-if="q.time"> &middot; {{q.time}}</span></div>
+          </div>
+          <div ng-repeat="round in dragView.rounds">
+            <div class="bc-drag-round">{{round.label}}</div>
+            <div class="bc-drag-heat" ng-repeat="h in round.heats" ng-class="{'bc-current': h.current, 'bc-done': h.done}">{{h.text}}<span class="bc-drag-win" ng-if="h.winner"> &middot; {{h.winner}}</span></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1185,7 +1340,7 @@
     <div class="bc-results-title">Final Standings</div>
     <div class="bc-scroll">
       <table class="bc-standings bc-results">
-        <tr class="bc-results-head">
+        <tr class="bc-results-head" ng-if="!dragView">
           <td class="bc-pos"></td>
           <td class="bc-name">Driver</td>
           <td class="bc-time">Time</td>
@@ -1193,15 +1348,25 @@
           <td class="bc-int">Gap</td>
           <td class="bc-react" ng-if="hud.f1Start">React</td>
         </tr>
+        <!-- A drag race (ADR-0067) ranks by its bracket: the round each driver reached and his best 1/4 mile
+             ET, which orders the drivers out in the same round. -->
+        <tr class="bc-results-head" ng-if="dragView">
+          <td class="bc-pos"></td>
+          <td class="bc-name">Driver</td>
+          <td class="bc-int">Reached</td>
+          <td class="bc-time">Best ET</td>
+        </tr>
         <tr ng-repeat="e in hud.entries"
             ng-class="{'bc-local': e.isLocal, 'bc-finished': e.finished, 'bc-dnf': e.dnf, 'bc-ai': e.ai,
                        'bc-p1': $index === 0, 'bc-p2': $index === 1, 'bc-p3': $index === 2}">
           <td class="bc-pos">P{{e.position}}</td>
           <td class="bc-name">{{e.name}}<span class="bc-jump-tag" ng-if="e.jumpPenalty">+{{e.jumpPenalty}}s</span></td>
-          <td class="bc-time">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
-          <td class="bc-bestlap" ng-if="hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
-          <td class="bc-int">{{formatDelta(e.interval)}}</td>
-          <td class="bc-react" ng-if="hud.f1Start">{{formatReaction(e.reaction)}}</td>
+          <td class="bc-time" ng-if="!dragView">{{e.dnf ? 'DNF (CP ' + e.checkpoint + '/' + e.count + ')' : formatTime(e.time)}}</td>
+          <td class="bc-bestlap" ng-if="!dragView && hud.isCircuit">{{e.bestLap != null ? formatTime(e.bestLap) : '--'}}</td>
+          <td class="bc-int" ng-if="!dragView">{{formatDelta(e.interval)}}</td>
+          <td class="bc-react" ng-if="!dragView && hud.f1Start">{{formatReaction(e.reaction)}}</td>
+          <td class="bc-int" ng-if="dragView">{{e.dnf ? 'Left' : dragReached(e)}}</td>
+          <td class="bc-time" ng-if="dragView">{{e.dragBest != null ? e.dragBest.toFixed(3) : '--'}}</td>
         </tr>
       </table>
     </div>
