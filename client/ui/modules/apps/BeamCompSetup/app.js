@@ -74,6 +74,8 @@ angular.module('beamng.apps')
     // for order=quali. random (default = today) or the previous race's finishing order.
     qualiStart: [{ v: 'random', label: 'random' }, { v: 'last', label: 'last result' }],
     qualiPresets: [5, 8, 12, 15],
+    // A drag race's seeding (ADR-0067), shown only for a drag strip: drawn, or by a solo qualifying pass.
+    seeding: [{ v: 'random', label: 'random' }, { v: 'quali', label: 'qualifying run' }],
     champPreset: [{ v: 'f1', label: 'F1 (25-18-15…)' }, { v: 'linear', label: 'linear (per starter)' },
       { v: 'quadratic', label: 'quadratic (64-32-16…)' }],
     champOrder: [{ v: 'reversed', label: 'reversed (handicap)' }, { v: 'normal', label: 'normal' },
@@ -154,6 +156,8 @@ angular.module('beamng.apps')
     resetUiLayout: 'Puts every BeamComp window back to its default size and position.',
     // --- Basics ---
     race: 'The track this race runs on. Pick it first, everything below applies to it.',
+    seeding: 'How the bracket is drawn. Random draws the pairings. Qualifying run gives every driver one '
+      + 'timed pass alone first, so the fastest meet as late as possible.',
     // The track's own type is knowable here, so it is shown rather than hidden behind a word. When it is
     // not known (no race picked, still being looked up, or a race that cannot be parsed) the panel sends
     // no mode at all and the game decides at the start -- which is what this says.
@@ -452,6 +456,8 @@ angular.module('beamng.apps')
       // booleans so a saved preset round-trips the admin's choice.
       carRandomTrim: true, carNoBigCars: true,
       orderMode: 'random', orderRev: false, qualiStart: 'random', qualiMinutes: 5, grid: '',
+      // A drag race's seeding (ADR-0067); read only while the race is a drag strip.
+      seeding: 'random',
       // The jump-start penalty opens EMPTY, not at 15. A prefilled 15 was sent as an explicit
       // jumpPenaltySeconds on every panel start, so the server's own f1.DEFAULT_PENALTY never applied to
       // a panel race at all -- change that constant and /race would follow while this panel silently
@@ -1208,7 +1214,8 @@ angular.module('beamng.apps')
           if (!payload || !payload.id || typeof payload.closed !== 'boolean') {
             return;
           }
-          scope.raceMetaById[payload.id] = { closed: payload.closed, defaultLaps: payload.defaultLaps };
+          scope.raceMetaById[payload.id] = { closed: payload.closed, defaultLaps: payload.defaultLaps,
+            drag: payload.drag === true };
           if (payload.id === scope.form.race) {
             applyRecommendedMode();
           }
@@ -1251,6 +1258,19 @@ angular.module('beamng.apps')
         if (scope.open === 'carList') {
           requestCarLists('the Car list dropdown');
         }
+      };
+
+      // Whether the selected race is a drag strip (ADR-0067): the race list marks one (racelist.options), and
+      // its description says so too once GE has sent it. Unknown reads as not a drag strip.
+      scope.isDrag = function () {
+        var races = scope.data.races || [];
+        for (var i = 0; i < races.length; i++) {
+          if (races[i].id === scope.form.race) {
+            return races[i].drag === true;
+          }
+        }
+        var meta = scope.raceMetaById[scope.form.race];
+        return !!(meta && meta.drag);
       };
 
       scope.labelFor = function (field) {
@@ -1582,12 +1602,22 @@ angular.module('beamng.apps')
       // class-drop (ADR-0042), order= and its qualifying length are omitted so the server grids by the
       // format -- an explicit per-race order would win. The FORM's mode decides, not what the server runs
       // now: the request is what the next race will run.
+      //
+      // A drag strip (ADR-0067) runs forward, once, as a bracket of heats: the fields the panel hides for it
+      // leave the request too (the server would drop them anyway), the assists go off, and its seeding rides
+      // along instead. Deciding it here keeps the staging comparison honest, since it compares this request.
       function raceRequest() {
         var overrides = buildOverrides(scope.form);
         overrides.format = buildFormat(scope.form);
         if (overrides.format.mode !== 'off') {
           delete overrides.order;
           delete overrides.qualiMinutes;
+        }
+        if (scope.isDrag()) {
+          ['mode', 'laps', 'direction', 'order', 'qualiMinutes', 'startMode', 'jumpPenaltySeconds']
+            .forEach(function (key) { delete overrides[key]; });
+          overrides.assists = { recoverEnabled: false, repairEnabled: false };
+          overrides.seeding = scope.form.seeding || 'random';
         }
         return { race: scope.form.race, overrides: overrides };
       }
