@@ -100,6 +100,13 @@ M.pwr = {}
 -- staging swap; vehiclespecs holds the one predicate. Table fields for the same reason as the two above.
 M.vehiclespecs = require("beamcomp/race/vehiclespecs")
 M.carlist = {}
+-- The drag race (ADR-0067): race/dragrun.lua measures a run and times the tree (pure), race/dragworld.lua
+-- touches the engine (the tree lamps, the game's own drag start, a car's motion), and M.drag below (after the
+-- staged quali block) is the glue that stages, starts, measures and reports the heats. Table fields for the
+-- same reason as the three above: no top-level local.
+M.dragrun = require("beamcomp/race/dragrun")
+M.dragworld = require("beamcomp/race/dragworld")
+M.drag = {}
 
 -- ===== namespace tables (the 200-local ceiling, see the header) ==========================
 -- Each of these costs exactly ONE top-level local no matter how many functions it carries, which is
@@ -256,7 +263,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-carlist-r2/2026-11-13"
+local BUILD_MARKER = "0.10.0-drag-r1/2026-11-14"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -520,6 +527,7 @@ notice.RACE_PHASES = {
     racing = true,
     qualifying = true,
     qualiResults = true,
+    drag = true,
     finished = true,
 }
 
@@ -820,6 +828,7 @@ local function handle_race_start(payload)
         disarm_freeze_hold_ve()
         countdown.clear()
         hud.clear()
+        M.drag.teardown()
         -- No race on this client means no grid the setup panel could describe -- and if this was the
         -- panel's own Confirm, it will not stage here either.
         setup.forget_build("race start rejected")
@@ -912,6 +921,8 @@ local function handle_race_start(payload)
     M.state.dash_refresh_pending = false
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
+    -- And a prior drag race's tree, runs and game-drag block (ADR-0067); M.drag.begin opens this race's.
+    M.drag.teardown()
 
     -- Lift any in-race lock before respawning (ADR-0017): the abort-restart path (finished -> spawning)
     -- skips the lobby reset, so a prior race's lock could still be guarding core_vehicles.spawnNewVehicle
@@ -1248,6 +1259,8 @@ local function handle_race_start(payload)
     -- "0 of N cars resolved (metadata unavailable)" means the cars fell back to the old centre-anchored
     -- spawn plus restage, and that a second box source is needed.
     vehicles.log_bbox_report()
+    -- A drag race (ADR-0067): the field stands in the waiting queue now; bind the strip's tree.
+    M.drag.begin(race)
 end
 
 -- Despawn everything BeamComp put into the world for a race and drop all race-scoped state, leaving
@@ -1258,6 +1271,7 @@ end
 -- onExtensionUnloaded (Lua reload). Deliberately does NOT touch M.state.phase, the BeamMP event
 -- handler, or editor/spawn-mute state -- each caller owns those.
 local function teardown_race_world()
+    M.drag.teardown()
     countdown.clear()
     -- Take any standing centred message + checkpoint readout down with the race, and push the clearing
     -- frame while the app is still there to hear it (feature race-toast-cleanup-and-checkpoint-readout).
@@ -1762,6 +1776,7 @@ function hold.is_frozen_phase()
         or (M.state.phase == "countdown" and not (M.state.countdown and M.state.countdown.lights))
         or (M.state.phase == "qualiResults" and M.state.quali_settle)
         or hold.is_held()
+        or M.drag.is_held()
 end
 
 -- Push the current held-ness to the recover-key block. Called from every transition that can change it
@@ -2004,6 +2019,15 @@ local function handle_race_phase(payload)
         -- covers a race where the pre-race passes never caught a bindable car (bug
         -- default-dashboard-ui-missing-at-race-start).
         arm_dashboard_refresh()
+    elseif phase == "drag" then
+        -- A drag race's heats (ADR-0067): no countdown -- the server stages one heat after another and each
+        -- has its own tree. Upgrade to the full fixed-car lock for the whole bracket (normally done at the
+        -- countdown this phase skips); every car stays frozen in the queue until its heat moves it.
+        lock.install()
+        M.state.staging = nil
+        M.state.countdown = nil
+        countdown.clear()
+        hud.show()
     elseif phase == "qualiResults" then
         -- Qualifying over (ADR-0041): stop scoring -- the classification card renders from the quali
         -- snapshot. The settle window stays closed until the re-grid places the cars on the race grid.
@@ -2070,6 +2094,8 @@ local function handle_race_phase(payload)
         disarm_assist_ve()
         M.state.caps_check = nil
         M.state.pwr_check = nil
+        -- A drag race ends its runs and lets the own car go, which waited frozen in the queue (ADR-0067).
+        M.drag.finish_phase()
     elseif phase == "lobby" then
         -- Race over (back to lobby): despawn the track props/cones and drop all race state, but leave
         -- the player's vehicle exactly where it is -- never despawn or move it (only unfrozen, so a
@@ -2265,6 +2291,11 @@ end
 -- them fresh (qualiRespawnAi), since a quali drive leaves them unteleportable.
 local function handle_regrid(payload)
     if not M.state.race or type(payload) ~= "table" then
+        return
+    end
+    -- A drag race's slots are its waiting queue; the server never re-grids one (ADR-0067).
+    if M.state.race.drag then
+        log("W", RACE_LOG_TAG, "regrid ignored: a drag race keeps its queue")
         return
     end
     -- A quali re-grid (fired during the quali-results pause) is the cars landing on the earned race grid:
@@ -2896,6 +2927,515 @@ function quali.step_staged()
 end
 -- ===== end rally staged sprint quali (client) ============================================
 
+-- ===== the drag race, client side (ADR-0067) ===============================================
+-- The server runs the bracket and sends each heat as dragStage -> dragTree -> dragHold, plus the heat and
+-- bracket snapshots (dragHeat, dragBracket). This side owns the geometry and the measurement: it moves the
+-- heat's cars between the waiting queue (race.gridPoses) and the lane slots (race.drag.lanePoses), drives
+-- the strip's tree from the shared timing, releases its own car at the tree start and measures it from ITS
+-- OWN green (race/dragrun.lua), so latency never decides a heat. The race owner does the same for every AI
+-- in a heat and launches it at green plus a reaction. Every function is a field on M.drag (no top-level
+-- local, the 200-local ceiling); M.state.drag is nil outside a drag race, which makes every entry a no-op.
+
+M.drag.MSG_RUN = "dragRun"         -- client -> server: one car's run (matches the server's drag.MSG_RUN)
+M.drag.LOG_TAG = "beamcomp.drag"
+-- An AI's reaction to green, drawn per heat: a plausible human one. An AI is frozen until then, so it can
+-- never jump the start.
+M.drag.AI_REACTION_MIN = 0.12
+M.drag.AI_REACTION_MAX = 0.32
+-- The game's wheelie easing for an AI at full throttle (gameplay/drag/phaseHandlers.lua): the throttle eases
+-- from 1 at a nose pitch of AI_PITCH_SOFT down to AI_THROTTLE_MIN at AI_PITCH_HARD (forward vector z).
+M.drag.AI_PITCH_SOFT = 0.30
+M.drag.AI_PITCH_HARD = 0.55
+M.drag.AI_THROTTLE_MIN = 0.5
+
+-- Open the drag state for a race that is one (handle_race_start, after the field is placed): bind the tree
+-- and keep the game's own drag start off the strip.
+function M.drag.begin(race)
+    local drag = race and race.drag
+    if not drag then
+        return
+    end
+    local facts = drag.facts
+    M.state.drag = {
+        facts = facts,
+        heat_size = drag.heatSize,
+        seeding = drag.seeding,
+        lanes = drag.lanePoses or {},
+        tree = M.dragworld.bind_tree(facts.stripId, #facts.lanes),
+        block = M.dragworld.block_game_drag(nil, facts.map, facts.settingsId, #facts.lanes),
+        heat = nil,       -- the heat on the strip {seq, label, qual, entrants}
+        clock = nil,      -- its tree on the local clock (dragrun.tree), from dragTree to dragHold
+        limit = nil,
+        runs = {},        -- "own" / AI id -> the run this client measures
+        own_free = false, -- the own car is released for its run
+        view = nil,       -- the server's heat snapshot (dragHeat)
+        last = nil,       -- the last decided heat (the timeslip)
+        bracket = nil,    -- the server's bracket snapshot (dragBracket)
+        told = {},        -- heat seq -> true once the own result was said
+        targets = {},     -- strip lane -> its endLine waypoint name, or false when not in the scene
+        game_drag_warned = false,
+    }
+    log("I", M.drag.LOG_TAG, string.format("drag race on '%s': %d per heat, seeding %s, %d lane slot(s)",
+        tostring(facts.title), drag.heatSize or 0, tostring(drag.seeding), #(drag.lanePoses or {})))
+end
+
+-- Drop the drag state: the tree goes dark and the game's drag start is given back. Every race start and the
+-- race teardown call it; a no-op outside a drag race.
+function M.drag.teardown()
+    local state = M.state.drag
+    if not state then
+        return
+    end
+    M.dragworld.dark(state.tree)
+    M.dragworld.unblock_game_drag(state.block)
+    M.state.drag = nil
+end
+
+-- Whether the local driver's car must stand still: all through the drag phase except his own run, from
+-- the tree start until the heat sends him back to the queue. Read by hold.is_frozen_phase.
+function M.drag.is_held()
+    return M.state.phase == "drag" and M.state.drag ~= nil and not M.state.drag.own_free
+end
+
+function M.drag.own_car()
+    return (M.state.race_car_id and be) and be:getObjectByID(M.state.race_car_id) or nil
+end
+
+-- Repair + teleport a car onto a pose (front-anchored, race/vehicles.lua place_at_grid) and freeze it there.
+function M.drag.place(veh, pose, what)
+    if not veh or type(pose) ~= "table" then
+        return false
+    end
+    local placed, err = vehicles.place_at_grid(veh, pose)
+    if not placed then
+        log("W", M.drag.LOG_TAG, "could not place " .. tostring(what) .. ": " .. tostring(err))
+        return false
+    end
+    vehicles.set_vehicle_frozen(veh, true)
+    return true
+end
+
+-- The strip lane (the tree's lane index) nearest a lane slot: the lamps a car in that slot lights.
+function M.drag.tree_lane(pose)
+    local facts = M.state.drag.facts
+    local lateral = (pose.pos.x - facts.origin.x) * facts.axis.y
+        - (pose.pos.y - facts.origin.y) * facts.axis.x
+    local best, best_gap = 1, math.huge
+    for _, lane in ipairs(facts.lanes) do
+        local gap = math.abs(lateral - lane.lateral)
+        if gap < best_gap then
+            best, best_gap = lane.index, gap
+        end
+    end
+    return best
+end
+
+-- The display name of a strip lane ("Left", "Right").
+function M.drag.lane_name(tree_lane)
+    for _, lane in ipairs(M.state.drag.facts.lanes) do
+        if lane.index == tree_lane then
+            return lane.name
+        end
+    end
+    return nil
+end
+
+function M.drag.is_mine(entrant)
+    local race = M.state.race
+    return race ~= nil and not entrant.ai and tonumber(entrant.slot) == race.mySlot
+end
+
+-- A heat goes onto the strip: its cars move from the queue to their lane slots and are held there.
+function M.drag.handle_stage(payload)
+    local state = M.state.drag
+    if not state or type(payload) ~= "table" or payload.race ~= M.state.race.serverName then
+        return
+    end
+    M.drag.stop_runs()
+    state.clock = nil
+    state.own_free = false
+    state.view = nil
+    state.block = M.dragworld.block_game_drag(state.block, state.facts.map, state.facts.settingsId,
+        #state.facts.lanes)
+    M.dragworld.dark(state.tree)
+    local entrants = {}
+    for _, entrant in ipairs(type(payload.entrants) == "table" and payload.entrants or {}) do
+        if type(entrant) == "table" then
+            local pose = state.lanes[(tonumber(entrant.lane) or 0) + 1]
+            entrant.tree_lane = pose and M.drag.tree_lane(pose) or 1
+            entrant.mine = M.drag.is_mine(entrant)
+            entrants[#entrants + 1] = entrant
+            if entrant.mine then
+                if M.drag.place(M.drag.own_car(), pose, "the own car on its lane") then
+                    arm_dashboard_refresh()
+                end
+                notice.say(payload.qual and "Your qualifying run is next. Hold the brake until green."
+                    or "Your heat is next. Hold the brake until green.", "info")
+            elseif entrant.ai then
+                local car = quali.find_ai(entrant.id)
+                if car then
+                    ai.drag_park(car)
+                    M.drag.place(be and be:getObjectByID(car.veh_id), pose, "AI " .. tostring(car.label))
+                end
+            end
+        end
+    end
+    state.heat = {seq = payload.heat, label = payload.label, qual = payload.qual == true, entrants = entrants}
+    log("I", M.drag.LOG_TAG, string.format("heat %s (%s) staged, %d car(s)", tostring(payload.heat),
+        tostring(payload.label), #entrants))
+end
+
+-- Start measuring one car of the heat from where it stands now.
+function M.drag.track(key, entrant, veh, car)
+    local state = M.state.drag
+    local facts = state.facts
+    local pos = M.dragworld.motion(veh, facts.axis)
+    local pose = state.lanes[(tonumber(entrant.lane) or 0) + 1]
+    local run = {
+        entrant = entrant,
+        veh_id = veh:getId(),
+        car = car,
+        launched = false,
+        throttle = 1,
+        tracker = M.dragrun.new({
+            origin = pos or (pose and pose.pos) or facts.origin,
+            axis = facts.axis,
+            beam = facts.beam,
+            finish = facts.finish,
+            timers = facts.timers,
+            green = state.clock.green,
+            limit = state.limit,
+        }),
+    }
+    state.runs[key] = run
+    return run
+end
+
+-- The tree starts: run it from the shared timing, release the own car (a driver holds the brake himself, so
+-- leaving early is a red light) and start measuring; an AI stays frozen until green plus its reaction.
+function M.drag.handle_tree(payload)
+    local state = M.state.drag
+    local heat = state and state.heat
+    if not heat or type(payload) ~= "table" or payload.heat ~= heat.seq then
+        return
+    end
+    state.clock = M.dragrun.tree(os.clockhp(), tonumber(payload.amberDelay) or 2.5,
+        tonumber(payload.greenAfter) or 0.4)
+    state.limit = tonumber(payload.limit) or 45
+    for _, entrant in ipairs(heat.entrants) do
+        if entrant.mine then
+            local own = M.drag.own_car()
+            if own then
+                vehicles.set_vehicle_frozen(own, false)
+                disarm_freeze_hold_ve()
+                M.state.freeze_hold_armed = false
+                state.own_free = true
+                M.drag.track("own", entrant, own, nil)
+            end
+        elseif entrant.ai then
+            local car = quali.find_ai(entrant.id)
+            local veh = car and be and be:getObjectByID(car.veh_id)
+            if veh then
+                local run = M.drag.track(entrant.id, entrant, veh, car)
+                run.reaction = M.drag.AI_REACTION_MIN
+                    + math.random() * (M.drag.AI_REACTION_MAX - M.drag.AI_REACTION_MIN)
+            end
+        end
+    end
+end
+
+-- The scene name of a strip lane's endLine waypoint when it is in the scene, else nil (probed once per lane
+-- and race; the AI then runs on the throttle alone).
+function M.drag.target(tree_lane)
+    local state = M.state.drag
+    local known = state.targets[tree_lane]
+    if known ~= nil then
+        return known or nil
+    end
+    local name
+    for _, lane in ipairs(state.facts.lanes) do
+        if lane.index == tree_lane then
+            name = lane.target
+        end
+    end
+    local found = name and scenetree and scenetree.findObject and scenetree.findObject(name)
+    state.targets[tree_lane] = found and name or false
+    if not found then
+        log("W", M.drag.LOG_TAG, "drag AI: waypoint '" .. tostring(name)
+            .. "' is not in the scene, the AI drives on the throttle alone")
+    end
+    return found and name or nil
+end
+
+function M.drag.launch_ai(run)
+    run.launched = true
+    ai.set_frozen({run.car}, false)
+    ai.drag_launch(run.car, M.drag.target(run.entrant.tree_lane))
+end
+
+-- The game's wheelie easing: less throttle while the nose pitches up hard.
+function M.drag.ease_throttle(run, pitch)
+    local target = 1
+    if pitch > M.drag.AI_PITCH_SOFT then
+        local t = math.min(1, (pitch - M.drag.AI_PITCH_SOFT) / (M.drag.AI_PITCH_HARD - M.drag.AI_PITCH_SOFT))
+        target = 1 - t * (1 - M.drag.AI_THROTTLE_MIN)
+    end
+    if math.abs(target - run.throttle) > 0.01 then
+        run.throttle = target
+        ai.drag_throttle(run.car, target)
+    end
+end
+
+-- Send one run to the server: partial at a red light, final at its end.
+function M.drag.report(key, run)
+    local state = M.state.drag
+    local report = M.dragrun.report(run.tracker)
+    report.race = M.state.race.serverName
+    report.heat = state.heat.seq
+    report.aiId = run.car and key or nil
+    send_to_server(M.drag.MSG_RUN, report)
+    if report.final then
+        log("I", M.drag.LOG_TAG, string.format("run of %s ended (%s): rt %s, et %s, total %s, %.1f m",
+            tostring(run.entrant.name), tostring(report.reason), tostring(report.rt), tostring(report.et),
+            tostring(report.total), report.distance or 0))
+    end
+end
+
+function M.drag.step_run(key, run, now)
+    local state = M.state.drag
+    if run.car and not run.launched and now >= state.clock.green + run.reaction then
+        M.drag.launch_ai(run)
+    end
+    local pos, speed, pitch = M.dragworld.motion(be and be:getObjectByID(run.veh_id), state.facts.axis)
+    if not pos then
+        M.dragrun.abandon(run.tracker)
+        M.drag.report(key, run)
+        return
+    end
+    for _, event in ipairs(M.dragrun.sample(run.tracker, now, pos, speed)) do
+        if event == "jump" then
+            M.drag.report(key, run)
+            if key == "own" then
+                notice.say("Red light. You left before green.", "warning")
+            end
+        end
+    end
+    if run.tracker.done then
+        M.drag.report(key, run)
+        if run.car then
+            ai.drag_stop(run.car)
+        end
+    elseif run.car and run.launched then
+        M.drag.ease_throttle(run, pitch)
+    end
+end
+
+-- Whether a heat entrant has a red light, from this client's own measurement or the server's snapshot.
+function M.drag.has_red(entrant)
+    local state = M.state.drag
+    local run = state.runs[entrant.mine and "own" or entrant.id]
+    if run and run.tracker.red then
+        return true
+    end
+    for _, seen in ipairs(state.view and state.view.entrants or {}) do
+        if seen.id == entrant.id and type(seen.run) == "table" and seen.run.redLight then
+            return true
+        end
+    end
+    return false
+end
+
+-- Light the world tree for the heat on the strip: ambers, then green, on every lane in use; red for good on
+-- a lane whose car jumped.
+function M.drag.paint_tree(now)
+    local state = M.state.drag
+    local lights = M.dragrun.lights(state.clock, now)
+    local lanes = {}
+    for _, entrant in ipairs(state.heat.entrants) do
+        local lane = lanes[entrant.tree_lane] or {used = false, red = false}
+        lane.used = true
+        lane.red = lane.red or M.drag.has_red(entrant)
+        lanes[entrant.tree_lane] = lane
+    end
+    for _, strip_lane in ipairs(state.facts.lanes) do
+        local lane = lanes[strip_lane.index] or {}
+        local clean = lane.used and not lane.red
+        M.dragworld.set_lane(state.tree, strip_lane.index, {
+            amber = clean and lights == "amber",
+            green = clean and lights == "green",
+            red = lane.red,
+        })
+    end
+end
+
+-- Per frame in the drag phase: launch, measure and report the runs this client owns, and light the tree.
+function M.drag.step()
+    local state = M.state.drag
+    if not state or not state.clock or not state.heat then
+        return
+    end
+    local now = os.clockhp()
+    for key, run in pairs(state.runs) do
+        if not run.tracker.done then
+            M.drag.step_run(key, run, now)
+        end
+    end
+    M.drag.paint_tree(now)
+    if not state.game_drag_warned and M.dragworld.game_drag_started() then
+        state.game_drag_warned = true
+        log("W", M.drag.LOG_TAG, "drag: the game's own drag race started on this client during a heat")
+    end
+end
+
+-- End every run this client still measures, without a report: the heat is decided or over.
+function M.drag.stop_runs()
+    local state = M.state.drag
+    if not state then
+        return
+    end
+    for _, run in pairs(state.runs) do
+        if run.car and not run.tracker.done then
+            ai.drag_stop(run.car)
+        end
+        M.dragrun.abandon(run.tracker)
+    end
+    state.runs = {}
+end
+
+-- The heat is over: its cars go back to the queue and are held there.
+function M.drag.handle_hold(payload)
+    local state = M.state.drag
+    local heat = state and state.heat
+    if not heat or type(payload) ~= "table" or payload.heat ~= heat.seq then
+        return
+    end
+    M.drag.stop_runs()
+    state.clock = nil
+    state.own_free = false
+    M.dragworld.dark(state.tree)
+    local race = M.state.race
+    for _, entrant in ipairs(heat.entrants) do
+        if entrant.mine then
+            if M.drag.place(M.drag.own_car(), race.gridPoses and race.gridPoses[race.mySlot + 1],
+                    "the own car in the queue") then
+                arm_dashboard_refresh()
+            end
+        elseif entrant.ai then
+            local car = quali.find_ai(entrant.id)
+            if car then
+                ai.drag_park(car)
+                M.drag.place(be and be:getObjectByID(car.veh_id), car.pose, "AI " .. tostring(car.label))
+            end
+        end
+    end
+end
+
+-- The words for the own result of a decided heat.
+M.drag.RESULT_TEXT = {
+    win = "You win the heat.",
+    loss = "You lose the heat.",
+    red = "Red light. You lose the heat.",
+    time = "Qualifying run done.",
+    noTime = "Qualifying run without a time.",
+}
+
+-- The server's heat snapshot: kept for the HUD; a decided heat becomes the timeslip and tells the local
+-- driver his result once.
+function M.drag.handle_heat(payload)
+    local state = M.state.drag
+    if not state or type(payload) ~= "table" then
+        return
+    end
+    payload.entrants = type(payload.entrants) == "table" and payload.entrants or {}
+    state.view = payload
+    if not payload.done then
+        return
+    end
+    state.last = payload
+    if state.told[payload.heat] then
+        return
+    end
+    for _, entrant in ipairs(payload.entrants) do
+        if M.drag.is_mine(entrant) and M.drag.RESULT_TEXT[entrant.result] then
+            state.told[payload.heat] = true
+            notice.say(M.drag.RESULT_TEXT[entrant.result], "info")
+        end
+    end
+end
+
+function M.drag.handle_bracket(payload)
+    local state = M.state.drag
+    if state and type(payload) == "table" then
+        state.bracket = payload
+    end
+end
+
+-- The race left the drag phase (finished: the bracket is complete or /raceend): every run ends, the tree goes
+-- dark and the own car is let go for the free-roam window.
+function M.drag.finish_phase()
+    local state = M.state.drag
+    if not state then
+        return
+    end
+    M.drag.stop_runs()
+    state.clock = nil
+    state.own_free = true
+    M.dragworld.dark(state.tree)
+    local own = M.drag.own_car()
+    if own then
+        vehicles.set_vehicle_frozen(own, false)
+    end
+end
+
+-- The drag part of the HUD snapshot (the BeamCompHud drag panel and results card), or nil outside a drag race.
+-- Raw numbers only; the app formats them.
+function M.drag.snapshot()
+    local state = M.state.drag
+    if not state then
+        return nil
+    end
+    local heat = state.heat
+    local by_id = {}
+    for _, entrant in ipairs(state.view and state.view.entrants or {}) do
+        by_id[tostring(entrant.id)] = entrant
+    end
+    local entrants = {}
+    for _, entrant in ipairs(heat and heat.entrants or {}) do
+        local seen = by_id[tostring(entrant.id)] or {}
+        entrants[#entrants + 1] = {
+            id = entrant.id,
+            name = entrant.name,
+            seed = entrant.seed,
+            ai = entrant.ai,
+            mine = entrant.mine or nil,
+            laneName = M.drag.lane_name(entrant.tree_lane),
+            red = M.drag.has_red(entrant) or nil,
+            run = seen.run,
+            result = seen.result,
+        }
+    end
+    local ok, imperial = pcall(function() return settings.getValue("uiUnitLength") == "imperial" end)
+    return {
+        title = state.facts.title,
+        heatSize = state.heat_size,
+        seeding = state.seeding,
+        timers = state.facts.timers,
+        imperial = ok and imperial or false,
+        heat = heat and {
+            label = heat.label,
+            qual = heat.qual,
+            done = (state.view and state.view.heat == heat.seq and state.view.done) or nil,
+            entrants = entrants,
+        } or nil,
+        lights = state.clock and M.dragrun.lights(state.clock, os.clockhp()) or "dark",
+        ownFree = state.own_free or nil,
+        last = state.last,
+        bracket = state.bracket,
+    }
+end
+-- ===== end the drag race, client side ======================================================
+
+
 
 -- ===== client-measured driver liveness ===================================================
 -- The client half of the server's `stall` predicate (feature stall-detection-client-measured-movement).
@@ -3424,6 +3964,8 @@ local function handle_validate_race(payload)
         -- staged single-car variant (sprint) vs. the ADR-0041 all-at-once circuit quali. The race-blind
         -- server reads this (it cannot see meta.closed) only when the race is order=quali.
         stagedQuali = result.stagedQuali,
+        -- Whether the race is a drag strip (ADR-0067): the server runs it as a bracket of heats.
+        drag = result.drag,
         -- Footprints of the cars this race already pinned (ADR-0051 round 2). Plain numbers the server
         -- only computes with; absent whenever the car is not knowable yet (car=random, a cap that may
         -- substitute, an AI whose car is rolled at spawn).
@@ -3842,6 +4384,8 @@ function M.request_race_meta(race_id)
         id = race_id,
         closed = meta and meta.closed,
         defaultLaps = meta and race_start.resolve_laps(nil, meta.defaultLaps) or nil,
+        -- A drag strip (ADR-0067): the panel hides what it ignores and shows its seeding.
+        drag = meta and meta.drag or nil,
     })
 end
 
@@ -4047,6 +4591,8 @@ local function push_grid_state()
         -- absent otherwise. The panel shows its line while this differs from `direction` above.
         setupDirection = setup.carried_direction_here(),
         hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
+        -- A drag strip (ADR-0067): forward only, and the count is the cars per heat.
+        drag = editor.drag,
         previewCount = grideditor.preview_count(),
         -- The ordered breakpoint boundaries, the active segment index (1-based) and its start slot, so the
         -- panel shows "segment i of n, from slot s" and can add/remove/select breakpoints.
@@ -5903,6 +6449,23 @@ local HANDLERS = {
     carLists = function(payload)
         M.carlist.handle_lists(payload)
     end,
+    -- The drag race's heats and snapshots (ADR-0067). Inline for the same reason: the handlers live on
+    -- M.drag, defined further up but filled in after this table could capture them.
+    dragStage = function(payload)
+        M.drag.handle_stage(payload)
+    end,
+    dragTree = function(payload)
+        M.drag.handle_tree(payload)
+    end,
+    dragHold = function(payload)
+        M.drag.handle_hold(payload)
+    end,
+    dragHeat = function(payload)
+        M.drag.handle_heat(payload)
+    end,
+    dragBracket = function(payload)
+        M.drag.handle_bracket(payload)
+    end,
 }
 
 -- Handle one server->client event. `data` arrives as a JSON string -- the BeamMP client
@@ -6840,8 +7403,8 @@ function M.onVehicleSwitched(_oldId, newId)
         props.enforce_non_enterable(newId, race_car_id, M.state.current_vehicle_id)
         return
     end
-    if (phase == "staging" or phase == "countdown" or phase == "racing" or phase == "qualifying")
-            and race_car_id ~= nil and not is_race_car then
+    if (phase == "staging" or phase == "countdown" or phase == "racing" or phase == "qualifying"
+            or phase == "drag") and race_car_id ~= nil and not is_race_car then
         -- Silent in staging: the swap-allowed lock already blocks every switch key there, so a switch
         -- that still arrives is engine-driven (a prop or AI auto-enter) and toasting the player about a
         -- lock they never hit would be pure noise. The log line is kept in both cases.
@@ -6905,7 +7468,7 @@ local function rearm_own_car_on_reload(vehicle_id)
     end
     local phase = M.state.phase
     if phase ~= "staging" and phase ~= "countdown" and phase ~= "racing"
-            and phase ~= "qualifying" and phase ~= "qualiResults" then
+            and phase ~= "qualifying" and phase ~= "qualiResults" and phase ~= "drag" then
         return
     end
     -- Only the player's own staged race car matters; a reset keeps the same game id, so compare against
@@ -7874,6 +8437,10 @@ local function build_hud_snapshot()
                 ai = e.ai or nil,  -- synthetic host-driven AI slot (ADR-0036), so the row can be tagged
                 jumpPenalty = e.jump_penalty,  -- F1 jump-start penalty seconds (ADR-0043); HUD tags "+Ns"
                 reaction = e.reaction,  -- F1 start reaction seconds (ADR-0043); HUD React column, neg = jump
+                -- A settled drag race (ADR-0067): the round reached and the best 1/4 mile ET, for the drag
+                -- results card. nil for every other race.
+                dragRound = e.drag_round,
+                dragBest = e.drag_best,
             }
         end
     end
@@ -8271,6 +8838,9 @@ local function build_hud_snapshot()
         -- {cps, states = {class, ...}} -- one record class per sector, live re-evaluated. nil outside
         -- qualifying, so the bar leaves with the quali HUD.
         sectorBar = sector_bar,
+        -- A drag race (ADR-0067): the heat on the strip, its tree, the last timeslip and the bracket, for the
+        -- drag panel and the drag results card. nil for every other race.
+        drag = M.drag.snapshot(),
     }
 end
 
@@ -8743,7 +9313,7 @@ function M.caps.restaging()
     local phase = M.state.phase
     return lock.replace_seen
         or (M.state.restage_pending
-            and phase ~= "racing" and phase ~= "qualifying" and phase ~= "qualiResults")
+            and phase ~= "racing" and phase ~= "qualifying" and phase ~= "qualiResults" and phase ~= "drag")
 end
 
 -- Advance the measurement clock and send what is due (first request or a resend).
@@ -9891,6 +10461,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- server's cutoff is wall-time; ADR-0014). Visual only -- the server stays authoritative on the
         -- actual DNF cutoff.
         stall.step_clocks(dtReal)
+    elseif M.state.phase == "drag" and M.state.race then
+        -- A drag heat (ADR-0067): launch, measure and report the cars this client owns, light the tree.
+        M.drag.step()
     end
     -- Host only: once BeamMP has registered the spawned AI cars, broadcast their server ids so remotes can
     -- label + suppress them (ADR-0036). Registration is async, so this retries while pending until every
@@ -9926,7 +10499,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- arms there (ADR-0021), but the recover keys are owned by this VE override (not action-filtered),
     -- so without it Insert/Ctrl+Insert would still trigger vanilla recover and break the grid freeze.
     if (M.state.phase == "staging" or M.state.phase == "countdown" or M.state.phase == "racing"
-        or M.state.phase == "qualifying" or M.state.phase == "qualiResults") and M.state.race then
+        or M.state.phase == "qualifying" or M.state.phase == "qualiResults" or M.state.phase == "drag")
+        and M.state.race then
         push_assist_arm()
     end
     -- Arm the EV start-freeze throttle clamp over the frozen windows (staging, a numeric countdown, and the
@@ -9953,7 +10527,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- qualiResults snapshot would linger until racing); all HUD cards are gated off countdown, so it stays
     -- blank behind the centered count.
     local full_hud = (M.state.phase == "racing" or M.state.phase == "finished" or M.state.phase == "qualifying"
-        or M.state.phase == "qualiResults" or M.state.phase == "countdown") and M.state.race
+        or M.state.phase == "qualiResults" or M.state.phase == "countdown" or M.state.phase == "drag")
+        and M.state.race
     local series_active = (M.state.tournament and M.state.tournament.active)
         or (M.state.championship and M.state.championship.active)
     if full_hud then
@@ -9983,7 +10558,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     -- (the countdown overlay arms there, ADR-0021) through finished; free-roam is untouched.
     if M.state.race and (M.state.phase == "staging" or M.state.phase == "countdown"
         or M.state.phase == "racing" or M.state.phase == "finished"
-        or M.state.phase == "qualifying" or M.state.phase == "qualiResults") then
+        or M.state.phase == "qualifying" or M.state.phase == "qualiResults" or M.state.phase == "drag") then
         step_hud_watchdog(dtReal)
         -- Re-bind the stock dashboard/tacho once the (re)seated race car is ready, in the same visible
         -- phases (bug default-dashboard-ui-missing-at-race-start). Idle unless a rebind is queued.
