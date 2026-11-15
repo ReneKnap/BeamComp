@@ -1001,6 +1001,29 @@
     .beamcomp-hud .bc-drag-heat.bc-done {
       opacity: 0.7;
     }
+    .beamcomp-hud .bc-drag-slip-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .beamcomp-hud .bc-drag-slip-head .bc-drag-sub {
+      flex: 1 1 auto;
+    }
+    .beamcomp-hud .bc-drag-btn {
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 4px;
+      padding: 0 8px;
+      font-size: 14px;
+      line-height: 20px;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .beamcomp-hud .bc-drag-btn:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
   </style>
   <div class="beamcomp-hud" ng-show="hud.active"
        ng-class="['bc-size-' + (hud.sizeBucket || 'normal'), hud.phase === 'finished' ? 'bc-phase-finished' : 'bc-phase-live']">
@@ -1055,10 +1078,10 @@
        are readable from any seat; the strip's own tree lights up too), then the timeslip of the last decided
        heat. Right: the bracket (and the qualifying times while seeding by qualifying). Nothing here takes a
        click; the panels keep pointer-events:auto from .bc-panel only so a long bracket scrolls. -->
-  <div ng-if="hud.phase === 'drag' && dragView">
+  <div ng-if="(hud.phase === 'drag' || hud.phase === 'finished') && dragView">
     <div class="bc-tl">
-      <div class="bc-drag-title">{{dragView.heat ? dragView.heat.label : dragView.title}}</div>
-      <div class="bc-panel bc-drag-panel" ng-if="dragView.heat">
+      <div class="bc-drag-title" ng-if="hud.phase === 'drag'">{{dragView.heat ? dragView.heat.label : dragView.title}}</div>
+      <div class="bc-panel bc-drag-panel" ng-if="hud.phase === 'drag' && dragView.heat">
         <div class="bc-drag-tree">
           <div class="bc-drag-col" ng-repeat="c in dragView.heat.columns" ng-class="{'bc-local': c.mine}">
             <div class="bc-drag-lamp bc-amber" ng-class="{on: c.amber}"></div>
@@ -1072,8 +1095,16 @@
         </div>
         <div class="bc-drag-hint" ng-if="dragView.holdHint">Hold the brake until green</div>
       </div>
+      <!-- The timeslip (ADR-0067 amendment 2026-11-15): the latest decided heat until the driver closes it or his
+           own heat goes onto the strip; the arrows page through his own last slips. Stays in the finished
+           phase, beside the results card. -->
       <div class="bc-panel bc-drag-slip" ng-if="dragView.slip">
-        <div class="bc-drag-sub">{{dragView.slip.label}}</div>
+        <div class="bc-drag-slip-head">
+          <span class="bc-drag-sub">{{dragView.page >= 0 ? 'Your run ' + (dragView.page + 1) + ' of ' + dragView.ownCount + ': ' : ''}}{{dragView.slip.label}}</span>
+          <button type="button" class="bc-drag-btn" ng-if="dragView.ownCount" ng-disabled="!dragView.canOlder" ng-click="dragSlipPage(1)">&lsaquo;</button>
+          <button type="button" class="bc-drag-btn" ng-if="dragView.ownCount" ng-disabled="!dragView.canNewer" ng-click="dragSlipPage(-1)">&rsaquo;</button>
+          <button type="button" class="bc-drag-btn" ng-click="dragSlipClose()">&times;</button>
+        </div>
         <table class="bc-standings bc-drag-table">
           <tr class="bc-results-head">
             <td class="bc-tb-label"></td>
@@ -1089,8 +1120,9 @@
           </tr>
         </table>
       </div>
+      <button type="button" class="bc-analysis-btn" ng-if="dragView.slipClosed && !dragView.ownRunning" ng-click="dragSlipOpen()">&#9656; Timeslips</button>
     </div>
-    <div class="bc-tr">
+    <div class="bc-tr" ng-if="hud.phase === 'drag'">
       <div class="bc-panel bc-drag-bracket" ng-if="dragView.rounds.length || dragView.qual.length">
         <div class="bc-scroll">
           <div ng-if="dragView.qual.length">
