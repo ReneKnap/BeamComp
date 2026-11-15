@@ -110,7 +110,7 @@
       88%, 100% { left: var(--bc-fit-shift, 0px); }
     }
     /* flex:1 1 auto lets the segmented control fill a flex .bc-row (the Mirror toggle); it is inert in
-       the Direction section where .bc-seg is a block-level child of a non-flex .bc-section. */
+       the Variant section where .bc-seg is a block-level child of a non-flex .bc-section. */
     .bc-seg { display: flex; flex: 1 1 auto; min-width: 0; gap: 6px; }
     .bc-seg button { flex: 1 1 auto; padding: 4px 0; border: 1px solid rgba(255,255,255,0.18);
       border-radius: 3px; background: #2a2e35; color: #cdd; cursor: pointer; font-weight: 700; }
@@ -214,21 +214,24 @@
         race's grids first; below the divider are the map's other grids, to copy one over.</div>
     </div>
 
-    <!-- Direction. A drag strip runs forward only (ADR-0067), so the section is not there for one. -->
-    <div class="bc-section" ng-if="state.active && !state.drag">
-      <div class="bc-section-title">Direction</div>
+    <!-- Variant: Forward, Reverse and Drag (ADR-0067 amendment 2026-11-15), each a layout of its own. A drag strip
+         has only Drag, so its Forward and Reverse are not there. -->
+    <div class="bc-section" ng-if="state.active">
+      <div class="bc-section-title">Variant</div>
       <div class="bc-seg" bc-grid-tip="tip('direction')">
-        <button ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
-        <button ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
+        <button ng-if="!state.strip" ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
+        <button ng-if="!state.strip" ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
+        <button ng-class="{on: state.direction === 'drag'}" ng-click="setDirection('drag')">Drag</button>
       </div>
-      <!-- Stands while this session's direction is not the one the race setup's Edit… carried for this race
+      <!-- Stands while this session's variant is not the one the race setup's Edit… carried for this race
            (directionNote in app.js; GE sends nothing to compare otherwise). Not a toast: it stays until the
-           directions agree again. -->
+           two agree again. -->
       <div class="bc-dir-note" ng-if="directionNote()">{{directionNote()}}</div>
       <!-- Replaced 2026-10-11, both halves of the old text were false: a switch alone seeds a reverse layout
            that Save then writes, and no race refuses Reverse here -- one without its own reverse route
            anchors where a forced reverse race lines up (race/grideditor.lua set_direction). -->
-      <div class="bc-hint">Races run in reverse start on the Reverse layout.</div>
+      <div class="bc-hint" ng-if="!state.strip">Races run in reverse start on the Reverse layout, drag races on the Drag layout.</div>
+      <div class="bc-hint" ng-if="state.strip">A drag strip has only the Drag layout.</div>
       <!-- Next to Forward/Reverse because both are about where on the map the grid is. Needs no ng-disabled:
            this whole section only exists while a session runs, and GE refuses (and says so) during a race. -->
       <div class="bc-row bc-grid-actions">
@@ -336,10 +339,10 @@
       </div>
       <!-- The number is saved WITH the grid and has two jobs since the ADR-0023 amendment 2026-08-02, so
            the label names both: it is the previewed field, and it is the size above which the race start
-           warns the admin who started the race. It still never feeds the layout. On a drag strip it is the
-           number of cars per heat (ADR-0067), and the label says so. -->
-      <div class="bc-row" bc-grid-tip="tip(state.drag ? 'previewCountDrag' : 'previewCount')">
-        <span>{{state.drag ? 'Cars per heat' : 'Preview / warn above'}}</span>
+           warns the admin who started the race. It still never feeds the layout. On the Drag variant it is the
+           number of cars per heat, a number of its own (ADR-0067 amendment 2026-11-15), and the label says so. -->
+      <div class="bc-row" bc-grid-tip="tip(state.direction === 'drag' ? 'previewCountDrag' : 'previewCount')">
+        <span>{{state.direction === 'drag' ? 'Cars per heat' : 'Preview / warn above'}}</span>
         <div class="bc-step">
           <button bc-grid-hold="stepPreview(-1)" bc-grid-hold-end="endHold()">&minus;</button>
           <input type="number" min="1" max="32" ng-model="edit.previewCount" ng-change="previewTyped()"

@@ -176,7 +176,8 @@ angular.module('beamng.apps')
     load: 'Show the grids saved on this map.',
     gridRow: 'Load this grid for editing.',
     gridDelete: 'Delete this saved grid.',
-    direction: 'Which way round the track this layout is for. Forward and reverse are stored separately.',
+    direction: 'Which layout you edit: Forward or Reverse for a race in that direction, Drag for the heats of a '
+      + 'drag race. Each is stored separately.',
     cameraToGrid: 'Move the camera above P1 of this grid. Not during a race.',
 
     breakpoint: 'The position where a new part of the grid begins. While you type, the plan shows it as a '
@@ -557,7 +558,7 @@ angular.module('beamng.apps')
       // that field's placeholder (see scope.knobHint). `setupDirection` is deliberately not seeded: absent
       // means no direction line (see scope.directionNote). `plan` is the field as GE lays it out, for the
       // plan strip (see planOf; ADR-0023 amendment 2026-10-16).
-      scope.state = { active: false, race: null, direction: 'forward', hasReverse: false, drag: false,
+      scope.state = { active: false, race: null, direction: 'forward', hasReverse: false, strip: false, hasDrag: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
         knobDefaults: null, plan: null };
       // Editable mirror of the number fields, synced from state on each push. The knob entries hold GE's own
@@ -1122,11 +1123,11 @@ angular.module('beamng.apps')
         geLuaArg('grid_set_direction', direction);
       };
 
-      // The line under Forward/Reverse while the race setup runs this race the other way round (ADR-0037
-      // amendment 2026-10-11). GE decides whether there is anything to compare: it sends setupDirection
-      // only while the running session edits the race the setup panel's Edit… carried, so an absent field
-      // is no line. Nothing is kept from an earlier push (the state handler replaces scope.state whole) and
-      // nothing is inferred here -- the same rule as the setup panel's serverDefaults.
+      // The line under the variants while the race setup runs this race in another one (ADR-0037 amendment
+      // 2026-10-11; Drag since ADR-0067 amendment 2026-11-15). GE decides whether there is anything to compare:
+      // it sends setupDirection only while the running session edits the race the setup panel's Edit… carried,
+      // so an absent field is no line. Nothing is kept from an earlier push (the state handler replaces
+      // scope.state whole) and nothing is inferred here -- the same rule as the setup panel's serverDefaults.
       scope.directionNote = function () {
         var carried = scope.state.setupDirection;
         if (!scope.state.active || !carried || carried === scope.state.direction) {
@@ -1137,6 +1138,9 @@ angular.module('beamng.apps')
         }
         if (carried === 'forward') {
           return 'The race setup runs this race forward.';
+        }
+        if (carried === 'drag') {
+          return 'The race setup runs this race as a drag race.';
         }
         return '';
       };
