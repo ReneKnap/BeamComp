@@ -176,9 +176,9 @@ function M.game_drag_started()
     return ok and started == true
 end
 
--- (public) A vehicle's position {x, y, z}, its speed along `axis` (m/s) and its nose pitch (the forward
--- vector's z), or nil when it cannot be read.
-function M.motion(veh, axis)
+-- (public) A vehicle's position {x, y, z}, its horizontal speed (m/s) and its nose pitch (the forward vector's
+-- z), or nil when it cannot be read.
+function M.motion(veh)
     if not veh then
         return nil
     end
@@ -188,7 +188,7 @@ function M.motion(veh, axis)
     if not ok or not pos or not vel then
         return nil
     end
-    return {x = pos.x, y = pos.y, z = pos.z}, vel.x * axis.x + vel.y * axis.y, dir and dir.z or 0
+    return {x = pos.x, y = pos.y, z = pos.z}, math.sqrt(vel.x * vel.x + vel.y * vel.y), dir and dir.z or 0
 end
 
 return M
