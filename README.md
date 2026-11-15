@@ -33,8 +33,8 @@ BeamComp is free and open source.
 - **Live race information.** Next checkpoint, your position, your time, and the standings of everyone
   on track.
 - **Qualifying**, if you want a grid order that was earned rather than drawn.
-- **Drag races** on the game's three drag strips: a Christmas tree start, a timeslip after every run, and
-  a knockout bracket over the whole field.
+- **Drag races** on any race or on the game's three drag strips: a Christmas tree start, a timeslip after
+  every run, and a knockout bracket over the whole field.
 - **Championships and class-drop tournaments** across several races in one session.
 - **AI opponents.** Up to 16, with difficulty presets, so a group of three still gets a full field.
 - **Vehicle rules.** Everyone in the same car, everyone in a random car, or free choice within a power
@@ -233,19 +233,32 @@ new ones ship.
 
 ## Drag races
 
-Hirochi Raceway, West Coast USA and Gridmap each have a drag strip, listed in the race panel as a drag
-race. Two cars stand side by side on the line and start on the strip's Christmas tree: three ambers, then
-green 0.4 seconds later. Leaving before green is a red light and loses the run. The first car across the
-1/4 mile wins, reaction time included.
+Any race runs as a drag race when you pick **Drag** as its Mode in the race panel. Hirochi Raceway, West
+Coast USA and Gridmap also each have a drag strip, listed in the race panel like any other race. A strip
+runs only as a drag race.
+
+Two cars stand side by side on the line and start on a Christmas tree: three ambers, then green 0.4
+seconds later. Leaving before green is a red light and loses the run. On a strip the first car across the
+1/4 mile wins, reaction time included. On any other race the run follows the route once, through every
+checkpoint, to the race's own finish. On a circuit that is one lap.
 
 With more drivers the race is a knockout bracket, players and AI alike, one heat after another. The
 winner of a heat goes through, and an odd field gives byes. **Seeding** in the race panel draws the first
 round at random, or gives everyone one timed pass alone first so the fastest meet as late as possible.
-Drivers waiting for their heat sit in their own car behind the start. After every run everyone sees the
-timeslip: reaction time, 60 ft, 330 ft, 1/8 mile, 1000 ft, 1/4 mile, and the speed at 1/8 and 1/4. The
-final placement follows the round each driver reached and scores in a championship.
+Drivers waiting for their heat sit in their own car behind the start. The final placement follows the
+round each driver reached and scores in a championship.
 
-A strip's grid has one slot per lane. More slots in the grid editor mean more cars in each heat.
+A heat ends 20 seconds after its first car finishes, or when its time runs out: 45 seconds on a strip,
+more on a long route. A car still out then ranks by how far it got.
+
+After every run the timeslip shows the reaction time, the marks the run passes (60 ft, 330 ft, 1/8 mile,
+1000 ft, 1/4 mile, and the speed at 1/8 and 1/4) and, away from a strip, the finish time. It stays until
+you close it or your own next heat comes up. Its arrows page through your own last five runs, and
+**Timeslips** brings it back.
+
+Drag on a race that is not a strip needs a saved grid with a Drag layout. The grid editor has **Drag**
+beside Forward and Reverse, and it starts with two cars side by side on the start line. **Cars per heat**
+sets how many cars run in each heat. A strip's grid starts with one slot per lane.
 
 ## When something looks wrong
 
