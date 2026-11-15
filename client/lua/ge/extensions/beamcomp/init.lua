@@ -263,7 +263,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-drag-r1/2026-11-14"
+local BUILD_MARKER = "0.10.0-drag-r2/2026-11-15"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -2928,12 +2928,14 @@ end
 -- ===== end rally staged sprint quali (client) ============================================
 
 -- ===== the drag race, client side (ADR-0067) ===============================================
--- The server runs the bracket and sends each heat as dragStage -> dragTree -> dragHold, plus the heat and
--- bracket snapshots (dragHeat, dragBracket). This side owns the geometry and the measurement: it moves the
--- heat's cars between the waiting queue (race.gridPoses) and the lane slots (race.drag.lanePoses), drives
--- the strip's tree from the shared timing, releases its own car at the tree start and measures it from ITS
--- OWN green (race/dragrun.lua), so latency never decides a heat. The race owner does the same for every AI
--- in a heat and launches it at green plus a reaction. Every function is a field on M.drag (no top-level
+-- The server runs the bracket and sends each heat as dragStage -> dragTree -> (dragCut) -> dragHold, plus the
+-- heat and bracket snapshots (dragHeat, dragBracket). This side owns the geometry and the measurement: it moves
+-- the heat's cars between the waiting queue (race.gridPoses) and the drag grid (race.drag.lanePoses), runs the
+-- tree from the shared timing, releases its own car at the tree start and measures it from ITS OWN green along
+-- the route (race/dragrun.lua), so latency never decides a heat. On a strip the run ends at the 1/4 mile and the
+-- strip's own tree lights up; on any other race in the Drag mode it ends at the race's own finish, through every
+-- checkpoint, with the HUD tree only (ADR-0067 amendment 2026-11-15). The race owner does the same for every
+-- AI in a heat and launches it at green plus a reaction. Every function is a field on M.drag (no top-level
 -- local, the 200-local ceiling); M.state.drag is nil outside a drag race, which makes every entry a no-op.
 
 M.drag.MSG_RUN = "dragRun"         -- client -> server: one car's run (matches the server's drag.MSG_RUN)
@@ -2942,41 +2944,50 @@ M.drag.LOG_TAG = "beamcomp.drag"
 -- never jump the start.
 M.drag.AI_REACTION_MIN = 0.12
 M.drag.AI_REACTION_MAX = 0.32
--- The game's wheelie easing for an AI at full throttle (gameplay/drag/phaseHandlers.lua): the throttle eases
--- from 1 at a nose pitch of AI_PITCH_SOFT down to AI_THROTTLE_MIN at AI_PITCH_HARD (forward vector z).
+-- The game's wheelie easing for an AI at full throttle on a strip (gameplay/drag/phaseHandlers.lua): the
+-- throttle eases from 1 at a nose pitch of AI_PITCH_SOFT down to AI_THROTTLE_MIN at AI_PITCH_HARD.
 M.drag.AI_PITCH_SOFT = 0.30
 M.drag.AI_PITCH_HARD = 0.55
 M.drag.AI_THROTTLE_MIN = 0.5
+-- How many of his own timeslips a driver can page back through.
+M.drag.OWN_SLIPS = 5
 
--- Open the drag state for a race that is one (handle_race_start, after the field is placed): bind the tree
--- and keep the game's own drag start off the strip.
+-- Open the drag state for a race that is one (handle_race_start, after the field is placed). On a strip, bind
+-- its tree and keep the game's own drag start off it.
 function M.drag.begin(race)
     local drag = race and race.drag
     if not drag then
         return
     end
-    local facts = drag.facts
+    local strip = drag.strip
     M.state.drag = {
-        facts = facts,
+        strip = strip,
+        title = drag.title,
         heat_size = drag.heatSize,
         seeding = drag.seeding,
         lanes = drag.lanePoses or {},
-        tree = M.dragworld.bind_tree(facts.stripId, #facts.lanes),
-        block = M.dragworld.block_game_drag(nil, facts.map, facts.settingsId, #facts.lanes),
+        timers = drag.timers,
+        beam = drag.beam,
+        finish = drag.finish,
+        route = M.dragrun.route(drag.route),
+        limit = drag.limit,
+        tree = strip and M.dragworld.bind_tree(strip.stripId, #strip.lanes) or nil,
+        block = strip and M.dragworld.block_game_drag(nil, strip.map, strip.settingsId, #strip.lanes) or nil,
         heat = nil,       -- the heat on the strip {seq, label, qual, entrants}
         clock = nil,      -- its tree on the local clock (dragrun.tree), from dragTree to dragHold
-        limit = nil,
         runs = {},        -- "own" / AI id -> the run this client measures
         own_free = false, -- the own car is released for its run
         view = nil,       -- the server's heat snapshot (dragHeat)
         last = nil,       -- the last decided heat (the timeslip)
+        own = {},         -- the local driver's own decided heats, newest first, at most OWN_SLIPS
         bracket = nil,    -- the server's bracket snapshot (dragBracket)
         told = {},        -- heat seq -> true once the own result was said
         targets = {},     -- strip lane -> its endLine waypoint name, or false when not in the scene
         game_drag_warned = false,
     }
-    log("I", M.drag.LOG_TAG, string.format("drag race on '%s': %d per heat, seeding %s, %d lane slot(s)",
-        tostring(facts.title), drag.heatSize or 0, tostring(drag.seeding), #(drag.lanePoses or {})))
+    log("I", M.drag.LOG_TAG, string.format("drag race on '%s': %d per heat, seeding %s, %d lane slot(s), %s",
+        tostring(drag.title), drag.heatSize or 0, tostring(drag.seeding), #(drag.lanePoses or {}),
+        strip and "strip tree" or "HUD tree only, to the race's own finish"))
 end
 
 -- Drop the drag state: the tree goes dark and the game's drag start is given back. Every race start and the
@@ -3015,13 +3026,17 @@ function M.drag.place(veh, pose, what)
     return true
 end
 
--- The strip lane (the tree's lane index) nearest a lane slot: the lamps a car in that slot lights.
+-- The strip lane (the tree's lane index) nearest a lane slot: the lamps a car in that slot lights. nil off a
+-- strip, which has no lamps.
 function M.drag.tree_lane(pose)
-    local facts = M.state.drag.facts
-    local lateral = (pose.pos.x - facts.origin.x) * facts.axis.y
-        - (pose.pos.y - facts.origin.y) * facts.axis.x
+    local strip = M.state.drag.strip
+    if not strip then
+        return nil
+    end
+    local lateral = (pose.pos.x - strip.origin.x) * strip.axis.y
+        - (pose.pos.y - strip.origin.y) * strip.axis.x
     local best, best_gap = 1, math.huge
-    for _, lane in ipairs(facts.lanes) do
+    for _, lane in ipairs(strip.lanes) do
         local gap = math.abs(lateral - lane.lateral)
         if gap < best_gap then
             best, best_gap = lane.index, gap
@@ -3030,9 +3045,10 @@ function M.drag.tree_lane(pose)
     return best
 end
 
--- The display name of a strip lane ("Left", "Right").
+-- The display name of a strip lane ("Left", "Right"), or nil off a strip.
 function M.drag.lane_name(tree_lane)
-    for _, lane in ipairs(M.state.drag.facts.lanes) do
+    local strip = M.state.drag.strip
+    for _, lane in ipairs(strip and strip.lanes or {}) do
         if lane.index == tree_lane then
             return lane.name
         end
@@ -3045,7 +3061,7 @@ function M.drag.is_mine(entrant)
     return race ~= nil and not entrant.ai and tonumber(entrant.slot) == race.mySlot
 end
 
--- A heat goes onto the strip: its cars move from the queue to their lane slots and are held there.
+-- A heat goes onto the strip: its cars move from the queue to their drag grid slots and are held there.
 function M.drag.handle_stage(payload)
     local state = M.state.drag
     if not state or type(payload) ~= "table" or payload.race ~= M.state.race.serverName then
@@ -3055,14 +3071,17 @@ function M.drag.handle_stage(payload)
     state.clock = nil
     state.own_free = false
     state.view = nil
-    state.block = M.dragworld.block_game_drag(state.block, state.facts.map, state.facts.settingsId,
-        #state.facts.lanes)
+    M.state.detection = nil
+    if state.strip then
+        state.block = M.dragworld.block_game_drag(state.block, state.strip.map, state.strip.settingsId,
+            #state.strip.lanes)
+    end
     M.dragworld.dark(state.tree)
     local entrants = {}
     for _, entrant in ipairs(type(payload.entrants) == "table" and payload.entrants or {}) do
         if type(entrant) == "table" then
             local pose = state.lanes[(tonumber(entrant.lane) or 0) + 1]
-            entrant.tree_lane = pose and M.drag.tree_lane(pose) or 1
+            entrant.tree_lane = pose and M.drag.tree_lane(pose) or nil
             entrant.mine = M.drag.is_mine(entrant)
             entrants[#entrants + 1] = entrant
             if entrant.mine then
@@ -3085,24 +3104,26 @@ function M.drag.handle_stage(payload)
         tostring(payload.label), #entrants))
 end
 
--- Start measuring one car of the heat from where it stands now.
+-- Start measuring one car of the heat from where it stands now. Off a strip the run also carries a checkpoint
+-- detector on the race's one-pass plan: its last crossing is the finish.
 function M.drag.track(key, entrant, veh, car)
     local state = M.state.drag
-    local facts = state.facts
-    local pos = M.dragworld.motion(veh, facts.axis)
+    local pos = M.dragworld.motion(veh)
     local pose = state.lanes[(tonumber(entrant.lane) or 0) + 1]
+    local race = M.state.race
     local run = {
         entrant = entrant,
         veh_id = veh:getId(),
         car = car,
         launched = false,
         throttle = 1,
+        detector = (not state.strip and race.plan) and checkpoints.new(race.plan) or nil,
         tracker = M.dragrun.new({
-            origin = pos or (pose and pose.pos) or facts.origin,
-            axis = facts.axis,
-            beam = facts.beam,
-            finish = facts.finish,
-            timers = facts.timers,
+            origin = pos or (pose and pose.pos) or state.route.points[1],
+            route = state.route,
+            beam = state.beam,
+            finish = state.finish,
+            timers = state.timers,
             green = state.clock.green,
             limit = state.limit,
         }),
@@ -3121,7 +3142,7 @@ function M.drag.handle_tree(payload)
     end
     state.clock = M.dragrun.tree(os.clockhp(), tonumber(payload.amberDelay) or 2.5,
         tonumber(payload.greenAfter) or 0.4)
-    state.limit = tonumber(payload.limit) or 45
+    state.limit = tonumber(payload.limit) or state.limit
     for _, entrant in ipairs(heat.entrants) do
         if entrant.mine then
             local own = M.drag.own_car()
@@ -3130,7 +3151,9 @@ function M.drag.handle_tree(payload)
                 disarm_freeze_hold_ve()
                 M.state.freeze_hold_armed = false
                 state.own_free = true
-                M.drag.track("own", entrant, own, nil)
+                local run = M.drag.track("own", entrant, own, nil)
+                -- The next checkpoint marker follows the own run on a race's route (onPreRender).
+                M.state.detection = run.detector
             end
         elseif entrant.ai then
             local car = quali.find_ai(entrant.id)
@@ -3153,7 +3176,7 @@ function M.drag.target(tree_lane)
         return known or nil
     end
     local name
-    for _, lane in ipairs(state.facts.lanes) do
+    for _, lane in ipairs(state.strip.lanes) do
         if lane.index == tree_lane then
             name = lane.target
         end
@@ -3167,13 +3190,36 @@ function M.drag.target(tree_lane)
     return found and name or nil
 end
 
+-- Release an AI at green plus its reaction: on a strip the game's own straight launch, on any other race the
+-- race line for one pass, through the same rolling window the race uses (ai.drive, ADR-0036).
 function M.drag.launch_ai(run)
     run.launched = true
     ai.set_frozen({run.car}, false)
-    ai.drag_launch(run.car, M.drag.target(run.entrant.tree_lane))
+    local state = M.state.drag
+    if state.strip then
+        ai.drag_launch(run.car, M.drag.target(run.entrant.tree_lane))
+        return
+    end
+    local race = M.state.race
+    M.state.ai_window = M.state.ai_window or {}
+    local route = ai.drive({run.car}, race.routePoints or race.checkpoints, 1,
+        ai.resolve_params(M.state.ai_config, race.aiDefaults), race.mode == "circuit",
+        {store = M.state.ai_window, backLaps = 1, mapLive = M.state.ai_custom_map})
+    -- Latched, never mirrored, like quali.launch_ai: the restore sites are the only ones that clear it.
+    if route and route.customMap then
+        M.state.ai_custom_map = true
+    end
 end
 
--- The game's wheelie easing: less throttle while the nose pitches up hard.
+-- An AI past its run: braking to a stop, out of the rolling window.
+function M.drag.stop_ai(run)
+    ai.drag_stop(run.car)
+    if M.state.ai_window then
+        M.state.ai_window[run.car.id] = nil
+    end
+end
+
+-- The game's wheelie easing on a strip: less throttle while the nose pitches up hard.
 function M.drag.ease_throttle(run, pitch)
     local target = 1
     if pitch > M.drag.AI_PITCH_SOFT then
@@ -3201,12 +3247,31 @@ function M.drag.report(key, run)
     end
 end
 
+-- Off a strip: step the run's checkpoint detector, and when its last crossing comes, finish the run at the
+-- moment the car crossed the finish gate.
+function M.drag.step_finish(run, pos)
+    if not run.detector or run.tracker.done then
+        return
+    end
+    local race = M.state.race
+    checkpoints.step(run.detector, race.checkpoints, pos, 0)
+    if not run.detector.done then
+        return
+    end
+    local entries = race.plan.entries
+    local gate = race.checkpoints[entries[#entries].cursor]
+    local tracker = run.tracker
+    local previous, last = tracker.previous or tracker.last, tracker.last
+    M.dragrun.finish(tracker, M.dragrun.gate_time(previous.pos, previous.t, last.pos, last.t,
+        gate.pos, gate.normal))
+end
+
 function M.drag.step_run(key, run, now)
     local state = M.state.drag
     if run.car and not run.launched and now >= state.clock.green + run.reaction then
         M.drag.launch_ai(run)
     end
-    local pos, speed, pitch = M.dragworld.motion(be and be:getObjectByID(run.veh_id), state.facts.axis)
+    local pos, speed, pitch = M.dragworld.motion(be and be:getObjectByID(run.veh_id))
     if not pos then
         M.dragrun.abandon(run.tracker)
         M.drag.report(key, run)
@@ -3220,12 +3285,13 @@ function M.drag.step_run(key, run, now)
             end
         end
     end
+    M.drag.step_finish(run, pos)
     if run.tracker.done then
         M.drag.report(key, run)
         if run.car then
-            ai.drag_stop(run.car)
+            M.drag.stop_ai(run)
         end
-    elseif run.car and run.launched then
+    elseif run.car and run.launched and state.strip then
         M.drag.ease_throttle(run, pitch)
     end
 end
@@ -3245,10 +3311,13 @@ function M.drag.has_red(entrant)
     return false
 end
 
--- Light the world tree for the heat on the strip: ambers, then green, on every lane in use; red for good on
--- a lane whose car jumped.
+-- Light the strip's tree for the heat on it: ambers, then green, on every lane in use; red for good on a lane
+-- whose car jumped. Nothing to light off a strip.
 function M.drag.paint_tree(now)
     local state = M.state.drag
+    if not state.strip then
+        return
+    end
     local lights = M.dragrun.lights(state.clock, now)
     local lanes = {}
     for _, entrant in ipairs(state.heat.entrants) do
@@ -3257,7 +3326,7 @@ function M.drag.paint_tree(now)
         lane.red = lane.red or M.drag.has_red(entrant)
         lanes[entrant.tree_lane] = lane
     end
-    for _, strip_lane in ipairs(state.facts.lanes) do
+    for _, strip_lane in ipairs(state.strip.lanes) do
         local lane = lanes[strip_lane.index] or {}
         local clean = lane.used and not lane.red
         M.dragworld.set_lane(state.tree, strip_lane.index, {
@@ -3281,9 +3350,28 @@ function M.drag.step()
         end
     end
     M.drag.paint_tree(now)
-    if not state.game_drag_warned and M.dragworld.game_drag_started() then
+    if state.strip and not state.game_drag_warned and M.dragworld.game_drag_started() then
         state.game_drag_warned = true
         log("W", M.drag.LOG_TAG, "drag: the game's own drag race started on this client during a heat")
+    end
+end
+
+-- The server cut the heat: every run this client still measures ends where its car is and is reported, so the
+-- server ranks it by how far it got.
+function M.drag.handle_cut(payload)
+    local state = M.state.drag
+    local heat = state and state.heat
+    if not heat or type(payload) ~= "table" or payload.heat ~= heat.seq then
+        return
+    end
+    for key, run in pairs(state.runs) do
+        if not run.tracker.done then
+            M.dragrun.cut(run.tracker)
+            M.drag.report(key, run)
+            if run.car then
+                M.drag.stop_ai(run)
+            end
+        end
     end
 end
 
@@ -3295,7 +3383,7 @@ function M.drag.stop_runs()
     end
     for _, run in pairs(state.runs) do
         if run.car and not run.tracker.done then
-            ai.drag_stop(run.car)
+            M.drag.stop_ai(run)
         end
         M.dragrun.abandon(run.tracker)
     end
@@ -3312,6 +3400,7 @@ function M.drag.handle_hold(payload)
     M.drag.stop_runs()
     state.clock = nil
     state.own_free = false
+    M.state.detection = nil
     M.dragworld.dark(state.tree)
     local race = M.state.race
     for _, entrant in ipairs(heat.entrants) do
@@ -3339,8 +3428,8 @@ M.drag.RESULT_TEXT = {
     noTime = "Qualifying run without a time.",
 }
 
--- The server's heat snapshot: kept for the HUD; a decided heat becomes the timeslip and tells the local
--- driver his result once.
+-- The server's heat snapshot: kept for the HUD; a decided heat becomes the timeslip, joins the local driver's
+-- own slips when he ran in it, and tells him his result once.
 function M.drag.handle_heat(payload)
     local state = M.state.drag
     if not state or type(payload) ~= "table" then
@@ -3356,9 +3445,13 @@ function M.drag.handle_heat(payload)
         return
     end
     for _, entrant in ipairs(payload.entrants) do
-        if M.drag.is_mine(entrant) and M.drag.RESULT_TEXT[entrant.result] then
+        if M.drag.is_mine(entrant) then
             state.told[payload.heat] = true
-            notice.say(M.drag.RESULT_TEXT[entrant.result], "info")
+            table.insert(state.own, 1, payload)
+            state.own[M.drag.OWN_SLIPS + 1] = nil
+            if M.drag.RESULT_TEXT[entrant.result] then
+                notice.say(M.drag.RESULT_TEXT[entrant.result], "info")
+            end
         end
     end
 end
@@ -3380,6 +3473,7 @@ function M.drag.finish_phase()
     M.drag.stop_runs()
     state.clock = nil
     state.own_free = true
+    M.state.detection = nil
     M.dragworld.dark(state.tree)
     local own = M.drag.own_car()
     if own then
@@ -3388,7 +3482,8 @@ function M.drag.finish_phase()
 end
 
 -- The drag part of the HUD snapshot (the BeamCompHud drag panel and results card), or nil outside a drag race.
--- Raw numbers only; the app formats them.
+-- Raw numbers only; the app formats them. `finishTimer` names the timer that IS the finish on a strip; off a
+-- strip it is nil and the timeslip adds a Finish row.
 function M.drag.snapshot()
     local state = M.state.drag
     if not state then
@@ -3416,12 +3511,14 @@ function M.drag.snapshot()
     end
     local ok, imperial = pcall(function() return settings.getValue("uiUnitLength") == "imperial" end)
     return {
-        title = state.facts.title,
+        title = state.title,
         heatSize = state.heat_size,
         seeding = state.seeding,
-        timers = state.facts.timers,
+        timers = state.timers,
+        finishTimer = state.strip and state.strip.finishTimer or nil,
         imperial = ok and imperial or false,
         heat = heat and {
+            seq = heat.seq,
             label = heat.label,
             qual = heat.qual,
             done = (state.view and state.view.heat == heat.seq and state.view.done) or nil,
@@ -3430,6 +3527,7 @@ function M.drag.snapshot()
         lights = state.clock and M.dragrun.lights(state.clock, os.clockhp()) or "dark",
         ownFree = state.own_free or nil,
         last = state.last,
+        own = state.own,
         bracket = state.bracket,
     }
 end
@@ -3964,8 +4062,12 @@ local function handle_validate_race(payload)
         -- staged single-car variant (sprint) vs. the ADR-0041 all-at-once circuit quali. The race-blind
         -- server reads this (it cannot see meta.closed) only when the race is order=quali.
         stagedQuali = result.stagedQuali,
-        -- Whether the race is a drag strip (ADR-0067): the server runs it as a bracket of heats.
+        -- Whether the race runs as a drag race (ADR-0067): the server runs it as a bracket of heats. `strip`
+        -- says it is one of the game's strips (anything else needs a saved drag grid) and `dragLimit` how long
+        -- a run may last on its route, in seconds (ADR-0067 amendment 2026-11-15).
         drag = result.drag,
+        strip = result.strip,
+        dragLimit = result.dragLimit,
         -- Footprints of the cars this race already pinned (ADR-0051 round 2). Plain numbers the server
         -- only computes with; absent whenever the car is not knowable yet (car=random, a cap that may
         -- substitute, an AI whose car is rolled at spawn).
@@ -4384,8 +4486,8 @@ function M.request_race_meta(race_id)
         id = race_id,
         closed = meta and meta.closed,
         defaultLaps = meta and race_start.resolve_laps(nil, meta.defaultLaps) or nil,
-        -- A drag strip (ADR-0067): the panel hides what it ignores and shows its seeding.
-        drag = meta and meta.drag or nil,
+        -- A drag strip (ADR-0067): the panel offers it only the Drag mode.
+        strip = meta and meta.strip or nil,
     })
 end
 
@@ -4514,7 +4616,7 @@ function setup.carry_direction(race, direction)
     if race == nil then
         return
     end
-    if direction ~= "forward" and direction ~= "reverse" then
+    if direction ~= "forward" and direction ~= "reverse" and direction ~= "drag" then
         log("I", setup.GRID_LOG_TAG, "Edit... carried no direction for race '" .. race
             .. "': the editor starts forward")
         return
@@ -4545,16 +4647,18 @@ function setup.apply_carried_direction()
             .. "session edits '" .. tostring(editor.race) .. "', it was carried for '" .. carried.race .. "'")
         return
     end
-    if carried.direction ~= "reverse" then
+    -- Reverse, or the Drag variant when the race setup runs this race in the Drag mode (ADR-0067 amendment
+    -- 2026-11-15). A strip starts on Drag by itself.
+    if carried.direction == "forward" or carried.direction == editor.direction then
         return
     end
-    local ok, reason = grideditor.set_direction("reverse")
+    local ok, reason = grideditor.set_direction(carried.direction)
     if ok then
-        log("I", setup.GRID_LOG_TAG, "session for '" .. editor.race
-            .. "' starts in reverse, the direction the race setup carried")
+        log("I", setup.GRID_LOG_TAG, "session for '" .. editor.race .. "' starts on '" .. carried.direction
+            .. "', the variant the race setup carried")
     else
         log("W", setup.GRID_LOG_TAG, "session for '" .. editor.race .. "' stays forward: the switch to the "
-            .. "carried reverse was refused (" .. tostring(reason) .. ")")
+            .. "carried '" .. carried.direction .. "' was refused (" .. tostring(reason) .. ")")
     end
 end
 
@@ -4591,8 +4695,10 @@ local function push_grid_state()
         -- absent otherwise. The panel shows its line while this differs from `direction` above.
         setupDirection = setup.carried_direction_here(),
         hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
-        -- A drag strip (ADR-0067): forward only, and the count is the cars per heat.
-        drag = editor.drag,
+        -- A drag strip has only the Drag variant (ADR-0067); `hasDrag` says this grid has one (its count is then
+        -- the cars per heat while Drag is the active variant).
+        strip = editor.strip,
+        hasDrag = (editor.blocks ~= nil and editor.blocks.drag ~= nil),
         previewCount = grideditor.preview_count(),
         -- The ordered breakpoint boundaries, the active segment index (1-based) and its start slot, so the
         -- panel shows "segment i of n, from slot s" and can add/remove/select breakpoints.
@@ -4673,6 +4779,9 @@ local function handle_grid_data(payload)
         -- it keeps, so the count has to be listed here or the reopened grid silently falls back to 16.
         -- grideditor coerces it, so a missing or hand-edited value degrades instead of breaking.
         previewCount = payload.previewCount,
+        -- The Drag variant and its cars per heat (ADR-0067 amendment 2026-11-15), listed for the same reason.
+        drag = payload.drag,
+        dragCount = payload.dragCount,
     }, anchor_race)
     if ok then
         -- Remember the loaded name so the panel can offer overwrite (same-name save) + assign without
@@ -6459,6 +6568,9 @@ local HANDLERS = {
     end,
     dragHold = function(payload)
         M.drag.handle_hold(payload)
+    end,
+    dragCut = function(payload)
+        M.drag.handle_cut(payload)
     end,
     dragHeat = function(payload)
         M.drag.handle_heat(payload)
@@ -10462,8 +10574,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         -- actual DNF cutoff.
         stall.step_clocks(dtReal)
     elseif M.state.phase == "drag" and M.state.race then
-        -- A drag heat (ADR-0067): launch, measure and report the cars this client owns, light the tree.
+        -- A drag heat (ADR-0067): launch, measure and report the cars this client owns, light the tree. Off a
+        -- strip the AI drive the race line, so their rolling route window is topped up as in a race.
         M.drag.step()
+        ai.step_window(M.state.ai_cars, M.state.ai_window, nil)
     end
     -- Host only: once BeamMP has registered the spawned AI cars, broadcast their server ids so remotes can
     -- label + suppress them (ADR-0036). Registration is async, so this retries while pending until every
@@ -10615,7 +10729,7 @@ function M.onPreRender(dtReal, dtSim, dtRaw)
         local race = M.state.race
         if race then
             local detection = M.state.detection
-            if (M.state.phase == "racing" or M.state.phase == "qualifying")
+            if (M.state.phase == "racing" or M.state.phase == "qualifying" or M.state.phase == "drag")
                 and detection and not detection.done then
                 -- Use the same owned car the detector crosses checkpoints with (step_detection), so the
                 -- posts face the point that actually triggers the gate, not a different camera vehicle.
