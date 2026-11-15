@@ -21,7 +21,7 @@
 -- crossing arms the finish grace and drives the racing -> finished transition (ADR-0006).
 --
 -- Chat commands handled (leading token; trailing text is the argument):
---   /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] [aiaggr=/aiskill=/airubber=<0..1>] [seed=random|quali] [all]
+--   /race [map:|menu:|strip:]<name> [sprint|circuit|drag] [laps] [reverse] [force] [recover[:secs]] [repair[:secs]] [grid=<name>] [car=<model[:config]|random>] [maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] [order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] [ai <n> [easy|medium|hard]] [aicar=<model[:config]>] [ailimit=on|off] [aiaggr=/aiskill=/airubber=<0..1>] [seed=random|quali] [all]
 --                 (each keyword token also accepts any unambiguous prefix: s/c, rev, f, rec/rep)
 --                 vehicle policy (ADR-0032): car=<model[:config]> = one fixed car for everyone (Mode 2);
 --                 car=random = a per-player random car composing with the caps (the exception to car-wins);
@@ -121,13 +121,16 @@ drag.MSG_HOLD = "dragHold"       -- server -> all: the heat's drivers go back to
 drag.MSG_HEAT = "dragHeat"       -- server -> all: the heat snapshot with every run and the result
 drag.MSG_BRACKET = "dragBracket" -- server -> all: the bracket snapshot
 drag.MSG_RUN = "dragRun"         -- client -> server: one car's run, partial (a red light) or final
+drag.MSG_CUT = "dragCut"         -- server -> all: the heat is over for every car still out {heat}
 drag.DEFAULT_HEAT = 2      -- cars per heat without a saved grid: one per lane
 drag.STAGE_SETTLE = 3.0    -- seconds from a heat's staging to its tree: the teleport settles
 drag.AMBER_MIN = 2.0       -- the ambers come 2 to 3 s after the tree starts, the game's own .400 tree
 drag.AMBER_MAX = 3.0
 drag.GREEN_AFTER = 0.4     -- green after the ambers: a Pro tree
-drag.RUN_LIMIT = 45.0      -- seconds after green a run may last
-drag.REPORT_SLACK = 5.0    -- the server waits this much longer for the last reports
+drag.RUN_LIMIT = 45.0      -- seconds after green a run may last, when the issuer's client named none
+drag.RUN_LIMIT_MAX = 600.0 -- the longest limit a client may name (a long route)
+drag.FINISH_GRACE = 20.0   -- after the first clean finish the cars still out get this long, then the heat is cut
+drag.REPORT_SLACK = 5.0    -- after a cut the server waits this long for the last reports
 drag.RESULT_SHOW = 6.0     -- the timeslip stands before the cars go back to the queue
 drag.HOLD_GAP = 2.0        -- from the return to the queue to the next heat
 
@@ -6181,8 +6184,8 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
     -- One heads-up to the issuer when the field outgrew what this grid was authored for (ADR-0023
     -- amendment 2026-08-02). Reading that one meta number is the server's only exception to relaying a
     -- grid record verbatim; everything below this line is unchanged -- same layout, same poses, same
-    -- gridParams on the wire. On a drag strip that number is the cars per heat, which the field is meant to
-    -- outgrow.
+    -- gridParams on the wire. A drag race reads the grid's drag count instead, the cars per heat, which the
+    -- field is meant to outgrow.
     if not drag.is_active() then
         grid_store.warn_over_capacity(owner_id, grid_params, #roster)
     end
@@ -6360,8 +6363,8 @@ local function start_race(race_name, owner_id, overrides, map, race_id, race_dat
                 showDriverNames = cfg.show_driver_names == true,
                 -- A drag race (ADR-0067): the cars per heat and the seeding. The client lays out the strip's
                 -- lanes and its waiting queue from it. nil for every other race.
-                drag = session.drag and {heatSize = session.drag.heat_size, seeding = session.drag.seeding}
-                    or nil,
+                drag = session.drag and {heatSize = session.drag.heat_size, seeding = session.drag.seeding,
+                    limit = session.drag.limit} or nil,
             })
         end
     end
@@ -7319,14 +7322,16 @@ function drag.normalize_seeding(value)
     return nil
 end
 
--- The cars per heat of a drag race: the resolved grid's preview count (the one documented read of a grid
--- record, ADR-0023 amendment 2026-08-02), else the strip's two lanes; clamped so a heat races at least two.
+-- The cars per heat of a drag race: the resolved grid's drag count (the grid's Drag variant, ADR-0067 amendment
+-- 2026-11-15; read like the preview count, the documented read of a grid record), else the strip's two lanes;
+-- clamped so a heat races at least two.
 function drag.heat_size_of(record)
-    local count = grid_store.usable_preview_count(record) or drag.DEFAULT_HEAT
+    local count = type(record) == "table" and grid_store.usable_preview_count({previewCount = record.dragCount})
+        or drag.DEFAULT_HEAT
     return math.max(2, math.min(grid_store.PREVIEW_COUNT_MAX, count))
 end
 
--- Open the drag event shell for a race the issuer's client reported as a drag strip (start_race, BEFORE the
+-- Open the drag event shell for a race the issuer's client reported as a drag race (start_race, BEFORE the
 -- slots are handed out, so the slot reservation sees it and stays out). nil for every other race.
 function drag.prepare(overrides, grid_record)
     if not overrides.drag then
@@ -7336,6 +7341,7 @@ function drag.prepare(overrides, grid_record)
     session.drag = {
         heat_size = drag.heat_size_of(grid_record),
         seeding = overrides.seeding or "random",
+        limit = overrides.drag_limit or drag.RUN_LIMIT,
         field = {},
         seed_of = {},
         stage = nil,       -- nil (staging) -> "quali" -> "bracket" -> "done"
@@ -7675,11 +7681,23 @@ function drag.step()
     if cur.step == "stage" and elapsed >= drag.STAGE_SETTLE then
         local amber = drag.AMBER_MIN + math.random() * (drag.AMBER_MAX - drag.AMBER_MIN)
         broadcast_event(drag.MSG_TREE, {race = session.race, heat = cur.seq, amberDelay = amber,
-            greenAfter = drag.GREEN_AFTER, limit = drag.RUN_LIMIT})
+            greenAfter = drag.GREEN_AFTER, limit = state.limit})
         cur.step = "run"
         cur.at = now()
-        cur.deadline = cur.at + amber + drag.GREEN_AFTER + drag.RUN_LIMIT + drag.REPORT_SLACK
-    elseif cur.step == "run" and (drag.all_reported(cur) or now() >= cur.deadline) then
+        cur.deadline = cur.at + amber + drag.GREEN_AFTER + state.limit
+    elseif (cur.step == "run" or cur.step == "cut") and drag.all_reported(cur) then
+        drag.decide(cur)
+        cur.step = "result"
+        cur.at = now()
+    elseif cur.step == "run" and (now() >= cur.deadline or (cur.cut_at and now() >= cur.cut_at)) then
+        -- The run limit, or FINISH_GRACE after the first clean finish: the cars still out end their runs where
+        -- they are and report how far they got, so they rank as non-finishers by distance.
+        broadcast_event(drag.MSG_CUT, {race = session.race, heat = cur.seq})
+        log_info("beamcomp.drag", string.format("heat %d cut (%s)", cur.seq,
+            now() >= cur.deadline and "run limit" or "finish grace"))
+        cur.step = "cut"
+        cur.at = now()
+    elseif cur.step == "cut" and elapsed >= drag.REPORT_SLACK then
         drag.decide(cur)
         cur.step = "result"
         cur.at = now()
@@ -7742,8 +7760,8 @@ end
 function drag.handle_run(player_id, payload)
     local state = session.drag
     local cur = state and state.cur
-    if session.phase ~= PHASE.drag or not cur or cur.step ~= "run" or type(payload) ~= "table"
-        or payload.heat ~= cur.seq or payload.race ~= session.race then
+    if session.phase ~= PHASE.drag or not cur or (cur.step ~= "run" and cur.step ~= "cut")
+        or type(payload) ~= "table" or payload.heat ~= cur.seq or payload.race ~= session.race then
         return
     end
     local id = player_id
@@ -7776,6 +7794,10 @@ function drag.handle_run(player_id, payload)
         speeds = drag.timer_table(payload.speeds),
     }
     cur.heat.runs[id] = run
+    -- The first clean finish starts the finish grace: whoever is still out after it is cut.
+    if run.final and run.finished and not run.redLight and not cur.cut_at then
+        cur.cut_at = now() + drag.FINISH_GRACE
+    end
     log_info("beamcomp.drag", string.format("heat %d: %s %s%s%s", cur.seq, drag.name_of(id),
         run.final and "final" or "partial", run.redLight and " red light" or "",
         run.total and string.format(" %.3f (rt %.3f)", run.total, run.rt or 0) or ""))
@@ -7989,7 +8011,7 @@ local function tick()
 end
 
 local RACE_USAGE =
-    "BeamComp: type /race [map:|menu:]<name> [sprint|circuit] [laps] [reverse] [force] "
+    "BeamComp: type /race [map:|menu:|strip:]<name> [sprint|circuit|drag] [laps] [reverse] [force] "
     .. "[recover[:secs|off]] [repair[:secs|off]] [grid=<name>] [car=<model[:config]|random|host>] "
     .. "[maxhp=<n>] [maxpwr=<n>] [maxkg=<n>] [minkg=<n>] "
     .. "[order=entry|random|last|pwr|championship|quali[:rev]] [quali=<min>] "
@@ -8035,8 +8057,8 @@ end
 -- three-way ambiguous (rec/rep/rev). There is deliberately no "forward" keyword -- forward is the
 -- default direction and is never typed, which keeps "f" unambiguously force. RACE_MODES and
 -- ASSIST_KEYWORDS classify a resolved keyword; only assist keywords accept a ":secs" suffix (ADR-0018).
-local RACE_KEYWORDS = {"sprint", "circuit", "reverse", "recover", "repair", "force", "lights"}
-local RACE_MODES = {sprint = true, circuit = true}
+local RACE_KEYWORDS = {"sprint", "circuit", "drag", "reverse", "recover", "repair", "force", "lights"}
+local RACE_MODES = {sprint = true, circuit = true, drag = true}
 local ASSIST_KEYWORDS = {recover = true, repair = true}
 
 -- AI difficulty presets, matched as the positional token right after "ai [<n>]" by unambiguous prefix
@@ -8330,7 +8352,7 @@ local function parse_race_args(argument)
                 bad_token = token
             end
         elseif token:match("^[Ss][Ee][Ee][Dd]=.+$") then
-            -- seed=random|quali picks a drag race's seeding (ADR-0067); read only on a drag strip. An unknown
+            -- seed=random|quali picks a drag race's seeding (ADR-0067); read only in a drag race. An unknown
             -- value falls to bad_token.
             overrides.seeding = drag.normalize_seeding(token:match("^[Ss][Ee][Ee][Dd]=(.+)$"):lower())
             if not overrides.seeding and not bad_token then
@@ -8935,11 +8957,27 @@ local function handle_race_validation(player_id, payload)
         -- issuer's client reports whether an order=quali on this race is the staged sprint variant (sprint =
         -- meta.closed false, or a sprint mode override). Captured verbatim; only read when order=quali.
         overrides.staged_quali = payload.stagedQuali == true
-        -- A drag strip (ADR-0067), as the issuer's client reports it: the race runs as a bracket of heats. The
-        -- mission-race options it ignores are dropped here, before a staging-time request is compared with the
-        -- staged one (tour.settle_staged): a typed /race carries the assists on, and comparing that would
-        -- switch them on in place for a drag race.
+        -- A drag race (ADR-0067), as the issuer's client reports it: a strip, or any race in the Drag mode. It
+        -- runs as a bracket of heats. The client also says whether it is a strip and how long a run may last on
+        -- its route. The mission-race options it ignores are dropped here, before a staging-time request is
+        -- compared with the staged one (tour.settle_staged): a typed /race carries the assists on, and
+        -- comparing that would switch them on in place for a drag race.
         overrides.drag = payload.drag == true
+        local limit = tonumber(payload.dragLimit)
+        overrides.drag_limit = (overrides.drag and limit and limit == limit)
+            and math.max(drag.RUN_LIMIT, math.min(drag.RUN_LIMIT_MAX, limit)) or nil
+        -- Drag on a race that is not a strip needs a saved grid with a Drag layout (ADR-0067 amendment
+        -- 2026-11-15): the one this race would line up on, the one asked for or its default.
+        if overrides.drag and payload.strip ~= true then
+            local record = resolve_grid(map, race_id or pending.race, overrides.grid)
+            if type(record) ~= "table" or type(record.drag) ~= "table" then
+                MP.SendChatMessage(pending.owner_id, "BeamComp: a drag race on this track needs a grid with a "
+                    .. "Drag layout. Pick one with grid=<name>, or build one in the grid editor")
+                log_info("beamcomp.race", string.format("/race '%s' refused: drag without a drag grid",
+                    pending.race))
+                return
+            end
+        end
         if overrides.drag then
             overrides.mode = nil
             overrides.laps = nil
@@ -10863,11 +10901,14 @@ function grid_store.send_grid_list(recipients, map, reason, target)
         for race_name, race_grids in pairs(map_grids) do
             if type(race_grids) == "table" then
                 local default_name = type(map_defaults) == "table" and map_defaults[race_name] or nil
-                for name in pairs(race_grids) do
+                for name, record in pairs(race_grids) do
                     entries[#entries + 1] = {
                         name = name,
                         race = race_name,
                         isDefault = name == default_name,
+                        -- Whether the grid has a Drag layout (ADR-0067 amendment 2026-11-15): the setup panel
+                        -- offers Drag on a race only with one.
+                        drag = type(record) == "table" and type(record.drag) == "table" or nil,
                     }
                 end
             end
@@ -10908,6 +10949,12 @@ local function handle_grid_save(player_id, payload)
     local record = {forward = payload.forward}
     if type(payload.reverse) == "table" then
         record.reverse = payload.reverse
+    end
+    -- The Drag variant and its cars per heat (ADR-0067 amendment 2026-11-15), coerced like the preview count.
+    if type(payload.drag) == "table" then
+        record.drag = payload.drag
+        record.dragCount = grid_store.usable_preview_count({previewCount = payload.dragCount})
+            or drag.DEFAULT_HEAT
     end
     -- The authored field size (ADR-0023 amendment 2026-08-02), coerced rather than relayed so the stored
     -- number is always usable whatever a client sent -- and so a client too old to send one stores the
@@ -11051,6 +11098,9 @@ local function handle_grid_fetch(player_id, payload)
         -- so a record that predates the field (or one the migration could not touch) reopens at 16
         -- instead of arriving as nil.
         previewCount = grid_store.preview_count_of(record),
+        -- The Drag variant (ADR-0067 amendment 2026-11-15); nil for a grid without one.
+        drag = record.drag,
+        dragCount = record.dragCount,
     })
 end
 
@@ -11204,7 +11254,7 @@ local function sanitize_overrides(raw)
     local overrides = {
         force = raw.force == true,
         all = raw.all == true,
-        mode = (raw.mode == "sprint" or raw.mode == "circuit") and raw.mode or nil,
+        mode = RACE_MODES[raw.mode] and raw.mode or nil,
         direction = (raw.direction == "reverse") and "reverse" or nil,
         laps = laps and math.max(1, math.floor(laps)) or nil,
         car = (type(raw.car) == "string" and raw.car ~= "") and raw.car or nil,
@@ -11218,7 +11268,7 @@ local function sanitize_overrides(raw)
         carList = (type(raw.carList) == "string" and raw.carList ~= "") and raw.carList or nil,
         -- F1 light start (ADR-0043): only "f1" survives; nil = the default lock countdown.
         startMode = (raw.startMode == "f1") and "f1" or nil,
-        -- A drag race's seeding (ADR-0067): "random" or "quali"; nil = random. Read only on a drag strip.
+        -- A drag race's seeding (ADR-0067): "random" or "quali"; nil = random. Read only in a drag race.
         seeding = drag.normalize_seeding(raw.seeding),
     }
 
