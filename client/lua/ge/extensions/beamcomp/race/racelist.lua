@@ -19,12 +19,9 @@ local optsort = require("beamcomp/race/optsort")
 -- aiRace set is "ai", the rallyStage set is "rally", the crawl set is "crawl", the level quickrace set is
 -- "menu" -- matching the "map:"/"ai:"/"rally:"/"crawl:"/"menu:" prefix /race accepts to pick same-named
 -- variants. rallyStage/crawl are Sprint-normalized in the parser, so the mode column reads "sprint";
--- this source tag only names which mission type the track came from. A drag strip (ADR-0067) is "drag",
--- the same word as its prefix.
+-- this source tag only names which mission type the track came from. A drag strip (ADR-0067) carries none:
+-- it is listed under its own title, which already says what it is.
 local function source_label(source)
-    if source == "drag" then
-        return "drag"
-    end
     if source == "quickrace" then
         return "menu"
     end
@@ -40,27 +37,28 @@ local function source_label(source)
     return "map"
 end
 
--- The name a race is listed under: "<slug> [<short>]", the bracket dropped when the shortname IS the slug.
--- A drag strip (ADR-0067) is listed under its title with the name /race takes in the bracket, which then
--- always shows: the title has spaces and is not what anybody types.
+-- The name a race is listed under: "<slug> [<short>] (<source>)", the bracket dropped when the shortname IS
+-- the slug. A drag strip (ADR-0067) is listed under its title with the name /race takes in the bracket, which
+-- then always shows (the title has spaces and is not what anybody types), and without a source tag.
 local function list_label(locator, shortname)
     if locator.title then
         return locator.title .. " [" .. (shortname or locator.displayName) .. "]"
     end
+    local label = locator.displayName
     if shortname and shortname ~= locator.displayName then
-        return locator.displayName .. " [" .. shortname .. "]"
+        label = label .. " [" .. shortname .. "]"
     end
-    return locator.displayName
+    return label .. " (" .. source_label(locator.source) .. ")"
 end
 
 -- One chat line describing a race: "  <slug> [<short>] (menu) - circuit, 6 cp, 2 laps" (laps only for
--- a closed-loop circuit), "  <title> [<slug>] (drag) - drag strip, 2 lanes", or
+-- a closed-loop circuit), "  <title> [<slug>] - drag strip, 2 lanes", or
 -- "  <slug> [<short>] (menu) - (unsupported)" when it can't be parsed (e.g. a branching race). <short> is
 -- the tippable shortname for /race. The (map)/(menu) tag names the source so two same-named variants are
 -- distinguishable via the prefix. Deprecated (quickrace) entries, only shown with "all", carry a
 -- "(deprecated)" marker (ADR-0026).
 local function describe(locator, shortname, deprecated)
-    local label = list_label(locator, shortname) .. " (" .. source_label(locator.source) .. ")"
+    local label = list_label(locator, shortname)
     if deprecated then
         label = label .. " (deprecated)"
     end
@@ -69,8 +67,8 @@ local function describe(locator, shortname, deprecated)
     if not race then
         return "  " .. label .. " - (unsupported)"
     end
-    if race.meta and race.meta.drag then
-        return string.format("  %s - drag strip, %d lanes", label, #race.meta.drag.lanes)
+    if race.meta and race.meta.strip then
+        return string.format("  %s - drag strip, %d lanes", label, #race.meta.strip.lanes)
     end
 
     local mode = (race.meta and race.meta.closed) and "circuit" or "sprint"
@@ -188,14 +186,13 @@ function M.options(loaded_map, include_deprecated)
     local options = {}
     for _, locator in ipairs(here) do
         local label = list_label(locator, shortnames[locator.id])
-            .. " (" .. source_label(locator.source) .. ")"
         if discovery.is_deprecated(locator) then
             label = label .. " (deprecated)"
         end
-        -- The panel hides what a drag strip ignores and shows its seeding (ADR-0067). Read off the source,
+        -- A drag strip runs only in the Drag mode (ADR-0067): the panel offers no other. Read off the source,
         -- so it costs no parse.
         options[#options + 1] = {id = locator.id, label = label,
-            drag = locator.source == "drag" or nil}
+            strip = locator.source == "strip" or nil}
     end
     return optsort.by_display(options, "label", "id")
 end
@@ -238,7 +235,7 @@ function M.meta_for(loaded_map, race_id)
     return {
         closed = race.meta.closed and true or false,
         defaultLaps = tonumber(race.meta.defaultLaps),
-        drag = race.meta.drag ~= nil or nil,
+        strip = race.meta.strip ~= nil or nil,
     }
 end
 

@@ -11,9 +11,11 @@
 --   checkpoints    -- CP0 the start line, CP1 the finish, both with the strip axis as their gate normal;
 --   routePoints    -- the two of them;
 --   props          -- none (the strip is level geometry);
---   meta.drag      -- the drag facts (lanes, axis, timers, tree, waypoint names, default grid), plain tables,
+--   meta.strip     -- the strip facts (lanes, axis, timers, tree, waypoint names, default grid), plain tables,
 --                     so the ADR-0039 relay carries them unchanged.
--- M.locators finds the strips on one map, M.parse reads one, M.build is the pure part of M.parse.
+-- M.locators finds the strips on one map, M.parse reads one, M.build is the pure part of M.parse. A strip is a
+-- race like any other (ADR-0067 amendment 2026-11-15): it is listed as one and runs only in the Drag mode, which
+-- every race offers. The timers and the queue below also serve a drag race on a normal race (race/start.lua).
 
 local M = {}
 
@@ -46,12 +48,13 @@ local DEFAULT_LANE_GAP = 8.0
 local GATE_MARGIN = 4.0
 
 -- The waiting queue behind the start line (ADR-0067 §2): its first row this far behind the deepest lane slot,
--- the rows this far apart, two columns one lane gap apart. Not part of the grid and not editable.
-local QUEUE_SETBACK = 20.0
-local QUEUE_ROW_GAP = 10.0
+-- the rows this far apart, two columns one lane gap apart. Not part of the grid and not editable. The same on
+-- every drag race, strip or not (race/start.lua).
+M.QUEUE_SETBACK = 20.0
+M.QUEUE_ROW_GAP = 10.0
 
--- The source string and the locator format every other module branches on.
-M.SOURCE = "drag"
+-- The source string, the name prefix and the locator format every other module branches on.
+M.SOURCE = "strip"
 M.FORMAT = "dragStrip"
 
 local SETTINGS_SUFFIX = ".dragSettings.json"
@@ -157,6 +160,11 @@ local function beam_and_finish(timers)
             id = finish and finish.id or "time_1_4"}
 end
 
+-- (public) The game's default timers, parsed: what a drag race on a normal race measures (it has no settings
+-- file). The beam and the 1/4 mile come first and last, like on a strip.
+M.DEFAULT_TIMERS = build_timers({})
+M.REACTION_BEAM = REACTION_BEAM
+
 -- (public) Build the race model from decoded settings + strip tables. `settings_id` is the strip's own id
 -- ("hirochiStrip"), `title` its display title. Returns the race table, or nil plus a reason.
 function M.build(settings, strip, settings_id, title)
@@ -244,7 +252,7 @@ function M.build(settings, strip, settings_id, title)
             noSlope = false,
         },
         defaultSlots = #lanes,
-        queue = {setback = QUEUE_SETBACK, rowGap = QUEUE_ROW_GAP, colGap = lane_gap, columns = 2},
+        queue = {setback = M.QUEUE_SETBACK, rowGap = M.QUEUE_ROW_GAP, colGap = lane_gap, columns = 2},
     }
 
     return {
@@ -254,7 +262,7 @@ function M.build(settings, strip, settings_id, title)
             closed = false,
             branching = false,
             reversible = false,
-            drag = facts,
+            strip = facts,
         },
         startPositions = {
             list = {{id = "drag", name = "drag start", pos = origin, rot = rotation_onto(axis)}},
@@ -280,8 +288,8 @@ local function read_title(folder, settings_id)
     return nil
 end
 
--- (public) The drag strips on one map as discovery locators (ADR-0024 shape): id "<map>/drag/<settingsId>",
--- source "drag", format "dragStrip". One small folder listing per map; the title is read now so the race
+-- (public) The drag strips on one map as discovery locators (ADR-0024 shape): id "<map>/strip/<settingsId>",
+-- source "strip", format "dragStrip". One small folder listing per map; the title is read now so the race
 -- lists can show it without parsing the strip.
 function M.locators(map)
     local folder = "/levels/" .. map .. "/dragstrips/"
@@ -330,7 +338,7 @@ function M.parse(locator)
     end
     race.raceFile = locator.raceFile
     race.folder = locator.folder
-    local facts = race.meta.drag
+    local facts = race.meta.strip
     -- The level the game's own drag facility is looked up on (race/dragworld.lua block_game_drag).
     facts.map = locator.map
     log("I", LOG_TAG, string.format(

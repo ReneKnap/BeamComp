@@ -9,12 +9,12 @@
 -- (source "mission", ADR-0005), aiRace (source "aiRace", ADR-0035), and rallyStage + crawl (their own
 -- sources; both point-to-point stages the parser normalizes to Sprint) -- plus the Time Trial menu's
 -- level quickrace tracks (/levels/<map>/quickrace/, source "quickrace", ADR-0024) and the level drag
--- strips (/levels/<map>/dragstrips/, source "drag", ADR-0067, race/dragstrip.lua). The scan is robust
+-- strips (/levels/<map>/dragstrips/, source "strip", ADR-0067, race/dragstrip.lua). The scan is robust
 -- against the missions subsystem not being initialized in a multiplayer session. Each locator carries a
 -- source and format ("racePath"/"quickrace"), and a map-qualified id ("<map>/<slug>" for timeTrial,
 -- "<map>/<type>/<slug>" for the other mission types, "<map>/quickrace/<slug>" for quickrace) so names
--- never collide; a drag strip is "<map>/drag/<id>". M.resolve maps a requested name (optionally
--- "map:"/"ai:"/"rally:"/"crawl:"/"menu:"/"drag:"-prefixed to pick a source) to a single locator, or reports
+-- never collide; a drag strip is "<map>/strip/<id>". M.resolve maps a requested name (optionally
+-- "map:"/"ai:"/"rally:"/"crawl:"/"menu:"/"strip:"-prefixed to pick a source) to a single locator, or reports
 -- a miss / ambiguity.
 
 local M = {}
@@ -231,9 +231,9 @@ end
 
 -- An optional source prefix on a /race name (ADR-0024/0035): "map:" restricts the match to the freeroam
 -- timeTrial set, "ai:" to the aiRace set, "rally:" to the rallyStage set, "crawl:" to the crawl set,
--- "menu:" to the level quickrace set, "drag:" to the drag strips (ADR-0067) -- so same-named variants
+-- "menu:" to the level quickrace set, "strip:" to the drag strips (ADR-0067) -- so same-named variants
 -- across the sources can be picked deterministically. Returns the source
--- ("mission"/"aiRace"/"rallyStage"/"crawl"/"quickrace"/"drag") or nil,
+-- ("mission"/"aiRace"/"rallyStage"/"crawl"/"quickrace"/"strip") or nil,
 -- plus the name with the prefix stripped. Case-insensitive on the prefix. The prefixes only match with
 -- their trailing colon, so a slug like "crawl_long" is a plain name, not a "crawl:" pick.
 local function split_source_prefix(name)
@@ -257,7 +257,7 @@ local function split_source_prefix(name)
     if rest then
         return "quickrace", rest
     end
-    rest = name:match("^[Dd][Rr][Aa][Gg]:(.*)$")
+    rest = name:match("^[Ss][Tt][Rr][Ii][Pp]:(.*)$")
     if rest then
         return dragstrip.SOURCE, rest
     end

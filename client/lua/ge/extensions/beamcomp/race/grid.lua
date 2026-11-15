@@ -266,6 +266,16 @@ function M.default_params()
     }
 end
 
+-- A fresh default param set for a race's Drag variant (ADR-0067 amendment 2026-11-15): two cars side by side
+-- on the start line, no stagger, no setback -- a heat lines up abreast. The column gap is the default one; a
+-- drag strip seeds its own (race/dragstrip.lua defaultParams, the measured lane gap) instead of this.
+function M.drag_default_params()
+    local params = M.default_params()
+    params.offsetForward = 0
+    params.rowGap = 0
+    return params
+end
+
 -- The forward setback of a single grid slot at `local_index` for a resolved param set. Shared by the pose
 -- loop (placed slots 0..count-1) and the segment continuation point (the un-placed slot at index = count),
 -- so both use the exact same ramp. Because setback = local_index * (row_gap / columns) + offset_forward is
