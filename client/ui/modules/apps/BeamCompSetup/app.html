@@ -53,7 +53,6 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
-    .bc-dd-opt.off, .bc-dd-opt.off:hover { background: none; color: rgba(255,255,255,0.4); cursor: default; }
     /* Settings popover (setup-settings-menu): a right-aligned gear reusing .bc-dd. Overrides geometry
        only -- .bc-settings shrinks the wrapper and pushes it to the right of the toolbar; the head drops
        the full width + the ::after chevron and shows just the gear; the list anchors to the right edge
@@ -321,19 +320,18 @@
           </div>
         </div>
       </div>
-      <!-- Drag (ADR-0067 and its amendment 2026-11-15) is a Mode beside Sprint and Circuit; a strip offers only it.
-           Without a saved drag grid the entry is greyed and does nothing on click. -->
+      <!-- Drag (ADR-0067 and its amendments 2026-11-15 and 2026-11-16) is a Mode beside Sprint and Circuit; a strip
+           offers Sprint and Drag. -->
       <div class="bc-row" bc-setup-tip="tip('mode')">
         <span>Mode</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('mode')">{{labelFor('mode')}}</button>
           <div class="bc-dd-list" ng-if="open === 'mode'">
-            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.mode" ng-class="{sel: o.v === form.mode, off: o.off}"
-              ng-click="o.off || pick('mode', o.v)">{{o.label}}</div>
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.mode" ng-class="{sel: o.v === form.mode}"
+              ng-click="pick('mode', o.v)">{{o.label}}</div>
           </div>
         </div>
       </div>
-      <div class="bc-stale-note" ng-if="form.mode === 'drag' && dragNeedsGrid()">No saved grid of this race has a Drag layout. Edit… under Grid builds one.</div>
       <!-- A drag race runs forward, once, as a bracket of heats: Laps and Reverse do not apply to it, and its
            seeding does. -->
       <div class="bc-row" ng-if="isDrag()" bc-setup-tip="tip('seeding')">
@@ -355,7 +353,8 @@
         <span>Laps</span>
         <input type="number" min="1" ng-model="form.laps" placeholder="{{lapsHint()}}">
       </label>
-      <label class="bc-row bc-check" ng-if="!isDrag()" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
+      <!-- A strip runs forward (ADR-0067 amendment 2026-11-16), as a sprint or a drag race. -->
+      <label class="bc-row bc-check" ng-if="!isDrag() && !isStrip()" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
     </div>
 
     <!-- Vehicles -->
@@ -480,6 +479,9 @@
         </div>
         <button class="bc-refresh" ng-disabled="!form.race" ng-click="editGrid()" bc-setup-tip="tip('editGrid')">Edit…</button>
       </div>
+      <!-- No custom grid for the variant the race runs (ADR-0067 amendment 2026-11-16): a warning, the race starts
+           on a default grid. Drag off a strip and Reverse only (gridWarning in app.js). -->
+      <div class="bc-stale-note" ng-if="gridWarning()">{{gridWarning()}}</div>
     </div>
 
     <!-- Assists. A drag run has none (ADR-0067). -->
