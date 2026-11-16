@@ -320,6 +320,8 @@
           </div>
         </div>
       </div>
+      <!-- Drag (ADR-0067 and its amendments 2026-11-15 and 2026-11-16) is a Mode beside Sprint and Circuit on every
+           race; a strip recommends it. -->
       <div class="bc-row" bc-setup-tip="tip('mode')">
         <span>Mode</span>
         <div class="bc-dd">
@@ -330,16 +332,28 @@
           </div>
         </div>
       </div>
+      <!-- A drag race runs forward, once, as a bracket of heats: Laps and Reverse do not apply to it, and its
+           seeding does. -->
+      <div class="bc-row" ng-if="isDrag()" bc-setup-tip="tip('seeding')">
+        <span>Seeding</span>
+        <div class="bc-dd">
+          <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('seeding')">{{labelFor('seeding')}}</button>
+          <div class="bc-dd-list" ng-if="open === 'seeding'">
+            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.seeding" ng-class="{sel: o.v === form.seeding}"
+              ng-click="pick('seeding', o.v)">{{o.label}}</div>
+          </div>
+        </div>
+      </div>
       <!-- A lap count only means something on a circuit; a sprint runs the route once (ADR-0013). The
            value is KEPT when the row hides, so switching mode back and forth does not eat a typed
            number, and the relayed payload is unchanged either way -- a sprint ignores laps GE-side.
            ng-if is safe here: the model is an object path (form.laps), not the bare primitive that the
            child scope would swallow. -->
-      <label class="bc-row" ng-if="form.mode === 'circuit'" bc-setup-tip="tip('laps')">
+      <label class="bc-row" ng-if="!isDrag() && form.mode === 'circuit'" bc-setup-tip="tip('laps')">
         <span>Laps</span>
         <input type="number" min="1" ng-model="form.laps" placeholder="{{lapsHint()}}">
       </label>
-      <label class="bc-row bc-check" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
+      <label class="bc-row bc-check" ng-if="!isDrag()" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
     </div>
 
     <!-- Vehicles -->
@@ -409,7 +423,8 @@
           </div>
         </div>
       </div>
-      <div class="bc-row">
+      <!-- A drag race seeds its own bracket (ADR-0067): no start order. -->
+      <div class="bc-row" ng-if="!isDrag()">
         <span bc-setup-tip="tip('orderMode')">Start order</span>
         <!-- While the Tournament section is set to a championship (ADR-0040) or a class-drop (ADR-0042),
              that format sets the grid, so the per-race picker is replaced and the race request omits order=
@@ -428,7 +443,7 @@
       <!-- Qualifying's own start order (ADR-0044 amendment): only for order=quali. The base order used
            INSIDE the quali -- random (default) or the previous race's finishing order. In a staged sprint
            quali the spawn slot then predicts the launch sequence (P2 launches first, P3 next, ...). -->
-      <div class="bc-row" ng-if="form.tourMode === 'off' && form.orderMode === 'quali'">
+      <div class="bc-row" ng-if="!isDrag() && form.tourMode === 'off' && form.orderMode === 'quali'">
         <span bc-setup-tip="tip('qualiStart')">Qualifying start</span>
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit bc-setup-tip="tip('qualiStart')" ng-click="toggle('qualiStart')">{{labelFor('qualiStart')}}</button>
@@ -440,7 +455,7 @@
       </div>
       <!-- Qualifying length (ADR-0041): only for order=quali; a short session sets the grid by best lap.
            A free minute value plus preset quick-buttons. -->
-      <div class="bc-row" ng-if="form.tourMode === 'off' && form.orderMode === 'quali'">
+      <div class="bc-row" ng-if="!isDrag() && form.tourMode === 'off' && form.orderMode === 'quali'">
         <span bc-setup-tip="tip('qualiMinutes')">Qualifying length</span>
         <span class="bc-quali-len">
           <input type="number" min="1" max="30" ng-model="form.qualiMinutes" bc-setup-tip="tip('qualiMinutes')"> min
@@ -449,7 +464,7 @@
         </span>
       </div>
       <label class="bc-row bc-check"
-             ng-if="form.tourMode === 'off' && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
+             ng-if="!isDrag() && form.tourMode === 'off' && (form.orderMode === 'last' || form.orderMode === 'pwr' || form.orderMode === 'championship')">
         <input type="checkbox" ng-model="form.orderRev"><span bc-setup-tip="tip('orderRev')">Reverse order (handicap)</span>
       </label>
       <div class="bc-row">
@@ -463,10 +478,13 @@
         </div>
         <button class="bc-refresh" ng-disabled="!form.race" ng-click="editGrid()" bc-setup-tip="tip('editGrid')">Edit…</button>
       </div>
+      <!-- No custom grid for the variant the race runs (ADR-0067 amendment 2026-11-16): a warning, the race starts
+           on a default grid. Drag off a strip and Reverse only (gridWarning in app.js). -->
+      <div class="bc-stale-note" ng-if="gridWarning()">{{gridWarning()}}</div>
     </div>
 
-    <!-- Assists -->
-    <div class="bc-section">
+    <!-- Assists. A drag run has none (ADR-0067). -->
+    <div class="bc-section" ng-if="!isDrag()">
       <div class="bc-section-title">Assists</div>
       <label class="bc-row bc-check" bc-setup-tip="tip('recover')"><input type="checkbox" ng-model="form.recover"><span>Recover</span></label>
       <label class="bc-row" ng-if="form.recover" bc-setup-tip="tip('recoverSecs')">
@@ -481,8 +499,9 @@
     </div>
 
     <!-- Start (ADR-0043): optional F1 light start instead of the lock countdown; a jump start costs a
-         configurable time penalty. Off = the default lock countdown. -->
-    <div class="bc-section">
+         configurable time penalty. Off = the default lock countdown. A drag race starts on its tree instead
+         (ADR-0067), so the section is not there for one. -->
+    <div class="bc-section" ng-if="!isDrag()">
       <div class="bc-section-title">Start</div>
       <!-- The label carries the part that actually surprises people (ADR-0043 decision 2): under this mode
            the car is NOT frozen while the lights are lit, so the launch is the driver's. "you launch
@@ -763,6 +782,9 @@
           </div>
         </div>
       </div>
+      <!-- The server refuses a drag race inside a class-drop tournament (ADR-0067); this says so before Confirm
+           does. A championship scores a drag race like any other. -->
+      <div class="bc-stale-note" ng-if="isDrag() && form.tourMode === 'classdrop'">A class-drop tournament cannot run a drag race.</div>
 
       <!-- Points championship (ADR-0040): points accrue across races; the standings drive the next grid. -->
       <div ng-if="form.tourMode === 'championship'">
@@ -955,9 +977,10 @@
 
   <!-- Race control (ADR-0038 amendment): stop the running race straight from the panel. Always present, but
        phase-gated -- Cancel is live in any non-lobby phase (incl. finished, to clear results + despawn);
-       End & score only during racing. One-click, no confirm. The server still admin-gates and guards. -->
+       End & score during racing and a drag race's heats (it scores the bracket as it stands, ADR-0067). One-click,
+       no confirm. The server still admin-gates and guards. -->
   <div class="bc-actions bc-rc-actions" ng-show="!locked">
     <button class="bc-cancel" ng-disabled="!canCancel()" ng-click="cancelRace()" bc-setup-tip="tip('cancelRace')">Cancel race</button>
-    <button class="bc-end" ng-disabled="phase !== 'racing'" ng-click="endRace()" bc-setup-tip="tip('endRace')">End &amp; score</button>
+    <button class="bc-end" ng-disabled="phase !== 'racing' && phase !== 'drag'" ng-click="endRace()" bc-setup-tip="tip('endRace')">End &amp; score</button>
   </div>
 </div>

@@ -33,6 +33,8 @@ BeamComp is free and open source.
 - **Live race information.** Next checkpoint, your position, your time, and the standings of everyone
   on track.
 - **Qualifying**, if you want a grid order that was earned rather than drawn.
+- **Drag races** on any race or on the game's three drag strips: a Christmas tree start, a timeslip after
+  every run, and a knockout bracket over the whole field.
 - **Championships and class-drop tournaments** across several races in one session.
 - **AI opponents.** Up to 16, with difficulty presets, so a group of three still gets a full field.
 - **Vehicle rules.** Everyone in the same car, everyone in a random car, or free choice within a power
@@ -223,11 +225,45 @@ on a sensible default layout until you build one for it.
 **Edit…** next to the grid in the race panel opens the grid editor: rows and columns, spacing, where the
 field sits relative to the start line, and how it is angled. You see the result on the track while you
 edit it. Grids are saved by name, and one can be set as the default for a race, so it is used every
-time that race is started.
+time that race is started. A grid holds a Forward, a Reverse and a Drag layout. A race run in reverse or as
+a drag race without its own layout starts on a default one, and the race panel says that no custom grid
+is set.
 
 Grids live in `Resources/Server/BeamComp/beamcomp.grids.json`. Keep that file when you update and your
 own grids stay. Grids added in a later version then do not reach your server; the changelog says when
 new ones ship.
+
+## Drag races
+
+Any race runs as a drag race when you pick **Drag** as its Mode in the race panel. Hirochi Raceway, West
+Coast USA and Gridmap also each have a drag strip, listed in the race panel like any other race. The panel
+preselects Drag there, and a strip runs as a **Sprint** or **Circuit** too: the whole field starts together
+on the stage line, a sprint finishes at the 1/4 mile line, a circuit turns there and comes back over the
+stage line. A circuit or a reverse race on a strip needs **Force**, as on any track that is no loop or has
+no reverse route.
+
+Two cars stand side by side on the line and start on a Christmas tree: three ambers, then green 0.4
+seconds later. Leaving before green is a red light and loses the run. On a strip the first car across the
+1/4 mile wins, reaction time included. On any other race the run follows the route once, through every
+checkpoint, to the race's own finish. On a circuit that is one lap.
+
+With more drivers the race is a knockout bracket, players and AI alike, one heat after another. The
+winner of a heat goes through and the others are out; an odd field gives some drivers a free pass to the
+next round. **Seeding** in the race panel draws the first round at random, or gives everyone one timed pass
+alone first so the fastest meet as late as possible. Drivers waiting for their heat sit in their own car
+behind the start. The final placement follows the round each driver reached and scores in a championship.
+
+A heat ends 20 seconds after its first car finishes, or when its time runs out: 45 seconds on a strip,
+more on a long route. A car still out then ranks by how far it got.
+
+After every run the timeslip shows the reaction time, the marks the run passes (60 ft, 330 ft, 1/8 mile,
+1000 ft, 1/4 mile, and the speed at 1/8 and 1/4) and, away from a strip, the finish time. It stays until
+you close it or your own next heat comes up. Its arrows page through your own last five runs, and
+**Timeslips** brings it back.
+
+Without a saved Drag layout the heats line up two cars side by side on the start line, on a strip one car
+per lane. To build your own, the grid editor has **Drag** beside Forward and Reverse. **Cars per heat**
+sets how many cars run in each heat.
 
 ## When something looks wrong
 

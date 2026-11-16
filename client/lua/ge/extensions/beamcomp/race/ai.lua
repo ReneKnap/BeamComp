@@ -1977,6 +1977,49 @@ function M.stop(cars)
     end
 end
 
+-- ===== the drag race AI (ADR-0067) ==========================================================
+-- The game's own drag launch (gameplay/drag/phaseHandlers.lua countdown/race/stop): full throttle through an
+-- override, the AI in manual mode at a speed it never reaches, steering for the lane's endLine waypoint. The
+-- car is released from its freeze by the caller at green + its reaction, so an AI never jumps the start.
+
+-- Queue one VE command on an AI car; false when its vehicle is gone.
+local function queue_on(car, command)
+    local veh = be and be:getObjectByID(car.veh_id)
+    if not veh then
+        return false
+    end
+    pcall(function() veh:queueLuaCommand(command) end)
+    return true
+end
+
+-- (public) Launch an AI car down its lane. `target` is the scene name of the lane's endLine waypoint, or nil
+-- when it is not in the scene: the car then runs on the throttle alone, which holds a straight line on a flat
+-- strip but does not steer. Returns false when the car is gone.
+function M.drag_launch(car, target)
+    local steer = target
+        and string.format("ai.setSpeed(800) ai.setSpeedMode('set') ai.setTarget(%q) ", target) or ""
+    return queue_on(car, "electrics.values.throttleOverride = 1 "
+        .. "ai.setState({mode = 'manual'}) ai.setAggression(2) "
+        .. "ai.setParameters({understeerThrottleControl = 'off', oversteerThrottleControl = 'off', "
+        .. "throttleTcs = 'off'}) " .. steer)
+end
+
+-- (public) Set an AI car's throttle override (the wheelie easing during a run).
+function M.drag_throttle(car, value)
+    return queue_on(car, string.format("electrics.values.throttleOverride = %.2f", value))
+end
+
+-- (public) An AI car past its run: off the throttle, braking to a stop.
+function M.drag_stop(car)
+    return queue_on(car, "electrics.values.throttleOverride = nil ai.setSpeedMode('off') ai.setMode('stop')")
+end
+
+-- (public) An AI car parked in the queue: no override, no AI.
+function M.drag_park(car)
+    return queue_on(car, "electrics.values.throttleOverride = nil ai.setMode('disabled')")
+end
+-- ===== end the drag race AI ==================================================================
+
 -- Despawn the host's AI cars (ADR-0036): delete each tracked vehicle. Tolerant of an already-gone
 -- vehicle. BeamMP propagates the owned delete ('Od:'), removing them for all clients. Returns the count
 -- processed. Mirrors cones.clear.

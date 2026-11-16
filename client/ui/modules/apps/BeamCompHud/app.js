@@ -364,6 +364,162 @@ angular.module('beamng.apps')
     return slice;
   }
 
+  // ===== the drag race (ADR-0067) =====
+  // GE pushes raw numbers on `hud.drag` (init.lua M.drag.snapshot); the panel's view is built once per push
+  // here, so the template only binds. Times are seconds to the thousandth, speeds m/s turned into km/h or
+  // mph by the game's own unit setting.
+  var DRAG_RESULT_TEXT = { win: 'Win', loss: 'Loss', red: 'Red light', time: 'Time', noTime: 'No time' };
+
+  function dragSeconds(s) {
+    return (s === null || s === undefined) ? '--' : s.toFixed(3);
+  }
+
+  function dragSpeed(v, imperial) {
+    if (v === null || v === undefined) {
+      return '--';
+    }
+    return imperial ? (v * 2.23694).toFixed(1) + ' mph' : (v * 3.6).toFixed(1) + ' km/h';
+  }
+
+  // The tree columns of the heat on the strip: one per car, its ambers and green following the lights
+  // unless that car has a red light, which stays lit.
+  function dragTreeColumns(heat, lights) {
+    return asArray(heat.entrants).map(function (e) {
+      return {
+        name: e.name,
+        lane: e.laneName || '',
+        mine: !!e.mine,
+        amber: !e.red && lights === 'amber',
+        green: !e.red && lights === 'green',
+        red: !!e.red,
+      };
+    });
+  }
+
+  // The timeslip of a decided heat: R/T, then the timers in their own order, then (off a strip, where no timer
+  // is the finish) the Finish ET, then each car's result. A mark the route never reaches stays '--'.
+  function dragTimeslip(heat, timers, imperial, finishTimer) {
+    var cars = asArray(heat.entrants);
+    var runOf = function (e) { return e.run || {}; };
+    var rows = [{ label: 'R/T', cells: cars.map(function (e) { return dragSeconds(runOf(e).rt); }) }];
+    timers.forEach(function (t) {
+      if (t.kind === 'distance' && t.distance >= 0.5) {
+        rows.push({ label: t.short || t.label, cells: cars.map(function (e) {
+          return dragSeconds((runOf(e).splits || {})[t.id]);
+        }) });
+      } else if (t.kind === 'speed') {
+        rows.push({ label: t.label, cells: cars.map(function (e) {
+          return dragSpeed((runOf(e).speeds || {})[t.id], imperial);
+        }) });
+      }
+    });
+    if (!finishTimer) {
+      rows.push({ label: 'Finish', cells: cars.map(function (e) { return dragSeconds(runOf(e).et); }) });
+    }
+    return {
+      label: heat.label,
+      names: cars.map(function (e) { return e.name; }),
+      rows: rows,
+      results: cars.map(function (e) {
+        return { text: DRAG_RESULT_TEXT[e.result] || '', kind: e.result || '' };
+      }),
+    };
+  }
+
+  // The bracket as text lines per round: "A vs B" with the winner marked, and under a decided heat that was raced
+  // one "<name> out" line per driver who did not win it. A free pass reads "A, no opponent, advances", and one
+  // whose drivers have all left "No driver left, nobody advances" (feature drag-race-mode round 5: the owner read
+  // "bye" as knocked out).
+  function dragRounds(bracket) {
+    return asArray(bracket.rounds).map(function (round) {
+      return {
+        label: round.label,
+        heats: asArray(round.heats).map(function (heat) {
+          var cars = asArray(heat.entrants);
+          var names = cars.map(function (e) { return e.name; });
+          var winner = null;
+          cars.forEach(function (e) {
+            if (heat.winner !== null && heat.winner !== undefined && String(e.id) === String(heat.winner)) {
+              winner = e.name;
+            }
+          });
+          var raced = !!heat.done && !heat.bye;
+          var out = raced ? cars.filter(function (e) {
+            return heat.winner === null || heat.winner === undefined || String(e.id) !== String(heat.winner);
+          }).map(function (e) { return e.name; }) : [];
+          var freePass = names[0] ? names[0] + ', no opponent, advances' : 'No driver left, nobody advances';
+          return {
+            text: heat.bye ? freePass : names.join(' vs '),
+            winner: heat.bye ? null : winner,
+            out: out,
+            current: !!heat.current,
+            done: !!heat.done,
+          };
+        }),
+      };
+    });
+  }
+
+  // `slipState` is the HUD's own {page, closedSeq}: page -1 shows the latest decided heat, 0.. the driver's own
+  // slips newest first; closedSeq is the latest heat the driver closed. The slip stands until he closes it or
+  // his own next heat goes onto the strip; a newer heat brings it back (ADR-0067 amendment 2026-11-15).
+  function buildDragView(drag, slipState) {
+    var lights = drag.lights || 'dark';
+    var heat = drag.heat || null;
+    var view = { title: drag.title, heat: null, holdHint: false, slip: null, rounds: [], qual: [],
+      roundCount: 0, champion: null, ownRunning: false, slipClosed: false, ownCount: 0, page: -1 };
+    if (heat) {
+      var columns = dragTreeColumns(heat, lights);
+      view.heat = { label: heat.label, columns: columns };
+      view.ownRunning = !heat.done && columns.some(function (c) { return c.mine; });
+      view.holdHint = view.ownRunning && lights !== 'green'
+        && columns.some(function (c) { return c.mine && !c.red; });
+    }
+    var own = asArray(drag.own);
+    view.ownCount = own.length;
+    view.page = Math.min(slipState.page, own.length - 1);
+    var shown = view.page >= 0 ? own[view.page] : drag.last;
+    view.latestSeq = drag.last ? drag.last.heat : null;
+    view.slipClosed = view.page < 0 && slipState.closedSeq !== null && slipState.closedSeq === view.latestSeq;
+    // The latest heat is often the driver's own newest: paging then skips that copy.
+    view.latestIsOwn = own.length > 0 && view.latestSeq !== null && own[0].heat === view.latestSeq;
+    var oldest = own.length - 1;
+    view.canOlder = view.page < oldest && !(view.page < 0 && view.latestIsOwn && oldest === 0);
+    view.canNewer = view.page >= 0;
+    if (shown && !view.ownRunning && !view.slipClosed) {
+      view.slip = dragTimeslip(shown, asArray(drag.timers), !!drag.imperial, drag.finishTimer);
+    }
+    if (drag.bracket) {
+      view.rounds = dragRounds(drag.bracket);
+      view.qual = asArray(drag.bracket.qual).map(function (q) {
+        return { name: q.name, time: q.et !== null && q.et !== undefined ? dragSeconds(q.et)
+          : (q.ran ? 'No time' : '') };
+      });
+      view.roundCount = drag.bracket.roundCount || 0;
+      view.champion = drag.bracket.champion;
+    }
+    return view;
+  }
+
+  // The round a driver reached, for the drag results card: "Winner", "Final", "Semifinal", "Round n".
+  function dragReached(entry, view) {
+    var round = entry.dragRound || 0;
+    var count = view ? view.roundCount : 0;
+    if (round === 0 || count === 0) {
+      return '--';
+    }
+    if (entry.position === 1 && view.champion !== null && view.champion !== undefined && round === count) {
+      return 'Winner';
+    }
+    if (round === count) {
+      return 'Final';
+    }
+    if (round === count - 1) {
+      return 'Semifinal';
+    }
+    return 'Round ' + round;
+  }
+
   return {
     templateUrl: '/ui/modules/apps/BeamCompHud/app.html',
     replace: true,
@@ -750,9 +906,45 @@ angular.module('beamng.apps')
         return value != null ? formatTime(value) : '--';
       };
 
+      scope.dragReached = function (entry) {
+        return dragReached(entry, scope.dragView);
+      };
+
+      // The timeslip's close and paging (ADR-0067 amendment 2026-11-15), local to this HUD: nothing goes to GE.
+      // The panel takes its own clicks (.bc-panel pointer-events:auto; the app frame is "interactive": "no").
+      scope.dragSlip = { page: -1, closedSeq: null };
+      scope.dragSlipClose = function () {
+        scope.dragSlip.closedSeq = scope.dragView ? scope.dragView.latestSeq : null;
+        scope.dragSlip.page = -1;
+        scope.dragView = scope.hud.drag ? buildDragView(scope.hud.drag, scope.dragSlip) : null;
+      };
+      scope.dragSlipOpen = function () {
+        scope.dragSlip.closedSeq = null;
+        scope.dragView = scope.hud.drag ? buildDragView(scope.hud.drag, scope.dragSlip) : null;
+      };
+      scope.dragSlipPage = function (step) {
+        var view = scope.dragView;
+        if (!view) {
+          return;
+        }
+        var page = scope.dragSlip.page + step;
+        if (page === 0 && view.latestIsOwn) {
+          page += step;
+        }
+        scope.dragSlip.page = Math.max(-1, Math.min(view.ownCount - 1, page));
+        scope.dragView = scope.hud.drag ? buildDragView(scope.hud.drag, scope.dragSlip) : null;
+      };
+
       scope.$on('BeamCompHudUpdate', function (event, data) {
         scope.$evalAsync(function () {
           scope.hud = data || {active: false, entries: []};
+          // The drag race's panel and results card (ADR-0067). Kept through the finished phase, where the
+          // results card reads the round count and the winner from it; null for every other race.
+          scope.dragView = scope.hud.drag ? buildDragView(scope.hud.drag, scope.dragSlip) : null;
+          // The driver's own heat is on the strip: the slip steps aside, and his own result shows after it.
+          if (scope.dragView && scope.dragView.ownRunning) {
+            scope.dragSlip.page = -1;
+          }
           // The three list fields on this snapshot, normalised before anything reads them. `entries` is
           // the one that fired: it is empty for the whole abort window of a race started while another
           // runs, and GE pushes through here about four times a frame while that lasts. The sub-tables

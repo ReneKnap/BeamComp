@@ -141,6 +141,18 @@ local function coerce_preview_count(count)
     return math.max(MIN_PREVIEW_COUNT, math.min(MAX_PREVIEW_COUNT, math.floor(number)))
 end
 
+-- The Drag variant's count is the number of cars per heat (ADR-0067 amendment 2026-11-15), so it starts at two:
+-- a heat of one has nobody to race. Same upper bound as the preview count; the server clamps the same way.
+local MIN_DRAG_COUNT = 2
+
+local function coerce_drag_count(count, fallback)
+    local number = tonumber(count)
+    if not number or number ~= number then
+        number = fallback or MIN_DRAG_COUNT
+    end
+    return math.max(MIN_DRAG_COUNT, math.min(MAX_PREVIEW_COUNT, math.floor(number)))
+end
+
 -- Styling of the ground-sample blobs the preview draws on each pose's four slope-measuring points
 -- (ADR-0034 amendment 2026-08-30): a flat disc, drawn as a very short cylinder because drawCylinder is
 -- the draw API this project has actually proven. init.lua renders them; they live HERE, as table fields,
@@ -226,6 +238,9 @@ M.state = {
     plan = nil,
     boundary_lines = nil,
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
+    -- The Drag variant's count, the cars per heat (ADR-0067 amendment 2026-11-15); `preview_count` stays the
+    -- Forward/Reverse field size. Each variant edits and saves its own.
+    drag_count = MIN_DRAG_COUNT,
     -- Bumped by every session start (enter, under both start_fresh and open) and never reset, not even
     -- by clear: race/gridcam.lua watches it to jump the camera on EVERY session start, whoever started it.
     session = 0,
@@ -429,7 +444,7 @@ local function recompute()
     -- and faceDir, which init.lua reads to highlight the active segment and draw the orientation line. The
     -- _with_frames form is the same layout plus the frame each segment was laid out in, for project().
     local poses, layouts = grid.poses_segmented_with_frames(anchor.base_pose.pos, anchor.base_pose.rot,
-        M.state.preview_count, segments, anchor.gate_normal)
+        M.preview_count(), segments, anchor.gate_normal)
     -- Ground the preview through the very function the spawn grounds with (placement.ground_all): the
     -- height-only drop, the height CHAIN across the slots (ADR-0034 amendment 2026-09-01) and the
     -- post-grounding `lift` are then one implementation, not two that have to be kept in step. Two
@@ -459,9 +474,12 @@ end
 -- stored race is always the canonical id (start.anchor resolves it), so a later assign is keyed the same
 -- way the server resolves it at race start (ADR-0023). `preview_count` is the saved authored field size
 -- (ADR-0023 amendment 2026-08-02); nil -- a brand-new grid, or a record from before the field existed --
--- coerces to DEFAULT_PREVIEW_COUNT. Returns true + the canonical id, or nil + a reason. Replaces any
--- prior session.
-local function enter(race_name_or_id, blocks, preview_count)
+-- coerces to DEFAULT_PREVIEW_COUNT. A nil `blocks.forward` is a brand-new grid: the race's own default params
+-- (a drag strip's generated grid, two lanes wide), else the generic default. The Drag variant (ADR-0067 amendment
+-- 2026-11-15) is anchored on the forward start; a stored `blocks.drag` and `drag_count` come back with it, and
+-- a strip always has one and starts on it. Returns true + the canonical id, or nil + a reason.
+-- Replaces any prior session.
+local function enter(race_name_or_id, blocks, preview_count, drag_count)
     local map = maps.current()
     if not map then
         return nil, "no map loaded"
@@ -474,19 +492,27 @@ local function enter(race_name_or_id, blocks, preview_count)
 
     -- Expand each stored block into its segment list (block_to_segments copies the params, so editing a
     -- segment never mutates the wire payload). A block with no `segments` yields a single segment.
-    local segment_blocks = {forward = grid.block_to_segments(blocks.forward)}
+    local forward = blocks.forward or anchor.default_params or grid.default_params()
+    local segment_blocks = {forward = grid.block_to_segments(forward)}
     if type(blocks.reverse) == "table" then
         segment_blocks.reverse = grid.block_to_segments(blocks.reverse)
+    end
+    local strip = anchor.strip == true
+    if type(blocks.drag) == "table" then
+        segment_blocks.drag = grid.block_to_segments(blocks.drag)
+    elseif strip then
+        segment_blocks.drag = grid.block_to_segments(anchor.drag_params)
     end
 
     M.state.active = true
     M.state.race = anchor.raceId
     M.state.map = map
-    M.state.direction = "forward"
+    M.state.direction = strip and "drag" or "forward"
     M.state.blocks = segment_blocks
     M.state.segment = 1
-    M.state.anchors = {forward = anchor}
+    M.state.anchors = {forward = anchor, drag = anchor}
     M.state.preview_count = coerce_preview_count(preview_count)
+    M.state.drag_count = coerce_drag_count(drag_count, anchor.drag_count)
     recompute()
     -- Only now: a session counts as started once its preview poses exist, which is what the camera flies to.
     M.state.session = M.state.session + 1
@@ -498,7 +524,7 @@ function M.start_fresh(race_name)
     if type(race_name) ~= "string" or race_name == "" then
         return nil, "usage: beamcomp_grid_new(\"<race>\")"
     end
-    local ok, race_id = enter(race_name, {forward = grid.default_params()})
+    local ok, race_id = enter(race_name, {})
     if ok then
         log("I", LOG_TAG, "editing new grid for '" .. race_id .. "'")
     end
@@ -516,12 +542,12 @@ function M.open(record, anchor_race)
     if type(record) ~= "table" or type(record.forward) ~= "table" or type(record.race) ~= "string" then
         return nil, "saved grid is missing its race or params"
     end
-    local blocks = {forward = record.forward}
+    local blocks = {forward = record.forward, drag = record.drag}
     if type(record.reverse) == "table" then
         blocks.reverse = record.reverse
     end
     local target = (type(anchor_race) == "string" and anchor_race ~= "") and anchor_race or record.race
-    local ok, race_id = enter(target, blocks, record.previewCount)
+    local ok, race_id = enter(target, blocks, record.previewCount, record.dragCount)
     if ok then
         log("I", LOG_TAG, "editing saved grid for '" .. race_id .. "'")
     end
@@ -540,8 +566,14 @@ function M.set_direction(direction)
     if not M.state.active then
         return nil, "not editing, run beamcomp_grid_new(\"<race>\") first"
     end
-    if direction ~= "forward" and direction ~= "reverse" then
-        return nil, "direction must be 'forward' or 'reverse'"
+    if direction ~= "forward" and direction ~= "reverse" and direction ~= "drag" then
+        return nil, "direction must be 'forward', 'reverse' or 'drag'"
+    end
+    -- The Drag variant (ADR-0067 amendment 2026-11-15): anchored on the forward start, seeded with the race's
+    -- drag default -- two cars abreast at the line -- the first time it is opened.
+    if direction == "drag" and not M.state.blocks.drag then
+        M.state.blocks.drag = grid.block_to_segments(M.state.anchors.forward.drag_params
+            or grid.drag_default_params())
     end
 
     if direction == "reverse" and not M.state.anchors.reverse then
@@ -551,8 +583,11 @@ function M.set_direction(direction)
         end
         M.state.anchors.reverse = anchor
     end
+    -- Seeded with the race's own default (a drag strip's generated grid, else the generic one), the layout a
+    -- reverse race without a saved Reverse layout lines up on (ADR-0067 amendment 2026-11-16, round 4).
     if direction == "reverse" and not M.state.blocks.reverse then
-        M.state.blocks.reverse = grid.block_to_segments(grid.default_params())
+        M.state.blocks.reverse = grid.block_to_segments(M.state.anchors.forward.default_params
+            or grid.default_params())
     end
 
     M.state.direction = direction
@@ -784,14 +819,24 @@ function M.set_preview_count(count)
     if not tonumber(count) then
         return nil, "value must be a number"
     end
-    local number = coerce_preview_count(count)
-    M.state.preview_count = number
+    local number
+    if M.state.direction == "drag" then
+        number = coerce_drag_count(count, M.state.drag_count)
+        M.state.drag_count = number
+    else
+        number = coerce_preview_count(count)
+        M.state.preview_count = number
+    end
     recompute()
     return true, number
 end
 
--- The current authored field size (previewed slots + the start's warn threshold).
+-- The active variant's count: the authored field size (previewed slots + the start's warn threshold) for
+-- Forward and Reverse, the cars per heat for Drag.
 function M.preview_count()
+    if M.state.direction == "drag" then
+        return M.state.drag_count
+    end
     return M.state.preview_count
 end
 
@@ -832,6 +877,10 @@ function M.snapshot(name)
         -- which is exactly what this must never become. The editor's count is session-level (switching
         -- direction keeps it), and one number per record is the faithful mirror of that.
         previewCount = M.state.preview_count,
+        -- The Drag variant and its cars per heat (ADR-0067 amendment 2026-11-15), at the record's top level
+        -- beside the other two; only when the session has one.
+        drag = M.state.blocks.drag and grid.segments_to_block(M.state.blocks.drag) or nil,
+        dragCount = M.state.blocks.drag and M.state.drag_count or nil,
     }
 end
 
@@ -848,6 +897,7 @@ function M.clear()
     M.state.plan = nil
     M.state.boundary_lines = nil
     M.state.preview_count = DEFAULT_PREVIEW_COUNT
+    M.state.drag_count = MIN_DRAG_COUNT
 end
 
 return M

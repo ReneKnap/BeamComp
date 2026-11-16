@@ -45,8 +45,10 @@ M.OWN_RESPAWN_WAIT = 10.0
 
 -- The phases in which a start or config verdict is carried out. Earlier (the raceStart window and spawning)
 -- the verdict waits: a car replace only goes through the restage pipeline under the staging lock, and a
--- respawn before staging would lose the freeze nothing re-asserts there.
-M.ACTING_PHASES = {staging = true, countdown = true, racing = true, qualifying = true, qualiResults = true}
+-- respawn before staging would lose the freeze nothing re-asserts there. A drag race's heats (ADR-0067) are
+-- the same: the car is the race car for the whole bracket.
+M.ACTING_PHASES = {staging = true, countdown = true, racing = true, qualifying = true, qualiResults = true,
+    drag = true}
 
 -- The weight tolerance, in kg, given to the car in its favour on every weight bound (owner decision
 -- 2026-11-08). It is NOT the metadata's 5 kg rounding, though it exists because of it: "Weight" is the car

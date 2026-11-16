@@ -8,16 +8,19 @@
 -- mission set under /gameplay/missions/<map>/<type>/, whose race-source mission types are timeTrial
 -- (source "mission", ADR-0005), aiRace (source "aiRace", ADR-0035), and rallyStage + crawl (their own
 -- sources; both point-to-point stages the parser normalizes to Sprint) -- plus the Time Trial menu's
--- level quickrace tracks (/levels/<map>/quickrace/, source "quickrace", ADR-0024). The scan is robust
+-- level quickrace tracks (/levels/<map>/quickrace/, source "quickrace", ADR-0024) and the level drag
+-- strips (/levels/<map>/dragstrips/, source "strip", ADR-0067, race/dragstrip.lua). The scan is robust
 -- against the missions subsystem not being initialized in a multiplayer session. Each locator carries a
 -- source and format ("racePath"/"quickrace"), and a map-qualified id ("<map>/<slug>" for timeTrial,
 -- "<map>/<type>/<slug>" for the other mission types, "<map>/quickrace/<slug>" for quickrace) so names
--- never collide. M.resolve maps a requested name (optionally "map:"/"ai:"/"rally:"/"crawl:"/"menu:"-
--- prefixed to pick a source) to a single locator, or reports a miss / ambiguity.
+-- never collide; a drag strip is "<map>/strip/<id>". M.resolve maps a requested name (optionally
+-- "map:"/"ai:"/"rally:"/"crawl:"/"menu:"/"strip:"-prefixed to pick a source) to a single locator, or reports
+-- a miss / ambiguity.
 
 local M = {}
 
 local maps = require("beamcomp/race/maps")
+local dragstrip = require("beamcomp/race/dragstrip")
 
 local LOG_TAG = "beamcomp.race"
 
@@ -121,9 +124,9 @@ local function level_names()
 end
 
 -- Walk the VFS for every installed race across all sources, as locators, sorted by id: the freeroam
--- mission set (timeTrial + aiRace + rallyStage + crawl, ADR-0024/0035) and the level quickrace set (the
--- Time Trial menu, ADR-0024). One mission-tree walk plus one folder walk per level -- on the owner's
--- install (257 races, 4 levels) that is 6 findFiles calls, and it is why M.list caches.
+-- mission set (timeTrial + aiRace + rallyStage + crawl, ADR-0024/0035), the level quickrace set (the
+-- Time Trial menu, ADR-0024) and the level drag strips (ADR-0067). One mission-tree walk plus two folder
+-- walks per level, and it is why M.list caches.
 local function scan()
     local locators = {}
 
@@ -141,6 +144,9 @@ local function scan()
             if locator then
                 locators[#locators + 1] = locator
             end
+        end
+        for _, locator in ipairs(dragstrip.locators(map)) do
+            locators[#locators + 1] = locator
         end
     end
 
@@ -225,8 +231,9 @@ end
 
 -- An optional source prefix on a /race name (ADR-0024/0035): "map:" restricts the match to the freeroam
 -- timeTrial set, "ai:" to the aiRace set, "rally:" to the rallyStage set, "crawl:" to the crawl set,
--- "menu:" to the level quickrace set -- so same-named variants across the sources can be picked
--- deterministically. Returns the source ("mission"/"aiRace"/"rallyStage"/"crawl"/"quickrace") or nil,
+-- "menu:" to the level quickrace set, "strip:" to the drag strips (ADR-0067) -- so same-named variants
+-- across the sources can be picked deterministically. Returns the source
+-- ("mission"/"aiRace"/"rallyStage"/"crawl"/"quickrace"/"strip") or nil,
 -- plus the name with the prefix stripped. Case-insensitive on the prefix. The prefixes only match with
 -- their trailing colon, so a slug like "crawl_long" is a plain name, not a "crawl:" pick.
 local function split_source_prefix(name)
@@ -249,6 +256,10 @@ local function split_source_prefix(name)
     rest = name:match("^[Mm][Ee][Nn][Uu]:(.*)$")
     if rest then
         return "quickrace", rest
+    end
+    rest = name:match("^[Ss][Tt][Rr][Ii][Pp]:(.*)$")
+    if rest then
+        return dragstrip.SOURCE, rest
     end
     return nil, name
 end

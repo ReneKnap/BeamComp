@@ -57,7 +57,9 @@ angular.module('beamng.apps')
   // type (BeamCompRaceMeta) and preselects the matching mode, marked '(recommended)' by rebuildModeOpts.
   // A preselection, not a lock -- the other mode stays pickable, which is the only thing that makes the
   // word "recommended" mean anything.
-  var MODE_OPTS = [{ v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }];
+  // Drag (ADR-0067 amendments 2026-11-15 and 2026-11-16) is a mode of every race, and every race offers all three;
+  // on a drag strip Drag is the recommended one.
+  var MODE_OPTS = [{ v: 'sprint', label: 'sprint' }, { v: 'circuit', label: 'circuit' }, { v: 'drag', label: 'drag' }];
 
   // What a dropdown head shows when the form holds a value no option carries. 'race' has never been
   // picked yet; 'mode' is the deliberate unknown-track fallback, where the empty value still means what
@@ -74,6 +76,8 @@ angular.module('beamng.apps')
     // for order=quali. random (default = today) or the previous race's finishing order.
     qualiStart: [{ v: 'random', label: 'random' }, { v: 'last', label: 'last result' }],
     qualiPresets: [5, 8, 12, 15],
+    // A drag race's seeding (ADR-0067), shown only in the Drag mode: drawn, or by a solo qualifying pass.
+    seeding: [{ v: 'random', label: 'random' }, { v: 'quali', label: 'qualifying run' }],
     champPreset: [{ v: 'f1', label: 'F1 (25-18-15…)' }, { v: 'linear', label: 'linear (per starter)' },
       { v: 'quadratic', label: 'quadratic (64-32-16…)' }],
     champOrder: [{ v: 'reversed', label: 'reversed (handicap)' }, { v: 'normal', label: 'normal' },
@@ -154,21 +158,26 @@ angular.module('beamng.apps')
     resetUiLayout: 'Puts every BeamComp window back to its default size and position.',
     // --- Basics ---
     race: 'The track this race runs on. Pick it first, everything below applies to it.',
+    seeding: 'How the bracket is drawn. Random draws the pairings. Qualifying run gives every driver one '
+      + 'timed pass alone first, so the fastest meet as late as possible.',
     // The track's own type is knowable here, so it is shown rather than hidden behind a word. When it is
     // not known (no race picked, still being looked up, or a race that cannot be parsed) the panel sends
     // no mode at all and the game decides at the start -- which is what this says.
     mode: function (scope) {
       var base = 'Sprint runs the route once and finishes at the end. Circuit runs laps and finishes back '
-        + 'at the start line. ';
+        + 'at the start line. Drag runs knockout heats from a light tree to the finish. ';
       if (!scope.form.race) {
         return base + 'Pick a race and the one it is built as is filled in for you.';
+      }
+      if (scope.isStrip()) {
+        return base + 'This track is a drag strip, so Drag is preselected. You can still pick another.';
       }
       var recommended = scope.recommendedMode();
       if (!recommended) {
         return base + 'This track has not said which it is, so the game decides when the race starts.';
       }
-      return base + 'This track is built as a ' + recommended + ', so that is preselected. You can still '
-        + 'pick the other one.';
+      return base + 'This track is built as a ' + recommended + ', so that is preselected. You can still pick '
+        + 'another.';
     },
     // The label already says "Laps", so the text is only the part it cannot say. It deliberately does not
     // name the number even now that BeamCompRaceMeta carries it: the grey placeholder shows the figure
@@ -223,6 +232,9 @@ angular.module('beamng.apps')
     // Names the grid this race actually starts on. The Edit button next to it is how that is changed, so
     // the sentence points at it instead of explaining what a default grid is.
     grid: function (scope) {
+      if (scope.isDrag()) {
+        return 'Which saved grid the heats line up on. The Drag mode lists only grids with a Drag layout.';
+      }
       var name = defaultGridName(scope.data.grids, scope.form.race);
       if (!name) {
         return 'Which saved grid the cars line up on. This race has none yet, so the game lines them up '
@@ -452,6 +464,8 @@ angular.module('beamng.apps')
       // booleans so a saved preset round-trips the admin's choice.
       carRandomTrim: true, carNoBigCars: true,
       orderMode: 'random', orderRev: false, qualiStart: 'random', qualiMinutes: 5, grid: '',
+      // A drag race's seeding (ADR-0067); read only in the Drag mode.
+      seeding: 'random',
       // The jump-start penalty opens EMPTY, not at 15. A prefilled 15 was sent as an explicit
       // jumpPenaltySeconds on every panel start, so the server's own f1.DEFAULT_PENALTY never applied to
       // a panel race at all -- change that constant and /race would follow while this panel silently
@@ -909,15 +923,20 @@ angular.module('beamng.apps')
       // passes `stillValid` and is left alone (an explicit pick is a pin), while a race that had no grid
       // at all carries `form.grid === ''`, fails `stillValid`, and lands on the grid just saved -- which
       // is the whole point of saving one.
+      // In the Drag mode (ADR-0067 amendment 2026-11-15) only the grids with a Drag layout are listed. Without one
+      // the race generates its drag grid (amendment 2026-11-16), which "auto generated grid" says. The Mode row
+      // marks the race's own mode, so it is rebuilt here too.
       function rebuildGridOpts() {
+        var drag = scope.isDrag();
         var raceGrids = (scope.data.grids || []).filter(function (g) {
-          return g && g.race === scope.form.race;
+          return g && g.race === scope.form.race && (!drag || g.drag === true);
         });
         scope.opts.grid = raceGrids.length
           ? raceGrids.map(function (g) {
             return { v: g.name, label: g.isDefault ? g.name + ' (default)' : g.name };
           })
           : [{ v: '', label: 'auto generated grid' }];
+        rebuildModeOpts();
         if (!gridsLoaded) {
           return;
         }
@@ -927,7 +946,9 @@ angular.module('beamng.apps')
         }
         var stillValid = raceGrids.some(function (g) { return g.name === scope.form.grid; });
         if (!stillValid) {
-          scope.form.grid = defaultGridName(scope.data.grids, scope.form.race) || raceGrids[0].name;
+          var fallback = defaultGridName(scope.data.grids, scope.form.race);
+          var usable = raceGrids.some(function (g) { return g.name === fallback; });
+          scope.form.grid = usable ? fallback : raceGrids[0].name;
         }
       }
       // The mode the SELECTED track itself declares (ADR-0013): a closed loop is a circuit, anything else
@@ -935,6 +956,9 @@ angular.module('beamng.apps')
       // flight, or a race GE could not parse. Never guessed: calling an unknown track a sprint would turn
       // a lap race into a single pass without anyone noticing.
       scope.recommendedMode = function () {
+        if (scope.isStrip()) {
+          return 'drag';
+        }
         var meta = scope.raceMetaById[scope.form.race];
         if (!meta) {
           return '';
@@ -943,7 +967,8 @@ angular.module('beamng.apps')
       };
 
       // Mark the track's own mode in the dropdown. Rebuilt rather than watched, so the label is a plain
-      // string the existing labelFor renders in the head for free.
+      // string the existing labelFor renders in the head for free. Every race lists all three modes; nothing is
+      // taken away, a strip included (ADR-0067 amendment 2026-11-16, round 4).
       function rebuildModeOpts() {
         var recommended = scope.recommendedMode();
         scope.opts.mode = MODE_OPTS.map(function (o) {
@@ -1112,6 +1137,8 @@ angular.module('beamng.apps')
           // harmless (labelFor falls back) and re-fetched on the next model change.
           rebuildGridOpts();
           rebuildConfigOpts();
+          // The list says which race is a strip (ADR-0067), whose recommended mode is Drag.
+          applyRecommendedMode();
         });
       });
 
@@ -1156,8 +1183,10 @@ angular.module('beamng.apps')
         });
       });
 
-      // The map's saved grids as {name, race, isDefault} (ADR-0023 amendment): server truth, kept whole so
-      // the dropdown can re-filter on a race change without asking again.
+      // The map's saved grids as {name, race, isDefault, drag, reverse} (ADR-0023 amendment; `drag` and `reverse`
+      // mark a grid with that layout, ADR-0067 amendments 2026-11-15 and 2026-11-16): server truth, kept whole so
+      // the dropdown can re-filter on a race or mode change and the warning can name a missing layout without
+      // asking again.
       scope.$on('BeamCompSetupGrids', function (event, payload) {
         scope.$evalAsync(function () {
           scope.data.grids = asArray(payload && payload.grids);
@@ -1208,7 +1237,8 @@ angular.module('beamng.apps')
           if (!payload || !payload.id || typeof payload.closed !== 'boolean') {
             return;
           }
-          scope.raceMetaById[payload.id] = { closed: payload.closed, defaultLaps: payload.defaultLaps };
+          scope.raceMetaById[payload.id] = { closed: payload.closed, defaultLaps: payload.defaultLaps,
+            strip: payload.strip === true };
           if (payload.id === scope.form.race) {
             applyRecommendedMode();
           }
@@ -1251,6 +1281,53 @@ angular.module('beamng.apps')
         if (scope.open === 'carList') {
           requestCarLists('the Car list dropdown');
         }
+      };
+
+      // Whether the selected race is one of the game's drag strips (ADR-0067): the race list marks one
+      // (racelist.options), and its description says so too once GE has sent it. Unknown reads as not a strip.
+      scope.isStrip = function () {
+        var meta = scope.raceMetaById[scope.form.race];
+        if (meta && meta.strip) {
+          return true;
+        }
+        return (scope.data.races || []).some(function (r) {
+          return r && r.id === scope.form.race && r.strip === true;
+        });
+      };
+
+      // Whether the race runs as a drag race (ADR-0067 amendments 2026-11-15 and 2026-11-16): any race in the
+      // Drag mode, and a strip that names no mode yet (Drag is its default).
+      scope.isDrag = function () {
+        return scope.form.mode === 'drag' || (scope.isStrip() && !scope.form.mode);
+      };
+
+      // The warning that no custom grid is set (ADR-0067 amendment 2026-11-16): the grid this race lines up on
+      // (the picked one, else the race's default) has no layout for the variant it runs, so a default one is
+      // generated. Drag off a strip and Reverse only; a strip's drag grid is its own lanes. Unknown (no race,
+      // the grid list not here yet) makes no claim. The server's chat line for a typed /race says the same.
+      scope.gridWarning = function () {
+        if (!scope.form.race || !gridsLoaded) {
+          return '';
+        }
+        var block = '';
+        if (scope.isDrag()) {
+          block = scope.isStrip() ? '' : 'drag';
+        } else if (scope.form.reverse) {
+          block = 'reverse';
+        }
+        if (!block) {
+          return '';
+        }
+        var name = scope.form.grid || defaultGridName(scope.data.grids, scope.form.race);
+        var used = (scope.data.grids || []).filter(function (g) {
+          return g && g.race === scope.form.race && g.name === name;
+        })[0];
+        if (used && used[block] === true) {
+          return '';
+        }
+        return block === 'drag'
+          ? 'No custom grid with a Drag layout is set. A default drag grid is used.'
+          : 'No custom grid with a Reverse layout is set. A default grid is used.';
       };
 
       scope.labelFor = function (field) {
@@ -1335,13 +1412,18 @@ angular.module('beamng.apps')
           onModelChange();
         }
         if (field === 'race') {
+          // A mode chosen for the previous track says nothing about this one, so hand the choice back to
+          // the new track. Its own mode lands here if it is already known, otherwise when GE answers. Cleared
+          // first, because the grid list below depends on whether the race runs as a drag race.
+          scope.form.mode = '';
           // Grids are per race: the new race has its own set, and the old race's pick is no longer valid.
           rebuildGridOpts();
-          // A mode chosen for the previous track says nothing about this one, so hand the choice back to
-          // the new track. Its own mode lands here if it is already known, otherwise when GE answers.
-          scope.form.mode = '';
           requestRaceMeta(value);
           applyRecommendedMode();
+        }
+        if (field === 'mode') {
+          // The Drag mode lists only the grids with a Drag layout (ADR-0067 amendment 2026-11-15).
+          rebuildGridOpts();
         }
       };
 
@@ -1488,9 +1570,11 @@ angular.module('beamng.apps')
       // panel runs it in, so a New or Load on that race starts there and the editor says when it is on
       // the other one (ADR-0037 amendment 2026-10-11). Read at the press: changing Reverse afterwards
       // reaches the editor only with the next Edit….
+      // Edit... carries the variant the race runs in (ADR-0037 amendment 2026-10-11): Drag in the Drag mode
+      // (ADR-0067 amendment 2026-11-15), else Reverse or Forward.
       scope.editGrid = function () {
         if (scope.form.race) {
-          var direction = scope.form.reverse ? 'reverse' : 'forward';
+          var direction = scope.isDrag() ? 'drag' : (scope.form.reverse ? 'reverse' : 'forward');
           geLuaArgs('open_grid_editor_with_race', scope.form.race, direction);
         }
       };
@@ -1582,12 +1666,24 @@ angular.module('beamng.apps')
       // class-drop (ADR-0042), order= and its qualifying length are omitted so the server grids by the
       // format -- an explicit per-race order would win. The FORM's mode decides, not what the server runs
       // now: the request is what the next race will run.
+      //
+      // A drag race (ADR-0067, any race in the Drag mode, a strip included) runs forward, once, as a bracket of
+      // heats: the fields the panel hides for it leave the request too (the server would drop them anyway), the
+      // mode says drag, the assists go off, and its seeding rides along instead. Deciding it here keeps the
+      // staging comparison honest, since it compares this request.
       function raceRequest() {
         var overrides = buildOverrides(scope.form);
         overrides.format = buildFormat(scope.form);
         if (overrides.format.mode !== 'off') {
           delete overrides.order;
           delete overrides.qualiMinutes;
+        }
+        if (scope.isDrag()) {
+          ['laps', 'direction', 'order', 'qualiMinutes', 'startMode', 'jumpPenaltySeconds']
+            .forEach(function (key) { delete overrides[key]; });
+          overrides.mode = 'drag';
+          overrides.assists = { recoverEnabled: false, repairEnabled: false };
+          overrides.seeding = scope.form.seeding || 'random';
         }
         return { race: scope.form.race, overrides: overrides };
       }
