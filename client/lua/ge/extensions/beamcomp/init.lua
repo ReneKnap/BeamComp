@@ -263,7 +263,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-drag-r3/2026-11-16"
+local BUILD_MARKER = "0.10.0-drag-r4/2026-11-16"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -921,9 +921,9 @@ local function handle_race_start(payload)
     M.state.dash_refresh_pending = false
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
-    -- And a prior drag race's tree, runs and game-drag block (ADR-0067); M.drag.begin opens this race's. A race
-    -- on a drag strip, drag race or sprint, keeps the game's own drag start off the strip from here on, before
-    -- any car stands on its stage line (ADR-0067 amendment 2026-11-16).
+    -- And a prior drag race's tree, runs and game-drag block (ADR-0067); M.drag.begin opens this race's. Any race
+    -- on a drag strip keeps the game's own drag start off the strip from here on, before any car stands on its
+    -- stage line (ADR-0067 amendment 2026-11-16).
     M.drag.teardown()
     M.drag.block_strip(race)
 
@@ -2955,7 +2955,7 @@ M.drag.AI_THROTTLE_MIN = 0.5
 -- How many of his own timeslips a driver can page back through.
 M.drag.OWN_SLIPS = 5
 
--- Keep the game's own drag start off a strip for a race on it, drag race or sprint (handle_race_start, before
+-- Keep the game's own drag start off a strip for a race on it, whatever its mode (handle_race_start, before
 -- the field is placed). The freeroam facility starts its drag race on any frame a player's car stands within
 -- 6 m of a stage waypoint (gameplay/drag/poi.lua onInside), and that is where a strip's front row stands.
 -- M.drag.teardown gives it back.
@@ -3005,7 +3005,8 @@ function M.drag.begin(race)
         strip and "strip tree" or "HUD tree only, to the race's own finish"))
 end
 
--- Drop the drag state: the tree goes dark and the game's drag start is given back (also after a strip sprint).
+-- Drop the drag state: the tree goes dark and the game's drag start is given back (also after any other race
+-- on a strip).
 -- Every race start and the race teardown call it; a no-op outside a race on a strip.
 function M.drag.teardown()
     M.dragworld.unblock_game_drag(M.state.drag_block)
@@ -4503,7 +4504,7 @@ function M.request_race_meta(race_id)
         id = race_id,
         closed = meta and meta.closed,
         defaultLaps = meta and race_start.resolve_laps(nil, meta.defaultLaps) or nil,
-        -- A drag strip (ADR-0067): the panel offers it Drag and Sprint, no Circuit.
+        -- A drag strip (ADR-0067): the panel recommends and preselects Drag on it.
         strip = meta and meta.strip or nil,
     })
 end
@@ -4665,7 +4666,7 @@ function setup.apply_carried_direction()
         return
     end
     -- Reverse, or the Drag variant when the race setup runs this race in the Drag mode (ADR-0067 amendment
-    -- 2026-11-15), or Forward on a strip, which starts on Drag by itself (amendment 2026-11-16).
+    -- 2026-11-15), or Forward on a strip, whose sessions start on Drag (amendment 2026-11-16).
     if carried.direction == editor.direction then
         return
     end
@@ -4712,9 +4713,8 @@ local function push_grid_state()
         -- absent otherwise. The panel shows its line while this differs from `direction` above.
         setupDirection = setup.carried_direction_here(),
         hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
-        -- A drag strip has Forward and Drag, no Reverse (ADR-0067); `hasDrag` says this grid has a Drag layout
-        -- (its count is then the cars per heat while Drag is the active variant).
-        strip = editor.strip,
+        -- Whether this grid has a Drag layout (ADR-0067); its count is the cars per heat while Drag is the active
+        -- variant. Every race offers all three variants, a drag strip included (amendment 2026-11-16, round 4).
         hasDrag = (editor.blocks ~= nil and editor.blocks.drag ~= nil),
         previewCount = grideditor.preview_count(),
         -- The ordered breakpoint boundaries, the active segment index (1-based) and its start slot, so the
