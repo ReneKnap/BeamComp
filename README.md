@@ -248,10 +248,10 @@ seconds later. Leaving before green is a red light and loses the run. On a strip
 checkpoint, to the race's own finish. On a circuit that is one lap.
 
 With more drivers the race is a knockout bracket, players and AI alike, one heat after another. The
-winner of a heat goes through, and an odd field gives byes. **Seeding** in the race panel draws the first
-round at random, or gives everyone one timed pass alone first so the fastest meet as late as possible.
-Drivers waiting for their heat sit in their own car behind the start. The final placement follows the
-round each driver reached and scores in a championship.
+winner of a heat goes through and the others are out; an odd field gives some drivers a free pass to the
+next round. **Seeding** in the race panel draws the first round at random, or gives everyone one timed pass
+alone first so the fastest meet as late as possible. Drivers waiting for their heat sit in their own car
+behind the start. The final placement follows the round each driver reached and scores in a championship.
 
 A heat ends 20 seconds after its first car finishes, or when its time runs out: 45 seconds on a strip,
 more on a long route. A car still out then ranks by how far it got.
