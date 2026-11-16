@@ -320,8 +320,8 @@
           </div>
         </div>
       </div>
-      <!-- Drag (ADR-0067 and its amendments 2026-11-15 and 2026-11-16) is a Mode beside Sprint and Circuit; a strip
-           offers Sprint and Drag. -->
+      <!-- Drag (ADR-0067 and its amendments 2026-11-15 and 2026-11-16) is a Mode beside Sprint and Circuit on every
+           race; a strip recommends it. -->
       <div class="bc-row" bc-setup-tip="tip('mode')">
         <span>Mode</span>
         <div class="bc-dd">
@@ -353,8 +353,7 @@
         <span>Laps</span>
         <input type="number" min="1" ng-model="form.laps" placeholder="{{lapsHint()}}">
       </label>
-      <!-- A strip runs forward (ADR-0067 amendment 2026-11-16), as a sprint or a drag race. -->
-      <label class="bc-row bc-check" ng-if="!isDrag() && !isStrip()" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
+      <label class="bc-row bc-check" ng-if="!isDrag()" bc-setup-tip="tip('reverse')"><input type="checkbox" ng-model="form.reverse"><span>Reverse</span></label>
     </div>
 
     <!-- Vehicles -->
