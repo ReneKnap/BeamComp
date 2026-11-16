@@ -236,9 +236,11 @@ new ones ship.
 ## Drag races
 
 Any race runs as a drag race when you pick **Drag** as its Mode in the race panel. Hirochi Raceway, West
-Coast USA and Gridmap also each have a drag strip, listed in the race panel like any other race. A strip
-runs as a drag race, or as a **Sprint**: the whole field starts together on the stage line and races to
-the 1/4 mile line.
+Coast USA and Gridmap also each have a drag strip, listed in the race panel like any other race. The panel
+preselects Drag there, and a strip runs as a **Sprint** or **Circuit** too: the whole field starts together
+on the stage line, a sprint finishes at the 1/4 mile line, a circuit turns there and comes back over the
+stage line. A circuit or a reverse race on a strip needs **Force**, as on any track that is no loop or has
+no reverse route.
 
 Two cars stand side by side on the line and start on a Christmas tree: three ambers, then green 0.4
 seconds later. Leaving before green is a red light and loses the run. On a strip the first car across the

@@ -69,9 +69,9 @@ Options can come in any order, and each word option also takes a short form, suc
 | `seed=quali` | In a drag race: everyone makes one timed pass alone first, and the bracket is seeded by it. |
 
 A name can start with `map:` or `menu:` to say which of the two lists you mean, when a race is in both.
-`strip:` picks a drag strip. It runs as a drag race, or with `sprint` as a race from its stage line to its
-1/4 mile line, and always forward. In a drag race the laps, `sprint`, `circuit`, `reverse`, the start
-order, qualifying, `lights` and the assists do not apply.
+`strip:` picks a drag strip. It runs as a drag race unless you name `sprint` or `circuit`; there, as on
+any track, `circuit` and `reverse` need `force`. In a drag race the laps, `sprint`, `circuit`, `reverse`,
+the start order, qualifying, `lights` and the assists do not apply.
 
 ### Cars
 
