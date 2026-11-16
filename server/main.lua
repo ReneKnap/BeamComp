@@ -8557,7 +8557,9 @@ end
 -- startRace event (ADR-0037): both produce the same `overrides` shape (parse_race_args output), relayed
 -- verbatim to clients (race-blind, ADR-0005/0013/0018) for the client to validate against geometry. The
 -- caller supplies an already-resolved race_name + overrides; this owns everything from the admin check on.
-local function begin_race_request(player_id, player_name, race_name, overrides)
+-- `typed` marks a /race typed in chat: its issuer is told in chat what the setup panel shows on screen (the
+-- missing-layout warning, ADR-0067 amendment 2026-11-16).
+local function begin_race_request(player_id, player_name, race_name, overrides, typed)
     if not is_race_admin(player_name, player_id) then
         access.refuse(player_id, "start races")
         log_info("beamcomp.race", "denied race request from " .. tostring(player_name) .. " (not a race admin)")
@@ -8631,6 +8633,7 @@ local function begin_race_request(player_id, player_name, race_name, overrides)
         race = race_name,
         overrides = overrides,
         owner_id = player_id,
+        typed = typed == true,
         nonce = nonce,
         deadline = now() + VALIDATION_TIMEOUT,
     }
@@ -8669,7 +8672,7 @@ local function handle_race_command(player_id, player_name, argument)
         return
     end
 
-    begin_race_request(player_id, player_name, race_name, overrides)
+    begin_race_request(player_id, player_name, race_name, overrides, true)
 end
 
 -- ===== a race request while a race stages (feature setup-confirm-applies-without-regrid) ===========
@@ -8931,6 +8934,31 @@ end
 
 -- The issuer's client's pre-flight verdict (ADR-0019). Match it to the in-flight check by nonce + owner
 -- so a stale or spoofed reply is dropped, then either commit the race (ok) or relay why it was refused.
+-- The warning that no custom grid is set (ADR-0067 amendment 2026-11-16). A drag race off a strip whose grid has
+-- no Drag layout lines up on the default drag layout, a reverse race whose grid has no Reverse layout on the
+-- default grid. The grid is the one the race lines up on: the one asked for, else the race's default. A strip's
+-- drag grid is its own lanes, so a drag race there is never warned about. Returns "drag", "reverse" or nil.
+grid_store.MISSING_LAYOUT_TEXT = {
+    drag = "BeamComp: no custom grid with a Drag layout is set, a default drag grid is used",
+    reverse = "BeamComp: no custom grid with a Reverse layout is set, a default grid is used",
+}
+function grid_store.missing_layout(map, race, overrides, strip)
+    local block
+    if overrides.drag then
+        block = not strip and "drag" or nil
+    elseif overrides.direction == "reverse" then
+        block = "reverse"
+    end
+    if not block then
+        return nil
+    end
+    local record = resolve_grid(map, race, overrides.grid)
+    if type(record) == "table" and type(record[block]) == "table" then
+        return nil
+    end
+    return block
+end
+
 local function handle_race_validation(player_id, payload)
     local pending = session.pending_validation
     if not pending or type(payload) ~= "table" or payload.nonce ~= pending.nonce
@@ -8957,27 +8985,15 @@ local function handle_race_validation(player_id, payload)
         -- issuer's client reports whether an order=quali on this race is the staged sprint variant (sprint =
         -- meta.closed false, or a sprint mode override). Captured verbatim; only read when order=quali.
         overrides.staged_quali = payload.stagedQuali == true
-        -- A drag race (ADR-0067), as the issuer's client reports it: a strip, or any race in the Drag mode. It
-        -- runs as a bracket of heats. The client also says whether it is a strip and how long a run may last on
-        -- its route. The mission-race options it ignores are dropped here, before a staging-time request is
+        -- A drag race (ADR-0067), as the issuer's client reports it: any race in the Drag mode, a strip included.
+        -- It runs as a bracket of heats. The client also says whether it is a strip and how long a run may last
+        -- on its route. The mission-race options it ignores are dropped here, before a staging-time request is
         -- compared with the staged one (tour.settle_staged): a typed /race carries the assists on, and
         -- comparing that would switch them on in place for a drag race.
         overrides.drag = payload.drag == true
         local limit = tonumber(payload.dragLimit)
         overrides.drag_limit = (overrides.drag and limit and limit == limit)
             and math.max(drag.RUN_LIMIT, math.min(drag.RUN_LIMIT_MAX, limit)) or nil
-        -- Drag on a race that is not a strip needs a saved grid with a Drag layout (ADR-0067 amendment
-        -- 2026-11-15): the one this race would line up on, the one asked for or its default.
-        if overrides.drag and payload.strip ~= true then
-            local record = resolve_grid(map, race_id or pending.race, overrides.grid)
-            if type(record) ~= "table" or type(record.drag) ~= "table" then
-                MP.SendChatMessage(pending.owner_id, "BeamComp: a drag race on this track needs a grid with a "
-                    .. "Drag layout. Pick one with grid=<name>, or build one in the grid editor")
-                log_info("beamcomp.race", string.format("/race '%s' refused: drag without a drag grid",
-                    pending.race))
-                return
-            end
-        end
         if overrides.drag then
             overrides.mode = nil
             overrides.laps = nil
@@ -8998,6 +9014,16 @@ local function handle_race_validation(player_id, payload)
             log_info("beamcomp.race", string.format("/race '%s' refused: drag race inside a class-drop",
                 pending.race))
             return
+        end
+        -- No custom grid for the variant this race runs (ADR-0067 amendment 2026-11-16): a warning, never a
+        -- refusal. The panel shows its own line; a typed /race hears it in chat.
+        local missing = grid_store.missing_layout(map, race_id or pending.race, overrides, payload.strip == true)
+        if missing then
+            log_info("beamcomp.grid", string.format("race '%s': no saved %s layout in %s, a default grid is used",
+                pending.race, missing, overrides.grid and ("grid '" .. overrides.grid .. "'") or "its grid"))
+            if pending.typed then
+                MP.SendChatMessage(pending.owner_id, grid_store.MISSING_LAYOUT_TEXT[missing])
+            end
         end
         -- The footprints of the already-decided cars (ADR-0051 round 2), resolved by the issuer's client
         -- from the tokens we relayed. Kept on overrides so they ride into start_race -- including a race
@@ -10906,9 +10932,11 @@ function grid_store.send_grid_list(recipients, map, reason, target)
                         name = name,
                         race = race_name,
                         isDefault = name == default_name,
-                        -- Whether the grid has a Drag layout (ADR-0067 amendment 2026-11-15): the setup panel
-                        -- offers Drag on a race only with one.
+                        -- Whether the grid has a Drag / a Reverse layout (ADR-0067 amendments 2026-11-15 and
+                        -- 2026-11-16): the setup panel lists drag grids in the Drag mode and warns when the
+                        -- grid a race lines up on has no layout for the variant it runs.
                         drag = type(record) == "table" and type(record.drag) == "table" or nil,
+                        reverse = type(record) == "table" and type(record.reverse) == "table" or nil,
                     }
                 end
             end
