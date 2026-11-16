@@ -215,11 +215,12 @@
     </div>
 
     <!-- Variant: Forward, Reverse and Drag (ADR-0067 amendment 2026-11-15), each a layout of its own. A drag strip
-         has only Drag, so its Forward and Reverse are not there. -->
+         runs forward, as a sprint on Forward or a drag race on Drag, so its Reverse is not there (amendment
+         2026-11-16). -->
     <div class="bc-section" ng-if="state.active">
       <div class="bc-section-title">Variant</div>
       <div class="bc-seg" bc-grid-tip="tip('direction')">
-        <button ng-if="!state.strip" ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
+        <button ng-class="{on: state.direction === 'forward'}" ng-click="setDirection('forward')">Forward</button>
         <button ng-if="!state.strip" ng-class="{on: state.direction === 'reverse'}" ng-click="setDirection('reverse')">Reverse</button>
         <button ng-class="{on: state.direction === 'drag'}" ng-click="setDirection('drag')">Drag</button>
       </div>
@@ -231,7 +232,7 @@
            that Save then writes, and no race refuses Reverse here -- one without its own reverse route
            anchors where a forced reverse race lines up (race/grideditor.lua set_direction). -->
       <div class="bc-hint" ng-if="!state.strip">Races run in reverse start on the Reverse layout, drag races on the Drag layout.</div>
-      <div class="bc-hint" ng-if="state.strip">A drag strip has only the Drag layout.</div>
+      <div class="bc-hint" ng-if="state.strip">Sprints on a drag strip start on the Forward layout, drag races on the Drag layout.</div>
       <!-- Next to Forward/Reverse because both are about where on the map the grid is. Needs no ng-disabled:
            this whole section only exists while a session runs, and GE refuses (and says so) during a race. -->
       <div class="bc-row bc-grid-actions">

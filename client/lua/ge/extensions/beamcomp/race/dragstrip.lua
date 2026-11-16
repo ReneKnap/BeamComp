@@ -14,8 +14,9 @@
 --   meta.strip     -- the strip facts (lanes, axis, timers, tree, waypoint names, default grid), plain tables,
 --                     so the ADR-0039 relay carries them unchanged.
 -- M.locators finds the strips on one map, M.parse reads one, M.build is the pure part of M.parse. A strip is a
--- race like any other (ADR-0067 amendment 2026-11-15): it is listed as one and runs only in the Drag mode, which
--- every race offers. The timers and the queue below also serve a drag race on a normal race (race/start.lua).
+-- race like any other (ADR-0067 amendments 2026-11-15 and 2026-11-16): it is listed as one and runs in the Drag
+-- mode, which every race offers, or as a sprint from its stage line to its 1/4 mile line over the two gates
+-- below. The timers and the queue below also serve a drag race on a normal race (race/start.lua).
 
 local M = {}
 
@@ -252,7 +253,6 @@ function M.build(settings, strip, settings_id, title)
             noSlope = false,
         },
         defaultSlots = #lanes,
-        queue = {setback = M.QUEUE_SETBACK, rowGap = M.QUEUE_ROW_GAP, colGap = lane_gap, columns = 2},
     }
 
     return {

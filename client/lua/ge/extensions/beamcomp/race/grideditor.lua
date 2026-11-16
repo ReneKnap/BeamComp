@@ -238,7 +238,7 @@ M.state = {
     plan = nil,
     boundary_lines = nil,
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
-    -- Whether the race being edited is a drag strip (ADR-0067): it has only the Drag variant.
+    -- Whether the race being edited is a drag strip (ADR-0067): Forward (its sprint) and Drag, no Reverse.
     strip = false,
     -- The Drag variant's count, the cars per heat (ADR-0067 amendment 2026-11-15); `preview_count` stays the
     -- Forward/Reverse field size. Each variant edits and saves its own.
@@ -477,9 +477,9 @@ end
 -- way the server resolves it at race start (ADR-0023). `preview_count` is the saved authored field size
 -- (ADR-0023 amendment 2026-08-02); nil -- a brand-new grid, or a record from before the field existed --
 -- coerces to DEFAULT_PREVIEW_COUNT. A nil `blocks.forward` is a brand-new grid: the race's own default params
--- (a drag strip's one slot per lane), else the generic default. The Drag variant (ADR-0067 amendment
+-- (a drag strip's sprint grid, two lanes wide), else the generic default. The Drag variant (ADR-0067 amendment
 -- 2026-11-15) is anchored on the forward start; a stored `blocks.drag` and `drag_count` come back with it, and
--- a strip, whose only variant it is, always has one. Returns true + the canonical id, or nil + a reason.
+-- a strip always has one and starts on it. Returns true + the canonical id, or nil + a reason.
 -- Replaces any prior session.
 local function enter(race_name_or_id, blocks, preview_count, drag_count)
     local map = maps.current()
@@ -572,8 +572,8 @@ function M.set_direction(direction)
     if direction ~= "forward" and direction ~= "reverse" and direction ~= "drag" then
         return nil, "direction must be 'forward', 'reverse' or 'drag'"
     end
-    if direction ~= "drag" and M.state.strip then
-        return nil, "a drag strip has only the Drag layout"
+    if direction == "reverse" and M.state.strip then
+        return nil, "a drag strip has no Reverse layout"
     end
     -- The Drag variant (ADR-0067 amendment 2026-11-15): anchored on the forward start, seeded with the race's
     -- drag default -- two cars abreast at the line -- the first time it is opened.
