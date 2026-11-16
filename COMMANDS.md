@@ -41,8 +41,9 @@ chat line, so nobody else sees what you typed.
 /race <name> car=<model>             everyone in the same car
 /race <name> car=host                everyone in the car you are sitting in
 /race <name> maxhp=300 order=random  power limit, random grid order
-/race <name> drag                    a drag race on its saved drag grid
+/race <name> drag                    a drag race
 /race strip:hirochiStrip seed=quali  a drag race on a strip, seeded by a qualifying pass
+/race strip:hirochiStrip sprint      the whole field down a strip at once
 ```
 
 `/races` gives you the names to put there. Before anything spawns, your own game checks the race and
@@ -58,7 +59,7 @@ Options can come in any order, and each word option also takes a short form, suc
 |---|---|
 | `sprint` | Runs the route once and finishes at the end. |
 | `circuit` | Runs laps and finishes back at the start line. |
-| `drag` | Runs knockout heats from a light tree to the finish. Needs a saved grid with a Drag layout, except on a drag strip. |
+| `drag` | Runs knockout heats from a light tree to the finish. Without a saved Drag layout two cars line up side by side on the start line. |
 | a number | How many laps. Without one, the track's own lap count applies. |
 | `reverse` | Drives the route backwards. A track without its own reverse route refuses this, `force` starts it anyway. |
 | `force` | Starts anyway when the track cannot do what you picked: laps on a track that is not a loop, or `reverse` without a reverse route. |
@@ -68,8 +69,9 @@ Options can come in any order, and each word option also takes a short form, suc
 | `seed=quali` | In a drag race: everyone makes one timed pass alone first, and the bracket is seeded by it. |
 
 A name can start with `map:` or `menu:` to say which of the two lists you mean, when a race is in both.
-`strip:` picks a drag strip, which always runs as a drag race. In a drag race the laps, `sprint`,
-`circuit`, `reverse`, the start order, qualifying, `lights` and the assists do not apply.
+`strip:` picks a drag strip. It runs as a drag race, or with `sprint` as a race from its stage line to its
+1/4 mile line, and always forward. In a drag race the laps, `sprint`, `circuit`, `reverse`, the start
+order, qualifying, `lights` and the assists do not apply.
 
 ### Cars
 

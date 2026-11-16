@@ -225,7 +225,9 @@ on a sensible default layout until you build one for it.
 **Edit…** next to the grid in the race panel opens the grid editor: rows and columns, spacing, where the
 field sits relative to the start line, and how it is angled. You see the result on the track while you
 edit it. Grids are saved by name, and one can be set as the default for a race, so it is used every
-time that race is started.
+time that race is started. A grid holds a Forward, a Reverse and a Drag layout. A race run in reverse or as
+a drag race without its own layout starts on a default one, and the race panel says that no custom grid
+is set.
 
 Grids live in `Resources/Server/BeamComp/beamcomp.grids.json`. Keep that file when you update and your
 own grids stay. Grids added in a later version then do not reach your server; the changelog says when
@@ -235,7 +237,8 @@ new ones ship.
 
 Any race runs as a drag race when you pick **Drag** as its Mode in the race panel. Hirochi Raceway, West
 Coast USA and Gridmap also each have a drag strip, listed in the race panel like any other race. A strip
-runs only as a drag race.
+runs as a drag race, or as a **Sprint**: the whole field starts together on the stage line and races to
+the 1/4 mile line.
 
 Two cars stand side by side on the line and start on a Christmas tree: three ambers, then green 0.4
 seconds later. Leaving before green is a red light and loses the run. On a strip the first car across the
@@ -256,9 +259,9 @@ After every run the timeslip shows the reaction time, the marks the run passes (
 you close it or your own next heat comes up. Its arrows page through your own last five runs, and
 **Timeslips** brings it back.
 
-Drag on a race that is not a strip needs a saved grid with a Drag layout. The grid editor has **Drag**
-beside Forward and Reverse, and it starts with two cars side by side on the start line. **Cars per heat**
-sets how many cars run in each heat. A strip's grid starts with one slot per lane.
+Without a saved Drag layout the heats line up two cars side by side on the start line, on a strip one car
+per lane. To build your own, the grid editor has **Drag** beside Forward and Reverse. **Cars per heat**
+sets how many cars run in each heat.
 
 ## When something looks wrong
 
