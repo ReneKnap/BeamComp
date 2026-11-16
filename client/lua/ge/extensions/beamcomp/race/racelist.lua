@@ -189,8 +189,8 @@ function M.options(loaded_map, include_deprecated)
         if discovery.is_deprecated(locator) then
             label = label .. " (deprecated)"
         end
-        -- A drag strip runs in the Drag mode or as a sprint (ADR-0067 amendment 2026-11-16): the panel offers
-        -- those two. Read off the source, so it costs no parse.
+        -- A drag strip (ADR-0067): the panel recommends and preselects Drag on it. Read off the source, so it
+        -- costs no parse.
         options[#options + 1] = {id = locator.id, label = label,
             strip = locator.source == "strip" or nil}
     end

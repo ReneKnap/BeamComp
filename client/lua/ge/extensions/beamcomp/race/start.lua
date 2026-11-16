@@ -312,11 +312,12 @@ local function strip_facts(race)
     return race.meta and race.meta.strip or nil
 end
 
--- A strip's generated forward grid, for a strip run as a sprint (ADR-0067 amendment 2026-11-16): the drag
--- default's two lanes, front edge on the stage line, every next slot half the generic row gap further back, so
--- the field stands two lanes wide in rows behind the line. Columns and row gap are the generic default's, which
--- is what the server's slot reservation assumes for a race without a saved grid (ADR-0051).
-local function strip_sprint_params(strip)
+-- A strip's generated grid, for a strip run as a normal race, sprint or circuit, either way round (ADR-0067
+-- amendments 2026-11-16): the drag default's two lanes, front edge on the start line (the stage line, or the 1/4
+-- mile line in reverse), every next slot half the generic row gap further back, so the field stands two lanes
+-- wide in rows behind the line. Columns and row gap are the generic default's, which is what the server's slot
+-- reservation assumes for a race without a saved grid (ADR-0051).
+local function strip_race_params(strip)
     local params = {}
     for key, value in pairs(strip.defaultParams) do
         params[key] = value
@@ -349,19 +350,20 @@ local function route_length(points)
     return length
 end
 
--- (public) The forward block a strip sprint lines up on (ADR-0067 amendment 2026-11-16): the saved one, else the
--- strip's sprint grid. A saved one without a row gap and without parts puts every car past the first row onto
--- the cars in front; on a strip that is the lane layout a grid saved before the strip sprint existed carries as
--- its Forward, so the sprint grid stands in, with a `W` line.
-function M.strip_sprint_block(strip, saved, field_size, race_id)
+-- (public) The block a strip run as a normal race lines up on (ADR-0067 amendments 2026-11-16): the saved one
+-- for its direction, else the strip's generated grid. A saved one without a row gap and without parts puts every
+-- car past the first row onto the cars in front; on a strip that is the lane layout a grid saved before the
+-- strip ran as a normal race carries as its Forward, so the generated grid stands in, with a `W` line.
+function M.strip_race_block(strip, saved, field_size, race_id, direction)
     if type(saved) ~= "table" then
-        return strip_sprint_params(strip)
+        return strip_race_params(strip)
     end
     local columns = tonumber(saved.columns) or grid.default_params().columns
     if tonumber(saved.rowGap) == 0 and type(saved.segments) ~= "table" and field_size > columns then
-        log("W", LOG_TAG, string.format("strip sprint on '%s': the saved Forward layout has no row gap for %d "
-            .. "car(s) in %d column(s), the strip's sprint grid is used", tostring(race_id), field_size, columns))
-        return strip_sprint_params(strip)
+        log("W", LOG_TAG, string.format("strip race on '%s': the saved %s layout has no row gap for %d car(s) "
+            .. "in %d column(s), the strip's generated grid is used", tostring(race_id), tostring(direction),
+            field_size, columns))
+        return strip_race_params(strip)
     end
     return saved
 end
@@ -749,19 +751,14 @@ function M.validate(payload)
     if not race then
         return {ok = false, reason = err}
     end
-    -- A drag race runs forward, once, as a bracket (ADR-0067): any race in the Drag mode, and a strip unless it
-    -- is asked to run as a sprint (ADR-0067 amendment 2026-11-16). A strip is no loop, so it runs no circuit,
-    -- and it has no reverse route, so a strip sprint runs forward, forced or not.
-    -- Laps and direction do not apply to a drag race, so they are not checked against its geometry either --
-    -- the server drops them. It needs a route to run: a start line and at least one checkpoint.
+    -- A drag race runs forward, once, as a bracket (ADR-0067): any race in the Drag mode, and a strip that names
+    -- no mode (Drag is its default, ADR-0067 amendments 2026-11-16). A strip asked for Sprint or Circuit is a
+    -- track like any other: no loop and no reverse route, so a circuit or a reverse is refused below without
+    -- force and starts with it (ADR-0019). Laps and direction do not apply to a drag race, so they are not
+    -- checked against its geometry either -- the server drops them. It needs a route to run: a start line and
+    -- at least one checkpoint.
     local strip = strip_facts(race)
-    if strip and payload.mode == "circuit" then
-        return {ok = false, reason = "a drag strip runs as a drag race or a sprint"}
-    end
-    local drag = payload.mode == "drag" or (strip ~= nil and payload.mode ~= "sprint")
-    if strip and not drag and payload.direction == "reverse" then
-        return {ok = false, reason = "a drag strip runs forward only"}
-    end
+    local drag = payload.mode == "drag" or (strip ~= nil and payload.mode == nil)
     if drag and not strip and #(race.checkpoints or {}) < 2 then
         return {ok = false, reason = "a drag race needs a route with at least two checkpoints"}
     end
@@ -951,10 +948,12 @@ function M.prepare(payload)
     -- race with no reverse block fall back to the default layout (nil -> grid.poses defaults).
     local gate_normal = race_checkpoints[1] and race_checkpoints[1].normal
     report_travel_axis(race_checkpoints, base_pose, direction, locator.id)
-    -- A strip sprint stands on its saved Forward, else two lanes wide on its stage line (M.strip_sprint_block).
+    -- A strip run as a normal race stands on its saved layout for the direction, else two lanes wide on its
+    -- start line (M.strip_race_block).
     local grid_params = grid_params_for(payload.gridParams, direction)
     if strip and not is_drag then
-        grid_params = M.strip_sprint_block(strip, grid_params, M.layout_extent(roster, my_slot), locator.id)
+        grid_params = M.strip_race_block(strip, grid_params, M.layout_extent(roster, my_slot), locator.id,
+            direction)
     end
     -- Drop every pose onto the real surface before anyone spawns on it (ADR-0034): grid.poses is pure
     -- math at the chain Z, so on undulating tracks the rear rows would bury or float. front-anchoring
@@ -1094,8 +1093,8 @@ function M.prepare(payload)
         -- A drag race (ADR-0067): {strip, title, heatSize, seeding, lanePoses, timers, beam, finish, route,
         -- limit}; nil for every other race. gridPoses above is its waiting queue, `plan` its one pass.
         drag = drag,
-        -- The strip facts of a race on a drag strip, drag race or sprint; nil elsewhere. The game's own drag
-        -- start is kept off the strip for the race's lifetime (init.lua M.drag.block_strip).
+        -- The strip facts of a race on a drag strip, whatever its mode; nil elsewhere. The game's own drag start
+        -- is kept off the strip for the race's lifetime (init.lua M.drag.block_strip).
         strip = strip,
     }
 end
@@ -1220,10 +1219,10 @@ function M.anchor(race_name, direction)
         end
     end
 
-    -- The editor's defaults (ADR-0067 amendments 2026-11-15 and 2026-11-16): a drag strip seeds Drag with one
-    -- slot per lane on its stage waypoints and Forward with its sprint grid (two lanes wide, rows behind); every
-    -- other race seeds Drag with the default drag layout, the one a race start falls back on, and Forward with
-    -- the generic default.
+    -- The editor's defaults (ADR-0067 amendments 2026-11-15 and 2026-11-16), the ones a race start falls back on:
+    -- a drag strip seeds Drag with one slot per lane on its stage waypoints and Forward and Reverse with its
+    -- generated grid (two lanes wide, rows behind the start line); every other race seeds Drag with the default
+    -- drag layout and Forward and Reverse with the generic default.
     local strip = strip_facts(race)
     return {
         base_pose = base_pose,
@@ -1232,7 +1231,7 @@ function M.anchor(race_name, direction)
         prefabFiles = direction_prefabs(race.props.prefabFiles, direction),
         checkpoints = route,
         strip = strip ~= nil or nil,
-        default_params = strip and strip_sprint_params(strip) or nil,
+        default_params = strip and strip_race_params(strip) or nil,
         drag_params = strip and strip.defaultParams or grid.drag_default_params(),
         drag_count = strip and strip.defaultSlots or DRAG_MIN_HEAT,
     }

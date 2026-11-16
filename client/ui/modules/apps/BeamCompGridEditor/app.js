@@ -558,7 +558,7 @@ angular.module('beamng.apps')
       // that field's placeholder (see scope.knobHint). `setupDirection` is deliberately not seeded: absent
       // means no direction line (see scope.directionNote). `plan` is the field as GE lays it out, for the
       // plan strip (see planOf; ADR-0023 amendment 2026-10-16).
-      scope.state = { active: false, race: null, direction: 'forward', hasReverse: false, strip: false, hasDrag: false,
+      scope.state = { active: false, race: null, direction: 'forward', hasReverse: false, hasDrag: false,
         previewCount: 16, segments: [], activeSegment: 1, activeStartSlot: 0, knobs: null,
         knobDefaults: null, plan: null };
       // Editable mirror of the number fields, synced from state on each push. The knob entries hold GE's own

@@ -238,8 +238,6 @@ M.state = {
     plan = nil,
     boundary_lines = nil,
     preview_count = DEFAULT_PREVIEW_COUNT,  -- the authored field size: previewed slots + warn threshold
-    -- Whether the race being edited is a drag strip (ADR-0067): Forward (its sprint) and Drag, no Reverse.
-    strip = false,
     -- The Drag variant's count, the cars per heat (ADR-0067 amendment 2026-11-15); `preview_count` stays the
     -- Forward/Reverse field size. Each variant edits and saves its own.
     drag_count = MIN_DRAG_COUNT,
@@ -477,7 +475,7 @@ end
 -- way the server resolves it at race start (ADR-0023). `preview_count` is the saved authored field size
 -- (ADR-0023 amendment 2026-08-02); nil -- a brand-new grid, or a record from before the field existed --
 -- coerces to DEFAULT_PREVIEW_COUNT. A nil `blocks.forward` is a brand-new grid: the race's own default params
--- (a drag strip's sprint grid, two lanes wide), else the generic default. The Drag variant (ADR-0067 amendment
+-- (a drag strip's generated grid, two lanes wide), else the generic default. The Drag variant (ADR-0067 amendment
 -- 2026-11-15) is anchored on the forward start; a stored `blocks.drag` and `drag_count` come back with it, and
 -- a strip always has one and starts on it. Returns true + the canonical id, or nil + a reason.
 -- Replaces any prior session.
@@ -515,7 +513,6 @@ local function enter(race_name_or_id, blocks, preview_count, drag_count)
     M.state.anchors = {forward = anchor, drag = anchor}
     M.state.preview_count = coerce_preview_count(preview_count)
     M.state.drag_count = coerce_drag_count(drag_count, anchor.drag_count)
-    M.state.strip = strip
     recompute()
     -- Only now: a session counts as started once its preview poses exist, which is what the camera flies to.
     M.state.session = M.state.session + 1
@@ -572,9 +569,6 @@ function M.set_direction(direction)
     if direction ~= "forward" and direction ~= "reverse" and direction ~= "drag" then
         return nil, "direction must be 'forward', 'reverse' or 'drag'"
     end
-    if direction == "reverse" and M.state.strip then
-        return nil, "a drag strip has no Reverse layout"
-    end
     -- The Drag variant (ADR-0067 amendment 2026-11-15): anchored on the forward start, seeded with the race's
     -- drag default -- two cars abreast at the line -- the first time it is opened.
     if direction == "drag" and not M.state.blocks.drag then
@@ -589,8 +583,11 @@ function M.set_direction(direction)
         end
         M.state.anchors.reverse = anchor
     end
+    -- Seeded with the race's own default (a drag strip's generated grid, else the generic one), the layout a
+    -- reverse race without a saved Reverse layout lines up on (ADR-0067 amendment 2026-11-16, round 4).
     if direction == "reverse" and not M.state.blocks.reverse then
-        M.state.blocks.reverse = grid.block_to_segments(grid.default_params())
+        M.state.blocks.reverse = grid.block_to_segments(M.state.anchors.forward.default_params
+            or grid.default_params())
     end
 
     M.state.direction = direction
@@ -901,7 +898,6 @@ function M.clear()
     M.state.boundary_lines = nil
     M.state.preview_count = DEFAULT_PREVIEW_COUNT
     M.state.drag_count = MIN_DRAG_COUNT
-    M.state.strip = false
 end
 
 return M
