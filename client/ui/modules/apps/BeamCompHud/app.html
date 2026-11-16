@@ -1001,6 +1001,11 @@
     .beamcomp-hud .bc-drag-heat.bc-done {
       opacity: 0.7;
     }
+    .beamcomp-hud .bc-drag-out {
+      font-size: 12px;
+      padding-left: 1em;
+      opacity: 0.8;
+    }
     .beamcomp-hud .bc-drag-slip-head {
       display: flex;
       align-items: center;
@@ -1131,7 +1136,9 @@
           </div>
           <div ng-repeat="round in dragView.rounds">
             <div class="bc-drag-round">{{round.label}}</div>
-            <div class="bc-drag-heat" ng-repeat="h in round.heats" ng-class="{'bc-current': h.current, 'bc-done': h.done}">{{h.text}}<span class="bc-drag-win" ng-if="h.winner"> &middot; {{h.winner}}</span></div>
+            <div class="bc-drag-heat" ng-repeat="h in round.heats" ng-class="{'bc-current': h.current, 'bc-done': h.done}">{{h.text}}<span class="bc-drag-win" ng-if="h.winner"> &middot; {{h.winner}}</span>
+              <div class="bc-drag-out" ng-repeat="o in h.out track by $index">{{o}} out</div>
+            </div>
           </div>
         </div>
       </div>

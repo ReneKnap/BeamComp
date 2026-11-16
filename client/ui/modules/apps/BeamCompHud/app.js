@@ -426,7 +426,10 @@ angular.module('beamng.apps')
     };
   }
 
-  // The bracket as text lines per round: "A vs B" with the winner marked, "A, bye" for a bye.
+  // The bracket as text lines per round: "A vs B" with the winner marked, and under a decided heat that was raced
+  // one "<name> out" line per driver who did not win it. A free pass reads "A, no opponent, advances", and one
+  // whose drivers have all left "No driver left, nobody advances" (feature drag-race-mode round 5: the owner read
+  // "bye" as knocked out).
   function dragRounds(bracket) {
     return asArray(bracket.rounds).map(function (round) {
       return {
@@ -440,9 +443,15 @@ angular.module('beamng.apps')
               winner = e.name;
             }
           });
+          var raced = !!heat.done && !heat.bye;
+          var out = raced ? cars.filter(function (e) {
+            return heat.winner === null || heat.winner === undefined || String(e.id) !== String(heat.winner);
+          }).map(function (e) { return e.name; }) : [];
+          var freePass = names[0] ? names[0] + ', no opponent, advances' : 'No driver left, nobody advances';
           return {
-            text: heat.bye ? (names[0] || 'Nobody') + ', bye' : names.join(' vs '),
+            text: heat.bye ? freePass : names.join(' vs '),
             winner: heat.bye ? null : winner,
+            out: out,
             current: !!heat.current,
             done: !!heat.done,
           };
