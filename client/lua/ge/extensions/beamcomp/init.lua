@@ -263,7 +263,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-drag-r2/2026-11-15"
+local BUILD_MARKER = "0.10.0-drag-r3/2026-11-16"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -921,8 +921,11 @@ local function handle_race_start(payload)
     M.state.dash_refresh_pending = false
     -- Blank the HUD so an abort-restart never carries a stale frozen readout into the countdown.
     hud.clear()
-    -- And a prior drag race's tree, runs and game-drag block (ADR-0067); M.drag.begin opens this race's.
+    -- And a prior drag race's tree, runs and game-drag block (ADR-0067); M.drag.begin opens this race's. A race
+    -- on a drag strip, drag race or sprint, keeps the game's own drag start off the strip from here on, before
+    -- any car stands on its stage line (ADR-0067 amendment 2026-11-16).
     M.drag.teardown()
+    M.drag.block_strip(race)
 
     -- Lift any in-race lock before respawning (ADR-0017): the abort-restart path (finished -> spawning)
     -- skips the lobby reset, so a prior race's lock could still be guarding core_vehicles.spawnNewVehicle
@@ -2952,8 +2955,21 @@ M.drag.AI_THROTTLE_MIN = 0.5
 -- How many of his own timeslips a driver can page back through.
 M.drag.OWN_SLIPS = 5
 
+-- Keep the game's own drag start off a strip for a race on it, drag race or sprint (handle_race_start, before
+-- the field is placed). The freeroam facility starts its drag race on any frame a player's car stands within
+-- 6 m of a stage waypoint (gameplay/drag/poi.lua onInside), and that is where a strip's front row stands.
+-- M.drag.teardown gives it back.
+function M.drag.block_strip(race)
+    local strip = race and race.strip
+    if not strip then
+        return
+    end
+    M.state.drag_block = M.dragworld.block_game_drag(M.state.drag_block, strip.map, strip.settingsId,
+        #strip.lanes)
+end
+
 -- Open the drag state for a race that is one (handle_race_start, after the field is placed). On a strip, bind
--- its tree and keep the game's own drag start off it.
+-- its tree.
 function M.drag.begin(race)
     local drag = race and race.drag
     if not drag then
@@ -2972,7 +2988,6 @@ function M.drag.begin(race)
         route = M.dragrun.route(drag.route),
         limit = drag.limit,
         tree = strip and M.dragworld.bind_tree(strip.stripId, #strip.lanes) or nil,
-        block = strip and M.dragworld.block_game_drag(nil, strip.map, strip.settingsId, #strip.lanes) or nil,
         heat = nil,       -- the heat on the strip {seq, label, qual, entrants}
         clock = nil,      -- its tree on the local clock (dragrun.tree), from dragTree to dragHold
         runs = {},        -- "own" / AI id -> the run this client measures
@@ -2990,15 +3005,16 @@ function M.drag.begin(race)
         strip and "strip tree" or "HUD tree only, to the race's own finish"))
 end
 
--- Drop the drag state: the tree goes dark and the game's drag start is given back. Every race start and the
--- race teardown call it; a no-op outside a drag race.
+-- Drop the drag state: the tree goes dark and the game's drag start is given back (also after a strip sprint).
+-- Every race start and the race teardown call it; a no-op outside a race on a strip.
 function M.drag.teardown()
+    M.dragworld.unblock_game_drag(M.state.drag_block)
+    M.state.drag_block = nil
     local state = M.state.drag
     if not state then
         return
     end
     M.dragworld.dark(state.tree)
-    M.dragworld.unblock_game_drag(state.block)
     M.state.drag = nil
 end
 
@@ -3073,7 +3089,7 @@ function M.drag.handle_stage(payload)
     state.view = nil
     M.state.detection = nil
     if state.strip then
-        state.block = M.dragworld.block_game_drag(state.block, state.strip.map, state.strip.settingsId,
+        M.state.drag_block = M.dragworld.block_game_drag(M.state.drag_block, state.strip.map, state.strip.settingsId,
             #state.strip.lanes)
     end
     M.dragworld.dark(state.tree)
@@ -4063,8 +4079,9 @@ local function handle_validate_race(payload)
         -- server reads this (it cannot see meta.closed) only when the race is order=quali.
         stagedQuali = result.stagedQuali,
         -- Whether the race runs as a drag race (ADR-0067): the server runs it as a bracket of heats. `strip`
-        -- says it is one of the game's strips (anything else needs a saved drag grid) and `dragLimit` how long
-        -- a run may last on its route, in seconds (ADR-0067 amendment 2026-11-15).
+        -- says it is a drag race on one of the game's strips, whose drag grid is its own lanes, so the server
+        -- does not warn about a missing Drag layout there (ADR-0067 amendment 2026-11-16); `dragLimit` how long a
+        -- run may last on its route, in seconds.
         drag = result.drag,
         strip = result.strip,
         dragLimit = result.dragLimit,
@@ -4486,7 +4503,7 @@ function M.request_race_meta(race_id)
         id = race_id,
         closed = meta and meta.closed,
         defaultLaps = meta and race_start.resolve_laps(nil, meta.defaultLaps) or nil,
-        -- A drag strip (ADR-0067): the panel offers it only the Drag mode.
+        -- A drag strip (ADR-0067): the panel offers it Drag and Sprint, no Circuit.
         strip = meta and meta.strip or nil,
     })
 end
@@ -4648,8 +4665,8 @@ function setup.apply_carried_direction()
         return
     end
     -- Reverse, or the Drag variant when the race setup runs this race in the Drag mode (ADR-0067 amendment
-    -- 2026-11-15). A strip starts on Drag by itself.
-    if carried.direction == "forward" or carried.direction == editor.direction then
+    -- 2026-11-15), or Forward on a strip, which starts on Drag by itself (amendment 2026-11-16).
+    if carried.direction == editor.direction then
         return
     end
     local ok, reason = grideditor.set_direction(carried.direction)
@@ -4657,8 +4674,8 @@ function setup.apply_carried_direction()
         log("I", setup.GRID_LOG_TAG, "session for '" .. editor.race .. "' starts on '" .. carried.direction
             .. "', the variant the race setup carried")
     else
-        log("W", setup.GRID_LOG_TAG, "session for '" .. editor.race .. "' stays forward: the switch to the "
-            .. "carried '" .. carried.direction .. "' was refused (" .. tostring(reason) .. ")")
+        log("W", setup.GRID_LOG_TAG, "session for '" .. editor.race .. "' stays on '" .. editor.direction
+            .. "': the switch to the carried '" .. carried.direction .. "' was refused (" .. tostring(reason) .. ")")
     end
 end
 
@@ -4695,8 +4712,8 @@ local function push_grid_state()
         -- absent otherwise. The panel shows its line while this differs from `direction` above.
         setupDirection = setup.carried_direction_here(),
         hasReverse = (editor.blocks ~= nil and editor.blocks.reverse ~= nil),
-        -- A drag strip has only the Drag variant (ADR-0067); `hasDrag` says this grid has one (its count is then
-        -- the cars per heat while Drag is the active variant).
+        -- A drag strip has Forward and Drag, no Reverse (ADR-0067); `hasDrag` says this grid has a Drag layout
+        -- (its count is then the cars per heat while Drag is the active variant).
         strip = editor.strip,
         hasDrag = (editor.blocks ~= nil and editor.blocks.drag ~= nil),
         previewCount = grideditor.preview_count(),
