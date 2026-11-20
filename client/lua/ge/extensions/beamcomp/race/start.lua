@@ -350,6 +350,13 @@ local function route_length(points)
     return length
 end
 
+-- (public) The horizontal length in metres of one pass of a race's own route: one lap of a circuit, closing segment
+-- included, or the whole run of an open route (a strip's: the stage line to its timed finish). The same measure a
+-- drag run's time limit is sized by; the race lists show it (race/racelist.lua).
+function M.route_length(race)
+    return route_length(drag_route(race, race.checkpoints, race.meta and race.meta.closed))
+end
+
 -- (public) The block a strip run as a normal race lines up on (ADR-0067 amendments 2026-11-16): the saved one
 -- for its direction, else the strip's generated grid. A saved one without a row gap and without parts puts every
 -- car past the first row onto the cars in front; on a strip that is the lane layout a grid saved before the

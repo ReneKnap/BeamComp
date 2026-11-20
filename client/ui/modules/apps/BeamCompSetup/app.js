@@ -875,7 +875,12 @@ angular.module('beamng.apps')
 
       // Rebuild the dynamic dropdown lists ({v, label}) from the latest GE-pushed data.
       function rebuildRaceCarOpts() {
-        scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
+        // `detail` is the race's facts line (mode, laps, checkpoints, length) as GE composed it
+        // (racelist.options), shown gray under the name in the open list. A race without one (an older GE, a
+        // race GE has not read) shows its name alone.
+        scope.opts.race = (scope.data.races || []).map(function (r) {
+          return { v: r.id, label: r.label, detail: typeof r.detail === 'string' ? r.detail : '' };
+        });
         // GE pushes each car as { model: key, label: displayName } (ADR-0037 carlist.options): the option
         // VALUE stays the model key so every consumer (car= token, AI car) is unchanged, only the shown
         // text is the human name. A bare-string entry (a stale GE/UI hot-reload mismatch) is tolerated so
@@ -1445,9 +1450,10 @@ angular.module('beamng.apps')
         document.removeEventListener('click', closeOnOutsideClick, false);
       });
 
-      // Ask GE to describe one race's track, unless it already has. Lazy per race, exactly like the
-      // per-model config fetch below: the race list carries no geometry on purpose, and parsing a whole
-      // map of races to learn one flag about one of them would be absurd.
+      // Ask GE to describe one race's track, unless it already has. Per race, like the per-model config fetch
+      // below: the race list carries a display line for each race, not the flags this panel acts on. GE answers
+      // from the facts it read for the whole map along with that list (racelist.meta_for), so a pick parses
+      // nothing and the Laps placeholder states the same laps as the list.
       function requestRaceMeta(raceId) {
         if (raceId && !scope.raceMetaById[raceId]) {
           geLuaArg('request_race_meta', raceId);
