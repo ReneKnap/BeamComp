@@ -582,8 +582,13 @@ angular.module('beamng.apps')
       // it CANNOT end up in a saved grid -- the grid file describes the grid, not the editor's state.
       scope.heightOpen = false;
 
+      // `detail` is the race's facts line (mode, laps, checkpoints, length) as GE composed it (racelist.options),
+      // shown gray under the name in the open list, as in the race-setup panel. A race without one (an older GE, a
+      // race GE has not read) shows its name alone.
       function rebuildRaceOpts() {
-        scope.opts.race = (scope.data.races || []).map(function (r) { return { v: r.id, label: r.label }; });
+        scope.opts.race = (scope.data.races || []).map(function (r) {
+          return { v: r.id, label: r.label, detail: typeof r.detail === 'string' ? r.detail : '' };
+        });
       }
 
       // A race's display name, for labelling grids that belong to another race. Falls back to the id.

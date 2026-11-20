@@ -53,6 +53,14 @@
       text-overflow: ellipsis; }
     .bc-dd-opt:hover { background: #2e7d32; }
     .bc-dd-opt.sel { background: rgba(143,211,255,0.18); }
+    /* A race in the Race list: its name, and under it a smaller gray line with its facts (mode, laps, checkpoints,
+       length), composed by GE. bcSetupFit sits on the NAME line, never on the row -- the directive moves every
+       child node of its element into the span it measures and scrolls, so the facts line would shrink and
+       marquee along with the name. The facts line is short and simply ends in an ellipsis when it has to. On the
+       green hover it turns lighter, because the gray alone is hard to read there. */
+    .bc-race-facts { font-size: 11px; color: #9aa3ad; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; }
+    .bc-dd-opt:hover .bc-race-facts { color: #d6dde4; }
     /* Settings popover (setup-settings-menu): a right-aligned gear reusing .bc-dd. Overrides geometry
        only -- .bc-settings shrinks the wrapper and pushes it to the right of the toolbar; the head drops
        the full width + the ::after chevron and shows just the gear; the list anchors to the right edge
@@ -315,8 +323,9 @@
         <div class="bc-dd">
           <button type="button" class="bc-dd-head" bc-setup-fit ng-click="toggle('race')">{{labelFor('race')}}</button>
           <div class="bc-dd-list" ng-if="open === 'race'">
-            <div class="bc-dd-opt" bc-setup-fit ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
-              ng-click="pick('race', o.v)">{{o.label}}</div>
+            <div class="bc-dd-opt" ng-repeat="o in opts.race" ng-class="{sel: o.v === form.race}"
+              ng-click="pick('race', o.v)"><div bc-setup-fit>{{o.label}}</div><div class="bc-race-facts"
+              ng-if="o.detail">{{o.detail}}</div></div>
           </div>
         </div>
       </div>
