@@ -263,7 +263,7 @@ local DASH_REFRESH_SETTLE = 0.75
 -- beammp-client-mod-cache-stale). Bump when shipping a client-visible fix that needs an in-game re-test.
 -- A release build carries its version; a test build between releases appends what it adds
 -- (0.10.0-<item>-r1), so the log names the build being tested.
-local BUILD_MARKER = "0.10.0-drag-r5/2026-11-17"
+local BUILD_MARKER = "0.10.0-tracklist-r1/2026-11-20"
 
 -- Speed (m/s) at or below which a car counts as STOPPED. One number, deliberately shared by the only two
 -- questions in this mod that ask it, so the two can never drift apart (user decision 2026-09-03, "dann ist
@@ -4487,14 +4487,16 @@ end
 -- lap count means anything (ADR-0013 amendment), and `defaultLaps` to show the lap count that applies when
 -- the Laps field is left empty, as its grey "3 (default)" placeholder (ADR-0049).
 --
--- Lazy per race for the same reason configs are lazy per model: racelist.options deliberately parses no
--- geometry, and a map can carry well over a hundred races. Both fields are nil when the race cannot be
--- resolved or parsed -- the panel then keeps its "track type unknown" fallback and its "auto" placeholder
--- instead of being told something false. Public so the app can reach it as beamcomp_init.request_race_meta.
+-- Answered from the facts racelist reads once per map for the race list's gray lines (racelist.meta_for), so
+-- this placeholder and the list's laps come from one record, and picking a race parses nothing. Both fields are
+-- nil when the race cannot be resolved or parsed -- the panel then keeps its "track type unknown" fallback and
+-- its "auto" placeholder instead of being told something false. Public so the app can reach it as
+-- beamcomp_init.request_race_meta.
 --
 -- defaultLaps is put through race_start.resolve_laps with no request, which is literally the panel's
 -- question: "what does this race run if I type nothing?". That covers the track that names no lap count
--- at all -- the answer is one lap, and it is race/start.lua's answer, not a second one invented here.
+-- at all -- the answer is one lap, and it is race/start.lua's answer, not a second one invented here. The race
+-- list asks the same function the same question for its circuits' laps (racelist.lua facts_line).
 function M.request_race_meta(race_id)
     if type(race_id) ~= "string" then
         return
@@ -4961,6 +4963,8 @@ end
 local function push_setup_data(include_deprecated)
     local map = maps.current()
     guihooks.trigger("BeamCompSetupData", {
+        -- Each race carries its facts line (mode, laps, checkpoints, length), read for the whole map on the first
+        -- panel open and remembered until the map changes (racelist.options).
         races = racelist.options(map, include_deprecated),
         cars = carlist.options().models,
         -- The static AI colour palette (ADR-0047 round 3) for the roster swatch picker; same list the
@@ -5812,6 +5816,7 @@ end
 local function push_grid_data()
     local map = maps.current()
     guihooks.trigger("BeamCompGridData", {
+        -- The same list, facts lines included, as the race-setup panel's (push_setup_data).
         races = racelist.options(map, true),
         seedRace = M.state.grid_seed_race,
     })
@@ -10795,6 +10800,8 @@ function M.onClientEndMission(_levelPath)
     -- the top of the file because init.lua sits at LuaJIT's 200-local ceiling and this is its only caller
     -- -- require is memoized, so it costs a table lookup (same trade as race/parser.lua's path loader).
     require("beamcomp/race/discovery").invalidate()
+    -- The race list's facts go with it: the same map entered again can carry another set of races.
+    racelist.forget()
 end
 
 function M.onExtensionUnloaded()
